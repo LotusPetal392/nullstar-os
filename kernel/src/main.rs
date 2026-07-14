@@ -9,6 +9,8 @@ use core::panic::PanicInfo;
 use core::ptr;
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster};
 
+mod serial;
+
 entry_point!(kernel_main);
 
 const FONT_WEIGHT: FontWeight = FontWeight::Regular;
@@ -230,10 +232,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let info = framebuffer.info();
     let mut writer = FramebufferWriter::new(framebuffer.buffer_mut(), info);
 
-    writer.write_string("Galactic OS\n");
+    writer.write_string("GalacticOS\n");
     writer.write_string("-------------\n\n");
     writer.write_string("The x86-64 kernel has booted successfully.\n");
     writer.write_string("Rust is writing directly to the framebuffer.");
+
+    serial_println!("kernel entered kernel_main");
 
     halt_forever();
 }

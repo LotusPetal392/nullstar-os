@@ -7,8 +7,8 @@ fn main() -> ExitCode {
         .args([
             "-drive",
             &format!("format=raw,file={bios_image}"),
-            "-no-reboot",
-            "-no-shutdown",
+            "-serial",
+            "stdio",
         ])
         .status();
 

@@ -5,8 +5,11 @@ edition = "2024"
 
 [dependencies]
 bootloader_api = "0.11.15"
+lazy_static = { version = "1.5", features = ["spin_no_std"] }
 noto-sans-mono-bitmap = { version = "0.2.0", default-features = false, features = [
     "regular",
     "size_16",
     "unicode-basic-latin",
 ] }
+spin = "0.10"
+uart_16550 = "0.3"
