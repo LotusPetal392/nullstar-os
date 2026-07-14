@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["kernel"]
+
+[package]
+name = "galactic-os"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+bootloader = "0.11.15"
+
+kernel = {
+    path = "kernel",
+    artifact = "bin",
+    target = "x86_64-unknown-none"
+}
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
