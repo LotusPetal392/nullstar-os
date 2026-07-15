@@ -11,5 +11,11 @@ noto-sans-mono-bitmap = { version = "0.2.0", default-features = false, features 
     "size_16",
     "unicode-basic-latin",
 ] }
+pc-keyboard = "0.9"
+pic8259 = { version = "0.11", default-features = false }
 spin = "0.10"
 uart_16550 = "0.3"
+x86_64 = { version = "0.15.5", default-features = false, features = [
+    "abi_x86_interrupt",
+    "instructions",
+] }

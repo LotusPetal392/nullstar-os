@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 use bootloader_api::{
     BootInfo, entry_point,
@@ -9,6 +10,9 @@ use core::panic::PanicInfo;
 use core::ptr;
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster};
 
+mod gdt;
+mod interrupts;
+mod keyboard;
 mod serial;
 
 entry_point!(kernel_main);
@@ -227,32 +231,60 @@ fn channel_at(channel: u8, position: u8) -> u64 {
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let Some(framebuffer) = boot_info.framebuffer.as_mut() else {
-        halt_forever();
+        serial_println!("no framebuffer was provided by the bootloader");
+        hlt_loop();
     };
     let info = framebuffer.info();
     let mut writer = FramebufferWriter::new(framebuffer.buffer_mut(), info);
 
+    gdt::init();
+    interrupts::init();
+
     writer.write_string("GalacticOS\n");
     writer.write_string("-------------\n\n");
     writer.write_string("The x86-64 kernel has booted successfully.\n");
-    writer.write_string("Rust is writing directly to the framebuffer.");
+    writer.write_string("Rust is writing directly to the framebuffer.\n\n");
+
+    writer.write_string("GDT loaded\n");
+    writer.write_string("IDT loaded\n");
+    writer.write_string("Interrupts enabled\n");
+
+    writer.write_string("Keyboard ready. Type below:\n");
 
     serial_println!("kernel entered kernel_main");
 
-    halt_forever();
-}
-
-fn halt_forever() -> ! {
+    let mut reported_seconds = 0;
     loop {
-        // Halt until an interrupt occurs. Interrupts are not configured yet,
-        // so this effectively leaves the processor stopped.
-        unsafe {
-            core::arch::asm!("hlt");
+        x86_64::instructions::hlt();
+
+        while let Some(key) = keyboard::poll_key() {
+            match key {
+                pc_keyboard::DecodedKey::Unicode(character) => {
+                    writer.write_char(character);
+                    serial_print!("{character}");
+                }
+                pc_keyboard::DecodedKey::RawKey(key_code) => {
+                    serial_print!("<{key_code:?}>");
+                }
+            }
+        }
+
+        let elapsed_seconds = interrupts::timer_ticks() / interrupts::TIMER_HZ;
+        if elapsed_seconds > reported_seconds {
+            reported_seconds = elapsed_seconds;
+            serial_println!("uptime: {elapsed_seconds}s");
         }
     }
 }
 
+fn hlt_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    halt_forever();
+fn panic(info: &PanicInfo) -> ! {
+    serial_println!("KERNEL PANIC: {info}");
+    hlt_loop();
 }
