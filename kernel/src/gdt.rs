@@ -7,7 +7,10 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
 
-static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
+#[repr(align(16))]
+struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
+
+static mut DOUBLE_FAULT_STACK: Stack = Stack([0; DOUBLE_FAULT_STACK_SIZE]);
 
 struct Selectors {
     code_selector: SegmentSelector,
@@ -19,7 +22,9 @@ lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
 
-        let stack_start = VirtAddr::from_ptr(&raw const DOUBLE_FAULT_STACK);
+        // Taking the raw address does not read or alias the stack contents.
+        let stack_start =
+            VirtAddr::from_ptr(unsafe { &raw const DOUBLE_FAULT_STACK.0 });
 
         let stack_end = stack_start + DOUBLE_FAULT_STACK_SIZE as u64;
 
