@@ -1,17 +1,21 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
+
+use alloc::{boxed::Box, vec::Vec};
 use bootloader_api::{
     BootInfo, BootloaderConfig, entry_point,
     config::Mapping,
     info::{FrameBufferInfo, PixelFormat},
 };
-use core::panic::PanicInfo;
-use core::ptr;
+use core::{alloc::Layout, panic::PanicInfo, ptr};
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster};
 use x86_64::VirtAddr;
 
+mod allocator;
 mod gdt;
 mod interrupts;
 mod keyboard;
@@ -245,9 +249,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     let physical_memory_offset = VirtAddr::new(physical_memory_offset);
 
-    let _mapper = unsafe { memory::init(physical_memory_offset) };
-    let frame_allocator =
+    let mut mapper = unsafe { memory::init(physical_memory_offset) };
+    let mut frame_allocator =
         unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+
+    if let Err(error) = allocator::init_heap(&mut mapper, &mut frame_allocator) {
+        serial_println!("failed to initialize the kernel heap: {error:?}");
+        hlt_loop();
+    }
 
     let Some(framebuffer) = boot_info.framebuffer.as_mut() else {
         serial_println!("no framebuffer was provided by the bootloader");
@@ -258,6 +267,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     gdt::init();
     interrupts::init();
+    heap_allocation_self_test();
 
     writer.write_string("GalacticOS\n");
     writer.write_string("-------------\n\n");
@@ -265,6 +275,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     writer.write_string("Rust is writing directly to the framebuffer.\n\n");
 
     writer.write_string("Physical memory manager ready\n");
+    writer.write_string("Kernel heap ready\n");
+    writer.write_string("Heap allocation self-test passed\n");
     writer.write_string("GDT loaded\n");
     writer.write_string("IDT loaded\n");
     writer.write_string("Interrupts enabled\n");
@@ -278,6 +290,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         physical_memory_offset.as_u64(),
         usable_frames,
         usable_mebibytes
+    );
+    serial_println!(
+        "kernel heap initialized: start={:#x}, size={} KiB, pages={}, allocated_frames={}, remaining_frames={}",
+        allocator::HEAP_START,
+        allocator::HEAP_SIZE / 1024,
+        allocator::HEAP_PAGE_COUNT,
+        frame_allocator.allocated_frame_count(),
+        frame_allocator.remaining_frame_count()
     );
     serial_println!("kernel entered kernel_main");
 
@@ -305,10 +325,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
+fn heap_allocation_self_test() {
+    const HEAP_VALUE: u64 = 0xC0FF_EE00_D15C_A11C;
+    const VECTOR_LENGTH: u64 = 1024;
+    const EXPECTED_SUM: u64 = (VECTOR_LENGTH - 1) * VECTOR_LENGTH / 2;
+
+    let heap_value = Box::new(HEAP_VALUE);
+    let mut values = Vec::new();
+    for value in 0..VECTOR_LENGTH {
+        values.push(value);
+    }
+
+    assert_eq!(*heap_value, HEAP_VALUE);
+    assert_eq!(values.len(), VECTOR_LENGTH as usize);
+    assert_eq!(values.iter().copied().sum::<u64>(), EXPECTED_SUM);
+
+    drop(values);
+    drop(heap_value);
+
+    let reused_value = Box::new(0xA110_C8ED_u64);
+    assert_eq!(*reused_value, 0xA110_C8ED);
+
+    serial_println!(
+        "heap allocation self-test passed: vector_len={}, vector_sum={}",
+        VECTOR_LENGTH,
+        EXPECTED_SUM
+    );
+}
+
 fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+#[alloc_error_handler]
+fn allocation_error(layout: Layout) -> ! {
+    serial_println!("KERNEL ALLOCATION ERROR: {layout:?}");
+    hlt_loop();
 }
 
 #[panic_handler]
