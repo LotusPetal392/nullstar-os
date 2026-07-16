@@ -62,9 +62,7 @@ pub fn _print(arguments: fmt::Arguments<'_>) {
 }
 
 fn with_console<R>(operation: impl FnOnce(&mut FramebufferWriter) -> R) -> Option<R> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        CONSOLE.lock().as_mut().map(operation)
-    })
+    x86_64::instructions::interrupts::without_interrupts(|| CONSOLE.lock().as_mut().map(operation))
 }
 
 struct FramebufferWriter {
