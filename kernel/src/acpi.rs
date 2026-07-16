@@ -198,9 +198,7 @@ pub struct AcpiInfo {
 
 impl AcpiInfo {
     pub fn oem_id(&self) -> &str {
-        str::from_utf8(&self.oem_id)
-            .unwrap_or("??????")
-            .trim_end()
+        str::from_utf8(&self.oem_id).unwrap_or("??????").trim_end()
     }
 
     pub fn table_signatures(&self) -> &[Signature] {
@@ -405,8 +403,7 @@ fn parse_rsdp(memory: PhysicalMemory, rsdp_address: u64) -> Result<ParsedRsdp, A
             return Err(AcpiError::InvalidRsdpChecksum);
         }
 
-        let xsdt_address =
-            read_u64(version_two, 24).ok_or(AcpiError::InvalidRsdpLength(length))?;
+        let xsdt_address = read_u64(version_two, 24).ok_or(AcpiError::InvalidRsdpLength(length))?;
 
         if xsdt_address != 0 {
             (RootTableKind::Xsdt, xsdt_address)
@@ -427,16 +424,12 @@ fn parse_rsdp(memory: PhysicalMemory, rsdp_address: u64) -> Result<ParsedRsdp, A
     })
 }
 
-fn read_table_header(
-    memory: PhysicalMemory,
-    table_address: u64,
-) -> Result<TableHeader, AcpiError> {
+fn read_table_header(memory: PhysicalMemory, table_address: u64) -> Result<TableHeader, AcpiError> {
     let bytes = memory.region(table_address, SDT_HEADER_LENGTH)?;
-    let signature =
-        Signature::from_slice(bytes).ok_or(AcpiError::InvalidTableLength {
-            address: table_address,
-            length: 0,
-        })?;
+    let signature = Signature::from_slice(bytes).ok_or(AcpiError::InvalidTableLength {
+        address: table_address,
+        length: 0,
+    })?;
     let length = read_u32(bytes, 4).ok_or(AcpiError::InvalidTableLength {
         address: table_address,
         length: 0,
@@ -446,11 +439,10 @@ fn read_table_header(
         length,
     })?;
 
-    let length_usize =
-        usize::try_from(length).map_err(|_| AcpiError::InvalidTableLength {
-            address: table_address,
-            length,
-        })?;
+    let length_usize = usize::try_from(length).map_err(|_| AcpiError::InvalidTableLength {
+        address: table_address,
+        length,
+    })?;
     if !(SDT_HEADER_LENGTH..=MAX_ACPI_TABLE_LENGTH).contains(&length_usize) {
         return Err(AcpiError::InvalidTableLength {
             address: table_address,
@@ -470,11 +462,10 @@ fn read_complete_table(
     table_address: u64,
     header: TableHeader,
 ) -> Result<&'static [u8], AcpiError> {
-    let length =
-        usize::try_from(header.length).map_err(|_| AcpiError::InvalidTableLength {
-            address: table_address,
-            length: header.length,
-        })?;
+    let length = usize::try_from(header.length).map_err(|_| AcpiError::InvalidTableLength {
+        address: table_address,
+        length: header.length,
+    })?;
     let table = memory.region(table_address, length)?;
 
     if !checksum_is_valid(table) {
@@ -534,8 +525,7 @@ fn parse_madt(table: &[u8]) -> Option<MadtInfo> {
                 }
             }
             2 if entry.len() >= 10 => {
-                info.interrupt_override_count =
-                    info.interrupt_override_count.saturating_add(1);
+                info.interrupt_override_count = info.interrupt_override_count.saturating_add(1);
             }
             5 if entry.len() >= 12 => {
                 info.local_apic_address = read_u64(entry, 4)?;
@@ -562,8 +552,7 @@ fn record_processor(info: &mut MadtInfo, flags: u32) {
         info.enabled_processor_count = info.enabled_processor_count.saturating_add(1);
     }
     if flags & 2 != 0 {
-        info.online_capable_processor_count =
-            info.online_capable_processor_count.saturating_add(1);
+        info.online_capable_processor_count = info.online_capable_processor_count.saturating_add(1);
     }
 }
 
