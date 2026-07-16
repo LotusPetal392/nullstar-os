@@ -7,8 +7,9 @@ extern crate alloc;
 
 use alloc::{boxed::Box, vec::Vec};
 use bootloader_api::{
-    BootInfo, BootloaderConfig, entry_point,
+    BootInfo, BootloaderConfig,
     config::Mapping,
+    entry_point,
     info::{FrameBufferInfo, PixelFormat},
 };
 use core::{alloc::Layout, panic::PanicInfo, ptr};

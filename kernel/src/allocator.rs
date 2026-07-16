@@ -1,7 +1,6 @@
 use core::{
     alloc::{GlobalAlloc, Layout},
-    mem,
-    ptr,
+    mem, ptr,
 };
 
 use spin::Mutex;
@@ -9,8 +8,7 @@ use x86_64::{
     VirtAddr,
     instructions::interrupts,
     structures::paging::{
-        FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB,
-        mapper::MapToError,
+        FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
     },
 };
 
@@ -134,11 +132,7 @@ impl LinkedListAllocator {
         }
     }
 
-    fn find_region(
-        &mut self,
-        size: usize,
-        align: usize,
-    ) -> Option<(&'static mut ListNode, usize)> {
+    fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
         let mut current = &mut self.head;
 
         while let Some(ref mut region) = current.next {
