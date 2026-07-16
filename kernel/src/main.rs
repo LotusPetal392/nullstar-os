@@ -15,6 +15,7 @@ mod allocator;
 mod apic;
 mod console;
 mod gdt;
+mod hpet;
 mod interrupts;
 mod keyboard;
 mod memory;
@@ -99,13 +100,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     gdt::init();
     let interrupt_controller = interrupts::init(
         acpi_info.as_ref().and_then(|info| info.madt.as_ref()),
+        acpi_info.as_ref().and_then(|info| info.hpet.as_ref()),
         physical_memory_offset,
         physical_memory_end,
     );
     interrupts::wait_for_timer_tick();
     serial_println!(
-        "interrupt timer verified: controller={}, ticks={}",
+        "interrupt timer verified: controller={}, source={}, ticks={}",
         interrupt_controller.kind,
+        interrupt_controller.timer_source,
         interrupts::timer_ticks()
     );
     heap_allocation_self_test();
@@ -123,6 +126,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("GDT loaded");
     println!("IDT loaded");
     println!("Interrupt controller: {}", interrupt_controller.kind);
+    println!("Timer source: {}", interrupt_controller.timer_source);
     println!("Timer interrupts verified");
     if acpi_info.is_some() {
         println!("ACPI tables loaded");
