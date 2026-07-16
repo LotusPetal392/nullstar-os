@@ -10,6 +10,7 @@ use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::{alloc::Layout, panic::PanicInfo};
 use x86_64::VirtAddr;
 
+mod acpi;
 mod allocator;
 mod console;
 mod gdt;
@@ -18,6 +19,8 @@ mod keyboard;
 mod memory;
 mod serial;
 mod shell;
+
+const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -33,6 +36,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     };
     let physical_memory_offset = VirtAddr::new(physical_memory_offset);
+    let physical_memory_end = boot_info
+        .memory_regions
+        .iter()
+        .map(|region| region.end)
+        .max()
+        .unwrap_or(0)
+        .max(BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END);
+    let rsdp_address = boot_info.rsdp_addr.into_option();
 
     let mut mapper = unsafe { memory::init(physical_memory_offset) };
     let mut frame_allocator =
@@ -42,6 +53,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!("failed to initialize the kernel heap: {error:?}");
         hlt_loop();
     }
+
+    let acpi_info = match rsdp_address {
+        Some(rsdp_address) => {
+            match acpi::init(
+                rsdp_address,
+                physical_memory_offset,
+                physical_memory_end,
+            ) {
+                Ok(info) => {
+                    serial_println!(
+                        "ACPI initialized: rsdp={:#x}, revision={}, root={}@{:#x}, tables={}, valid={}, invalid={}, madt={}, fadt={}, hpet={}, mcfg={}",
+                        info.rsdp_address,
+                        info.revision,
+                        info.root_table_kind,
+                        info.root_table_address,
+                        info.total_table_count,
+                        info.valid_table_count,
+                        info.invalid_table_count,
+                        info.madt.is_some(),
+                        info.fadt.is_some(),
+                        info.hpet.is_some(),
+                        info.mcfg.is_some()
+                    );
+                    Some(info)
+                }
+                Err(error) => {
+                    serial_println!("ACPI initialization failed: {error:?}");
+                    None
+                }
+            }
+        }
+        None => {
+            serial_println!("ACPI unavailable: bootloader did not provide an RSDP");
+            None
+        }
+    };
 
     let Some(framebuffer) = boot_info.framebuffer.take() else {
         serial_println!("no framebuffer was provided by the bootloader");
@@ -69,6 +116,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("GDT loaded");
     println!("IDT loaded");
     println!("Interrupts enabled");
+    if acpi_info.is_some() {
+        println!("ACPI tables loaded");
+    } else {
+        println!("ACPI unavailable");
+    }
     println!("Interactive shell initialized");
 
     let usable_frames = frame_allocator.usable_frame_count();
@@ -94,7 +146,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("interactive shell initialized");
     serial_println!("kernel entered kernel_main");
 
-    let system_info = shell::SystemInfo::new(usable_frames, allocated_frames, remaining_frames);
+    let system_info =
+        shell::SystemInfo::new(usable_frames, allocated_frames, remaining_frames, acpi_info);
     let mut interactive_shell = shell::Shell::new(system_info);
     interactive_shell.start();
 
