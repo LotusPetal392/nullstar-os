@@ -7,10 +7,6 @@ name = "galactic-os"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-qemu-test = ["kernel/qemu-test"]
-
 [build-dependencies]
 bootloader = "0.11.15"
 
