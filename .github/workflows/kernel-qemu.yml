@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   qemu-smoke-test:
@@ -15,10 +15,8 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check out pull request branch
+      - name: Check out repository
         uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
 
       - name: Install pinned Rust toolchain
         run: |
@@ -29,21 +27,8 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Format Rust sources
-        run: cargo +nightly-2026-02-01 fmt --all
-
-      - name: Commit formatting changes
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add kernel/src/allocator.rs kernel/src/main.rs src/main.rs
-          if git diff --cached --quiet; then
-            echo "No formatting changes"
-          else
-            git commit -m "Format heap allocator changes"
-            git push origin HEAD:${{ github.event.pull_request.head.ref }}
-          fi
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
 
       - name: Install QEMU
         run: |
