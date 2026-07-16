@@ -114,7 +114,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let scheduler_initial = match scheduler::init() {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            serial_println!("failed to initialize the scheduler: {}", error.description());
+            serial_println!(
+                "failed to initialize the scheduler: {}",
+                error.description()
+            );
             hlt_loop();
         }
     };

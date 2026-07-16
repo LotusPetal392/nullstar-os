@@ -9,8 +9,7 @@ use spin::Mutex;
 use x86_64::{
     VirtAddr,
     instructions::{
-        hlt,
-        interrupts as cpu_interrupts,
+        hlt, interrupts as cpu_interrupts,
         segmentation::{CS, Segment},
     },
 };
@@ -180,10 +179,7 @@ impl Task {
             .checked_sub(size_of::<SavedContext>())
             .ok_or(InitError::StackLayoutInvalid)?;
 
-        if stack_start % align_of::<u128>() != 0
-            || stack_end % 16 != 0
-            || stack_pointer % 16 != 0
-        {
+        if stack_start % align_of::<u128>() != 0 || stack_end % 16 != 0 || stack_pointer % 16 != 0 {
             return Err(InitError::StackLayoutInvalid);
         }
 
@@ -268,7 +264,8 @@ impl Scheduler {
             return Err(InitError::AlreadyInitialized);
         }
 
-        self.tasks.push(Task::bootstrap(self.allocate_task_id()));
+        let bootstrap_id = self.allocate_task_id();
+        self.tasks.push(Task::bootstrap(bootstrap_id));
         self.spawn("scheduler-probe-a", scheduler_probe_a)?;
         self.spawn("scheduler-probe-b", scheduler_probe_b)?;
         self.running = true;
