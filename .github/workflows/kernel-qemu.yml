@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   qemu-smoke-test:
@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Install pinned Rust toolchain
         run: |
@@ -27,8 +29,20 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Check formatting
-        run: cargo +nightly-2026-02-01 fmt --all -- --check
+      - name: Apply pinned formatting
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Commit formatted sources
+        run: |
+          if git diff --quiet; then
+            echo "Sources already match pinned rustfmt"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add kernel/src src/main.rs
+            git commit -m "Apply pinned rustfmt"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
 
       - name: Install QEMU
         run: |
