@@ -231,11 +231,29 @@ impl Shell {
             interrupts::SPURIOUS_VECTOR
         );
         shell_println!(
-            "timer: {} Hz, ticks={}, spurious interrupts={}",
+            "timer: source={}, frequency={} Hz, ticks={}, spurious interrupts={}",
+            info.timer_source,
             interrupts::TIMER_HZ,
             interrupts::timer_ticks(),
             interrupts::spurious_interrupts()
         );
+
+        if info.timer_source == interrupts::TimerSource::LocalApic {
+            shell_println!(
+                "local APIC timer: ticks/s={}, initial count={}, divisor={}",
+                info.local_apic_timer_ticks_per_second.unwrap_or(0),
+                info.local_apic_timer_initial_count.unwrap_or(0),
+                info.local_apic_timer_divisor.unwrap_or(0)
+            );
+            shell_println!(
+                "HPET calibration: frequency={} Hz, period={} fs, 64-bit={}",
+                info.hpet_frequency_hz.unwrap_or(0),
+                info.hpet_period_femtoseconds.unwrap_or(0),
+                info.hpet_counter_is_64_bit.unwrap_or(false)
+            );
+        } else if let Some(reason) = info.timer_fallback_reason {
+            shell_println!("local APIC timer fallback: {reason}");
+        }
 
         match info.kind {
             interrupts::ControllerKind::Apic => {
@@ -251,11 +269,21 @@ impl Shell {
                     info.io_apic_address.unwrap_or(0),
                     info.io_apic_redirection_entries.unwrap_or(0)
                 );
-                shell_println!(
-                    "routes: PIT IRQ0 -> GSI {}, keyboard IRQ1 -> GSI {}",
-                    info.timer_gsi.unwrap_or(0),
-                    info.keyboard_gsi.unwrap_or(0)
-                );
+                match info.timer_source {
+                    interrupts::TimerSource::LocalApic => {
+                        shell_println!(
+                            "routes: local APIC timer, keyboard IRQ1 -> GSI {}",
+                            info.keyboard_gsi.unwrap_or(0)
+                        );
+                    }
+                    interrupts::TimerSource::Pit => {
+                        shell_println!(
+                            "routes: PIT IRQ0 -> GSI {}, keyboard IRQ1 -> GSI {}",
+                            info.timer_gsi.unwrap_or(0),
+                            info.keyboard_gsi.unwrap_or(0)
+                        );
+                    }
+                }
             }
             interrupts::ControllerKind::Pic => {
                 shell_println!(

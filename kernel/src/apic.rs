@@ -6,7 +6,10 @@ use core::{
 
 use x86_64::VirtAddr;
 
-use crate::acpi::{InterruptPolarity, InterruptTriggerMode, IsaInterruptRoute, MadtInfo};
+use crate::{
+    acpi::{HpetInfo, InterruptPolarity, InterruptTriggerMode, IsaInterruptRoute, MadtInfo},
+    hpet,
+};
 
 const APIC_BASE_MSR: u32 = 0x1b;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
@@ -27,8 +30,16 @@ const LOCAL_APIC_LVT_PERFORMANCE: usize = 0x340;
 const LOCAL_APIC_LVT_LINT0: usize = 0x350;
 const LOCAL_APIC_LVT_LINT1: usize = 0x360;
 const LOCAL_APIC_LVT_ERROR: usize = 0x370;
+const LOCAL_APIC_TIMER_INITIAL_COUNT: usize = 0x380;
+const LOCAL_APIC_TIMER_CURRENT_COUNT: usize = 0x390;
+const LOCAL_APIC_TIMER_DIVIDE_CONFIGURATION: usize = 0x3e0;
 const LOCAL_APIC_SOFTWARE_ENABLE: u32 = 1 << 8;
 const LOCAL_APIC_LVT_MASKED: u32 = 1 << 16;
+const LOCAL_APIC_TIMER_PERIODIC: u32 = 1 << 17;
+const LOCAL_APIC_TIMER_DIVIDE_BY_16_ENCODING: u32 = 0x3;
+const LOCAL_APIC_TIMER_DIVISOR: u32 = 16;
+const TIMER_CALIBRATION_INTERVAL_FEMTOSECONDS: u64 = 10_000_000_000_000;
+const FEMTOSECONDS_PER_SECOND: u128 = 1_000_000_000_000_000;
 
 const IO_APIC_REGION_LENGTH: u64 = 0x20;
 const IO_APIC_REGISTER_SELECT: usize = 0x00;
@@ -83,6 +94,32 @@ impl fmt::Display for InitError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerSource {
+    Pit,
+    LocalApic,
+}
+
+impl fmt::Display for TimerSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pit => formatter.write_str("pit"),
+            Self::LocalApic => formatter.write_str("lapic"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTimerInfo {
+    pub ticks_per_second: u64,
+    pub initial_count: u32,
+    pub divisor: u32,
+    pub calibration_hpet_ticks: u64,
+    pub hpet_period_femtoseconds: u64,
+    pub hpet_frequency_hz: u64,
+    pub hpet_counter_is_64_bit: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ControllerInfo {
     pub local_apic_id: u8,
@@ -91,8 +128,36 @@ pub struct ControllerInfo {
     pub io_apic_id: u8,
     pub io_apic_address: u32,
     pub io_apic_redirection_entries: u32,
+    pub timer_source: TimerSource,
     pub timer_route: IsaInterruptRoute,
     pub keyboard_route: IsaInterruptRoute,
+    pub local_timer: Option<LocalTimerInfo>,
+    pub timer_fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerCalibrationError {
+    HpetUnavailable,
+    Hpet(hpet::Error),
+    LocalApicTimerDidNotAdvance,
+    InvalidMeasuredFrequency,
+    InvalidInitialCount,
+}
+
+impl TimerCalibrationError {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::HpetUnavailable => "HPET table is unavailable",
+            Self::Hpet(error) => error.description(),
+            Self::LocalApicTimerDidNotAdvance => "local APIC timer did not advance",
+            Self::InvalidMeasuredFrequency => {
+                "local APIC timer calibration produced an invalid frequency"
+            }
+            Self::InvalidInitialCount => {
+                "local APIC timer period does not fit in the initial-count register"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -189,6 +254,90 @@ impl LocalApic {
         (local_apic_id, version)
     }
 
+    fn calibrate_and_start_periodic_timer(
+        self,
+        reference_timer: hpet::Hpet,
+        vector: u8,
+        target_hz: u64,
+    ) -> Result<LocalTimerInfo, TimerCalibrationError> {
+        if target_hz == 0 {
+            return Err(TimerCalibrationError::InvalidMeasuredFrequency);
+        }
+
+        self.mmio.write_u32(
+            LOCAL_APIC_TIMER_DIVIDE_CONFIGURATION,
+            LOCAL_APIC_TIMER_DIVIDE_BY_16_ENCODING,
+        );
+        self.mmio.write_u32(
+            LOCAL_APIC_LVT_TIMER,
+            u32::from(vector) | LOCAL_APIC_LVT_MASKED,
+        );
+        self.mmio
+            .write_u32(LOCAL_APIC_TIMER_INITIAL_COUNT, u32::MAX);
+
+        let measurement =
+            match reference_timer.measure_duration(TIMER_CALIBRATION_INTERVAL_FEMTOSECONDS) {
+                Ok(measurement) => measurement,
+                Err(error) => {
+                    self.stop_timer();
+                    return Err(TimerCalibrationError::Hpet(error));
+                }
+            };
+        let current_count = self.mmio.read_u32(LOCAL_APIC_TIMER_CURRENT_COUNT);
+        self.stop_timer();
+
+        let elapsed_apic_ticks = u64::from(u32::MAX - current_count);
+        if elapsed_apic_ticks == 0 {
+            return Err(TimerCalibrationError::LocalApicTimerDidNotAdvance);
+        }
+        if measurement.elapsed_femtoseconds == 0 {
+            return Err(TimerCalibrationError::InvalidMeasuredFrequency);
+        }
+
+        let ticks_per_second = (u128::from(elapsed_apic_ticks) * FEMTOSECONDS_PER_SECOND
+            + measurement.elapsed_femtoseconds / 2)
+            / measurement.elapsed_femtoseconds;
+        let ticks_per_second = u64::try_from(ticks_per_second)
+            .map_err(|_| TimerCalibrationError::InvalidMeasuredFrequency)?;
+        if ticks_per_second == 0 {
+            return Err(TimerCalibrationError::InvalidMeasuredFrequency);
+        }
+
+        let initial_count =
+            (u128::from(ticks_per_second) + u128::from(target_hz) / 2) / u128::from(target_hz);
+        if initial_count == 0 || initial_count > u128::from(u32::MAX) {
+            return Err(TimerCalibrationError::InvalidInitialCount);
+        }
+        let initial_count = initial_count as u32;
+
+        self.mmio.write_u32(
+            LOCAL_APIC_TIMER_DIVIDE_CONFIGURATION,
+            LOCAL_APIC_TIMER_DIVIDE_BY_16_ENCODING,
+        );
+        self.mmio.write_u32(
+            LOCAL_APIC_LVT_TIMER,
+            u32::from(vector) | LOCAL_APIC_TIMER_PERIODIC,
+        );
+        self.mmio
+            .write_u32(LOCAL_APIC_TIMER_INITIAL_COUNT, initial_count);
+
+        let hpet_info = reference_timer.info();
+        Ok(LocalTimerInfo {
+            ticks_per_second,
+            initial_count,
+            divisor: LOCAL_APIC_TIMER_DIVISOR,
+            calibration_hpet_ticks: measurement.elapsed_ticks,
+            hpet_period_femtoseconds: hpet_info.period_femtoseconds,
+            hpet_frequency_hz: hpet_info.frequency_hz,
+            hpet_counter_is_64_bit: hpet_info.counter_is_64_bit,
+        })
+    }
+
+    fn stop_timer(self) {
+        self.mmio.write_u32(LOCAL_APIC_TIMER_INITIAL_COUNT, 0);
+        self.mask_lvt(LOCAL_APIC_LVT_TIMER);
+    }
+
     fn mask_lvt(self, offset: usize) {
         let value = self.mmio.read_u32(offset);
         self.mmio.write_u32(offset, value | LOCAL_APIC_LVT_MASKED);
@@ -274,11 +423,13 @@ impl IoApic {
 
 pub fn init(
     madt: &MadtInfo,
+    hpet_info: Option<&HpetInfo>,
     physical_memory_offset: VirtAddr,
     physical_memory_end: u64,
     timer_vector: u8,
     keyboard_vector: u8,
     spurious_vector: u8,
+    timer_hz: u64,
 ) -> Result<ControllerInfo, InitError> {
     let features = unsafe { __cpuid(1) };
     if features.edx & (1 << 9) == 0 {
@@ -333,14 +484,37 @@ pub fn init(
         return Err(InitError::DuplicateInterruptRoute);
     }
 
+    let reference_timer = match hpet_info {
+        Some(info) => hpet::Hpet::new(info, physical_memory_offset, physical_memory_end)
+            .map_err(TimerCalibrationError::Hpet),
+        None => Err(TimerCalibrationError::HpetUnavailable),
+    };
+
     if apic_base_msr & APIC_BASE_ENABLE == 0 {
         unsafe { write_msr(APIC_BASE_MSR, apic_base_msr | APIC_BASE_ENABLE) };
     }
 
     let (local_apic_id, local_apic_version) = local_apic.configure(spurious_vector);
     io_apic.mask_all();
-    io_apic.route(timer_route, timer_vector, local_apic_id);
     io_apic.route(keyboard_route, keyboard_vector, local_apic_id);
+
+    let (timer_source, local_timer, timer_fallback_reason) = match reference_timer {
+        Ok(reference_timer) => match local_apic.calibrate_and_start_periodic_timer(
+            reference_timer,
+            timer_vector,
+            timer_hz,
+        ) {
+            Ok(timer_info) => (TimerSource::LocalApic, Some(timer_info), None),
+            Err(error) => {
+                io_apic.route(timer_route, timer_vector, local_apic_id);
+                (TimerSource::Pit, None, Some(error.description()))
+            }
+        },
+        Err(error) => {
+            io_apic.route(timer_route, timer_vector, local_apic_id);
+            (TimerSource::Pit, None, Some(error.description()))
+        }
+    };
 
     LOCAL_APIC_VIRTUAL_BASE.store(local_apic.mmio.virtual_base as u64, Ordering::Release);
 
@@ -351,8 +525,11 @@ pub fn init(
         io_apic_id: io_apic.id(),
         io_apic_address: io_apic_info.address,
         io_apic_redirection_entries: io_apic.redirection_entries,
+        timer_source,
         timer_route,
         keyboard_route,
+        local_timer,
+        timer_fallback_reason,
     })
 }
 
