@@ -87,16 +87,12 @@ impl Hpet {
         )?;
         let capabilities = mmio.read_u64(GENERAL_CAPABILITIES);
         let period_femtoseconds = capabilities >> 32;
-        if period_femtoseconds == 0
-            || period_femtoseconds > MAX_CLOCK_PERIOD_FEMTOSECONDS
-        {
+        if period_femtoseconds == 0 || period_femtoseconds > MAX_CLOCK_PERIOD_FEMTOSECONDS {
             return Err(Error::InvalidClockPeriod);
         }
 
-        let frequency_hz = u64::try_from(
-            FEMTOSECONDS_PER_SECOND / u128::from(period_femtoseconds),
-        )
-        .map_err(|_| Error::InvalidClockPeriod)?;
+        let frequency_hz = u64::try_from(FEMTOSECONDS_PER_SECOND / u128::from(period_femtoseconds))
+            .map_err(|_| Error::InvalidClockPeriod)?;
         if frequency_hz == 0 {
             return Err(Error::InvalidClockPeriod);
         }
@@ -128,11 +124,11 @@ impl Hpet {
     }
 
     pub fn measure_duration(self, duration_femtoseconds: u64) -> Result<Measurement, Error> {
-        let target_ticks = (u128::from(duration_femtoseconds)
-            + u128::from(self.info.period_femtoseconds)
-            - 1)
-            / u128::from(self.info.period_femtoseconds);
-        let target_ticks = u64::try_from(target_ticks.max(1)).map_err(|_| Error::IntervalTooLong)?;
+        let target_ticks =
+            (u128::from(duration_femtoseconds) + u128::from(self.info.period_femtoseconds) - 1)
+                / u128::from(self.info.period_femtoseconds);
+        let target_ticks =
+            u64::try_from(target_ticks.max(1)).map_err(|_| Error::IntervalTooLong)?;
         let elapsed_ticks = self.wait_ticks(target_ticks)?;
 
         Ok(Measurement {
