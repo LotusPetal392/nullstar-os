@@ -1,0 +1,42 @@
+name: Kernel QEMU smoke test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  qemu-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
+
+      - name: Build bootable image
+        run: cargo +nightly-2026-02-01 build --locked
+
+      - name: Boot heap smoke test in QEMU
+        run: cargo +nightly-2026-02-01 run --locked -- --test
