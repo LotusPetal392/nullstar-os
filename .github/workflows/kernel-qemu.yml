@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   qemu-smoke-test:
@@ -15,10 +15,8 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check out repository branch
+      - name: Check out repository
         uses: actions/checkout@v7
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Install pinned Rust toolchain
         run: |
@@ -29,32 +27,8 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Apply scheduler build fix and formatting
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("kernel/src/scheduler.rs")
-          source = path.read_text()
-          old = "        self.tasks.push(Task::bootstrap(self.allocate_task_id()));\n"
-          new = (
-              "        let bootstrap_id = self.allocate_task_id();\n"
-              "        self.tasks.push(Task::bootstrap(bootstrap_id));\n"
-          )
-          if old in source:
-              path.write_text(source.replace(old, new, 1))
-          PY
-          cargo +nightly-2026-02-01 fmt --all
-
-      - name: Commit scheduler fix and formatted sources
-        run: |
-          git config user.name "lotuspetalagent"
-          git config user.email "lotuspetalagent@users.noreply.github.com"
-          git add kernel/src src/main.rs
-          if ! git diff --cached --quiet; then
-            git commit -m "Fix scheduler build and format sources"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
 
       - name: Install QEMU
         run: |
@@ -64,5 +38,16 @@ jobs:
       - name: Build bootable image
         run: cargo +nightly-2026-02-01 build --locked --quiet
 
-      - name: Boot heap smoke test in QEMU
-        run: cargo +nightly-2026-02-01 run --locked --quiet -- --test
+      - name: Boot scheduler smoke test in QEMU
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee scheduler-qemu.log
+
+      - name: Upload scheduler runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: scheduler-qemu-log
+          path: scheduler-qemu.log
+          if-no-files-found: ignore
