@@ -27,9 +27,18 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Check formatting
-        continue-on-error: true
-        run: cargo +nightly-2026-02-01 fmt --all -- --check
+      - name: Generate rustfmt patch
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          git diff > rustfmt.patch
+
+      - name: Upload rustfmt patch
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Install QEMU
         run: |
