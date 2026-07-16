@@ -126,6 +126,57 @@ impl fmt::Display for PowerProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptPolarity {
+    ActiveHigh,
+    ActiveLow,
+}
+
+impl fmt::Display for InterruptPolarity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ActiveHigh => formatter.write_str("active-high"),
+            Self::ActiveLow => formatter.write_str("active-low"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptTriggerMode {
+    Edge,
+    Level,
+}
+
+impl fmt::Display for InterruptTriggerMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Edge => formatter.write_str("edge"),
+            Self::Level => formatter.write_str("level"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsaInterruptRoute {
+    pub source_irq: u8,
+    pub global_system_interrupt: u32,
+    pub polarity: InterruptPolarity,
+    pub trigger_mode: InterruptTriggerMode,
+    pub overridden: bool,
+}
+
+impl IsaInterruptRoute {
+    const fn legacy(source_irq: u8) -> Self {
+        Self {
+            source_irq,
+            global_system_interrupt: source_irq as u32,
+            polarity: InterruptPolarity::ActiveHigh,
+            trigger_mode: InterruptTriggerMode::Edge,
+            overridden: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct IoApicInfo {
     pub id: u8,
@@ -144,6 +195,8 @@ pub struct MadtInfo {
     pub interrupt_override_count: u16,
     pub malformed_entry_count: u16,
     pub first_io_apic: Option<IoApicInfo>,
+    pub timer_route: IsaInterruptRoute,
+    pub keyboard_route: IsaInterruptRoute,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -492,6 +545,8 @@ fn parse_madt(table: &[u8]) -> Option<MadtInfo> {
         interrupt_override_count: 0,
         malformed_entry_count: 0,
         first_io_apic: None,
+        timer_route: IsaInterruptRoute::legacy(0),
+        keyboard_route: IsaInterruptRoute::legacy(1),
     };
 
     let mut cursor = MADT_HEADER_LENGTH;
@@ -526,6 +581,14 @@ fn parse_madt(table: &[u8]) -> Option<MadtInfo> {
             }
             2 if entry.len() >= 10 => {
                 info.interrupt_override_count = info.interrupt_override_count.saturating_add(1);
+                match parse_interrupt_override(entry) {
+                    Some(route) if route.source_irq == 0 => info.timer_route = route,
+                    Some(route) if route.source_irq == 1 => info.keyboard_route = route,
+                    Some(_) => {}
+                    None => {
+                        info.malformed_entry_count = info.malformed_entry_count.saturating_add(1);
+                    }
+                }
             }
             5 if entry.len() >= 12 => {
                 info.local_apic_address = read_u64(entry, 4)?;
@@ -544,6 +607,35 @@ fn parse_madt(table: &[u8]) -> Option<MadtInfo> {
     }
 
     Some(info)
+}
+
+fn parse_interrupt_override(entry: &[u8]) -> Option<IsaInterruptRoute> {
+    if entry.len() < 10 || entry[2] != 0 {
+        return None;
+    }
+
+    let source_irq = entry[3];
+    let global_system_interrupt = read_u32(entry, 4)?;
+    let flags = read_u16(entry, 8)?;
+
+    let polarity = match flags & 0b11 {
+        0 | 1 => InterruptPolarity::ActiveHigh,
+        3 => InterruptPolarity::ActiveLow,
+        _ => return None,
+    };
+    let trigger_mode = match (flags >> 2) & 0b11 {
+        0 | 1 => InterruptTriggerMode::Edge,
+        3 => InterruptTriggerMode::Level,
+        _ => return None,
+    };
+
+    Some(IsaInterruptRoute {
+        source_irq,
+        global_system_interrupt,
+        polarity,
+        trigger_mode,
+        overridden: true,
+    })
 }
 
 fn record_processor(info: &mut MadtInfo, flags: u32) {

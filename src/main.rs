@@ -9,6 +9,7 @@ use std::{
 
 const HEAP_TEST_MARKER: &str = "heap allocation self-test passed:";
 const ACPI_TEST_MARKER: &str = "ACPI initialized:";
+const APIC_TEST_MARKER: &str = "interrupt timer verified: controller=apic";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
@@ -60,7 +61,7 @@ fn parse_options() -> Result<Options, ExitCode> {
 fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
-    println!("  --test      Run the kernel smoke test and verify heap plus ACPI startup");
+    println!("  --test      Verify heap, ACPI, and APIC timer startup in QEMU");
 }
 
 fn qemu_command(options: &Options) -> Command {
@@ -114,6 +115,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut terminal = io::stdout().lock();
         let mut heap_ready = false;
         let mut acpi_ready = false;
+        let mut apic_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -122,8 +124,9 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
 
             heap_ready |= line.contains(HEAP_TEST_MARKER);
             acpi_ready |= line.contains(ACPI_TEST_MARKER);
+            apic_ready |= line.contains(APIC_TEST_MARKER);
 
-            if heap_ready && acpi_ready {
+            if heap_ready && acpi_ready && apic_ready {
                 let _ = marker_sender.send(());
                 break;
             }
