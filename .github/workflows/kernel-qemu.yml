@@ -44,7 +44,18 @@ jobs:
           sudo apt-get install --yes --quiet qemu-system-x86
 
       - name: Build bootable image
-        run: cargo +nightly-2026-02-01 build --locked --quiet
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 build --locked --quiet 2>&1 | tee scheduler-build.log
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: scheduler-build-log
+          path: scheduler-build.log
+          if-no-files-found: ignore
 
       - name: Boot heap smoke test in QEMU
         run: cargo +nightly-2026-02-01 run --locked --quiet -- --test
