@@ -34,11 +34,7 @@ pub struct SystemInfo {
 }
 
 impl SystemInfo {
-    pub const fn new(
-        usable_frames: u64,
-        allocated_frames: u64,
-        remaining_frames: u64,
-    ) -> Self {
+    pub const fn new(usable_frames: u64, allocated_frames: u64, remaining_frames: u64) -> Self {
         Self {
             usable_frames,
             allocated_frames,
@@ -195,8 +191,11 @@ impl Shell {
     }
 
     fn print_memory(&self) {
-        let usable_mebibytes =
-            self.system_info.usable_frames.saturating_mul(memory::FRAME_SIZE) / (1024 * 1024);
+        let usable_mebibytes = self
+            .system_info
+            .usable_frames
+            .saturating_mul(memory::FRAME_SIZE)
+            / (1024 * 1024);
 
         shell_println!(
             "physical memory: {} MiB usable ({} frames)",
