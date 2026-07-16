@@ -10,7 +10,7 @@ use x86_64::{
     VirtAddr,
     instructions::{
         hlt, interrupts as cpu_interrupts,
-        segmentation::{CS, Segment},
+        segmentation::{CS, SS, Segment},
     },
 };
 
@@ -202,6 +202,8 @@ impl Task {
             rip: thread_entry_trampoline_address().as_u64(),
             cs: u64::from(CS::get_reg().0),
             rflags: INITIAL_RFLAGS,
+            stack_pointer: stack_end as u64,
+            stack_segment: u64::from(SS::get_reg().0),
         };
 
         unsafe { (stack_pointer as *mut SavedContext).write(context) };
@@ -361,6 +363,8 @@ struct SavedContext {
     rip: u64,
     cs: u64,
     rflags: u64,
+    stack_pointer: u64,
+    stack_segment: u64,
 }
 
 pub fn init() -> Result<Snapshot, InitError> {
