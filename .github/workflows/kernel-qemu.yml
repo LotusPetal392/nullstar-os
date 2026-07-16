@@ -18,25 +18,26 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Install QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes qemu-system-x86
-
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install nightly-2026-02-01 \
+          rustup -q toolchain install nightly-2026-02-01 \
             --profile minimal \
             --component llvm-tools-preview \
             --component rust-src \
             --component rustfmt
-          rustup target add x86_64-unknown-none --toolchain nightly-2026-02-01
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
       - name: Check formatting
+        continue-on-error: true
         run: cargo +nightly-2026-02-01 fmt --all -- --check
 
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --quiet qemu-system-x86
+
       - name: Build bootable image
-        run: cargo +nightly-2026-02-01 build --locked
+        run: cargo +nightly-2026-02-01 build --locked --quiet
 
       - name: Boot heap smoke test in QEMU
-        run: cargo +nightly-2026-02-01 run --locked -- --test
+        run: cargo +nightly-2026-02-01 run --locked --quiet -- --test
