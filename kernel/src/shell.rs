@@ -32,6 +32,7 @@ pub struct SystemInfo {
     allocated_frames: u64,
     remaining_frames: u64,
     acpi: Option<acpi::AcpiInfo>,
+    interrupt_controller: interrupts::ControllerInfo,
 }
 
 impl SystemInfo {
@@ -40,12 +41,14 @@ impl SystemInfo {
         allocated_frames: u64,
         remaining_frames: u64,
         acpi: Option<acpi::AcpiInfo>,
+        interrupt_controller: interrupts::ControllerInfo,
     ) -> Self {
         Self {
             usable_frames,
             allocated_frames,
             remaining_frames,
             acpi,
+            interrupt_controller,
         }
     }
 }
@@ -182,6 +185,7 @@ impl Shell {
                 );
             }
             "acpi" => self.print_acpi(),
+            "interrupts" => self.print_interrupts(),
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
             }
@@ -215,6 +219,51 @@ impl Shell {
             self.system_info.allocated_frames,
             self.system_info.remaining_frames
         );
+    }
+
+    fn print_interrupts(&self) {
+        let info = self.system_info.interrupt_controller;
+        shell_println!("interrupt controller: {}", info.kind);
+        shell_println!(
+            "vectors: timer={}, keyboard={}, spurious={}",
+            info.timer_vector,
+            info.keyboard_vector,
+            interrupts::SPURIOUS_VECTOR
+        );
+        shell_println!(
+            "timer: {} Hz, ticks={}, spurious interrupts={}",
+            interrupts::TIMER_HZ,
+            interrupts::timer_ticks(),
+            interrupts::spurious_interrupts()
+        );
+
+        match info.kind {
+            interrupts::ControllerKind::Apic => {
+                shell_println!(
+                    "local APIC: id={}, version={:#x}, address={:#x}",
+                    info.local_apic_id.unwrap_or(0),
+                    info.local_apic_version.unwrap_or(0),
+                    info.local_apic_address.unwrap_or(0)
+                );
+                shell_println!(
+                    "I/O APIC: id={}, address={:#x}, redirection entries={}",
+                    info.io_apic_id.unwrap_or(0),
+                    info.io_apic_address.unwrap_or(0),
+                    info.io_apic_redirection_entries.unwrap_or(0)
+                );
+                shell_println!(
+                    "routes: PIT IRQ0 -> GSI {}, keyboard IRQ1 -> GSI {}",
+                    info.timer_gsi.unwrap_or(0),
+                    info.keyboard_gsi.unwrap_or(0)
+                );
+            }
+            interrupts::ControllerKind::Pic => {
+                shell_println!(
+                    "APIC fallback reason: {}",
+                    info.fallback_reason.unwrap_or("not recorded")
+                );
+            }
+        }
     }
 
     fn print_acpi(&self) {
@@ -256,6 +305,20 @@ impl Shell {
                 madt.io_apic_count,
                 madt.interrupt_override_count,
                 madt.supports_legacy_pic
+            );
+            shell_println!(
+                "IRQ0: GSI={}, {}, {}, override={}",
+                madt.timer_route.global_system_interrupt,
+                madt.timer_route.polarity,
+                madt.timer_route.trigger_mode,
+                madt.timer_route.overridden
+            );
+            shell_println!(
+                "IRQ1: GSI={}, {}, {}, override={}",
+                madt.keyboard_route.global_system_interrupt,
+                madt.keyboard_route.polarity,
+                madt.keyboard_route.trigger_mode,
+                madt.keyboard_route.overridden
             );
             if let Some(io_apic) = madt.first_io_apic {
                 shell_println!(
@@ -334,6 +397,7 @@ fn print_help() {
     shell_println!("  memory           show physical frame statistics");
     shell_println!("  heap             show the kernel heap mapping");
     shell_println!("  acpi             show ACPI table and platform data");
+    shell_println!("  interrupts       show interrupt-controller routes");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }
