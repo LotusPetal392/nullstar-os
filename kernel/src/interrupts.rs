@@ -13,7 +13,10 @@ use x86_64::{
     structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
 };
 
-use crate::{acpi::MadtInfo, apic, gdt, hlt_loop, keyboard, serial_println};
+use crate::{
+    acpi::{HpetInfo, MadtInfo},
+    apic, gdt, hlt_loop, keyboard, serial_println,
+};
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -52,9 +55,25 @@ impl fmt::Display for ControllerKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerSource {
+    Pit,
+    LocalApic,
+}
+
+impl fmt::Display for TimerSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pit => formatter.write_str("pit"),
+            Self::LocalApic => formatter.write_str("lapic"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ControllerInfo {
     pub kind: ControllerKind,
+    pub timer_source: TimerSource,
     pub timer_vector: u8,
     pub keyboard_vector: u8,
     pub timer_gsi: Option<u32>,
@@ -65,6 +84,13 @@ pub struct ControllerInfo {
     pub io_apic_id: Option<u8>,
     pub io_apic_address: Option<u32>,
     pub io_apic_redirection_entries: Option<u32>,
+    pub local_apic_timer_ticks_per_second: Option<u64>,
+    pub local_apic_timer_initial_count: Option<u32>,
+    pub local_apic_timer_divisor: Option<u32>,
+    pub hpet_period_femtoseconds: Option<u64>,
+    pub hpet_frequency_hz: Option<u64>,
+    pub hpet_counter_is_64_bit: Option<bool>,
+    pub timer_fallback_reason: Option<&'static str>,
     pub fallback_reason: Option<&'static str>,
 }
 
@@ -72,6 +98,7 @@ impl ControllerInfo {
     fn pic(fallback_reason: Option<&'static str>) -> Self {
         Self {
             kind: ControllerKind::Pic,
+            timer_source: TimerSource::Pit,
             timer_vector: TIMER_VECTOR,
             keyboard_vector: KEYBOARD_VECTOR,
             timer_gsi: None,
@@ -82,16 +109,32 @@ impl ControllerInfo {
             io_apic_id: None,
             io_apic_address: None,
             io_apic_redirection_entries: None,
+            local_apic_timer_ticks_per_second: None,
+            local_apic_timer_initial_count: None,
+            local_apic_timer_divisor: None,
+            hpet_period_femtoseconds: None,
+            hpet_frequency_hz: None,
+            hpet_counter_is_64_bit: None,
+            timer_fallback_reason: None,
             fallback_reason,
         }
     }
 
     fn apic(info: apic::ControllerInfo) -> Self {
+        let timer_source = match info.timer_source {
+            apic::TimerSource::Pit => TimerSource::Pit,
+            apic::TimerSource::LocalApic => TimerSource::LocalApic,
+        };
+        let timer_gsi = (timer_source == TimerSource::Pit)
+            .then_some(info.timer_route.global_system_interrupt);
+        let local_timer = info.local_timer;
+
         Self {
             kind: ControllerKind::Apic,
+            timer_source,
             timer_vector: TIMER_VECTOR,
             keyboard_vector: KEYBOARD_VECTOR,
-            timer_gsi: Some(info.timer_route.global_system_interrupt),
+            timer_gsi,
             keyboard_gsi: Some(info.keyboard_route.global_system_interrupt),
             local_apic_id: Some(info.local_apic_id),
             local_apic_address: Some(info.local_apic_address),
@@ -99,6 +142,13 @@ impl ControllerInfo {
             io_apic_id: Some(info.io_apic_id),
             io_apic_address: Some(info.io_apic_address),
             io_apic_redirection_entries: Some(info.io_apic_redirection_entries),
+            local_apic_timer_ticks_per_second: local_timer.map(|timer| timer.ticks_per_second),
+            local_apic_timer_initial_count: local_timer.map(|timer| timer.initial_count),
+            local_apic_timer_divisor: local_timer.map(|timer| timer.divisor),
+            hpet_period_femtoseconds: local_timer.map(|timer| timer.hpet_period_femtoseconds),
+            hpet_frequency_hz: local_timer.map(|timer| timer.hpet_frequency_hz),
+            hpet_counter_is_64_bit: local_timer.map(|timer| timer.hpet_counter_is_64_bit),
+            timer_fallback_reason: info.timer_fallback_reason,
             fallback_reason: None,
         }
     }
@@ -126,6 +176,7 @@ lazy_static! {
 
 pub fn init(
     madt: Option<&MadtInfo>,
+    hpet: Option<&HpetInfo>,
     physical_memory_offset: VirtAddr,
     physical_memory_end: u64,
 ) -> ControllerInfo {
@@ -137,11 +188,13 @@ pub fn init(
     let controller = match madt {
         Some(madt) => match apic::init(
             madt,
+            hpet,
             physical_memory_offset,
             physical_memory_end,
             TIMER_VECTOR,
             KEYBOARD_VECTOR,
             SPURIOUS_VECTOR,
+            TIMER_HZ,
         ) {
             Ok(apic_info) => {
                 ACTIVE_CONTROLLER.store(CONTROLLER_APIC, Ordering::Release);
@@ -164,12 +217,12 @@ pub fn init(
     match controller.kind {
         ControllerKind::Apic => {
             serial_println!(
-                "interrupt controller initialized: apic, lapic_id={}, lapic={:#x}, ioapic_id={}, ioapic={:#x}, timer_gsi={}, keyboard_gsi={}",
+                "interrupt controller initialized: apic, lapic_id={}, lapic={:#x}, ioapic_id={}, ioapic={:#x}, timer={}, keyboard_gsi={}",
                 controller.local_apic_id.unwrap_or(0),
                 controller.local_apic_address.unwrap_or(0),
                 controller.io_apic_id.unwrap_or(0),
                 controller.io_apic_address.unwrap_or(0),
-                controller.timer_gsi.unwrap_or(0),
+                controller.timer_source,
                 controller.keyboard_gsi.unwrap_or(0)
             );
         }
@@ -181,7 +234,29 @@ pub fn init(
         }
     }
 
-    serial_println!("PIT configured: timer frequency = {TIMER_HZ} Hz");
+    match controller.timer_source {
+        TimerSource::LocalApic => {
+            serial_println!(
+                "timer initialized: source=lapic, frequency={} Hz, lapic_ticks_per_second={}, initial_count={}, divisor={}, hpet_period_fs={}, hpet_frequency_hz={}, hpet_64_bit={}",
+                TIMER_HZ,
+                controller.local_apic_timer_ticks_per_second.unwrap_or(0),
+                controller.local_apic_timer_initial_count.unwrap_or(0),
+                controller.local_apic_timer_divisor.unwrap_or(0),
+                controller.hpet_period_femtoseconds.unwrap_or(0),
+                controller.hpet_frequency_hz.unwrap_or(0),
+                controller.hpet_counter_is_64_bit.unwrap_or(false)
+            );
+        }
+        TimerSource::Pit => {
+            serial_println!(
+                "timer initialized: source=pit, frequency={} Hz, gsi={}, fallback_reason={}",
+                TIMER_HZ,
+                controller.timer_gsi.unwrap_or(0),
+                controller.timer_fallback_reason.unwrap_or("none")
+            );
+        }
+    }
+
     x86_64::instructions::interrupts::enable();
     controller
 }
