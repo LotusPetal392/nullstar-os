@@ -56,11 +56,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let acpi_info = match rsdp_address {
         Some(rsdp_address) => {
-            match acpi::init(
-                rsdp_address,
-                physical_memory_offset,
-                physical_memory_end,
-            ) {
+            match acpi::init(rsdp_address, physical_memory_offset, physical_memory_end) {
                 Ok(info) => {
                     serial_println!(
                         "ACPI initialized: rsdp={:#x}, revision={}, root={}@{:#x}, tables={}, valid={}, invalid={}, madt={}, fadt={}, hpet={}, mcfg={}",
