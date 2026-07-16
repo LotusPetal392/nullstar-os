@@ -29,6 +29,12 @@ const FOREGROUND: Color = Color {
     blue: 255,
 };
 
+const BACKGROUND: Color = Color {
+    red: 0,
+    green: 0,
+    blue: 0,
+};
+
 pub fn init(framebuffer: FrameBuffer) -> Result<(), InitError> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut console = CONSOLE.lock();
@@ -50,6 +56,14 @@ pub fn clear() {
 
 pub fn write_char(character: char) {
     with_console(|console| console.write_char(character));
+}
+
+pub fn backspace() {
+    with_console(|console| console.backspace());
+}
+
+pub fn text_columns() -> Option<usize> {
+    with_console(|console| console.text_columns())
 }
 
 #[doc(hidden)]
@@ -134,6 +148,24 @@ impl FramebufferWriter {
         self.x += raster.width() + LETTER_SPACING;
     }
 
+    fn backspace(&mut self) {
+        if self.x <= BORDER_PADDING {
+            return;
+        }
+
+        let character_width = glyph_advance(' ');
+        let new_x = self.x.saturating_sub(character_width).max(BORDER_PADDING);
+        let erase_width = self.x.saturating_sub(new_x);
+
+        self.clear_rectangle(new_x, self.y, erase_width, FONT_HEIGHT.val());
+        self.x = new_x;
+    }
+
+    fn text_columns(&self) -> usize {
+        let available_width = self.info.width.saturating_sub(BORDER_PADDING * 2);
+        available_width / glyph_advance(' ')
+    }
+
     fn new_line(&mut self) {
         let line_height = FONT_HEIGHT.val() + LINE_SPACING;
         self.x = BORDER_PADDING;
@@ -169,6 +201,17 @@ impl FramebufferWriter {
         }
         for byte in &mut self.buffer[remaining..] {
             unsafe { ptr::write_volatile(byte, 0) };
+        }
+    }
+
+    fn clear_rectangle(&mut self, x: usize, y: usize, width: usize, height: usize) {
+        let end_x = x.saturating_add(width).min(self.info.width);
+        let end_y = y.saturating_add(height).min(self.info.height);
+
+        for pixel_y in y..end_y {
+            for pixel_x in x..end_x {
+                self.write_pixel(pixel_x, pixel_y, BACKGROUND);
+            }
         }
     }
 
@@ -248,6 +291,14 @@ impl fmt::Write for FramebufferWriter {
         self.write_string(text);
         Ok(())
     }
+}
+
+fn glyph_advance(character: char) -> usize {
+    get_raster(character, FONT_WEIGHT, FONT_HEIGHT)
+        .or_else(|| get_raster('?', FONT_WEIGHT, FONT_HEIGHT))
+        .expect("the fallback glyph must be available")
+        .width()
+        + LETTER_SPACING
 }
 
 fn scale_channel(channel: u8, intensity: u8) -> u8 {
