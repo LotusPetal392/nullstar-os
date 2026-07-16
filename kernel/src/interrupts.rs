@@ -1,13 +1,19 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    fmt,
+    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+};
 
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
-use x86_64::instructions::port::Port;
-use x86_64::registers::control::Cr2;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::{
+    VirtAddr,
+    instructions::port::Port,
+    registers::control::Cr2,
+    structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
+};
 
-use crate::{gdt, hlt_loop, keyboard, serial_println};
+use crate::{acpi::MadtInfo, apic, gdt, hlt_loop, keyboard, serial_println};
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -15,23 +21,86 @@ const PIT_COMMAND_PORT: u16 = 0x43;
 const PIT_CHANNEL_0_PORT: u16 = 0x40;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 
+const CONTROLLER_UNINITIALIZED: u8 = 0;
+const CONTROLLER_PIC: u8 = 1;
+const CONTROLLER_APIC: u8 = 2;
+
+pub const TIMER_VECTOR: u8 = PIC_1_OFFSET;
+pub const KEYBOARD_VECTOR: u8 = PIC_1_OFFSET + 1;
+pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const TIMER_HZ: u64 = 100;
 
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+static SPURIOUS_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CONTROLLER: AtomicU8 = AtomicU8::new(CONTROLLER_UNINITIALIZED);
 
 static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum InterruptIndex {
-    Timer = PIC_1_OFFSET,
-    Keyboard,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerKind {
+    Pic,
+    Apic,
 }
 
-impl InterruptIndex {
-    const fn as_u8(self) -> u8 {
-        self as u8
+impl fmt::Display for ControllerKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pic => formatter.write_str("pic"),
+            Self::Apic => formatter.write_str("apic"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ControllerInfo {
+    pub kind: ControllerKind,
+    pub timer_vector: u8,
+    pub keyboard_vector: u8,
+    pub timer_gsi: Option<u32>,
+    pub keyboard_gsi: Option<u32>,
+    pub local_apic_id: Option<u8>,
+    pub local_apic_address: Option<u64>,
+    pub local_apic_version: Option<u8>,
+    pub io_apic_id: Option<u8>,
+    pub io_apic_address: Option<u32>,
+    pub io_apic_redirection_entries: Option<u32>,
+    pub fallback_reason: Option<&'static str>,
+}
+
+impl ControllerInfo {
+    fn pic(fallback_reason: Option<&'static str>) -> Self {
+        Self {
+            kind: ControllerKind::Pic,
+            timer_vector: TIMER_VECTOR,
+            keyboard_vector: KEYBOARD_VECTOR,
+            timer_gsi: None,
+            keyboard_gsi: None,
+            local_apic_id: None,
+            local_apic_address: None,
+            local_apic_version: None,
+            io_apic_id: None,
+            io_apic_address: None,
+            io_apic_redirection_entries: None,
+            fallback_reason,
+        }
+    }
+
+    fn apic(info: apic::ControllerInfo) -> Self {
+        Self {
+            kind: ControllerKind::Apic,
+            timer_vector: TIMER_VECTOR,
+            keyboard_vector: KEYBOARD_VECTOR,
+            timer_gsi: Some(info.timer_route.global_system_interrupt),
+            keyboard_gsi: Some(info.keyboard_route.global_system_interrupt),
+            local_apic_id: Some(info.local_apic_id),
+            local_apic_address: Some(info.local_apic_address),
+            local_apic_version: Some(info.local_apic_version),
+            io_apic_id: Some(info.io_apic_id),
+            io_apic_address: Some(info.io_apic_address),
+            io_apic_redirection_entries: Some(info.io_apic_redirection_entries),
+            fallback_reason: None,
+        }
     }
 }
 
@@ -41,8 +110,9 @@ lazy_static! {
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
-        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
-        idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
+        idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt_handler);
+        idt[SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
 
         unsafe {
             idt.double_fault
@@ -54,26 +124,95 @@ lazy_static! {
     };
 }
 
-pub fn init() {
+pub fn init(
+    madt: Option<&MadtInfo>,
+    physical_memory_offset: VirtAddr,
+    physical_memory_end: u64,
+) -> ControllerInfo {
+    x86_64::instructions::interrupts::disable();
     IDT.load();
-
-    unsafe {
-        let mut pics = PICS.lock();
-        pics.initialize();
-
-        // Unmask IRQ0 (PIT timer) and IRQ1 (PS/2 keyboard). Keeping every
-        // other IRQ masked prevents entry into an IDT slot without a handler.
-        pics.write_masks(0b1111_1100, 0b1111_1111);
-    }
-
+    initialize_pics(0xff, 0xff);
     configure_pit();
 
-    serial_println!("interrupts initialized; timer frequency = {TIMER_HZ} Hz");
+    let controller = match madt {
+        Some(madt) => match apic::init(
+            madt,
+            physical_memory_offset,
+            physical_memory_end,
+            TIMER_VECTOR,
+            KEYBOARD_VECTOR,
+            SPURIOUS_VECTOR,
+        ) {
+            Ok(apic_info) => {
+                ACTIVE_CONTROLLER.store(CONTROLLER_APIC, Ordering::Release);
+                ControllerInfo::apic(apic_info)
+            }
+            Err(error) => {
+                enable_pic_timer_and_keyboard();
+                ACTIVE_CONTROLLER.store(CONTROLLER_PIC, Ordering::Release);
+                serial_println!("APIC initialization failed: {error}");
+                ControllerInfo::pic(Some(error.description()))
+            }
+        },
+        None => {
+            enable_pic_timer_and_keyboard();
+            ACTIVE_CONTROLLER.store(CONTROLLER_PIC, Ordering::Release);
+            ControllerInfo::pic(Some("MADT is unavailable"))
+        }
+    };
+
+    match controller.kind {
+        ControllerKind::Apic => {
+            serial_println!(
+                "interrupt controller initialized: apic, lapic_id={}, lapic={:#x}, ioapic_id={}, ioapic={:#x}, timer_gsi={}, keyboard_gsi={}",
+                controller.local_apic_id.unwrap_or(0),
+                controller.local_apic_address.unwrap_or(0),
+                controller.io_apic_id.unwrap_or(0),
+                controller.io_apic_address.unwrap_or(0),
+                controller.timer_gsi.unwrap_or(0),
+                controller.keyboard_gsi.unwrap_or(0)
+            );
+        }
+        ControllerKind::Pic => {
+            serial_println!(
+                "interrupt controller initialized: pic, fallback_reason={}",
+                controller.fallback_reason.unwrap_or("none")
+            );
+        }
+    }
+
+    serial_println!("PIT configured: timer frequency = {TIMER_HZ} Hz");
     x86_64::instructions::interrupts::enable();
+    controller
 }
 
 pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+pub fn spurious_interrupts() -> u64 {
+    SPURIOUS_INTERRUPTS.load(Ordering::Relaxed)
+}
+
+pub fn wait_for_timer_tick() {
+    let starting_tick = timer_ticks();
+    while timer_ticks() == starting_tick {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn initialize_pics(master_mask: u8, slave_mask: u8) {
+    unsafe {
+        let mut pics = PICS.lock();
+        pics.initialize();
+        pics.write_masks(master_mask, slave_mask);
+    }
+}
+
+fn enable_pic_timer_and_keyboard() {
+    unsafe {
+        PICS.lock().write_masks(0b1111_1100, 0b1111_1111);
+    }
 }
 
 fn configure_pit() {
@@ -82,10 +221,19 @@ fn configure_pit() {
     let mut channel_0 = Port::<u8>::new(PIT_CHANNEL_0_PORT);
 
     unsafe {
-        // Channel 0, low byte then high byte, square-wave mode, binary count.
         command.write(0x36);
         channel_0.write(divisor as u8);
         channel_0.write((divisor >> 8) as u8);
+    }
+}
+
+fn end_of_interrupt(vector: u8) {
+    match ACTIVE_CONTROLLER.load(Ordering::Acquire) {
+        CONTROLLER_APIC => apic::end_of_interrupt(),
+        CONTROLLER_PIC => unsafe {
+            PICS.lock().notify_end_of_interrupt(vector);
+        },
+        _ => {}
     }
 }
 
@@ -106,22 +254,18 @@ extern "x86-interrupt" fn page_fault_handler(
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
-    }
+    end_of_interrupt(TIMER_VECTOR);
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut keyboard_port = Port::<u8>::new(0x60);
     let scancode = unsafe { keyboard_port.read() };
     keyboard::push_scancode(scancode);
+    end_of_interrupt(KEYBOARD_VECTOR);
+}
 
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-    }
+extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    SPURIOUS_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
