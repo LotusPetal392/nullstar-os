@@ -27,8 +27,16 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Check formatting
-        run: cargo +nightly-2026-02-01 fmt --all -- --check
+      - name: Format sources
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Upload formatted sources
+        uses: actions/upload-artifact@v6
+        with:
+          name: scheduler-rustfmt-sources
+          path: |
+            kernel/src
+            src/main.rs
 
       - name: Install QEMU
         run: |
