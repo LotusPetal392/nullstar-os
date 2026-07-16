@@ -17,6 +17,7 @@ mod interrupts;
 mod keyboard;
 mod memory;
 mod serial;
+mod shell;
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -68,11 +69,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("GDT loaded");
     println!("IDT loaded");
     println!("Interrupts enabled");
-    println!();
-    println!("Keyboard ready. Type below:");
+    println!("Interactive shell initialized");
 
     let usable_frames = frame_allocator.usable_frame_count();
+    let allocated_frames = frame_allocator.allocated_frame_count();
+    let remaining_frames = frame_allocator.remaining_frame_count();
     let usable_mebibytes = usable_frames.saturating_mul(memory::FRAME_SIZE) / (1024 * 1024);
+
     serial_println!(
         "physical memory manager initialized: offset={:#x}, usable_frames={}, usable_memory={} MiB",
         physical_memory_offset.as_u64(),
@@ -84,24 +87,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         allocator::HEAP_START,
         allocator::HEAP_SIZE / 1024,
         allocator::HEAP_PAGE_COUNT,
-        frame_allocator.allocated_frame_count(),
-        frame_allocator.remaining_frame_count()
+        allocated_frames,
+        remaining_frames
     );
     serial_println!("framebuffer console initialized");
+    serial_println!("interactive shell initialized");
     serial_println!("kernel entered kernel_main");
+
+    let system_info = shell::SystemInfo::new(usable_frames, allocated_frames, remaining_frames);
+    let mut interactive_shell = shell::Shell::new(system_info);
+    interactive_shell.start();
 
     let mut reported_seconds = 0;
     loop {
         x86_64::instructions::hlt();
 
         while let Some(key) = keyboard::poll_key() {
-            match key {
-                pc_keyboard::DecodedKey::Unicode(character) => {
-                    console::write_char(character);
-                    serial_print!("{character}");
-                }
-                pc_keyboard::DecodedKey::RawKey(key_code) => {
-                    serial_print!("<{key_code:?}>");
+            match interactive_shell.handle_key(key) {
+                shell::ShellAction::Continue => {}
+                shell::ShellAction::Halt => {
+                    serial_println!("halt requested by interactive shell");
+                    x86_64::instructions::interrupts::disable();
+                    hlt_loop();
                 }
             }
         }
