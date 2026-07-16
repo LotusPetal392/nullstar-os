@@ -12,6 +12,7 @@ use x86_64::VirtAddr;
 
 mod acpi;
 mod allocator;
+mod apic;
 mod console;
 mod gdt;
 mod interrupts;
@@ -96,7 +97,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     gdt::init();
-    interrupts::init();
+    let interrupt_info = interrupts::init(
+        acpi_info.as_ref(),
+        physical_memory_offset,
+        physical_memory_end,
+    );
+    interrupts::wait_for_timer_ticks(3);
+    serial_println!(
+        "interrupt timer delivery confirmed: controller={}, ticks={}",
+        interrupt_info.kind,
+        interrupts::timer_ticks()
+    );
     heap_allocation_self_test();
 
     println!("GalacticOS");
@@ -111,6 +122,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("Console initialized");
     println!("GDT loaded");
     println!("IDT loaded");
+    println!("Interrupt controller: {}", interrupt_info.kind);
     println!("Interrupts enabled");
     if acpi_info.is_some() {
         println!("ACPI tables loaded");
@@ -142,8 +154,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("interactive shell initialized");
     serial_println!("kernel entered kernel_main");
 
-    let system_info =
-        shell::SystemInfo::new(usable_frames, allocated_frames, remaining_frames, acpi_info);
+    let system_info = shell::SystemInfo::new(
+        usable_frames,
+        allocated_frames,
+        remaining_frames,
+        acpi_info,
+        interrupt_info,
+    );
     let mut interactive_shell = shell::Shell::new(system_info);
     interactive_shell.start();
 
