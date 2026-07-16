@@ -275,15 +275,14 @@ impl LocalApic {
         self.mmio
             .write_u32(LOCAL_APIC_TIMER_INITIAL_COUNT, u32::MAX);
 
-        let measurement = match reference_timer
-            .measure_duration(TIMER_CALIBRATION_INTERVAL_FEMTOSECONDS)
-        {
-            Ok(measurement) => measurement,
-            Err(error) => {
-                self.stop_timer();
-                return Err(TimerCalibrationError::Hpet(error));
-            }
-        };
+        let measurement =
+            match reference_timer.measure_duration(TIMER_CALIBRATION_INTERVAL_FEMTOSECONDS) {
+                Ok(measurement) => measurement,
+                Err(error) => {
+                    self.stop_timer();
+                    return Err(TimerCalibrationError::Hpet(error));
+                }
+            };
         let current_count = self.mmio.read_u32(LOCAL_APIC_TIMER_CURRENT_COUNT);
         self.stop_timer();
 
@@ -304,8 +303,8 @@ impl LocalApic {
             return Err(TimerCalibrationError::InvalidMeasuredFrequency);
         }
 
-        let initial_count = (u128::from(ticks_per_second) + u128::from(target_hz) / 2)
-            / u128::from(target_hz);
+        let initial_count =
+            (u128::from(ticks_per_second) + u128::from(target_hz) / 2) / u128::from(target_hz);
         if initial_count == 0 || initial_count > u128::from(u32::MAX) {
             return Err(TimerCalibrationError::InvalidInitialCount);
         }

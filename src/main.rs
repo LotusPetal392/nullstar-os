@@ -9,8 +9,7 @@ use std::{
 
 const HEAP_TEST_MARKER: &str = "heap allocation self-test passed:";
 const ACPI_TEST_MARKER: &str = "ACPI initialized:";
-const LAPIC_TIMER_TEST_MARKER: &str =
-    "interrupt timer verified: controller=apic, source=lapic";
+const LAPIC_TIMER_TEST_MARKER: &str = "interrupt timer verified: controller=apic, source=lapic";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]

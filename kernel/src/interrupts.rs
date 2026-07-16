@@ -125,8 +125,8 @@ impl ControllerInfo {
             apic::TimerSource::Pit => TimerSource::Pit,
             apic::TimerSource::LocalApic => TimerSource::LocalApic,
         };
-        let timer_gsi = (timer_source == TimerSource::Pit)
-            .then_some(info.timer_route.global_system_interrupt);
+        let timer_gsi =
+            (timer_source == TimerSource::Pit).then_some(info.timer_route.global_system_interrupt);
         let local_timer = info.local_timer;
 
         Self {
