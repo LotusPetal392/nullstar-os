@@ -182,9 +182,7 @@ impl LocalApic {
         let spurious = self.mmio.read_u32(LOCAL_APIC_SPURIOUS);
         self.mmio.write_u32(
             LOCAL_APIC_SPURIOUS,
-            (spurious & !0x1ff)
-                | u32::from(spurious_vector)
-                | LOCAL_APIC_SOFTWARE_ENABLE,
+            (spurious & !0x1ff) | u32::from(spurious_vector) | LOCAL_APIC_SOFTWARE_ENABLE,
         );
 
         let local_apic_id = (self.mmio.read_u32(LOCAL_APIC_ID) >> 24) as u8;
@@ -193,8 +191,7 @@ impl LocalApic {
 
     fn mask_lvt(self, offset: usize) {
         let value = self.mmio.read_u32(offset);
-        self.mmio
-            .write_u32(offset, value | LOCAL_APIC_LVT_MASKED);
+        self.mmio.write_u32(offset, value | LOCAL_APIC_LVT_MASKED);
     }
 }
 
