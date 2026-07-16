@@ -32,6 +32,7 @@ pub struct SystemInfo {
     allocated_frames: u64,
     remaining_frames: u64,
     acpi: Option<acpi::AcpiInfo>,
+    interrupts: interrupts::ControllerInfo,
 }
 
 impl SystemInfo {
@@ -40,12 +41,14 @@ impl SystemInfo {
         allocated_frames: u64,
         remaining_frames: u64,
         acpi: Option<acpi::AcpiInfo>,
+        interrupts: interrupts::ControllerInfo,
     ) -> Self {
         Self {
             usable_frames,
             allocated_frames,
             remaining_frames,
             acpi,
+            interrupts,
         }
     }
 }
@@ -182,6 +185,7 @@ impl Shell {
                 );
             }
             "acpi" => self.print_acpi(),
+            "interrupts" | "irq" => self.print_interrupts(),
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
             }
@@ -320,6 +324,55 @@ impl Shell {
         }
     }
 
+    fn print_interrupts(&self) {
+        let info = self.system_info.interrupts;
+        shell_println!("interrupt controller: {}", info.kind);
+        shell_println!(
+            "vectors: timer={}, keyboard={}, spurious={}",
+            interrupts::TIMER_VECTOR,
+            interrupts::KEYBOARD_VECTOR,
+            interrupts::SPURIOUS_VECTOR
+        );
+
+        if let Some(apic) = info.apic {
+            shell_println!(
+                "local APIC: id={}, version={:#x}, address={:#x}",
+                apic.local_apic_id,
+                apic.local_apic_version,
+                apic.local_apic_address
+            );
+            shell_println!(
+                "I/O APIC: firmware-id={}, hardware-id={}, version={:#x}, address={:#x}, entries={}",
+                apic.io_apic_firmware_id,
+                apic.io_apic_id,
+                apic.io_apic_version,
+                apic.io_apic_address,
+                apic.io_apic_redirection_entries
+            );
+            shell_println!(
+                "timer: IRQ0 -> GSI{} ({}, {})",
+                apic.timer_gsi,
+                apic.timer_polarity,
+                apic.timer_trigger_mode
+            );
+            shell_println!(
+                "keyboard: IRQ1 -> GSI{} ({}, {})",
+                apic.keyboard_gsi,
+                apic.keyboard_polarity,
+                apic.keyboard_trigger_mode
+            );
+            shell_println!(
+                "local APIC spurious interrupts: {}",
+                interrupts::spurious_interrupt_count()
+            );
+        } else {
+            shell_println!("legacy PIC routes: timer IRQ0, keyboard IRQ1");
+            if let Some(reason) = info.fallback_reason {
+                shell_println!("APIC fallback reason: {reason:?}");
+            }
+        }
+    }
+
     fn print_prompt(&self) {
         shell_print!("{PROMPT}");
     }
@@ -334,6 +387,7 @@ fn print_help() {
     shell_println!("  memory           show physical frame statistics");
     shell_println!("  heap             show the kernel heap mapping");
     shell_println!("  acpi             show ACPI table and platform data");
+    shell_println!("  interrupts       show interrupt-controller routing");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }
