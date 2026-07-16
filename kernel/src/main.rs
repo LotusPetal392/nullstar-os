@@ -6,11 +6,7 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, vec::Vec};
-use bootloader_api::{
-    BootInfo, BootloaderConfig,
-    config::Mapping,
-    entry_point,
-};
+use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::{alloc::Layout, panic::PanicInfo};
 use x86_64::VirtAddr;
 
