@@ -10,17 +10,14 @@ use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::{alloc::Layout, panic::PanicInfo};
 use x86_64::VirtAddr;
 
-mod acpi;
-mod allocator;
-mod apic;
-mod console;
-mod gdt;
-mod hpet;
-mod interrupts;
-mod keyboard;
+mod arch;
+mod drivers;
 mod memory;
-mod serial;
 mod shell;
+
+pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};
+pub(crate) use drivers::{console, keyboard, serial};
+pub(crate) use memory::allocator;
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
 
