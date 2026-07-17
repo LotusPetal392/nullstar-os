@@ -8,6 +8,7 @@ use std::{
 };
 
 const HEAP_TEST_MARKER: &str = "heap allocation self-test passed:";
+const FRAMEBUFFER_TEST_MARKER: &str = "framebuffer shadow buffer initialized:";
 const ACPI_TEST_MARKER: &str = "ACPI initialized:";
 const LAPIC_TIMER_TEST_MARKER: &str = "interrupt timer verified: controller=apic, source=lapic";
 const SCHEDULER_TEST_MARKER: &str = "scheduler verified:";
@@ -66,7 +67,9 @@ fn parse_options() -> Result<Options, ExitCode> {
 fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
-    println!("  --test      Verify heap, ACPI, timers, scheduler, PCIe, AHCI, partitions, and FAT");
+    println!(
+        "  --test      Verify heap, framebuffer, ACPI, timers, scheduler, PCIe, AHCI, partitions, and FAT"
+    );
 }
 
 fn qemu_command(options: &Options) -> Command {
@@ -121,6 +124,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
     let reader = thread::spawn(move || -> io::Result<()> {
         let mut terminal = io::stdout().lock();
         let mut heap_ready = false;
+        let mut framebuffer_ready = false;
         let mut acpi_ready = false;
         let mut lapic_timer_ready = false;
         let mut scheduler_ready = false;
@@ -135,6 +139,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             terminal.flush()?;
 
             heap_ready |= line.contains(HEAP_TEST_MARKER);
+            framebuffer_ready |= line.contains(FRAMEBUFFER_TEST_MARKER);
             acpi_ready |= line.contains(ACPI_TEST_MARKER);
             lapic_timer_ready |= line.contains(LAPIC_TIMER_TEST_MARKER);
             scheduler_ready |= line.contains(SCHEDULER_TEST_MARKER);
@@ -144,6 +149,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             fat_ready |= line.contains(FAT_TEST_MARKER);
 
             if heap_ready
+                && framebuffer_ready
                 && acpi_ready
                 && lapic_timer_ready
                 && scheduler_ready
