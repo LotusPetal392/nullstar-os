@@ -146,7 +146,10 @@ impl fmt::Display for Error {
                 "read ending at byte {end} exceeds the {maximum}-byte FAT prefix bound"
             ),
             Self::ShortRead { expected, actual } => {
-                write!(formatter, "short filesystem read: expected {expected}, received {actual}")
+                write!(
+                    formatter,
+                    "short filesystem read: expected {expected}, received {actual}"
+                )
             }
             Self::Fat(error) => write!(formatter, "FAT error: {error}"),
             _ => formatter.write_str(self.description()),
@@ -198,8 +201,7 @@ impl FileSystem for FatFileSystem {
         let entry = entries
             .into_iter()
             .find(|entry| {
-                entry.name.eq_ignore_ascii_case(name)
-                    || entry.short_name.eq_ignore_ascii_case(name)
+                entry.name.eq_ignore_ascii_case(name) || entry.short_name.eq_ignore_ascii_case(name)
             })
             .ok_or(Error::NotFound)?;
 
@@ -270,9 +272,7 @@ impl FileSystem for FatFileSystem {
             usize::try_from(end).map_err(|_| Error::AddressOverflow)?,
         )?;
         let start = usize::try_from(offset).map_err(|_| Error::AddressOverflow)?;
-        let end = start
-            .checked_add(requested)
-            .ok_or(Error::AddressOverflow)?;
+        let end = start.checked_add(requested).ok_or(Error::AddressOverflow)?;
         let source = prefix.bytes.get(start..end).ok_or(Error::ShortRead {
             expected: end,
             actual: prefix.bytes.len(),
@@ -355,7 +355,7 @@ pub fn read_file(path: &str, maximum_bytes: usize) -> Result<FileData, Error> {
     Ok(FileData {
         bytes,
         total_size: metadata.size,
-        truncated: requested as u64 < metadata.size,
+        truncated: (requested as u64) < metadata.size,
     })
 }
 

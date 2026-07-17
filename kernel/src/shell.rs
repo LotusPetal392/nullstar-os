@@ -2,7 +2,7 @@ use alloc::{string::String, vec};
 
 use pc_keyboard::{DecodedKey, KeyCode};
 
-use crate::{acpi, ahci, allocator, console, fat, interrupts, memory, partition, pci};
+use crate::{acpi, ahci, allocator, console, elf, fat, interrupts, memory, partition, pci, vfs};
 
 const PROMPT: &str = "galactic> ";
 const DEFAULT_CONSOLE_COLUMNS: usize = 80;
@@ -205,6 +205,7 @@ impl Shell {
             "disk" => self.handle_disk_command(words.next(), words.next()),
             "partitions" => self.print_partitions(),
             "fs" => self.print_filesystem(),
+            "vfs" => self.print_vfs(),
             "ls" => self.list_files(words.next().unwrap_or("/")),
             "cat" => {
                 let Some(path) = words.next() else {
@@ -212,6 +213,13 @@ impl Shell {
                     return ShellAction::Continue;
                 };
                 self.cat_file(path);
+            }
+            "elf" => {
+                let Some(path) = words.next() else {
+                    shell_println!("usage: elf <path>");
+                    return ShellAction::Continue;
+                };
+                self.inspect_elf(path);
             }
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
@@ -421,11 +429,7 @@ impl Shell {
     }
 
     fn list_files(&self, path: &str) {
-        if self.system_info.filesystem.is_none() {
-            shell_println!("filesystem: unavailable");
-            return;
-        }
-        let entries = match fat::list_directory(path) {
+        let entries = match vfs::read_directory(path) {
             Ok(entries) => entries,
             Err(error) => {
                 shell_println!("ls: {error}");
@@ -445,9 +449,9 @@ impl Shell {
             shell_println!(
                 "{}{}{}{} {:>10} {}{}",
                 kind,
-                if entry.is_read_only() { "r" } else { "-" },
-                if entry.is_hidden() { "h" } else { "-" },
-                if entry.is_system() { "s" } else { "-" },
+                if entry.read_only { "r" } else { "-" },
+                if entry.hidden { "h" } else { "-" },
+                if entry.system { "s" } else { "-" },
                 entry.size,
                 entry.name,
                 suffix
@@ -456,11 +460,7 @@ impl Shell {
     }
 
     fn cat_file(&self, path: &str) {
-        if self.system_info.filesystem.is_none() {
-            shell_println!("filesystem: unavailable");
-            return;
-        }
-        let data = match fat::read_file(path, FILE_PREVIEW_BYTES) {
+        let data = match vfs::read_file(path, FILE_PREVIEW_BYTES) {
             Ok(data) => data,
             Err(error) => {
                 shell_println!("cat: {error}");
@@ -505,6 +505,70 @@ impl Shell {
         }
         if data.truncated {
             shell_println!("cat: output limited to {} bytes", FILE_PREVIEW_BYTES);
+        }
+    }
+
+    fn print_vfs(&self) {
+        let Some(info) = vfs::info() else {
+            shell_println!("VFS: unavailable");
+            return;
+        };
+
+        shell_println!(
+            "VFS: {} mounted at {}, read-only={}",
+            info.filesystem,
+            info.mount_path,
+            info.read_only
+        );
+        shell_println!(
+            "backend: volume=`{}`, id={:#010x}, partition={}, start_lba={}",
+            info.volume_label,
+            info.volume_id,
+            info.partition_index,
+            info.partition_start_lba
+        );
+        shell_println!(
+            "limits: path_bytes={}, path_components={}, read_window={} KiB",
+            vfs::MAX_PATH_BYTES,
+            vfs::MAX_PATH_COMPONENTS,
+            vfs::MAX_READ_WINDOW_BYTES / 1024
+        );
+    }
+
+    fn inspect_elf(&self, path: &str) {
+        let image = match elf::validate(path) {
+            Ok(image) => image,
+            Err(error) => {
+                shell_println!("elf: {error}");
+                return;
+            }
+        };
+
+        shell_println!("ELF64 x86-64 {}: `{}`", image.image_type, image.path);
+        shell_println!(
+            "entry={:#018x}, file={} bytes, program headers={}, LOAD segments={}",
+            image.entry_point,
+            image.file_size,
+            image.program_header_count,
+            image.load_segments().len()
+        );
+        shell_println!(
+            "dynamic={}, TLS={}, executable stack requested={}",
+            image.has_dynamic_segment,
+            image.has_tls_segment,
+            image.executable_stack_requested
+        );
+        for segment in image.load_segments() {
+            shell_println!(
+                "LOAD[{}] {} file={:#x}+{:#x} virtual={:#018x}+{:#x} align={:#x}",
+                segment.program_header_index,
+                segment.permissions(),
+                segment.file_offset,
+                segment.file_size,
+                segment.virtual_address,
+                segment.memory_size,
+                segment.alignment
+            );
         }
     }
 
@@ -805,8 +869,10 @@ fn print_help() {
     shell_println!("  disk read <lba>  read and preview one logical block");
     shell_println!("  partitions       list MBR/GPT partitions");
     shell_println!("  fs               show the mounted FAT volume");
-    shell_println!("  ls [path]        list a FAT directory");
-    shell_println!("  cat <path>       preview a FAT file");
+    shell_println!("  vfs              show the root VFS mount");
+    shell_println!("  ls [path]        list a VFS directory");
+    shell_println!("  cat <path>       preview a VFS file");
+    shell_println!("  elf <path>       validate an ELF64 executable");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }
