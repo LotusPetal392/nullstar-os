@@ -146,7 +146,9 @@ impl Error {
             Self::InvalidHeaderSize(_) => "ELF64 header size is invalid",
             Self::MissingProgramHeaders => "ELF image does not contain program headers",
             Self::InvalidProgramHeaderSize(_) => "ELF64 program-header size is invalid",
-            Self::TooManyProgramHeaders(_) => "ELF program-header count exceeds the configured bound",
+            Self::TooManyProgramHeaders(_) => {
+                "ELF program-header count exceeds the configured bound"
+            }
             Self::ProgramHeaderTableOutOfRange => "ELF program-header table is outside the file",
             Self::ProgramHeaderTableOutsideReadWindow(_) => {
                 "ELF program-header table is outside the bounded VFS read window"
@@ -160,9 +162,13 @@ impl Error {
             }
             Self::SegmentFileOutOfRange(_) => "ELF segment references bytes outside the file",
             Self::SegmentAddressOverflow(_) => "ELF segment virtual-address range overflowed",
-            Self::NonCanonicalSegment(_) => "ELF segment uses a non-canonical virtual-address range",
+            Self::NonCanonicalSegment(_) => {
+                "ELF segment uses a non-canonical virtual-address range"
+            }
             Self::InvalidSegmentAlignment(_) => "ELF segment alignment is invalid",
-            Self::WritableExecutableSegment(_) => "ELF segment requests write and execute permissions",
+            Self::WritableExecutableSegment(_) => {
+                "ELF segment requests write and execute permissions"
+            }
             Self::OverlappingSegments { .. } => "ELF loadable segments overlap",
             Self::NonCanonicalEntryPoint(_) => "ELF entry point is not a canonical x86-64 address",
             Self::EntryPointNotExecutable(_) => {
@@ -210,25 +216,40 @@ impl fmt::Display for Error {
                 vfs::MAX_READ_WINDOW_BYTES
             ),
             Self::ShortRead { expected, actual } => {
-                write!(formatter, "short ELF read: expected {expected}, received {actual}")
+                write!(
+                    formatter,
+                    "short ELF read: expected {expected}, received {actual}"
+                )
             }
             Self::SegmentFileLargerThanMemory(index) => {
                 write!(formatter, "ELF LOAD segment {index} has p_filesz > p_memsz")
             }
             Self::SegmentFileOutOfRange(index) => {
-                write!(formatter, "ELF LOAD segment {index} extends beyond the file")
+                write!(
+                    formatter,
+                    "ELF LOAD segment {index} extends beyond the file"
+                )
             }
             Self::SegmentAddressOverflow(index) => {
-                write!(formatter, "ELF LOAD segment {index} address range overflowed")
+                write!(
+                    formatter,
+                    "ELF LOAD segment {index} address range overflowed"
+                )
             }
             Self::NonCanonicalSegment(index) => {
-                write!(formatter, "ELF LOAD segment {index} is outside canonical address space")
+                write!(
+                    formatter,
+                    "ELF LOAD segment {index} is outside canonical address space"
+                )
             }
             Self::InvalidSegmentAlignment(index) => {
                 write!(formatter, "ELF LOAD segment {index} has invalid alignment")
             }
             Self::WritableExecutableSegment(index) => {
-                write!(formatter, "ELF LOAD segment {index} requests writable executable memory")
+                write!(
+                    formatter,
+                    "ELF LOAD segment {index} requests writable executable memory"
+                )
             }
             Self::OverlappingSegments { first, second } => {
                 write!(formatter, "ELF LOAD segments {first} and {second} overlap")
@@ -439,8 +460,7 @@ fn parse_load_segment(
     }
 
     if alignment > 1
-        && (!alignment.is_power_of_two()
-            || virtual_address % alignment != file_offset % alignment)
+        && (!alignment.is_power_of_two() || virtual_address % alignment != file_offset % alignment)
     {
         return Err(Error::InvalidSegmentAlignment(index));
     }
