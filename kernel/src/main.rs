@@ -13,6 +13,7 @@ use x86_64::VirtAddr;
 mod arch;
 mod drivers;
 mod memory;
+mod scheduler;
 mod shell;
 
 pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};
@@ -110,6 +111,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     heap_allocation_self_test();
 
+    let scheduler_initial = match scheduler::init() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            serial_println!(
+                "failed to initialize the scheduler: {}",
+                error.description()
+            );
+            hlt_loop();
+        }
+    };
+    serial_println!(
+        "scheduler initialized: tasks={}, quantum_ticks={}",
+        scheduler_initial.task_count,
+        scheduler_initial.quantum_ticks
+    );
+
+    let scheduler_verified = scheduler::wait_for_self_test();
+    serial_println!(
+        "scheduler verified: tasks={}, switches={}, preemptions={}, probe_a={}, probe_b={}",
+        scheduler_verified.task_count,
+        scheduler_verified.context_switches,
+        scheduler_verified.preemptions,
+        scheduler_verified.probe_a_heartbeats,
+        scheduler_verified.probe_b_heartbeats
+    );
+
     println!("GalacticOS");
     println!("-------------");
     println!();
@@ -125,6 +152,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("Interrupt controller: {}", interrupt_controller.kind);
     println!("Timer source: {}", interrupt_controller.timer_source);
     println!("Timer interrupts verified");
+    println!("Preemptive scheduler ready");
     if acpi_info.is_some() {
         println!("ACPI tables loaded");
     } else {
@@ -152,6 +180,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         remaining_frames
     );
     serial_println!("framebuffer console initialized");
+    serial_println!("preemptive scheduler initialized");
     serial_println!("interactive shell initialized");
     serial_println!("kernel entered kernel_main");
 

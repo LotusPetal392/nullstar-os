@@ -15,7 +15,7 @@ use x86_64::{
 
 use crate::{
     acpi::{HpetInfo, MadtInfo},
-    apic, gdt, hlt_loop, keyboard, serial_println,
+    apic, gdt, hlt_loop, keyboard, scheduler, serial_println,
 };
 
 const PIC_1_OFFSET: u8 = 32;
@@ -160,11 +160,11 @@ lazy_static! {
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
-        idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
 
         unsafe {
+            idt[TIMER_VECTOR].set_handler_addr(scheduler::timer_interrupt_entry_address());
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
@@ -312,6 +312,13 @@ fn end_of_interrupt(vector: u8) {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn galactic_timer_interrupt_dispatch(current_stack_pointer: usize) -> usize {
+    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    end_of_interrupt(TIMER_VECTOR);
+    scheduler::on_timer_interrupt(current_stack_pointer)
+}
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{stack_frame:#?}");
 }
@@ -325,11 +332,6 @@ extern "x86-interrupt" fn page_fault_handler(
     serial_println!("Error code: {error_code:?}");
     serial_println!("{stack_frame:#?}");
     hlt_loop();
-}
-
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-    end_of_interrupt(TIMER_VECTOR);
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
