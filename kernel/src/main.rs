@@ -13,13 +13,16 @@ use x86_64::VirtAddr;
 mod arch;
 mod drivers;
 mod memory;
+mod process;
 mod scheduler;
 mod shell;
 mod storage;
+mod vfs;
 
 pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};
 pub(crate) use drivers::{ahci, console, keyboard, pci, serial};
 pub(crate) use memory::allocator;
+pub(crate) use process::elf;
 pub(crate) use storage::{fat, partition};
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
@@ -283,6 +286,70 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
+    let vfs_info = if filesystem_info.is_some() {
+        match vfs::mount_fat_root() {
+            Ok(info) => {
+                serial_println!(
+                    "VFS initialized: root={}, filesystem={}, read_only={}, label=`{}`, volume_id={:#010x}, partition={}, start_lba={}",
+                    info.mount_path,
+                    info.filesystem,
+                    info.read_only,
+                    info.volume_label,
+                    info.volume_id,
+                    info.partition_index,
+                    info.partition_start_lba
+                );
+                Some(info)
+            }
+            Err(error) => {
+                serial_println!("VFS initialization failed: {error}");
+                None
+            }
+        }
+    } else {
+        serial_println!("VFS unavailable: no FAT filesystem is mounted");
+        None
+    };
+
+    let elf_image = if vfs_info.is_some() {
+        match elf::validate_first_in_directory("/") {
+            Ok(image) => {
+                serial_println!(
+                    "ELF image validated: path=`{}`, type={}, machine=x86_64, entry={:#018x}, file_bytes={}, program_headers={}, load_segments={}, dynamic={}, tls={}, executable_stack={}",
+                    image.path,
+                    image.image_type,
+                    image.entry_point,
+                    image.file_size,
+                    image.program_header_count,
+                    image.load_segments().len(),
+                    image.has_dynamic_segment,
+                    image.has_tls_segment,
+                    image.executable_stack_requested
+                );
+                for segment in image.load_segments() {
+                    serial_println!(
+                        "ELF LOAD: index={}, file={:#x}+{:#x}, virtual={:#018x}+{:#x}, align={:#x}, permissions={}",
+                        segment.program_header_index,
+                        segment.file_offset,
+                        segment.file_size,
+                        segment.virtual_address,
+                        segment.memory_size,
+                        segment.alignment,
+                        segment.permissions()
+                    );
+                }
+                Some(image)
+            }
+            Err(error) => {
+                serial_println!("ELF validation failed: {error}");
+                None
+            }
+        }
+    } else {
+        serial_println!("ELF validation unavailable: VFS is not initialized");
+        None
+    };
+
     let scheduler_initial = match scheduler::init() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -349,6 +416,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Read-only FAT filesystem mounted");
     } else {
         println!("FAT filesystem unavailable");
+    }
+    if vfs_info.is_some() {
+        println!("Virtual filesystem mounted");
+    } else {
+        println!("Virtual filesystem unavailable");
+    }
+    if elf_image.is_some() {
+        println!("ELF64 image validated");
+    } else {
+        println!("ELF64 validation unavailable");
     }
     println!("Interactive shell initialized");
 

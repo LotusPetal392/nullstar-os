@@ -16,6 +16,8 @@ const PCIE_TEST_MARKER: &str = "PCIe initialized:";
 const AHCI_TEST_MARKER: &str = "AHCI storage verified:";
 const PARTITION_TEST_MARKER: &str = "partition table initialized:";
 const FAT_TEST_MARKER: &str = "FAT filesystem mounted:";
+const VFS_TEST_MARKER: &str = "VFS initialized:";
+const ELF_TEST_MARKER: &str = "ELF image validated:";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Default)]
@@ -68,7 +70,7 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify heap, framebuffer, ACPI, timers, scheduler, PCIe, AHCI, partitions, and FAT"
+        "  --test      Verify heap, framebuffer, ACPI, timers, scheduler, storage, VFS, and ELF"
     );
 }
 
@@ -132,6 +134,8 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut ahci_ready = false;
         let mut partitions_ready = false;
         let mut fat_ready = false;
+        let mut vfs_ready = false;
+        let mut elf_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -147,6 +151,8 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             ahci_ready |= line.contains(AHCI_TEST_MARKER);
             partitions_ready |= line.contains(PARTITION_TEST_MARKER);
             fat_ready |= line.contains(FAT_TEST_MARKER);
+            vfs_ready |= line.contains(VFS_TEST_MARKER);
+            elf_ready |= line.contains(ELF_TEST_MARKER);
 
             if heap_ready
                 && framebuffer_ready
@@ -157,6 +163,8 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && ahci_ready
                 && partitions_ready
                 && fat_ready
+                && vfs_ready
+                && elf_ready
             {
                 let _ = marker_sender.send(());
                 break;
