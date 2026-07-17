@@ -7,5 +7,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", linker_script.display());
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
+    println!("cargo:rustc-link-arg=-no-pie");
     println!("cargo:rustc-link-arg=--build-id=none");
 }
