@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - agent/process-scheduling-isolation
+  pull_request:
 
 permissions:
   contents: write
