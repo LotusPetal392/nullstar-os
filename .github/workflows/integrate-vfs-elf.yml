@@ -1,0 +1,39 @@
+name: Integrate VFS and ELF loader
+
+on:
+  push:
+    branches:
+      - agent/vfs-elf-loader
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/vfs-elf-loader
+
+      - name: Install pinned formatter
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component rustfmt
+
+      - name: Integrate VFS and ELF support
+        run: |
+          python3 tools/integrate_vfs_elf.py
+          cargo +nightly-2026-02-01 fmt --all
+
+      - name: Commit integration
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add kernel/src/main.rs kernel/src/shell.rs src/main.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "Integrate VFS and ELF validation"
+            git push origin HEAD:agent/vfs-elf-loader
+          fi
