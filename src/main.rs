@@ -13,7 +13,9 @@ const LAPIC_TIMER_TEST_MARKER: &str = "interrupt timer verified: controller=apic
 const SCHEDULER_TEST_MARKER: &str = "scheduler verified:";
 const PCIE_TEST_MARKER: &str = "PCIe initialized:";
 const AHCI_TEST_MARKER: &str = "AHCI storage verified:";
-const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PARTITION_TEST_MARKER: &str = "partition table initialized:";
+const FAT_TEST_MARKER: &str = "FAT filesystem mounted:";
+const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Default)]
 struct Options {
@@ -64,7 +66,7 @@ fn parse_options() -> Result<Options, ExitCode> {
 fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
-    println!("  --test      Verify heap, ACPI, LAPIC timer, scheduler, PCIe, and AHCI startup");
+    println!("  --test      Verify heap, ACPI, timers, scheduler, PCIe, AHCI, partitions, and FAT");
 }
 
 fn qemu_command(options: &Options) -> Command {
@@ -124,6 +126,8 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut scheduler_ready = false;
         let mut pcie_ready = false;
         let mut ahci_ready = false;
+        let mut partitions_ready = false;
+        let mut fat_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -136,6 +140,8 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             scheduler_ready |= line.contains(SCHEDULER_TEST_MARKER);
             pcie_ready |= line.contains(PCIE_TEST_MARKER);
             ahci_ready |= line.contains(AHCI_TEST_MARKER);
+            partitions_ready |= line.contains(PARTITION_TEST_MARKER);
+            fat_ready |= line.contains(FAT_TEST_MARKER);
 
             if heap_ready
                 && acpi_ready
@@ -143,6 +149,8 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && scheduler_ready
                 && pcie_ready
                 && ahci_ready
+                && partitions_ready
+                && fat_ready
             {
                 let _ = marker_sender.send(());
                 break;

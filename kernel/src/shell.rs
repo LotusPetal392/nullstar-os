@@ -2,13 +2,14 @@ use alloc::{string::String, vec};
 
 use pc_keyboard::{DecodedKey, KeyCode};
 
-use crate::{acpi, ahci, allocator, console, interrupts, memory, pci};
+use crate::{acpi, ahci, allocator, console, fat, interrupts, memory, partition, pci};
 
 const PROMPT: &str = "galactic> ";
 const DEFAULT_CONSOLE_COLUMNS: usize = 80;
 const MAX_COMMAND_LENGTH: usize = 128;
 const MAX_PCI_SHELL_FUNCTIONS: usize = 64;
 const DISK_PREVIEW_BYTES: usize = 128;
+const FILE_PREVIEW_BYTES: usize = 16 * 1024;
 
 macro_rules! shell_print {
     ($($argument:tt)*) => {{
@@ -37,6 +38,8 @@ pub struct SystemInfo {
     interrupt_controller: interrupts::ControllerInfo,
     pci_inventory: Option<pci::Inventory>,
     storage: Option<ahci::DiskInfo>,
+    partitions: Option<partition::Inventory>,
+    filesystem: Option<fat::VolumeInfo>,
 }
 
 impl SystemInfo {
@@ -48,6 +51,8 @@ impl SystemInfo {
         interrupt_controller: interrupts::ControllerInfo,
         pci_inventory: Option<pci::Inventory>,
         storage: Option<ahci::DiskInfo>,
+        partitions: Option<partition::Inventory>,
+        filesystem: Option<fat::VolumeInfo>,
     ) -> Self {
         Self {
             usable_frames,
@@ -57,6 +62,8 @@ impl SystemInfo {
             interrupt_controller,
             pci_inventory,
             storage,
+            partitions,
+            filesystem,
         }
     }
 }
@@ -196,6 +203,16 @@ impl Shell {
             "interrupts" => self.print_interrupts(),
             "pci" => self.print_pci(),
             "disk" => self.handle_disk_command(words.next(), words.next()),
+            "partitions" => self.print_partitions(),
+            "fs" => self.print_filesystem(),
+            "ls" => self.list_files(words.next().unwrap_or("/")),
+            "cat" => {
+                let Some(path) = words.next() else {
+                    shell_println!("usage: cat <path>");
+                    return ShellAction::Continue;
+                };
+                self.cat_file(path);
+            }
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
             }
@@ -316,6 +333,178 @@ impl Shell {
                 shell_print!("{byte:02x} ");
             }
             shell_println!();
+        }
+    }
+
+    fn print_partitions(&self) {
+        let Some(inventory) = self.system_info.partitions.as_ref() else {
+            shell_println!("partitions: unavailable");
+            return;
+        };
+
+        shell_println!(
+            "partition table: {}, {} partition(s), disk={} blocks x {} bytes",
+            inventory.table_kind,
+            inventory.partitions().len(),
+            inventory.disk_block_count,
+            inventory.disk_block_size
+        );
+        if inventory.table_kind == partition::TableKind::Gpt {
+            shell_println!(
+                "GPT validation: header CRC={}, entry-array CRC={}, protective MBR={}",
+                inventory.header_crc_valid,
+                inventory.entry_array_crc_valid,
+                inventory.protective_mbr
+            );
+        }
+        for entry in inventory.partitions() {
+            shell_println!(
+                "{}: {} LBA {}-{} ({} blocks, {} KiB) bootable={}",
+                entry.index,
+                entry.kind,
+                entry.start_lba,
+                entry.end_lba_inclusive(),
+                entry.block_count,
+                entry
+                    .block_count
+                    .saturating_mul(inventory.disk_block_size as u64)
+                    / 1024,
+                entry.bootable
+            );
+            if !entry.name.is_empty() {
+                shell_println!("  name: `{}`", entry.name);
+            }
+            if let Some(type_guid) = entry.type_guid {
+                shell_println!("  type GUID: {type_guid}");
+            }
+            if let Some(unique_guid) = entry.unique_guid {
+                shell_println!("  unique GUID: {unique_guid}");
+            }
+        }
+        if inventory.truncated {
+            shell_println!("warning: partition inventory reached its configured bound");
+        }
+    }
+
+    fn print_filesystem(&self) {
+        let Some(info) = self.system_info.filesystem.as_ref() else {
+            shell_println!("filesystem: unavailable");
+            return;
+        };
+
+        shell_println!(
+            "filesystem: {} on partition {} at LBA {}",
+            info.fat_type,
+            info.partition_index,
+            info.partition_start_lba
+        );
+        shell_println!(
+            "volume: label=`{}`, id={:#010x}, sectors={}",
+            info.volume_label,
+            info.volume_id,
+            info.total_sectors
+        );
+        shell_println!(
+            "geometry: {} bytes/sector, {} sectors/cluster, {} bytes/cluster",
+            info.bytes_per_sector,
+            info.sectors_per_cluster,
+            info.bytes_per_cluster
+        );
+        shell_println!(
+            "FAT: copies={}, sectors/copy={}, clusters={}, root entries={}",
+            info.fat_count,
+            info.sectors_per_fat,
+            info.cluster_count,
+            info.root_entry_count
+        );
+        shell_println!("mount: read-only at /");
+    }
+
+    fn list_files(&self, path: &str) {
+        if self.system_info.filesystem.is_none() {
+            shell_println!("filesystem: unavailable");
+            return;
+        }
+        let entries = match fat::list_directory(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                shell_println!("ls: {error}");
+                return;
+            }
+        };
+
+        shell_println!(
+            "{}: {} entr{}",
+            path,
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" }
+        );
+        for entry in entries {
+            let kind = if entry.is_directory() { "d" } else { "-" };
+            let suffix = if entry.is_directory() { "/" } else { "" };
+            shell_println!(
+                "{}{}{}{} {:>10} {}{}",
+                kind,
+                if entry.is_read_only() { "r" } else { "-" },
+                if entry.is_hidden() { "h" } else { "-" },
+                if entry.is_system() { "s" } else { "-" },
+                entry.size,
+                entry.name,
+                suffix
+            );
+        }
+    }
+
+    fn cat_file(&self, path: &str) {
+        if self.system_info.filesystem.is_none() {
+            shell_println!("filesystem: unavailable");
+            return;
+        }
+        let data = match fat::read_file(path, FILE_PREVIEW_BYTES) {
+            Ok(data) => data,
+            Err(error) => {
+                shell_println!("cat: {error}");
+                return;
+            }
+        };
+
+        shell_println!(
+            "{}: {} bytes{}",
+            path,
+            data.total_size,
+            if data.truncated {
+                " (preview truncated)"
+            } else {
+                ""
+            }
+        );
+        let mut ended_with_newline = true;
+        for byte in data.bytes {
+            match byte {
+                b'\n' => {
+                    shell_println!();
+                    ended_with_newline = true;
+                }
+                b'\r' => {}
+                b'\t' => {
+                    shell_print!("    ");
+                    ended_with_newline = false;
+                }
+                0x20..=0x7e => {
+                    shell_print!("{}", char::from(byte));
+                    ended_with_newline = false;
+                }
+                _ => {
+                    shell_print!(".");
+                    ended_with_newline = false;
+                }
+            }
+        }
+        if !ended_with_newline {
+            shell_println!();
+        }
+        if data.truncated {
+            shell_println!("cat: output limited to {} bytes", FILE_PREVIEW_BYTES);
         }
     }
 
@@ -614,6 +803,10 @@ fn print_help() {
     shell_println!("  pci              list PCIe functions discovered by ECAM");
     shell_println!("  disk             show the AHCI disk");
     shell_println!("  disk read <lba>  read and preview one logical block");
+    shell_println!("  partitions       list MBR/GPT partitions");
+    shell_println!("  fs               show the mounted FAT volume");
+    shell_println!("  ls [path]        list a FAT directory");
+    shell_println!("  cat <path>       preview a FAT file");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }

@@ -15,10 +15,12 @@ mod drivers;
 mod memory;
 mod scheduler;
 mod shell;
+mod storage;
 
 pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};
 pub(crate) use drivers::{ahci, console, keyboard, pci, serial};
 pub(crate) use memory::allocator;
+pub(crate) use storage::{fat, partition};
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
 
@@ -197,6 +199,90 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
+    let partition_inventory = if storage_info.is_some() {
+        match partition::scan() {
+            Ok(inventory) => {
+                serial_println!(
+                    "partition table initialized: kind={}, partitions={}, protective_mbr={}, header_crc_valid={}, entry_crc_valid={}, truncated={}",
+                    inventory.table_kind,
+                    inventory.partitions().len(),
+                    inventory.protective_mbr,
+                    inventory.header_crc_valid,
+                    inventory.entry_array_crc_valid,
+                    inventory.truncated
+                );
+                for partition in inventory.partitions() {
+                    serial_println!(
+                        "partition: index={}, kind={}, start_lba={}, end_lba={}, blocks={}, bootable={}, name=`{}`",
+                        partition.index,
+                        partition.kind,
+                        partition.start_lba,
+                        partition.end_lba_inclusive(),
+                        partition.block_count,
+                        partition.bootable,
+                        partition.name
+                    );
+                }
+                Some(inventory)
+            }
+            Err(error) => {
+                serial_println!("partition discovery failed: {error}");
+                None
+            }
+        }
+    } else {
+        serial_println!("partition discovery unavailable: AHCI storage is missing");
+        None
+    };
+
+    let filesystem_info = match partition_inventory.as_ref() {
+        Some(partitions) => match fat::init(partitions) {
+            Ok(info) => {
+                let root_entries = fat::list_directory("/").unwrap_or_default();
+                let file_probe = root_entries
+                    .iter()
+                    .find(|entry| !entry.is_directory() && entry.size != 0)
+                    .and_then(|entry| fat::read_file(&entry.name, 64).ok());
+                let probe_bytes = file_probe
+                    .as_ref()
+                    .map(|data| data.bytes.len())
+                    .unwrap_or(0);
+                let probe_checksum = file_probe
+                    .as_ref()
+                    .map(|data| {
+                        data.bytes
+                            .iter()
+                            .copied()
+                            .fold(0x811c_9dc5_u32, |hash, byte| {
+                                (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+                            })
+                    })
+                    .unwrap_or(0);
+                serial_println!(
+                    "FAT filesystem mounted: type={}, partition={}, start_lba={}, label=`{}`, sectors={}, cluster_bytes={}, root_entries={}, file_probe_bytes={}, file_probe_checksum={:#010x}",
+                    info.fat_type,
+                    info.partition_index,
+                    info.partition_start_lba,
+                    info.volume_label,
+                    info.total_sectors,
+                    info.bytes_per_cluster,
+                    root_entries.len(),
+                    probe_bytes,
+                    probe_checksum
+                );
+                Some(info)
+            }
+            Err(error) => {
+                serial_println!("FAT filesystem mount failed: {error}");
+                None
+            }
+        },
+        None => {
+            serial_println!("FAT filesystem unavailable: no partition inventory");
+            None
+        }
+    };
+
     let scheduler_initial = match scheduler::init() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -254,6 +340,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         println!("AHCI block storage unavailable");
     }
+    if partition_inventory.is_some() {
+        println!("Partition table discovered");
+    } else {
+        println!("Partition table unavailable");
+    }
+    if filesystem_info.is_some() {
+        println!("Read-only FAT filesystem mounted");
+    } else {
+        println!("FAT filesystem unavailable");
+    }
     println!("Interactive shell initialized");
 
     let usable_frames = frame_allocator.usable_frame_count();
@@ -288,6 +384,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         interrupt_controller,
         pci_inventory,
         storage_info,
+        partition_inventory,
+        filesystem_info,
     );
     let mut interactive_shell = shell::Shell::new(system_info);
     interactive_shell.start();
