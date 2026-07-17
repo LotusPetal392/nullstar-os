@@ -71,7 +71,6 @@ const SATA_STATUS_DEVICE_PRESENT: u32 = 3;
 const SATA_STATUS_INTERFACE_ACTIVE: u32 = 1;
 const SATA_CONTROL_DETECT_MASK: u32 = 0x0f;
 const SATA_CONTROL_COMRESET: u32 = 1;
-const SATA_DISK_SIGNATURE: u32 = 0x0000_0101;
 
 const COMMAND_LIST_BYTES: usize = 1024;
 const RECEIVED_FIS_OFFSET: usize = 1024;
@@ -378,7 +377,7 @@ impl Port {
         self.hba.write_u32(self.offset(register), value);
     }
 
-    fn wake_and_is_sata(self) -> bool {
+    fn wake_and_has_device(self) -> bool {
         self.write(
             PORT_COMMAND,
             self.read(PORT_COMMAND) | PORT_CMD_SPIN_UP_DEVICE | PORT_CMD_POWER_ON_DEVICE,
@@ -402,32 +401,16 @@ impl Port {
             crate::interrupts::wait_for_timer_tick();
         }
 
-        let mut signature_ready = false;
-        if link_ready {
-            for _ in 0..100 {
-                let task_file = self.read(PORT_TASK_FILE_DATA);
-                let signature = self.read(PORT_SIGNATURE);
-                if task_file & (PORT_TFD_BUSY | PORT_TFD_DATA_REQUEST) == 0 && signature != u32::MAX
-                {
-                    signature_ready = true;
-                    break;
-                }
-                crate::interrupts::wait_for_timer_tick();
-            }
-        }
-
-        let sata_status = self.read(PORT_SATA_STATUS);
-        let signature = self.read(PORT_SIGNATURE);
         crate::serial_println!(
             "AHCI port {}: ssts={:#010x}, sig={:#010x}, cmd={:#010x}, tfd={:#010x}",
             self.index,
-            sata_status,
-            signature,
+            self.read(PORT_SATA_STATUS),
+            self.read(PORT_SIGNATURE),
             self.read(PORT_COMMAND),
             self.read(PORT_TASK_FILE_DATA)
         );
 
-        link_ready && signature_ready && signature == SATA_DISK_SIGNATURE
+        link_ready
     }
     fn link_is_active(self) -> bool {
         let sata_status = self.read(PORT_SATA_STATUS);
@@ -575,7 +558,7 @@ impl Controller {
                 continue;
             }
             let port = Port { hba, index };
-            if port.wake_and_is_sata() {
+            if port.wake_and_has_device() {
                 selected_port = Some(port);
                 break;
             }
