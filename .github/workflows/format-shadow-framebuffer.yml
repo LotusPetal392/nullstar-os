@@ -1,0 +1,37 @@
+name: Format shadow framebuffer
+
+on:
+  push:
+    branches:
+      - agent/shadow-framebuffer-scroll
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/shadow-framebuffer-scroll
+
+      - name: Install pinned formatter
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component rustfmt
+
+      - name: Format sources
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Commit formatted sources
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add kernel/src/drivers/console.rs kernel/src/memory/allocator.rs src/main.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "Format shadow framebuffer sources"
+            git push origin HEAD:agent/shadow-framebuffer-scroll
+          fi
