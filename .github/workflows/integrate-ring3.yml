@@ -48,7 +48,10 @@ jobs:
           fi
 
       - name: Build bootable image
-        run: cargo +nightly-2026-02-01 build --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 build --locked 2>&1 | tee ring3-build.log
 
       - name: Upload integration diagnostics
         if: always()
@@ -56,4 +59,12 @@ jobs:
         with:
           name: ring3-integration-log
           path: ring3-integration.log
+          if-no-files-found: ignore
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ring3-build-log
+          path: ring3-build.log
           if-no-files-found: ignore
