@@ -9,3 +9,9 @@ name = "init"
 path = "src/main.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "fault_probe"
+path = "src/bin/fault_probe.rs"
+test = false
+bench = false

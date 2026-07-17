@@ -9,8 +9,7 @@ use spin::Mutex;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
     instructions::port::Port,
-    registers::control::Cr2,
-    structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
+    structures::idt::{InterruptDescriptorTable, InterruptStackFrame},
 };
 
 use crate::{
@@ -161,11 +160,14 @@ lazy_static! {
         let mut idt = InterruptDescriptorTable::new();
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
-        idt.page_fault.set_handler_fn(page_fault_handler);
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
 
         unsafe {
+            idt.page_fault
+                .set_handler_addr(userspace::page_fault_interrupt_entry_address());
+            idt.general_protection_fault
+                .set_handler_addr(userspace::general_protection_interrupt_entry_address());
             idt[TIMER_VECTOR].set_handler_addr(scheduler::timer_interrupt_entry_address());
             idt[userspace::SYSCALL_VECTOR]
                 .set_handler_addr(userspace::syscall_interrupt_entry_address())
@@ -326,17 +328,6 @@ pub extern "C" fn galactic_timer_interrupt_dispatch(current_stack_pointer: usize
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{stack_frame:#?}");
-}
-
-extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
-    error_code: PageFaultErrorCode,
-) {
-    serial_println!("EXCEPTION: PAGE FAULT");
-    serial_println!("Address: {:?}", Cr2::read());
-    serial_println!("Error code: {error_code:?}");
-    serial_println!("{stack_frame:#?}");
-    hlt_loop();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

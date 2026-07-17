@@ -1,23 +1,28 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     arch::global_asm,
+    fmt,
     mem::{align_of, size_of},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use spin::Mutex;
 use x86_64::{
-    VirtAddr,
+    PhysAddr, VirtAddr,
     instructions::{
         hlt, interrupts as cpu_interrupts,
         segmentation::{CS, SS, Segment},
     },
+    registers::control::{Cr3, Cr3Flags},
+    structures::paging::{PhysFrame, Size4KiB},
 };
+
+use crate::gdt;
 
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_STACK_WORDS: usize = KERNEL_STACK_SIZE / size_of::<u128>();
 const DEFAULT_QUANTUM_TICKS: u64 = 5;
-pub const MAX_SNAPSHOT_TASKS: usize = 8;
+pub const MAX_SNAPSHOT_TASKS: usize = 16;
 const INITIAL_RFLAGS: u64 = 0x202;
 
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
@@ -91,23 +96,71 @@ pub type ThreadEntry = extern "C" fn() -> !;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitError {
     AlreadyInitialized,
+    NotInitialized,
     StackLayoutInvalid,
+    InvalidUserContext,
 }
 
 impl InitError {
     pub const fn description(self) -> &'static str {
         match self {
             Self::AlreadyInitialized => "scheduler is already initialized",
+            Self::NotInitialized => "scheduler is not initialized",
             Self::StackLayoutInvalid => "kernel-thread stack layout is invalid",
+            Self::InvalidUserContext => "userspace task context is invalid",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Bootstrap,
+    KernelThread,
+    UserProcess,
+}
+
+impl fmt::Display for TaskKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bootstrap => formatter.write_str("bootstrap"),
+            Self::KernelThread => formatter.write_str("kernel"),
+            Self::UserProcess => formatter.write_str("user"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Runnable,
+    Zombie,
+}
+
+impl fmt::Display for TaskState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runnable => formatter.write_str("runnable"),
+            Self::Zombie => formatter.write_str("zombie"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReapedProcessTask {
+    pub process_id: u64,
+    pub task_id: u64,
+    pub scheduled_count: u64,
+    pub runtime_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct TaskSnapshot {
     pub id: u64,
     pub name: &'static str,
+    pub kind: TaskKind,
+    pub state: TaskState,
+    pub process_id: Option<u64>,
     pub stack_bytes: usize,
+    pub page_table_address: u64,
     pub scheduled_count: u64,
     pub runtime_ticks: u64,
 }
@@ -116,7 +169,11 @@ impl TaskSnapshot {
     const EMPTY: Self = Self {
         id: 0,
         name: "",
+        kind: TaskKind::KernelThread,
+        state: TaskState::Zombie,
+        process_id: None,
         stack_bytes: 0,
+        page_table_address: 0,
         scheduled_count: 0,
         runtime_ticks: 0,
     };
@@ -126,11 +183,18 @@ impl TaskSnapshot {
 pub struct Snapshot {
     pub running: bool,
     pub task_count: usize,
+    pub runnable_task_count: usize,
+    pub zombie_task_count: usize,
+    pub user_task_count: usize,
     pub current_task_id: u64,
     pub current_task_name: &'static str,
+    pub current_task_kind: TaskKind,
+    pub current_process_id: Option<u64>,
     pub quantum_ticks: u64,
     pub context_switches: u64,
     pub preemptions: u64,
+    pub voluntary_switches: u64,
+    pub address_space_switches: u64,
     pub probe_a_heartbeats: u64,
     pub probe_b_heartbeats: u64,
     pub truncated: bool,
@@ -144,28 +208,69 @@ impl Snapshot {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AddressSpace {
+    frame: PhysFrame<Size4KiB>,
+    flags: Cr3Flags,
+}
+
+impl AddressSpace {
+    fn current() -> Self {
+        let (frame, flags) = Cr3::read();
+        Self { frame, flags }
+    }
+
+    fn user(frame: PhysFrame<Size4KiB>) -> Self {
+        Self {
+            frame,
+            flags: Cr3Flags::empty(),
+        }
+    }
+
+    fn address(self) -> u64 {
+        self.frame.start_address().as_u64()
+    }
+}
+
 struct Task {
     id: u64,
     name: &'static str,
+    kind: TaskKind,
+    state: TaskState,
+    process_id: Option<u64>,
     stack_pointer: usize,
     stack: Option<Box<[u128]>>,
+    stack_bytes: usize,
+    address_space: AddressSpace,
+    privilege_stack_top: Option<VirtAddr>,
     scheduled_count: u64,
     runtime_ticks: u64,
 }
 
 impl Task {
-    fn bootstrap(id: u64) -> Self {
+    fn bootstrap(id: u64, address_space: AddressSpace) -> Self {
         Self {
             id,
             name: "bootstrap-shell",
+            kind: TaskKind::Bootstrap,
+            state: TaskState::Runnable,
+            process_id: None,
             stack_pointer: 0,
             stack: None,
+            stack_bytes: 0,
+            address_space,
+            privilege_stack_top: None,
             scheduled_count: 1,
             runtime_ticks: 0,
         }
     }
 
-    fn kernel_thread(id: u64, name: &'static str, entry: ThreadEntry) -> Result<Self, InitError> {
+    fn kernel_thread(
+        id: u64,
+        name: &'static str,
+        entry: ThreadEntry,
+        address_space: AddressSpace,
+    ) -> Result<Self, InitError> {
         let mut stack = vec![0_u128; KERNEL_STACK_WORDS].into_boxed_slice();
         let stack_start = stack.as_mut_ptr() as usize;
         let stack_bytes = stack
@@ -211,25 +316,65 @@ impl Task {
         Ok(Self {
             id,
             name,
+            kind: TaskKind::KernelThread,
+            state: TaskState::Runnable,
+            process_id: None,
             stack_pointer,
             stack: Some(stack),
+            stack_bytes,
+            address_space,
+            privilege_stack_top: None,
             scheduled_count: 0,
             runtime_ticks: 0,
         })
     }
 
-    fn stack_bytes(&self) -> usize {
-        self.stack
-            .as_ref()
-            .map(|stack| stack.len() * size_of::<u128>())
-            .unwrap_or(0)
+    fn user_process(
+        id: u64,
+        name: &'static str,
+        process_id: u64,
+        stack_pointer: usize,
+        kernel_stack_top: VirtAddr,
+        kernel_stack_bytes: usize,
+        page_table_frame: PhysFrame<Size4KiB>,
+    ) -> Result<Self, InitError> {
+        if stack_pointer == 0
+            || stack_pointer % 16 != 0
+            || kernel_stack_top.as_u64() == 0
+            || kernel_stack_bytes == 0
+        {
+            return Err(InitError::InvalidUserContext);
+        }
+
+        Ok(Self {
+            id,
+            name,
+            kind: TaskKind::UserProcess,
+            state: TaskState::Runnable,
+            process_id: Some(process_id),
+            stack_pointer,
+            stack: None,
+            stack_bytes: kernel_stack_bytes,
+            address_space: AddressSpace::user(page_table_frame),
+            privilege_stack_top: Some(kernel_stack_top),
+            scheduled_count: 0,
+            runtime_ticks: 0,
+        })
+    }
+
+    fn is_runnable(&self) -> bool {
+        self.state == TaskState::Runnable && self.stack_pointer != 0
     }
 
     fn snapshot(&self) -> TaskSnapshot {
         TaskSnapshot {
             id: self.id,
             name: self.name,
-            stack_bytes: self.stack_bytes(),
+            kind: self.kind,
+            state: self.state,
+            process_id: self.process_id,
+            stack_bytes: self.stack_bytes,
+            page_table_address: self.address_space.address(),
             scheduled_count: self.scheduled_count,
             runtime_ticks: self.runtime_ticks,
         }
@@ -241,10 +386,13 @@ struct Scheduler {
     current_task: usize,
     next_task_id: u64,
     running: bool,
+    kernel_address_space: Option<AddressSpace>,
     quantum_ticks: u64,
     ticks_in_quantum: u64,
     context_switches: u64,
     preemptions: u64,
+    voluntary_switches: u64,
+    address_space_switches: u64,
 }
 
 impl Scheduler {
@@ -254,10 +402,13 @@ impl Scheduler {
             current_task: 0,
             next_task_id: 0,
             running: false,
+            kernel_address_space: None,
             quantum_ticks: DEFAULT_QUANTUM_TICKS,
             ticks_in_quantum: 0,
             context_switches: 0,
             preemptions: 0,
+            voluntary_switches: 0,
+            address_space_switches: 0,
         }
     }
 
@@ -266,17 +417,48 @@ impl Scheduler {
             return Err(InitError::AlreadyInitialized);
         }
 
+        let kernel_address_space = AddressSpace::current();
+        self.kernel_address_space = Some(kernel_address_space);
         let bootstrap_id = self.allocate_task_id();
-        self.tasks.push(Task::bootstrap(bootstrap_id));
-        self.spawn("scheduler-probe-a", scheduler_probe_a)?;
-        self.spawn("scheduler-probe-b", scheduler_probe_b)?;
+        self.tasks
+            .push(Task::bootstrap(bootstrap_id, kernel_address_space));
+        self.spawn_kernel("scheduler-probe-a", scheduler_probe_a)?;
+        self.spawn_kernel("scheduler-probe-b", scheduler_probe_b)?;
         self.running = true;
+        gdt::reset_privilege_stack();
         Ok(())
     }
 
-    fn spawn(&mut self, name: &'static str, entry: ThreadEntry) -> Result<u64, InitError> {
+    fn spawn_kernel(&mut self, name: &'static str, entry: ThreadEntry) -> Result<u64, InitError> {
+        let address_space = self.kernel_address_space.ok_or(InitError::NotInitialized)?;
         let id = self.allocate_task_id();
-        self.tasks.push(Task::kernel_thread(id, name, entry)?);
+        self.tasks
+            .push(Task::kernel_thread(id, name, entry, address_space)?);
+        Ok(id)
+    }
+
+    fn spawn_user(
+        &mut self,
+        name: &'static str,
+        process_id: u64,
+        stack_pointer: usize,
+        kernel_stack_top: VirtAddr,
+        kernel_stack_bytes: usize,
+        page_table_frame: PhysFrame<Size4KiB>,
+    ) -> Result<u64, InitError> {
+        if !self.running {
+            return Err(InitError::NotInitialized);
+        }
+        let id = self.allocate_task_id();
+        self.tasks.push(Task::user_process(
+            id,
+            name,
+            process_id,
+            stack_pointer,
+            kernel_stack_top,
+            kernel_stack_bytes,
+            page_table_frame,
+        )?);
         Ok(id)
     }
 
@@ -295,17 +477,13 @@ impl Scheduler {
         self.tasks[current].stack_pointer = current_stack_pointer;
         self.tasks[current].runtime_ticks = self.tasks[current].runtime_ticks.saturating_add(1);
 
-        if self.tasks.len() < 2 {
-            return current_stack_pointer;
-        }
-
         self.ticks_in_quantum = self.ticks_in_quantum.saturating_add(1);
         if self.ticks_in_quantum < self.quantum_ticks {
             return current_stack_pointer;
         }
         self.ticks_in_quantum = 0;
 
-        self.switch_to_next(current_stack_pointer, true)
+        self.switch_to_next(current_stack_pointer, SwitchReason::Preempt)
     }
 
     fn yield_now(&mut self, current_stack_pointer: usize) -> usize {
@@ -313,31 +491,120 @@ impl Scheduler {
             return current_stack_pointer;
         }
 
+        self.tasks[self.current_task].stack_pointer = current_stack_pointer;
         self.ticks_in_quantum = 0;
-        self.switch_to_next(current_stack_pointer, false)
+        self.switch_to_next(current_stack_pointer, SwitchReason::Voluntary)
     }
 
-    fn switch_to_next(&mut self, current_stack_pointer: usize, preempted: bool) -> usize {
+    fn terminate_current(&mut self, current_stack_pointer: usize) -> usize {
+        if !self.running || self.tasks.is_empty() {
+            return current_stack_pointer;
+        }
+
         let current = self.current_task;
         self.tasks[current].stack_pointer = current_stack_pointer;
+        self.tasks[current].state = TaskState::Zombie;
+        self.ticks_in_quantum = 0;
 
-        if self.tasks.len() < 2 {
+        let next = self
+            .next_runnable_after(current)
+            .expect("scheduler has no runnable task after process termination");
+        self.switch_to(next, SwitchReason::Termination)
+    }
+
+    fn switch_to_next(&mut self, current_stack_pointer: usize, reason: SwitchReason) -> usize {
+        let Some(next) = self.next_runnable_after(self.current_task) else {
+            return current_stack_pointer;
+        };
+        if next == self.current_task {
             return current_stack_pointer;
         }
+        self.switch_to(next, reason)
+    }
 
-        let next = (current + 1) % self.tasks.len();
+    fn next_runnable_after(&self, current: usize) -> Option<usize> {
+        if self.tasks.is_empty() {
+            return None;
+        }
+        for offset in 1..=self.tasks.len() {
+            let index = (current + offset) % self.tasks.len();
+            if self.tasks[index].is_runnable() {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn switch_to(&mut self, next: usize, reason: SwitchReason) -> usize {
+        let current = self.current_task;
+        let current_address_space = self.tasks[current].address_space;
+        let next_address_space = self.tasks[next].address_space;
         let next_stack_pointer = self.tasks[next].stack_pointer;
-        if next_stack_pointer == 0 {
-            return current_stack_pointer;
-        }
 
         self.current_task = next;
         self.context_switches = self.context_switches.saturating_add(1);
-        if preempted {
-            self.preemptions = self.preemptions.saturating_add(1);
+        match reason {
+            SwitchReason::Preempt => self.preemptions = self.preemptions.saturating_add(1),
+            SwitchReason::Voluntary => {
+                self.voluntary_switches = self.voluntary_switches.saturating_add(1)
+            }
+            SwitchReason::Termination => {}
         }
         self.tasks[next].scheduled_count = self.tasks[next].scheduled_count.saturating_add(1);
+
+        if current_address_space != next_address_space {
+            unsafe { Cr3::write(next_address_space.frame, next_address_space.flags) };
+            self.address_space_switches = self.address_space_switches.saturating_add(1);
+        }
+        match self.tasks[next].privilege_stack_top {
+            Some(stack_top) => gdt::set_privilege_stack(stack_top),
+            None => gdt::reset_privilege_stack(),
+        }
+
         next_stack_pointer
+    }
+
+    fn current_process_id(&self) -> Option<u64> {
+        self.tasks
+            .get(self.current_task)
+            .and_then(|task| task.process_id)
+    }
+
+    fn current_task_kind(&self) -> TaskKind {
+        self.tasks
+            .get(self.current_task)
+            .map(|task| task.kind)
+            .unwrap_or(TaskKind::KernelThread)
+    }
+
+    fn reap_zombies(&mut self) -> Vec<ReapedProcessTask> {
+        let current_id = self.tasks.get(self.current_task).map(|task| task.id);
+        let mut process_tasks = Vec::new();
+        self.tasks.retain(|task| {
+            if task.state == TaskState::Zombie {
+                if let Some(process_id) = task.process_id {
+                    process_tasks.push(ReapedProcessTask {
+                        process_id,
+                        task_id: task.id,
+                        scheduled_count: task.scheduled_count,
+                        runtime_ticks: task.runtime_ticks,
+                    });
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(current_id) = current_id {
+            self.current_task = self
+                .tasks
+                .iter()
+                .position(|task| task.id == current_id)
+                .unwrap_or(0);
+        } else {
+            self.current_task = 0;
+        }
+        process_tasks
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -351,11 +618,32 @@ impl Scheduler {
         Snapshot {
             running: self.running,
             task_count: self.tasks.len(),
+            runnable_task_count: self
+                .tasks
+                .iter()
+                .filter(|task| task.state == TaskState::Runnable)
+                .count(),
+            zombie_task_count: self
+                .tasks
+                .iter()
+                .filter(|task| task.state == TaskState::Zombie)
+                .count(),
+            user_task_count: self
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::UserProcess)
+                .count(),
             current_task_id: current_task.map(|task| task.id).unwrap_or(0),
             current_task_name: current_task.map(|task| task.name).unwrap_or("none"),
+            current_task_kind: current_task
+                .map(|task| task.kind)
+                .unwrap_or(TaskKind::KernelThread),
+            current_process_id: current_task.and_then(|task| task.process_id),
             quantum_ticks: self.quantum_ticks,
             context_switches: self.context_switches,
             preemptions: self.preemptions,
+            voluntary_switches: self.voluntary_switches,
+            address_space_switches: self.address_space_switches,
             probe_a_heartbeats: PROBE_A_HEARTBEATS.load(Ordering::Relaxed),
             probe_b_heartbeats: PROBE_B_HEARTBEATS.load(Ordering::Relaxed),
             truncated: self.tasks.len() > recorded_task_count,
@@ -363,6 +651,13 @@ impl Scheduler {
             recorded_task_count,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum SwitchReason {
+    Preempt,
+    Voluntary,
+    Termination,
 }
 
 #[repr(C)]
@@ -417,12 +712,50 @@ pub fn snapshot() -> Snapshot {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().snapshot())
 }
 
+pub fn current_process_id() -> Option<u64> {
+    SCHEDULER.lock().current_process_id()
+}
+
+pub fn current_task_kind() -> TaskKind {
+    SCHEDULER.lock().current_task_kind()
+}
+
+pub fn spawn_user_process(
+    name: &'static str,
+    process_id: u64,
+    stack_pointer: usize,
+    kernel_stack_top: VirtAddr,
+    kernel_stack_bytes: usize,
+    page_table_address: u64,
+) -> Result<u64, InitError> {
+    let page_table_frame = PhysFrame::from_start_address(PhysAddr::new(page_table_address))
+        .map_err(|_| InitError::InvalidUserContext)?;
+    cpu_interrupts::without_interrupts(|| {
+        SCHEDULER.lock().spawn_user(
+            name,
+            process_id,
+            stack_pointer,
+            kernel_stack_top,
+            kernel_stack_bytes,
+            page_table_frame,
+        )
+    })
+}
+
 pub fn on_timer_interrupt(current_stack_pointer: usize) -> usize {
     SCHEDULER.lock().schedule(current_stack_pointer)
 }
 
 pub fn on_yield(current_stack_pointer: usize) -> usize {
     SCHEDULER.lock().yield_now(current_stack_pointer)
+}
+
+pub fn terminate_current(current_stack_pointer: usize) -> usize {
+    SCHEDULER.lock().terminate_current(current_stack_pointer)
+}
+
+pub fn reap_zombie_processes() -> Vec<ReapedProcessTask> {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().reap_zombies())
 }
 
 pub fn timer_interrupt_entry_address() -> VirtAddr {

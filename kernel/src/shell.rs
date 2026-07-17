@@ -576,36 +576,69 @@ impl Shell {
     }
 
     fn print_userspace(&self) {
-        let Some(result) = userspace::last_result() else {
+        let snapshot = userspace::snapshot();
+        let scheduler = crate::scheduler::snapshot();
+        shell_println!(
+            "process manager: spawned={}, active={}, exited={}, faulted={}, reaped={}",
+            snapshot.spawned,
+            snapshot.active,
+            snapshot.exited,
+            snapshot.faulted,
+            snapshot.reaped
+        );
+        shell_println!(
+            "resources: frames reclaimed={}, scheduler users={}, zombies={}, address-space switches={}",
+            snapshot.frames_reclaimed,
+            scheduler.user_task_count,
+            scheduler.zombie_task_count,
+            scheduler.address_space_switches
+        );
+        if snapshot.results.is_empty() {
             shell_println!("userspace: no process has completed");
             return;
-        };
+        }
 
-        shell_println!(
-            "userspace: `{}` exited with code {}",
-            result.path,
-            result.exit_code
-        );
-        shell_println!(
-            "entry={:#018x}, page table={:#x}, mapped pages={}, LOAD segments={}",
-            result.entry_point,
-            result.page_table_address,
-            result.mapped_pages,
-            result.load_segments
-        );
-        shell_println!(
-            "stacks: user={} KiB, guard={:#018x}, kernel={} KiB",
-            result.user_stack_bytes / 1024,
-            result.guard_page_address,
-            result.kernel_stack_bytes / 1024
-        );
-        shell_println!(
-            "syscalls: total={}, writes={}, yields={}, bytes written={}",
-            result.syscall_count,
-            result.write_count,
-            result.yield_count,
-            result.bytes_written
-        );
+        for result in &snapshot.results {
+            shell_println!(
+                "pid={} task={} `{}`: {}",
+                result.process_id,
+                result.task_id,
+                result.path,
+                result.termination
+            );
+            shell_println!(
+                "  entry={:#018x}, page table={:#x}, pages={}, LOAD segments={}",
+                result.entry_point,
+                result.page_table_address,
+                result.mapped_pages,
+                result.load_segments
+            );
+            shell_println!(
+                "  scheduling: runs={}, runtime ticks={}; stacks: user={} KiB, kernel={} KiB, guard={:#018x}",
+                result.scheduled_count,
+                result.runtime_ticks,
+                result.user_stack_bytes / 1024,
+                result.kernel_stack_bytes / 1024,
+                result.guard_page_address
+            );
+            shell_println!(
+                "  syscalls: total={}, writes={}, yields={}, bytes={}; frames reclaimed={}",
+                result.syscall_count,
+                result.write_count,
+                result.yield_count,
+                result.bytes_written,
+                result.frames_reclaimed
+            );
+            if let Some(fault) = result.fault() {
+                shell_println!(
+                    "  fault: vector={}, error={:#x}, address={:#018x}, rip={:#018x}",
+                    fault.vector,
+                    fault.error_code,
+                    fault.address,
+                    fault.instruction_pointer
+                );
+            }
+        }
     }
 
     fn print_interrupts(&self) {
@@ -909,7 +942,7 @@ fn print_help() {
     shell_println!("  ls [path]        list a VFS directory");
     shell_println!("  cat <path>       preview a VFS file");
     shell_println!("  elf <path>       validate an ELF64 executable");
-    shell_println!("  process          show the completed ring-3 process");
+    shell_println!("  process          show process scheduling and fault results");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }
