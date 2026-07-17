@@ -26,7 +26,10 @@ jobs:
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
       - name: Apply ring 3 integration
-        run: python3 tools/integrate_ring3.py
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tools/integrate_ring3.py 2>&1 | tee ring3-integration.log
 
       - name: Format all sources
         run: cargo +nightly-2026-02-01 fmt --all
@@ -46,3 +49,11 @@ jobs:
 
       - name: Build bootable image
         run: cargo +nightly-2026-02-01 build --locked
+
+      - name: Upload integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ring3-integration-log
+          path: ring3-integration.log
+          if-no-files-found: ignore
