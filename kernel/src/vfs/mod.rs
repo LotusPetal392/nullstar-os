@@ -198,8 +198,7 @@ impl FileSystem for FatFileSystem {
         let entry = fat::list_directory(parent)?
             .into_iter()
             .find(|entry| {
-                entry.name.eq_ignore_ascii_case(name)
-                    || entry.short_name.eq_ignore_ascii_case(name)
+                entry.name.eq_ignore_ascii_case(name) || entry.short_name.eq_ignore_ascii_case(name)
             })
             .ok_or(Error::NotFound)?;
 
