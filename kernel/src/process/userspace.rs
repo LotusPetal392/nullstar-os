@@ -982,7 +982,7 @@ pub extern "C" fn galactic_user_fault_dispatch(current_stack_pointer: usize, vec
     let frame = unsafe { &*(current_stack_pointer as *const FaultStack) };
     if frame.cs & 3 != 3 {
         let address = if vector == PAGE_FAULT_VECTOR {
-            Cr2::read().as_u64()
+            Cr2::read().map(|address| address.as_u64()).unwrap_or(0)
         } else {
             0
         };
@@ -1001,7 +1001,7 @@ pub extern "C" fn galactic_user_fault_dispatch(current_stack_pointer: usize, vec
         vector,
         error_code: frame.error_code,
         address: if vector == PAGE_FAULT_VECTOR {
-            Cr2::read().as_u64()
+            Cr2::read().map(|address| address.as_u64()).unwrap_or(0)
         } else {
             0
         },
