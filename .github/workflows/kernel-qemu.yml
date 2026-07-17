@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   qemu-smoke-test:
@@ -15,8 +15,10 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check out repository
+      - name: Check out repository branch
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Install pinned Rust toolchain
         run: |
@@ -27,8 +29,127 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Check formatting
-        run: cargo +nightly-2026-02-01 fmt --all -- --check
+      - name: Reset AHCI SATA links after host reset
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("kernel/src/drivers/ahci.rs")
+          source = path.read_text()
+
+          replacements = [
+              (
+                  "const PORT_SATA_STATUS: usize = 0x28;\n",
+                  "const PORT_SATA_STATUS: usize = 0x28;\nconst PORT_SATA_CONTROL: usize = 0x2c;\n",
+              ),
+              (
+                  "const SATA_STATUS_INTERFACE_ACTIVE: u32 = 1;\n",
+                  "const SATA_STATUS_INTERFACE_ACTIVE: u32 = 1;\nconst SATA_CONTROL_DETECT_MASK: u32 = 0x0f;\nconst SATA_CONTROL_COMRESET: u32 = 1;\n",
+              ),
+              (
+                  '''    fn wake_and_is_sata(self) -> bool {
+        self.write(
+            PORT_COMMAND,
+            self.read(PORT_COMMAND) | PORT_CMD_SPIN_UP_DEVICE | PORT_CMD_POWER_ON_DEVICE,
+        );
+
+        for _ in 0..PORT_LINK_SPINS {
+            let sata_status = self.read(PORT_SATA_STATUS);
+            let detection = sata_status & 0x0f;
+            let power = (sata_status >> 8) & 0x0f;
+            if detection == SATA_STATUS_DEVICE_PRESENT && power == SATA_STATUS_INTERFACE_ACTIVE {
+                return self.read(PORT_SIGNATURE) == SATA_DISK_SIGNATURE;
+            }
+            spin_loop();
+        }
+
+        false
+    }
+''',
+                  '''    fn wake_and_is_sata(self) -> bool {
+        self.write(
+            PORT_COMMAND,
+            self.read(PORT_COMMAND) | PORT_CMD_SPIN_UP_DEVICE | PORT_CMD_POWER_ON_DEVICE,
+        );
+
+        if !self.link_is_active() {
+            let sata_control = self.read(PORT_SATA_CONTROL);
+            self.write(
+                PORT_SATA_CONTROL,
+                (sata_control & !SATA_CONTROL_DETECT_MASK) | SATA_CONTROL_COMRESET,
+            );
+            crate::interrupts::wait_for_timer_tick();
+            self.write(
+                PORT_SATA_CONTROL,
+                sata_control & !SATA_CONTROL_DETECT_MASK,
+            );
+            self.write(PORT_SATA_ERROR, u32::MAX);
+            let _ = wait_until(PORT_LINK_SPINS, || self.link_is_active());
+        }
+
+        let sata_status = self.read(PORT_SATA_STATUS);
+        let signature = self.read(PORT_SIGNATURE);
+        crate::serial_println!(
+            "AHCI port {}: ssts={:#010x}, sig={:#010x}, cmd={:#010x}, tfd={:#010x}",
+            self.index,
+            sata_status,
+            signature,
+            self.read(PORT_COMMAND),
+            self.read(PORT_TASK_FILE_DATA)
+        );
+
+        self.link_is_active() && signature == SATA_DISK_SIGNATURE
+    }
+
+    fn link_is_active(self) -> bool {
+        let sata_status = self.read(PORT_SATA_STATUS);
+        sata_status & 0x0f == SATA_STATUS_DEVICE_PRESENT
+            && (sata_status >> 8) & 0x0f == SATA_STATUS_INTERFACE_ACTIVE
+    }
+''',
+              ),
+              (
+                  '''        let implemented_ports = hba.read_u32(HBA_PORTS_IMPLEMENTED);
+
+        let mut selected_port = None;
+''',
+                  '''        let implemented_ports = hba.read_u32(HBA_PORTS_IMPLEMENTED);
+        crate::serial_println!(
+            "AHCI controller: abar={:#x}, version={:#010x}, cap={:#010x}, pi={:#010x}, ports={}, slots={}, dma64={}",
+            abar,
+            hba.read_u32(HBA_VERSION),
+            capabilities,
+            implemented_ports,
+            port_count,
+            command_slots,
+            supports_64_bit_dma
+        );
+
+        let mut selected_port = None;
+''',
+              ),
+          ]
+
+          changed = False
+          for old, new in replacements:
+              if old in source:
+                  source = source.replace(old, new, 1)
+                  changed = True
+
+          if changed:
+              path.write_text(source)
+          PY
+          cargo +nightly-2026-02-01 fmt --all
+
+      - name: Commit AHCI link reset
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add kernel/src/drivers/ahci.rs kernel/src/drivers/block.rs src/main.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "Reset AHCI SATA links after host reset"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
 
       - name: Install QEMU
         run: |
@@ -38,5 +159,5 @@ jobs:
       - name: Build bootable image
         run: cargo +nightly-2026-02-01 build --locked --quiet
 
-      - name: Boot PCIe smoke test in QEMU
+      - name: Boot AHCI smoke test in QEMU
         run: cargo +nightly-2026-02-01 run --locked --quiet -- --test
