@@ -1,0 +1,45 @@
+name: AHCI runtime diagnostics
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --quiet qemu-system-x86
+
+      - name: Build bootable image
+        run: cargo +nightly-2026-02-01 build --locked --quiet
+
+      - name: Capture AHCI QEMU output
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee ahci-qemu.log
+
+      - name: Upload AHCI runtime log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ahci-qemu-log
+          path: ahci-qemu.log
+          if-no-files-found: ignore
