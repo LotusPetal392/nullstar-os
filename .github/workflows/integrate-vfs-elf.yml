@@ -31,8 +31,8 @@ jobs:
           path = Path("tools/integrate_vfs_elf.py")
           lines = path.read_text().splitlines()
           for index, line in enumerate(lines[:-1]):
-              if line == "cat_and_diagnostics = block(" and lines[index + 1].lstrip().startswith("'''\\"):
-                  lines[index + 1] = lines[index + 1].replace("'''", "r'''", 1)
+              if line == "cat_and_diagnostics = block(":
+                  lines[index + 1] = "    r'''"
                   break
           else:
               raise SystemExit("cat/ELF generator block was not found")
