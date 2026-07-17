@@ -1,0 +1,11 @@
+use std::{env, path::PathBuf};
+
+fn main() {
+    let manifest_directory =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR was not set"));
+    let linker_script = manifest_directory.join("linker.ld");
+
+    println!("cargo:rerun-if-changed={}", linker_script.display());
+    println!("cargo:rustc-link-arg=-T{}", linker_script.display());
+    println!("cargo:rustc-link-arg=--build-id=none");
+}
