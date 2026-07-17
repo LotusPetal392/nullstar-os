@@ -52,6 +52,7 @@ const PORT_COMMAND: usize = 0x18;
 const PORT_TASK_FILE_DATA: usize = 0x20;
 const PORT_SIGNATURE: usize = 0x24;
 const PORT_SATA_STATUS: usize = 0x28;
+const PORT_SATA_CONTROL: usize = 0x2c;
 const PORT_SATA_ERROR: usize = 0x30;
 const PORT_SATA_ACTIVE: usize = 0x34;
 const PORT_COMMAND_ISSUE: usize = 0x38;
@@ -68,6 +69,8 @@ const PORT_TFD_BUSY: u32 = 1 << 7;
 const PORT_IS_TASK_FILE_ERROR: u32 = 1 << 30;
 const SATA_STATUS_DEVICE_PRESENT: u32 = 3;
 const SATA_STATUS_INTERFACE_ACTIVE: u32 = 1;
+const SATA_CONTROL_DETECT_MASK: u32 = 0x0f;
+const SATA_CONTROL_COMRESET: u32 = 1;
 const SATA_DISK_SIGNATURE: u32 = 0x0000_0101;
 
 const COMMAND_LIST_BYTES: usize = 1024;
@@ -382,19 +385,37 @@ impl Port {
             self.read(PORT_COMMAND) | PORT_CMD_SPIN_UP_DEVICE | PORT_CMD_POWER_ON_DEVICE,
         );
 
-        for _ in 0..PORT_LINK_SPINS {
-            let sata_status = self.read(PORT_SATA_STATUS);
-            let detection = sata_status & 0x0f;
-            let power = (sata_status >> 8) & 0x0f;
-            if detection == SATA_STATUS_DEVICE_PRESENT && power == SATA_STATUS_INTERFACE_ACTIVE {
-                return self.read(PORT_SIGNATURE) == SATA_DISK_SIGNATURE;
-            }
-            spin_loop();
+        if !self.link_is_active() {
+            let sata_control = self.read(PORT_SATA_CONTROL);
+            self.write(
+                PORT_SATA_CONTROL,
+                (sata_control & !SATA_CONTROL_DETECT_MASK) | SATA_CONTROL_COMRESET,
+            );
+            crate::interrupts::wait_for_timer_tick();
+            self.write(PORT_SATA_CONTROL, sata_control & !SATA_CONTROL_DETECT_MASK);
+            self.write(PORT_SATA_ERROR, u32::MAX);
+            let _ = wait_until(PORT_LINK_SPINS, || self.link_is_active());
         }
 
-        false
+        let sata_status = self.read(PORT_SATA_STATUS);
+        let signature = self.read(PORT_SIGNATURE);
+        crate::serial_println!(
+            "AHCI port {}: ssts={:#010x}, sig={:#010x}, cmd={:#010x}, tfd={:#010x}",
+            self.index,
+            sata_status,
+            signature,
+            self.read(PORT_COMMAND),
+            self.read(PORT_TASK_FILE_DATA)
+        );
+
+        self.link_is_active() && signature == SATA_DISK_SIGNATURE
     }
 
+    fn link_is_active(self) -> bool {
+        let sata_status = self.read(PORT_SATA_STATUS);
+        sata_status & 0x0f == SATA_STATUS_DEVICE_PRESENT
+            && (sata_status >> 8) & 0x0f == SATA_STATUS_INTERFACE_ACTIVE
+    }
     fn stop(self) -> Result<(), Error> {
         self.write(PORT_COMMAND, self.read(PORT_COMMAND) & !PORT_CMD_START);
         if !wait_until(PORT_TRANSITION_SPINS, || {
@@ -519,6 +540,16 @@ impl Controller {
         let command_slots = (((capabilities >> 8) & 0x1f) + 1) as u8;
         let port_count = ((capabilities & 0x1f) + 1).min(32) as u8;
         let implemented_ports = hba.read_u32(HBA_PORTS_IMPLEMENTED);
+        crate::serial_println!(
+            "AHCI controller: abar={:#x}, version={:#010x}, cap={:#010x}, pi={:#010x}, ports={}, slots={}, dma64={}",
+            abar,
+            hba.read_u32(HBA_VERSION),
+            capabilities,
+            implemented_ports,
+            port_count,
+            command_slots,
+            supports_64_bit_dma
+        );
 
         let mut selected_port = None;
         for index in 0..port_count {
