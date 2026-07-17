@@ -155,7 +155,7 @@ if "fn print_userspace(&self)" not in shell:
 '''
     shell = shell.replace(marker, method + marker, 1)
 
-help_old = '    shell_println!("  elf <path>       validate and inspect an ELF64 image");\n'
+help_old = '    shell_println!("  elf <path>       validate an ELF64 executable");\n'
 help_new = help_old + '    shell_println!("  process          show the completed ring-3 process");\n'
 shell = replace_once(shell, help_old, help_new, "userspace help entry")
 shell_path.write_text(shell)
