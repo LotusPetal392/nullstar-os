@@ -1,9 +1,7 @@
 name: Integrate VFS and ELF loader
 
 on:
-  push:
-    branches:
-      - agent/vfs-elf-loader
+  pull_request:
 
 permissions:
   contents: write
@@ -12,10 +10,10 @@ jobs:
   integrate:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out feature branch
+      - name: Check out pull request branch
         uses: actions/checkout@v7
         with:
-          ref: agent/vfs-elf-loader
+          ref: ${{ github.head_ref }}
 
       - name: Install pinned formatter
         run: |
@@ -35,5 +33,5 @@ jobs:
           git add kernel/src/main.rs kernel/src/shell.rs src/main.rs
           if ! git diff --cached --quiet; then
             git commit -m "Integrate VFS and ELF validation"
-            git push origin HEAD:agent/vfs-elf-loader
+            git push origin HEAD:${{ github.head_ref }}
           fi
