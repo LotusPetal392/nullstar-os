@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - agent/ring3-userspace
+  pull_request:
 
 permissions:
   contents: write
@@ -16,7 +17,7 @@ jobs:
       - name: Check out feature branch
         uses: actions/checkout@v7
         with:
-          ref: agent/ring3-userspace
+          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Install pinned Rust toolchain
         run: |
@@ -40,7 +41,7 @@ jobs:
           git add Cargo.lock kernel/src/main.rs kernel/src/shell.rs src/main.rs userspace
           if ! git diff --cached --quiet; then
             git commit -m "Integrate first ring 3 process"
-            git push origin HEAD:agent/ring3-userspace
+            git push origin HEAD:${{ github.head_ref || github.ref_name }}
           fi
 
       - name: Build bootable image
