@@ -32,20 +32,8 @@ jobs:
 
           path = Path("kernel/src/vfs/mod.rs")
           source = path.read_text()
-          old = '''            .map(|entry| DirectoryEntry {
-                name: entry.name,
-                kind: if entry.is_directory() {
-                    NodeKind::Directory
-                } else {
-                    NodeKind::File
-                },
-                size: u64::from(entry.size),
-                read_only: entry.is_read_only(),
-                hidden: entry.is_hidden(),
-                system: entry.is_system(),
-            })
-          '''
-          new = '''            .map(|entry| {
+          old_start = "            .map(|entry| DirectoryEntry {"
+          replacement = '''            .map(|entry| {
                 let kind = if entry.is_directory() {
                     NodeKind::Directory
                 } else {
@@ -64,10 +52,13 @@ jobs:
                     system,
                 }
             })
-          '''
-          if old in source:
-              path.write_text(source.replace(old, new, 1))
-          elif new not in source:
+'''
+          if old_start in source:
+              start = source.index(old_start)
+              end = source.index("            .collect())", start)
+              source = source[:start] + replacement + source[end:]
+              path.write_text(source)
+          elif "                let read_only = entry.is_read_only();" not in source:
               raise SystemExit("VFS directory-entry conversion was not found")
           PY
           cargo +nightly-2026-02-01 fmt --all
