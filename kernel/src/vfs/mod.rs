@@ -145,12 +145,10 @@ impl fmt::Display for Error {
                 formatter,
                 "read ending at byte {end} exceeds the {maximum}-byte FAT prefix bound"
             ),
-            Self::ShortRead { expected, actual } => {
-                write!(
-                    formatter,
-                    "short filesystem read: expected {expected}, received {actual}"
-                )
-            }
+            Self::ShortRead { expected, actual } => write!(
+                formatter,
+                "short filesystem read: expected {expected}, received {actual}"
+            ),
             Self::Fat(error) => write!(formatter, "FAT error: {error}"),
             _ => formatter.write_str(self.description()),
         }
@@ -197,11 +195,11 @@ impl FileSystem for FatFileSystem {
         }
 
         let (parent, name) = parent_and_name(path)?;
-        let entries = fat::list_directory(parent)?;
-        let entry = entries
+        let entry = fat::list_directory(parent)?
             .into_iter()
             .find(|entry| {
-                entry.name.eq_ignore_ascii_case(name) || entry.short_name.eq_ignore_ascii_case(name)
+                entry.name.eq_ignore_ascii_case(name)
+                    || entry.short_name.eq_ignore_ascii_case(name)
             })
             .ok_or(Error::NotFound)?;
 
@@ -224,21 +222,9 @@ impl FileSystem for FatFileSystem {
             return Err(Error::NotDirectory);
         }
 
-        let entries = fat::list_directory(path)?;
-        Ok(entries
+        Ok(fat::list_directory(path)?
             .into_iter()
-            .map(|entry| DirectoryEntry {
-                name: entry.name,
-                kind: if entry.is_directory() {
-                    NodeKind::Directory
-                } else {
-                    NodeKind::File
-                },
-                size: u64::from(entry.size),
-                read_only: entry.is_read_only(),
-                hidden: entry.is_hidden(),
-                system: entry.is_system(),
-            })
+            .map(convert_fat_directory_entry)
             .collect())
     }
 
@@ -257,19 +243,19 @@ impl FileSystem for FatFileSystem {
             .ok_or(Error::AddressOverflow)?;
         let requested = usize::try_from(remaining.min(buffer.len() as u64))
             .map_err(|_| Error::AddressOverflow)?;
-        let end = offset
+        let prefix_end = offset
             .checked_add(requested as u64)
             .ok_or(Error::AddressOverflow)?;
-        if end > MAX_READ_WINDOW_BYTES as u64 {
+        if prefix_end > MAX_READ_WINDOW_BYTES as u64 {
             return Err(Error::ReadWindowTooLarge {
-                end,
+                end: prefix_end,
                 maximum: MAX_READ_WINDOW_BYTES,
             });
         }
 
         let prefix = fat::read_file(
             path,
-            usize::try_from(end).map_err(|_| Error::AddressOverflow)?,
+            usize::try_from(prefix_end).map_err(|_| Error::AddressOverflow)?,
         )?;
         let start = usize::try_from(offset).map_err(|_| Error::AddressOverflow)?;
         let end = start.checked_add(requested).ok_or(Error::AddressOverflow)?;
@@ -279,6 +265,27 @@ impl FileSystem for FatFileSystem {
         })?;
         buffer[..requested].copy_from_slice(source);
         Ok(requested)
+    }
+}
+
+fn convert_fat_directory_entry(entry: fat::DirectoryEntry) -> DirectoryEntry {
+    let kind = if entry.is_directory() {
+        NodeKind::Directory
+    } else {
+        NodeKind::File
+    };
+    let size = u64::from(entry.size);
+    let read_only = entry.is_read_only();
+    let hidden = entry.is_hidden();
+    let system = entry.is_system();
+
+    DirectoryEntry {
+        name: entry.name,
+        kind,
+        size,
+        read_only,
+        hidden,
+        system,
     }
 }
 
