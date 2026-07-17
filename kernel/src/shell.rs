@@ -2,11 +2,12 @@ use alloc::string::String;
 
 use pc_keyboard::{DecodedKey, KeyCode};
 
-use crate::{acpi, allocator, console, interrupts, memory};
+use crate::{acpi, allocator, console, interrupts, memory, pci};
 
 const PROMPT: &str = "galactic> ";
 const DEFAULT_CONSOLE_COLUMNS: usize = 80;
 const MAX_COMMAND_LENGTH: usize = 128;
+const MAX_PCI_SHELL_FUNCTIONS: usize = 64;
 
 macro_rules! shell_print {
     ($($argument:tt)*) => {{
@@ -26,22 +27,24 @@ macro_rules! shell_println {
     }};
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct SystemInfo {
     usable_frames: u64,
     allocated_frames: u64,
     remaining_frames: u64,
     acpi: Option<acpi::AcpiInfo>,
     interrupt_controller: interrupts::ControllerInfo,
+    pci_inventory: Option<pci::Inventory>,
 }
 
 impl SystemInfo {
-    pub const fn new(
+    pub fn new(
         usable_frames: u64,
         allocated_frames: u64,
         remaining_frames: u64,
         acpi: Option<acpi::AcpiInfo>,
         interrupt_controller: interrupts::ControllerInfo,
+        pci_inventory: Option<pci::Inventory>,
     ) -> Self {
         Self {
             usable_frames,
@@ -49,6 +52,7 @@ impl SystemInfo {
             remaining_frames,
             acpi,
             interrupt_controller,
+            pci_inventory,
         }
     }
 }
@@ -186,6 +190,7 @@ impl Shell {
             }
             "acpi" => self.print_acpi(),
             "interrupts" => self.print_interrupts(),
+            "pci" => self.print_pci(),
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
             }
@@ -291,6 +296,85 @@ impl Shell {
                     info.fallback_reason.unwrap_or("not recorded")
                 );
             }
+        }
+    }
+
+    fn print_pci(&self) {
+        let Some(info) = self.system_info.pci_inventory.as_ref() else {
+            shell_println!("PCIe: unavailable");
+            return;
+        };
+
+        shell_println!(
+            "PCIe: regions={}/{}, buses={}, functions={} ({} recorded)",
+            info.scanned_region_count,
+            info.declared_region_count,
+            info.scanned_bus_count,
+            info.total_function_count,
+            info.recorded_function_count()
+        );
+        shell_println!(
+            "classes: storage={}, network={}, display={}, bridges={}",
+            info.class_count(0x01),
+            info.class_count(0x02),
+            info.class_count(0x03),
+            info.bridge_count()
+        );
+
+        for function in info.functions().iter().take(MAX_PCI_SHELL_FUNCTIONS) {
+            shell_println!(
+                "{} {:04x}:{:04x} {:02x}:{:02x}:{:02x} {}",
+                function.location,
+                function.vendor_id,
+                function.device_id,
+                function.class_code,
+                function.subclass,
+                function.programming_interface,
+                function.class_description()
+            );
+            shell_println!(
+                "  header={}, revision={:02x}, multifunction={}, IRQ line={}, pin={}",
+                function.header_kind,
+                function.revision_id,
+                function.multifunction,
+                function.interrupt_line,
+                function.interrupt_pin
+            );
+            if let Some(subsystem) = function.subsystem {
+                shell_println!(
+                    "  subsystem={:04x}:{:04x}",
+                    subsystem.vendor_id,
+                    subsystem.device_id
+                );
+            }
+            if let Some(buses) = function.bridge_buses {
+                shell_println!(
+                    "  bridge buses: primary={}, secondary={}, subordinate={}",
+                    buses.primary,
+                    buses.secondary,
+                    buses.subordinate
+                );
+            }
+        }
+
+        let displayed = info.recorded_function_count().min(MAX_PCI_SHELL_FUNCTIONS);
+        if displayed < info.recorded_function_count() {
+            shell_println!(
+                "{} additional recorded functions omitted",
+                info.recorded_function_count() - displayed
+            );
+        }
+        if info.unscanned_region_count > 0 {
+            shell_println!(
+                "warning: {} additional MCFG region(s) were not scanned",
+                info.unscanned_region_count
+            );
+        }
+        if info.bus_scan_truncated {
+            shell_println!("warning: ECAM bus scan reached its configured bound");
+        }
+        if info.function_list_truncated {
+            shell_println!("warning: PCIe function recording reached its configured bound");
         }
     }
 
@@ -426,6 +510,7 @@ fn print_help() {
     shell_println!("  heap             show the kernel heap mapping");
     shell_println!("  acpi             show ACPI table and platform data");
     shell_println!("  interrupts       show interrupt-controller routes");
+    shell_println!("  pci              list PCIe functions discovered by ECAM");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }

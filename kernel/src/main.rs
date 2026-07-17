@@ -17,7 +17,7 @@ mod scheduler;
 mod shell;
 
 pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};
-pub(crate) use drivers::{console, keyboard, serial};
+pub(crate) use drivers::{console, keyboard, pci, serial};
 pub(crate) use memory::allocator;
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
@@ -111,6 +111,51 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     heap_allocation_self_test();
 
+    let pci_inventory = match acpi_info.as_ref().and_then(|info| info.mcfg.as_ref()) {
+        Some(mcfg) => match pci::enumerate(mcfg, physical_memory_offset, physical_memory_end) {
+            Ok(inventory) => {
+                serial_println!(
+                    "PCIe initialized: regions={}/{}, buses={}, functions={}, recorded={}, storage={}, network={}, display={}, bridges={}, truncated={}",
+                    inventory.scanned_region_count,
+                    inventory.declared_region_count,
+                    inventory.scanned_bus_count,
+                    inventory.total_function_count,
+                    inventory.recorded_function_count(),
+                    inventory.class_count(0x01),
+                    inventory.class_count(0x02),
+                    inventory.class_count(0x03),
+                    inventory.bridge_count(),
+                    inventory.is_truncated()
+                );
+                for function in inventory.functions() {
+                    serial_println!(
+                        "PCIe function: {} {:04x}:{:04x} class={:02x}:{:02x}:{:02x} revision={:02x} header={} irq_line={} irq_pin={} description={}",
+                        function.location,
+                        function.vendor_id,
+                        function.device_id,
+                        function.class_code,
+                        function.subclass,
+                        function.programming_interface,
+                        function.revision_id,
+                        function.header_kind,
+                        function.interrupt_line,
+                        function.interrupt_pin,
+                        function.class_description()
+                    );
+                }
+                Some(inventory)
+            }
+            Err(error) => {
+                serial_println!("PCIe initialization failed: {error}");
+                None
+            }
+        },
+        None => {
+            serial_println!("PCIe unavailable: ACPI did not provide an MCFG table");
+            None
+        }
+    };
+
     let scheduler_initial = match scheduler::init() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -158,6 +203,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         println!("ACPI unavailable");
     }
+    if pci_inventory.is_some() {
+        println!("PCIe functions enumerated");
+    } else {
+        println!("PCIe enumeration unavailable");
+    }
     println!("Interactive shell initialized");
 
     let usable_frames = frame_allocator.usable_frame_count();
@@ -190,6 +240,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         remaining_frames,
         acpi_info,
         interrupt_controller,
+        pci_inventory,
     );
     let mut interactive_shell = shell::Shell::new(system_info);
     interactive_shell.start();

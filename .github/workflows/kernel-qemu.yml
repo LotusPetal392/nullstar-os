@@ -38,5 +38,5 @@ jobs:
       - name: Build bootable image
         run: cargo +nightly-2026-02-01 build --locked --quiet
 
-      - name: Boot heap smoke test in QEMU
+      - name: Boot PCIe smoke test in QEMU
         run: cargo +nightly-2026-02-01 run --locked --quiet -- --test
