@@ -1,0 +1,35 @@
+name: Format AHCI launcher
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull request branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Install pinned formatter
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component rustfmt
+
+      - name: Format launcher
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Commit formatted launcher
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add src/main.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "Format q35 AHCI launcher"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
