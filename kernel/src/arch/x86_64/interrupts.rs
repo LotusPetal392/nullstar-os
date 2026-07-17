@@ -7,7 +7,7 @@ use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::{
-    VirtAddr,
+    PrivilegeLevel, VirtAddr,
     instructions::port::Port,
     registers::control::Cr2,
     structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
@@ -15,7 +15,9 @@ use x86_64::{
 
 use crate::{
     acpi::{HpetInfo, MadtInfo},
-    apic, gdt, hlt_loop, keyboard, scheduler, serial_println,
+    apic, gdt, hlt_loop, keyboard,
+    process::userspace,
+    scheduler, serial_println,
 };
 
 const PIC_1_OFFSET: u8 = 32;
@@ -165,6 +167,9 @@ lazy_static! {
 
         unsafe {
             idt[TIMER_VECTOR].set_handler_addr(scheduler::timer_interrupt_entry_address());
+            idt[userspace::SYSCALL_VECTOR]
+                .set_handler_addr(userspace::syscall_interrupt_entry_address())
+                .set_privilege_level(PrivilegeLevel::Ring3);
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);

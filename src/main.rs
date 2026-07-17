@@ -18,7 +18,8 @@ const PARTITION_TEST_MARKER: &str = "partition table initialized:";
 const FAT_TEST_MARKER: &str = "FAT filesystem mounted:";
 const VFS_TEST_MARKER: &str = "VFS initialized:";
 const ELF_TEST_MARKER: &str = "ELF image validated:";
-const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(45);
+const USERSPACE_TEST_MARKER: &str = "userspace process exited: path=/init, exit_code=42";
+const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default)]
 struct Options {
@@ -69,9 +70,7 @@ fn parse_options() -> Result<Options, ExitCode> {
 fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
-    println!(
-        "  --test      Verify heap, framebuffer, ACPI, timers, scheduler, storage, VFS, and ELF"
-    );
+    println!("  --test      Verify hardware, storage, VFS, ELF, and the first ring-3 process");
 }
 
 fn qemu_command(options: &Options) -> Command {
@@ -136,6 +135,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut fat_ready = false;
         let mut vfs_ready = false;
         let mut elf_ready = false;
+        let mut userspace_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -153,6 +153,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             fat_ready |= line.contains(FAT_TEST_MARKER);
             vfs_ready |= line.contains(VFS_TEST_MARKER);
             elf_ready |= line.contains(ELF_TEST_MARKER);
+            userspace_ready |= line.contains(USERSPACE_TEST_MARKER);
 
             if heap_ready
                 && framebuffer_ready
@@ -165,6 +166,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && fat_ready
                 && vfs_ready
                 && elf_ready
+                && userspace_ready
             {
                 let _ = marker_sender.send(());
                 break;

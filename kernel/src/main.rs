@@ -22,7 +22,7 @@ mod vfs;
 pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};
 pub(crate) use drivers::{ahci, console, keyboard, pci, serial};
 pub(crate) use memory::allocator;
-pub(crate) use process::elf;
+pub(crate) use process::{elf, userspace};
 pub(crate) use storage::{fat, partition};
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
@@ -376,6 +376,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler_verified.probe_b_heartbeats
     );
 
+    let userspace_result = match elf::validate("/init") {
+        Ok(init_image) => match userspace::run(
+            "/init",
+            &init_image,
+            &mut mapper,
+            &mut frame_allocator,
+            physical_memory_offset,
+        ) {
+            Ok(result) => {
+                serial_println!(
+                    "userspace process exited: path={}, exit_code={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, load_segments={}, user_stack_bytes={}, guard_page={:#018x}, kernel_stack_bytes={}, syscalls={}, writes={}, yields={}, bytes_written={}",
+                    result.path,
+                    result.exit_code,
+                    result.entry_point,
+                    result.page_table_address,
+                    result.mapped_pages,
+                    result.load_segments,
+                    result.user_stack_bytes,
+                    result.guard_page_address,
+                    result.kernel_stack_bytes,
+                    result.syscall_count,
+                    result.write_count,
+                    result.yield_count,
+                    result.bytes_written
+                );
+                Some(result)
+            }
+            Err(error) => {
+                serial_println!("userspace process failed: {error}");
+                None
+            }
+        },
+        Err(error) => {
+            serial_println!("userspace init validation failed: {error}");
+            None
+        }
+    };
+
     println!("GalacticOS");
     println!("-------------");
     println!();
@@ -426,6 +464,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("ELF64 image validated");
     } else {
         println!("ELF64 validation unavailable");
+    }
+    if userspace_result.is_some() {
+        println!("First ring-3 process exited");
+    } else {
+        println!("Ring-3 process unavailable");
     }
     println!("Interactive shell initialized");
 
