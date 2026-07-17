@@ -3,6 +3,7 @@
 
 use core::{arch::global_asm, panic::PanicInfo};
 
+// This process deliberately faults so the kernel can verify per-process exception isolation.
 global_asm!(
     r#"
     .section .text._start,"ax"
