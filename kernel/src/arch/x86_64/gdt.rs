@@ -14,10 +14,8 @@ const PRIVILEGE_STACK_TABLE_INDEX: usize = 0;
 #[repr(align(16))]
 struct Stack<const SIZE: usize>([u8; SIZE]);
 
-static mut DOUBLE_FAULT_STACK: Stack<DOUBLE_FAULT_STACK_SIZE> =
-    Stack([0; DOUBLE_FAULT_STACK_SIZE]);
-static mut DEFAULT_PRIVILEGE_STACK: Stack<PRIVILEGE_STACK_SIZE> =
-    Stack([0; PRIVILEGE_STACK_SIZE]);
+static mut DOUBLE_FAULT_STACK: Stack<DOUBLE_FAULT_STACK_SIZE> = Stack([0; DOUBLE_FAULT_STACK_SIZE]);
+static mut DEFAULT_PRIVILEGE_STACK: Stack<PRIVILEGE_STACK_SIZE> = Stack([0; PRIVILEGE_STACK_SIZE]);
 
 struct TssCell(UnsafeCell<TaskStateSegment>);
 

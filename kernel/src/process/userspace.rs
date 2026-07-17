@@ -224,7 +224,10 @@ impl fmt::Display for Error {
                 "required kernel address {address:#018x} uses PML4 slot zero"
             ),
             Self::PageAlreadyMapped(address) => {
-                write!(formatter, "userspace page {address:#018x} is already mapped")
+                write!(
+                    formatter,
+                    "userspace page {address:#018x} is already mapped"
+                )
             }
             Self::ProcessExitMismatch { returned, recorded } => write!(
                 formatter,
@@ -355,12 +358,7 @@ impl BuiltAddressSpace {
                 physical_memory_offset,
                 &mut pages,
             )?;
-            copy_segment(
-                path,
-                segment,
-                physical_memory_offset,
-                &pages,
-            )?;
+            copy_segment(path, segment, physical_memory_offset, &pages)?;
             ranges.push(UserRange {
                 start: segment.virtual_address,
                 end,
@@ -398,9 +396,7 @@ impl BuiltAddressSpace {
         });
 
         if !ranges.iter().any(|range| {
-            range.executable
-                && image.entry_point >= range.start
-                && image.entry_point < range.end
+            range.executable && image.entry_point >= range.start && image.entry_point < range.end
         }) {
             return Err(Error::InvalidUserRange);
         }
@@ -707,11 +703,11 @@ fn copy_segment(
             .iter()
             .find(|page| page.virtual_address == page_address)
             .ok_or(Error::InvalidUserRange)?;
-        let within_page = usize::try_from(virtual_address - page_address)
-            .map_err(|_| Error::AddressOverflow)?;
+        let within_page =
+            usize::try_from(virtual_address - page_address).map_err(|_| Error::AddressOverflow)?;
         let remaining_page = Size4KiB::SIZE as usize - within_page;
-        let remaining_file = usize::try_from(segment.file_size - copied)
-            .map_err(|_| Error::AddressOverflow)?;
+        let remaining_file =
+            usize::try_from(segment.file_size - copied).map_err(|_| Error::AddressOverflow)?;
         let chunk = remaining_page.min(remaining_file);
         let destination_address = physical_memory_offset
             .as_u64()
@@ -732,10 +728,7 @@ fn copy_segment(
     Ok(())
 }
 
-fn zero_frame(
-    frame: PhysFrame<Size4KiB>,
-    physical_memory_offset: VirtAddr,
-) -> Result<(), Error> {
+fn zero_frame(frame: PhysFrame<Size4KiB>, physical_memory_offset: VirtAddr) -> Result<(), Error> {
     let address = physical_memory_offset
         .as_u64()
         .checked_add(frame.start_address().as_u64())
