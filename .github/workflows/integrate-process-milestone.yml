@@ -56,6 +56,16 @@ jobs:
           set -o pipefail
           cargo +nightly-2026-02-01 build --locked 2>&1 | tee process-build.log
 
+      - name: Remove temporary integration tooling
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git rm .github/workflows/integrate-process-milestone.yml
+          git rm tools/apply_process_milestone.py
+          git rm -r tools/process_payload
+          git commit -m "Remove temporary process integration tooling"
+          git push origin HEAD:agent/process-scheduling-isolation
+
       - name: Upload integration diagnostics
         if: always()
         uses: actions/upload-artifact@v6
