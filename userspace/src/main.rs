@@ -13,7 +13,7 @@ _start:
     mov rax, 1
     mov rdi, 1
     lea rsi, [rip + first_message]
-    mov rdx, first_message_end - first_message
+    mov rdx, 29
     int 0x80
 
     mov rax, 2
@@ -22,7 +22,7 @@ _start:
     mov rax, 1
     mov rdi, 1
     lea rsi, [rip + second_message]
-    mov rdx, second_message_end - second_message
+    mov rdx, 31
     int 0x80
 
     mov rax, 3
@@ -35,10 +35,8 @@ _start:
     .section .rodata,"a"
 first_message:
     .ascii "userspace: hello from ring 3\n"
-first_message_end:
 second_message:
     .ascii "userspace: resumed after yield\n"
-second_message_end:
 "#,
 );
 
