@@ -25,11 +25,14 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Integrate and format ring 3 support
-        run: |
-          python3 tools/integrate_ring3.py
-          cargo +nightly-2026-02-01 fmt --all
-          cargo +nightly-2026-02-01 generate-lockfile
+      - name: Apply ring 3 integration
+        run: python3 tools/integrate_ring3.py
+
+      - name: Format all sources
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Generate workspace lockfile
+        run: cargo +nightly-2026-02-01 generate-lockfile
 
       - name: Commit integrated sources
         run: |
