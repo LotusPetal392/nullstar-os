@@ -15,16 +15,13 @@ const MAX_GPT_ENTRY_ARRAY_BYTES: usize = 1024 * 1024;
 const MAX_RECORDED_GPT_PARTITIONS: usize = 256;
 
 const GPT_EFI_SYSTEM: Guid = Guid::from_raw([
-    0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e,
-    0xc9, 0x3b,
+    0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
 ]);
 const GPT_MICROSOFT_BASIC_DATA: Guid = Guid::from_raw([
-    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26,
-    0x99, 0xc7,
+    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 ]);
 const GPT_BIOS_BOOT: Guid = Guid::from_raw([
-    0x48, 0x61, 0x68, 0x21, 0x49, 0x64, 0x6f, 0x6e, 0x74, 0x4e, 0x65, 0x65, 0x64, 0x45,
-    0x46, 0x49,
+    0x48, 0x61, 0x68, 0x21, 0x49, 0x64, 0x6f, 0x6e, 0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49,
 ]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +51,9 @@ impl Error {
             Self::BlockSizeTooSmall(_) => "disk logical block size is smaller than 512 bytes",
             Self::AddressOverflow => "partition address calculation overflowed",
             Self::LbaOutOfRange => "partition metadata references an LBA outside the disk",
-            Self::MissingMbrSignature => "disk does not contain an MBR signature or FAT boot sector",
+            Self::MissingMbrSignature => {
+                "disk does not contain an MBR signature or FAT boot sector"
+            }
             Self::InvalidExtendedPartition => "extended partition chain is malformed",
             Self::ExtendedPartitionLoop => "extended partition chain contains a loop",
             Self::InvalidGptSignature => "protective MBR is not followed by a GPT header",
@@ -73,9 +72,14 @@ impl fmt::Display for Error {
         match self {
             Self::Ahci(error) => write!(formatter, "AHCI error: {error}"),
             Self::BlockSizeTooSmall(size) => {
-                write!(formatter, "disk block size is {size} bytes; at least 512 are required")
+                write!(
+                    formatter,
+                    "disk block size is {size} bytes; at least 512 are required"
+                )
             }
-            Self::InvalidGptHeaderSize(size) => write!(formatter, "invalid GPT header size: {size}"),
+            Self::InvalidGptHeaderSize(size) => {
+                write!(formatter, "invalid GPT header size: {size}")
+            }
             Self::InvalidGptHeaderCrc { expected, actual } => write!(
                 formatter,
                 "GPT header CRC mismatch: expected {expected:#010x}, calculated {actual:#010x}"
@@ -245,7 +249,8 @@ impl Inventory {
 
 pub fn scan() -> Result<Inventory, Error> {
     let disk = ahci::info().ok_or(Error::DiskUnavailable)?;
-    let block_size = usize::try_from(disk.logical_block_size).map_err(|_| Error::AddressOverflow)?;
+    let block_size =
+        usize::try_from(disk.logical_block_size).map_err(|_| Error::AddressOverflow)?;
     if block_size < 512 {
         return Err(Error::BlockSizeTooSmall(block_size));
     }
@@ -360,8 +365,8 @@ fn scan_extended_partition(
             return Err(Error::InvalidExtendedPartition);
         }
 
-        let logical = &block[MBR_PARTITION_TABLE_OFFSET
-            ..MBR_PARTITION_TABLE_OFFSET + MBR_PARTITION_ENTRY_SIZE];
+        let logical = &block
+            [MBR_PARTITION_TABLE_OFFSET..MBR_PARTITION_TABLE_OFFSET + MBR_PARTITION_ENTRY_SIZE];
         let logical_type = logical[4];
         let logical_relative = u64::from(read_u32(logical, 8).ok_or(Error::AddressOverflow)?);
         let logical_blocks = u64::from(read_u32(logical, 12).ok_or(Error::AddressOverflow)?);
@@ -452,12 +457,7 @@ fn scan_gpt(block_size: usize, disk_block_count: u64) -> Result<Inventory, Error
         return Err(Error::GptEntryArrayTooLarge(entry_array_bytes));
     }
     let entry_array_len = usize::try_from(entry_array_bytes).map_err(|_| Error::AddressOverflow)?;
-    let entry_bytes = read_bytes(
-        entries_lba,
-        entry_array_len,
-        block_size,
-        disk_block_count,
-    )?;
+    let entry_bytes = read_bytes(entries_lba, entry_array_len, block_size, disk_block_count)?;
     let actual_entries_crc = crc32(&entry_bytes);
     if actual_entries_crc != expected_entries_crc {
         return Err(Error::InvalidGptEntryArrayCrc {
@@ -667,10 +667,10 @@ fn looks_like_fat_boot_sector(block: &[u8]) -> bool {
     let sectors_per_cluster = block[13];
     let reserved_sectors = read_u16(block, 14).unwrap_or(0);
     let fat_count = block[16];
-    let total_sectors = u32::from(read_u16(block, 19).unwrap_or(0))
-        .max(read_u32(block, 32).unwrap_or(0));
-    let sectors_per_fat = u32::from(read_u16(block, 22).unwrap_or(0))
-        .max(read_u32(block, 36).unwrap_or(0));
+    let total_sectors =
+        u32::from(read_u16(block, 19).unwrap_or(0)).max(read_u32(block, 32).unwrap_or(0));
+    let sectors_per_fat =
+        u32::from(read_u16(block, 22).unwrap_or(0)).max(read_u32(block, 36).unwrap_or(0));
 
     matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096)
         && sectors_per_cluster != 0

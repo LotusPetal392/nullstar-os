@@ -81,7 +81,9 @@ impl fmt::Display for Error {
                 formatter,
                 "disk blocks are {disk} bytes but the FAT volume uses {fat}-byte sectors"
             ),
-            Self::InvalidBootSector(reason) => write!(formatter, "invalid FAT boot sector: {reason}"),
+            Self::InvalidBootSector(reason) => {
+                write!(formatter, "invalid FAT boot sector: {reason}")
+            }
             Self::InvalidCluster(cluster) => write!(formatter, "invalid FAT cluster {cluster}"),
             Self::FreeCluster(cluster) => write!(formatter, "cluster {cluster} is marked free"),
             Self::ReservedCluster(cluster) => {
@@ -196,9 +198,7 @@ impl FatVolume {
         let disk_block_size =
             usize::try_from(disk.logical_block_size).map_err(|_| Error::AddressOverflow)?;
         let boot_sector = read_disk_block(partition.start_lba, disk_block_size)?;
-        if boot_sector.len() < 512
-            || boot_sector.get(510..512) != Some(&[0x55_u8, 0xaa][..])
-        {
+        if boot_sector.len() < 512 || boot_sector.get(510..512) != Some(&[0x55_u8, 0xaa][..]) {
             return Err(Error::InvalidBootSector("missing 0x55aa signature"));
         }
 
@@ -207,7 +207,9 @@ impl FatVolume {
                 .ok_or(Error::InvalidBootSector("missing bytes-per-sector field"))?,
         );
         if !(512..=4096).contains(&bytes_per_sector) || !bytes_per_sector.is_power_of_two() {
-            return Err(Error::InvalidBootSector("unsupported bytes-per-sector value"));
+            return Err(Error::InvalidBootSector(
+                "unsupported bytes-per-sector value",
+            ));
         }
         if bytes_per_sector != disk_block_size {
             return Err(Error::BlockSizeMismatch {
@@ -221,7 +223,9 @@ impl FatVolume {
             || !sectors_per_cluster.is_power_of_two()
             || sectors_per_cluster > 128
         {
-            return Err(Error::InvalidBootSector("invalid sectors-per-cluster value"));
+            return Err(Error::InvalidBootSector(
+                "invalid sectors-per-cluster value",
+            ));
         }
 
         let reserved_sectors = u32::from(
@@ -245,10 +249,9 @@ impl FatVolume {
             read_u16(&boot_sector, 19)
                 .ok_or(Error::InvalidBootSector("missing total-sector field"))?,
         );
-        let total_sectors_32 = u64::from(
-            read_u32(&boot_sector, 32)
-                .ok_or(Error::InvalidBootSector("missing extended total-sector field"))?,
-        );
+        let total_sectors_32 = u64::from(read_u32(&boot_sector, 32).ok_or(
+            Error::InvalidBootSector("missing extended total-sector field"),
+        )?);
         let total_sectors = if total_sectors_16 != 0 {
             total_sectors_16
         } else {
@@ -261,8 +264,7 @@ impl FatVolume {
         }
 
         let sectors_per_fat_16 = u32::from(
-            read_u16(&boot_sector, 22)
-                .ok_or(Error::InvalidBootSector("missing FAT-size field"))?,
+            read_u16(&boot_sector, 22).ok_or(Error::InvalidBootSector("missing FAT-size field"))?,
         );
         let sectors_per_fat_32 = read_u32(&boot_sector, 36)
             .ok_or(Error::InvalidBootSector("missing FAT32 size field"))?;
@@ -294,7 +296,9 @@ impl FatVolume {
             .checked_add(root_dir_sector_count)
             .ok_or(Error::AddressOverflow)?;
         if first_data_sector >= total_sectors {
-            return Err(Error::InvalidBootSector("data region starts outside the volume"));
+            return Err(Error::InvalidBootSector(
+                "data region starts outside the volume",
+            ));
         }
 
         let data_sectors = total_sectors
@@ -343,16 +347,20 @@ impl FatVolume {
             .checked_add(2)
             .ok_or(Error::AddressOverflow)?;
         let required_fat_bytes = match fat_type {
-            FatType::Fat12 => fat_entries
-                .checked_mul(3)
-                .and_then(|value| value.checked_add(1))
-                .ok_or(Error::AddressOverflow)?
-                / 2,
+            FatType::Fat12 => {
+                fat_entries
+                    .checked_mul(3)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(Error::AddressOverflow)?
+                    / 2
+            }
             FatType::Fat16 => fat_entries.checked_mul(2).ok_or(Error::AddressOverflow)?,
             FatType::Fat32 => fat_entries.checked_mul(4).ok_or(Error::AddressOverflow)?,
         };
         if fat_bytes < required_fat_bytes {
-            return Err(Error::InvalidBootSector("FAT is too small for the data region"));
+            return Err(Error::InvalidBootSector(
+                "FAT is too small for the data region",
+            ));
         }
 
         let bytes_per_cluster = bytes_per_sector
@@ -500,10 +508,7 @@ impl FatVolume {
             .find(|entry| path_name_matches(entry, name)))
     }
 
-    fn scan_directory(
-        &self,
-        location: DirectoryLocation,
-    ) -> Result<Vec<DirectoryEntry>, Error> {
+    fn scan_directory(&self, location: DirectoryLocation) -> Result<Vec<DirectoryEntry>, Error> {
         let mut parser = DirectoryParser::new();
         match location {
             DirectoryLocation::FixedRoot => {
@@ -640,10 +645,9 @@ impl FatVolume {
                 .checked_add(u64::try_from(copied).map_err(|_| Error::AddressOverflow)?)
                 .ok_or(Error::AddressOverflow)?;
             let relative_sector = absolute_offset / self.info.bytes_per_sector as u64;
-            let within_sector = usize::try_from(
-                absolute_offset % self.info.bytes_per_sector as u64,
-            )
-            .map_err(|_| Error::AddressOverflow)?;
+            let within_sector =
+                usize::try_from(absolute_offset % self.info.bytes_per_sector as u64)
+                    .map_err(|_| Error::AddressOverflow)?;
             let block = self.read_volume_sector(relative_sector)?;
             let chunk = (length - copied).min(self.info.bytes_per_sector - within_sector);
             output[copied..copied + chunk]
