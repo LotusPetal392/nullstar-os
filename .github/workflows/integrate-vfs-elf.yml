@@ -25,6 +25,19 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/integrate_vfs_elf.py")
+          lines = path.read_text().splitlines()
+          for index, line in enumerate(lines[:-1]):
+              if line == "cat_and_diagnostics = block(" and lines[index + 1].lstrip().startswith("'''\\"):
+                  lines[index + 1] = lines[index + 1].replace("'''", "r'''", 1)
+                  break
+          else:
+              raise SystemExit("cat/ELF generator block was not found")
+          path.write_text("\n".join(lines) + "\n")
+          PY
           python3 tools/integrate_vfs_elf.py 2>&1 | tee integration.log
           cargo +nightly-2026-02-01 fmt --all 2>&1 | tee -a integration.log
 
