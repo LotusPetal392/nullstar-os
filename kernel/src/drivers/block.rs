@@ -1,6 +1,8 @@
 use core::fmt;
 
 /// Minimal synchronous block-device interface used by early storage drivers.
+///
+/// Buffers always describe exactly one logical block as reported by the device.
 pub trait BlockDevice {
     type Error: fmt::Debug;
 
