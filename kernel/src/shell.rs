@@ -1,13 +1,14 @@
-use alloc::string::String;
+use alloc::{string::String, vec};
 
 use pc_keyboard::{DecodedKey, KeyCode};
 
-use crate::{acpi, allocator, console, interrupts, memory, pci};
+use crate::{acpi, ahci, allocator, console, interrupts, memory, pci};
 
 const PROMPT: &str = "galactic> ";
 const DEFAULT_CONSOLE_COLUMNS: usize = 80;
 const MAX_COMMAND_LENGTH: usize = 128;
 const MAX_PCI_SHELL_FUNCTIONS: usize = 64;
+const DISK_PREVIEW_BYTES: usize = 128;
 
 macro_rules! shell_print {
     ($($argument:tt)*) => {{
@@ -35,6 +36,7 @@ pub struct SystemInfo {
     acpi: Option<acpi::AcpiInfo>,
     interrupt_controller: interrupts::ControllerInfo,
     pci_inventory: Option<pci::Inventory>,
+    storage: Option<ahci::DiskInfo>,
 }
 
 impl SystemInfo {
@@ -45,6 +47,7 @@ impl SystemInfo {
         acpi: Option<acpi::AcpiInfo>,
         interrupt_controller: interrupts::ControllerInfo,
         pci_inventory: Option<pci::Inventory>,
+        storage: Option<ahci::DiskInfo>,
     ) -> Self {
         Self {
             usable_frames,
@@ -53,6 +56,7 @@ impl SystemInfo {
             acpi,
             interrupt_controller,
             pci_inventory,
+            storage,
         }
     }
 }
@@ -191,6 +195,7 @@ impl Shell {
             "acpi" => self.print_acpi(),
             "interrupts" => self.print_interrupts(),
             "pci" => self.print_pci(),
+            "disk" => self.handle_disk_command(words.next(), words.next()),
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
             }
@@ -224,6 +229,94 @@ impl Shell {
             self.system_info.allocated_frames,
             self.system_info.remaining_frames
         );
+    }
+
+    fn handle_disk_command(&self, action: Option<&str>, argument: Option<&str>) {
+        match action {
+            None | Some("info") => self.print_disk_info(),
+            Some("read") => {
+                let Some(lba) = argument.and_then(parse_u64) else {
+                    shell_println!("usage: disk read <logical-block-address>");
+                    return;
+                };
+                self.read_disk_block(lba);
+            }
+            Some(_) => shell_println!("usage: disk [info | read <logical-block-address>]"),
+        }
+    }
+
+    fn print_disk_info(&self) {
+        let Some(info) = self.system_info.storage.as_ref() else {
+            shell_println!("AHCI disk: unavailable");
+            return;
+        };
+
+        shell_println!(
+            "AHCI disk: `{}` at controller {}, port {}",
+            info.model,
+            info.controller_location,
+            info.port
+        );
+        shell_println!(
+            "identity: serial=`{}`, firmware=`{}`, PCI={:04x}:{:04x}",
+            info.serial,
+            info.firmware,
+            info.vendor_id,
+            info.device_id
+        );
+        shell_println!(
+            "geometry: {} blocks x {} bytes, capacity={} MiB, LBA48={}",
+            info.logical_block_count,
+            info.logical_block_size,
+            info.capacity_bytes / (1024 * 1024),
+            info.lba48
+        );
+        shell_println!(
+            "AHCI: ABAR={:#x}, version={:#010x}, slots={}, PI={:#010x}, DMA64={}",
+            info.abar,
+            info.hba_version,
+            info.command_slots,
+            info.implemented_ports,
+            info.supports_64_bit_dma
+        );
+        shell_println!(
+            "sector 0: signature={:#06x}, checksum={:#010x}",
+            info.sector_zero_signature,
+            info.sector_zero_checksum
+        );
+    }
+
+    fn read_disk_block(&self, logical_block_address: u64) {
+        let Some(info) = self.system_info.storage.as_ref() else {
+            shell_println!("AHCI disk: unavailable");
+            return;
+        };
+
+        let block_size = info.logical_block_size as usize;
+        let mut block = vec![0_u8; block_size];
+        if let Err(error) = ahci::read_block(logical_block_address, &mut block) {
+            shell_println!("disk read failed: {error}");
+            return;
+        }
+
+        shell_println!(
+            "disk block {} read successfully; showing first {} bytes:",
+            logical_block_address,
+            block.len().min(DISK_PREVIEW_BYTES)
+        );
+        for (line, bytes) in block[..block.len().min(DISK_PREVIEW_BYTES)]
+            .chunks(16)
+            .enumerate()
+        {
+            let byte_offset = logical_block_address
+                .saturating_mul(block_size as u64)
+                .saturating_add((line * 16) as u64);
+            shell_print!("{byte_offset:#010x}: ");
+            for byte in bytes {
+                shell_print!("{byte:02x} ");
+            }
+            shell_println!();
+        }
     }
 
     fn print_interrupts(&self) {
@@ -500,6 +593,14 @@ impl Shell {
     }
 }
 
+fn parse_u64(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|digits| u64::from_str_radix(digits, 16).ok())
+        .unwrap_or_else(|| value.parse().ok())
+}
+
 fn print_help() {
     shell_println!("commands:");
     shell_println!("  help             show this command list");
@@ -511,6 +612,8 @@ fn print_help() {
     shell_println!("  acpi             show ACPI table and platform data");
     shell_println!("  interrupts       show interrupt-controller routes");
     shell_println!("  pci              list PCIe functions discovered by ECAM");
+    shell_println!("  disk             show the AHCI disk");
+    shell_println!("  disk read <lba>  read and preview one logical block");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }
