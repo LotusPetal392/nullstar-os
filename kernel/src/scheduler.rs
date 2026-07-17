@@ -305,6 +305,26 @@ impl Scheduler {
         }
         self.ticks_in_quantum = 0;
 
+        self.switch_to_next(current_stack_pointer, true)
+    }
+
+    fn yield_now(&mut self, current_stack_pointer: usize) -> usize {
+        if !self.running || self.tasks.is_empty() {
+            return current_stack_pointer;
+        }
+
+        self.ticks_in_quantum = 0;
+        self.switch_to_next(current_stack_pointer, false)
+    }
+
+    fn switch_to_next(&mut self, current_stack_pointer: usize, preempted: bool) -> usize {
+        let current = self.current_task;
+        self.tasks[current].stack_pointer = current_stack_pointer;
+
+        if self.tasks.len() < 2 {
+            return current_stack_pointer;
+        }
+
         let next = (current + 1) % self.tasks.len();
         let next_stack_pointer = self.tasks[next].stack_pointer;
         if next_stack_pointer == 0 {
@@ -313,7 +333,9 @@ impl Scheduler {
 
         self.current_task = next;
         self.context_switches = self.context_switches.saturating_add(1);
-        self.preemptions = self.preemptions.saturating_add(1);
+        if preempted {
+            self.preemptions = self.preemptions.saturating_add(1);
+        }
         self.tasks[next].scheduled_count = self.tasks[next].scheduled_count.saturating_add(1);
         next_stack_pointer
     }
@@ -397,6 +419,10 @@ pub fn snapshot() -> Snapshot {
 
 pub fn on_timer_interrupt(current_stack_pointer: usize) -> usize {
     SCHEDULER.lock().schedule(current_stack_pointer)
+}
+
+pub fn on_yield(current_stack_pointer: usize) -> usize {
+    SCHEDULER.lock().yield_now(current_stack_pointer)
 }
 
 pub fn timer_interrupt_entry_address() -> VirtAddr {
