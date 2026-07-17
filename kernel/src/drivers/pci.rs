@@ -289,11 +289,7 @@ impl EcamRegion {
     }
 
     fn config_function(self, bus: u8, device: u8, function: u8) -> Option<ConfigFunction> {
-        if bus < self.info.start_bus
-            || bus > self.scan_end_bus
-            || device >= 32
-            || function >= 8
-        {
+        if bus < self.info.start_bus || bus > self.scan_end_bus || device >= 32 || function >= 8 {
             return None;
         }
 
@@ -479,11 +475,7 @@ pub fn enable_memory_and_bus_mastering(
         return Err(Error::FunctionOutsideConfigurationRegion);
     }
 
-    let (region, _) = EcamRegion::new(
-        region_info,
-        physical_memory_offset,
-        physical_memory_end,
-    )?;
+    let (region, _) = EcamRegion::new(region_info, physical_memory_offset, physical_memory_end)?;
     let function = region
         .config_function(location.bus, location.device, location.function)
         .ok_or(Error::FunctionOutsideConfigurationRegion)?;

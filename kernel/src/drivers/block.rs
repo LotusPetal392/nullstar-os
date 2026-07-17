@@ -6,6 +6,9 @@ pub trait BlockDevice {
 
     fn block_size(&self) -> usize;
     fn block_count(&self) -> u64;
-    fn read_block(&mut self, logical_block_address: u64, buffer: &mut [u8])
-        -> Result<(), Self::Error>;
+    fn read_block(
+        &mut self,
+        logical_block_address: u64,
+        buffer: &mut [u8],
+    ) -> Result<(), Self::Error>;
 }

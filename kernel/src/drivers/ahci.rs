@@ -147,7 +147,9 @@ impl Error {
             Self::TransferIncomplete { .. } => "AHCI completed an incomplete DMA transfer",
             Self::IdentifyDataInvalid => "ATA IDENTIFY data is invalid",
             Self::UnsupportedLogicalBlockSize(_) => "ATA logical block size is unsupported",
-            Self::BufferLength { .. } => "block read buffer length does not match the disk block size",
+            Self::BufferLength { .. } => {
+                "block read buffer length does not match the disk block size"
+            }
             Self::LbaOutOfRange => "logical block address is outside the disk",
         }
     }
@@ -161,10 +163,16 @@ impl fmt::Display for Error {
                 write!(formatter, "AHCI transferred {actual} of {expected} bytes")
             }
             Self::UnsupportedLogicalBlockSize(bytes) => {
-                write!(formatter, "unsupported ATA logical block size: {bytes} bytes")
+                write!(
+                    formatter,
+                    "unsupported ATA logical block size: {bytes} bytes"
+                )
             }
             Self::BufferLength { expected, actual } => {
-                write!(formatter, "block buffer is {actual} bytes; expected {expected}")
+                write!(
+                    formatter,
+                    "block buffer is {actual} bytes; expected {expected}"
+                )
             }
             _ => formatter.write_str(self.description()),
         }
@@ -592,8 +600,7 @@ impl Controller {
 
         let command_list = self.dma.command_and_fis.physical_address;
         let received_fis = self.dma.received_fis_physical();
-        self.port
-            .write(PORT_COMMAND_LIST_BASE, command_list as u32);
+        self.port.write(PORT_COMMAND_LIST_BASE, command_list as u32);
         self.port
             .write(PORT_COMMAND_LIST_BASE_UPPER, (command_list >> 32) as u32);
         self.port.write(PORT_FIS_BASE, received_fis as u32);
@@ -682,8 +689,7 @@ impl Controller {
                 data_base: data_address as u32,
                 data_base_upper: (data_address >> 32) as u32,
                 reserved: 0,
-                byte_count_and_flags: (output.len() as u32 - 1)
-                    | PRDT_INTERRUPT_ON_COMPLETION,
+                byte_count_and_flags: (output.len() as u32 - 1) | PRDT_INTERRUPT_ON_COMPLETION,
             },
         };
 
@@ -718,7 +724,11 @@ impl Controller {
                 }
 
                 unsafe {
-                    ptr::copy_nonoverlapping(self.dma.data_ptr(), output.as_mut_ptr(), output.len());
+                    ptr::copy_nonoverlapping(
+                        self.dma.data_ptr(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                    );
                 }
                 self.port.write(PORT_INTERRUPT_STATUS, u32::MAX);
                 return Ok(());
@@ -857,9 +867,7 @@ fn perform_bios_handoff(hba: MmioRegion) -> Result<(), Error> {
         hba.read_u32(HBA_BIOS_HANDOFF_CONTROL) | HBA_BOHC_OS_OWNED,
     );
     if wait_until(BIOS_HANDOFF_SPINS, || {
-        hba.read_u32(HBA_BIOS_HANDOFF_CONTROL)
-            & (HBA_BOHC_BIOS_OWNED | HBA_BOHC_BIOS_BUSY)
-            == 0
+        hba.read_u32(HBA_BIOS_HANDOFF_CONTROL) & (HBA_BOHC_BIOS_OWNED | HBA_BOHC_BIOS_BUSY) == 0
     }) {
         Ok(())
     } else {
@@ -895,8 +903,8 @@ fn parse_identify_data(data: &[u8; 512]) -> Result<IdentifyData, Error> {
     }
 
     let lba48 = identify_word(data, 83) & (1 << 10) != 0;
-    let lba28_count = u64::from(identify_word(data, 60))
-        | (u64::from(identify_word(data, 61)) << 16);
+    let lba28_count =
+        u64::from(identify_word(data, 60)) | (u64::from(identify_word(data, 61)) << 16);
     let lba48_count = u64::from(identify_word(data, 100))
         | (u64::from(identify_word(data, 101)) << 16)
         | (u64::from(identify_word(data, 102)) << 32)
@@ -911,14 +919,12 @@ fn parse_identify_data(data: &[u8; 512]) -> Result<IdentifyData, Error> {
     }
 
     let sector_size_descriptor = identify_word(data, 106);
-    let logical_words = if sector_size_descriptor & 0xc000 == 0x4000
-        && sector_size_descriptor & (1 << 12) != 0
-    {
-        u32::from(identify_word(data, 117))
-            | (u32::from(identify_word(data, 118)) << 16)
-    } else {
-        256
-    };
+    let logical_words =
+        if sector_size_descriptor & 0xc000 == 0x4000 && sector_size_descriptor & (1 << 12) != 0 {
+            u32::from(identify_word(data, 117)) | (u32::from(identify_word(data, 118)) << 16)
+        } else {
+            256
+        };
     let logical_block_size = logical_words
         .checked_mul(2)
         .ok_or(Error::IdentifyDataInvalid)?;
