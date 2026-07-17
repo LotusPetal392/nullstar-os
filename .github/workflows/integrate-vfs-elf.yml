@@ -28,15 +28,24 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("tools/integrate_vfs_elf.py")
-          lines = path.read_text().splitlines()
+          helper = Path("tools/integrate_vfs_elf.py")
+          lines = helper.read_text().splitlines()
           for index, line in enumerate(lines[:-1]):
               if line == "cat_and_diagnostics = block(":
                   lines[index + 1] = "    r'''"
                   break
           else:
               raise SystemExit("cat/ELF generator block was not found")
-          path.write_text("\n".join(lines) + "\n")
+          helper.write_text("\n".join(lines) + "\n")
+
+          vfs = Path("kernel/src/vfs/mod.rs")
+          source = vfs.read_text()
+          source = source.replace(
+              "truncated: requested as u64 < metadata.size,",
+              "truncated: (requested as u64) < metadata.size,",
+              1,
+          )
+          vfs.write_text(source)
           PY
           python3 tools/integrate_vfs_elf.py 2>&1 | tee integration.log
           cargo +nightly-2026-02-01 fmt --all 2>&1 | tee -a integration.log
@@ -45,7 +54,7 @@ jobs:
         run: |
           git config user.name "lotuspetalagent"
           git config user.email "lotuspetalagent@users.noreply.github.com"
-          git add kernel/src/main.rs kernel/src/shell.rs src/main.rs
+          git add kernel/src/main.rs kernel/src/shell.rs kernel/src/vfs/mod.rs src/main.rs
           if ! git diff --cached --quiet; then
             git commit -m "Integrate VFS and ELF validation"
             git push origin HEAD:${{ github.head_ref }}
