@@ -357,9 +357,7 @@ impl Shell {
             }
         }
 
-        let displayed = info
-            .recorded_function_count()
-            .min(MAX_PCI_SHELL_FUNCTIONS);
+        let displayed = info.recorded_function_count().min(MAX_PCI_SHELL_FUNCTIONS);
         if displayed < info.recorded_function_count() {
             shell_println!(
                 "{} additional recorded functions omitted",

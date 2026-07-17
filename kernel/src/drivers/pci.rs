@@ -213,9 +213,7 @@ impl Inventory {
     }
 
     pub fn is_truncated(&self) -> bool {
-        self.unscanned_region_count > 0
-            || self.bus_scan_truncated
-            || self.function_list_truncated
+        self.unscanned_region_count > 0 || self.bus_scan_truncated || self.function_list_truncated
     }
 
     fn record(&mut self, function: Function) {
@@ -389,9 +387,7 @@ pub fn enumerate(
     physical_memory_offset: VirtAddr,
     physical_memory_end: u64,
 ) -> Result<Inventory, Error> {
-    let region = mcfg
-        .first_region
-        .ok_or(Error::MissingConfigurationRegion)?;
+    let region = mcfg.first_region.ok_or(Error::MissingConfigurationRegion)?;
     let (region, bus_scan_truncated) =
         EcamRegion::new(region, physical_memory_offset, physical_memory_end)?;
 
