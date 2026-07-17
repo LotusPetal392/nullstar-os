@@ -1,0 +1,37 @@
+name: VFS and ELF build diagnostics
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Capture build output
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 build --locked 2>&1 | tee vfs-elf-build.log
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: vfs-elf-build-log
+          path: vfs-elf-build.log
+          if-no-files-found: ignore
