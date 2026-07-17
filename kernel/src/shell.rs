@@ -2,7 +2,9 @@ use alloc::{string::String, vec};
 
 use pc_keyboard::{DecodedKey, KeyCode};
 
-use crate::{acpi, ahci, allocator, console, elf, fat, interrupts, memory, partition, pci, vfs};
+use crate::{
+    acpi, ahci, allocator, console, elf, fat, interrupts, memory, partition, pci, userspace, vfs,
+};
 
 const PROMPT: &str = "galactic> ";
 const DEFAULT_CONSOLE_COLUMNS: usize = 80;
@@ -221,6 +223,7 @@ impl Shell {
                 };
                 self.inspect_elf(path);
             }
+            "process" | "userspace" => self.print_userspace(),
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
             }
@@ -572,6 +575,39 @@ impl Shell {
         }
     }
 
+    fn print_userspace(&self) {
+        let Some(result) = userspace::last_result() else {
+            shell_println!("userspace: no process has completed");
+            return;
+        };
+
+        shell_println!(
+            "userspace: `{}` exited with code {}",
+            result.path,
+            result.exit_code
+        );
+        shell_println!(
+            "entry={:#018x}, page table={:#x}, mapped pages={}, LOAD segments={}",
+            result.entry_point,
+            result.page_table_address,
+            result.mapped_pages,
+            result.load_segments
+        );
+        shell_println!(
+            "stacks: user={} KiB, guard={:#018x}, kernel={} KiB",
+            result.user_stack_bytes / 1024,
+            result.guard_page_address,
+            result.kernel_stack_bytes / 1024
+        );
+        shell_println!(
+            "syscalls: total={}, writes={}, yields={}, bytes written={}",
+            result.syscall_count,
+            result.write_count,
+            result.yield_count,
+            result.bytes_written
+        );
+    }
+
     fn print_interrupts(&self) {
         let info = self.system_info.interrupt_controller;
         shell_println!("interrupt controller: {}", info.kind);
@@ -873,6 +909,7 @@ fn print_help() {
     shell_println!("  ls [path]        list a VFS directory");
     shell_println!("  cat <path>       preview a VFS file");
     shell_println!("  elf <path>       validate an ELF64 executable");
+    shell_println!("  process          show the completed ring-3 process");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }
