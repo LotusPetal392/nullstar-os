@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   qemu-smoke-test:
@@ -15,10 +15,8 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check out repository branch
+      - name: Check out repository
         uses: actions/checkout@v7
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Install pinned Rust toolchain
         run: |
@@ -29,18 +27,8 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Format PCIe sources
-        run: cargo +nightly-2026-02-01 fmt --all
-
-      - name: Commit formatted sources
-        run: |
-          git config user.name "lotuspetalagent"
-          git config user.email "lotuspetalagent@users.noreply.github.com"
-          git add kernel/src src/main.rs
-          if ! git diff --cached --quiet; then
-            git commit -m "Format PCIe enumeration sources"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
 
       - name: Install QEMU
         run: |
