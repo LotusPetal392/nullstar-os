@@ -17,7 +17,7 @@ mod scheduler;
 mod shell;
 
 pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};
-pub(crate) use drivers::{console, keyboard, pci, serial};
+pub(crate) use drivers::{ahci, console, keyboard, pci, serial};
 pub(crate) use memory::allocator;
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
@@ -156,6 +156,47 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
+    let storage_info = match (
+        pci_inventory.as_ref(),
+        acpi_info.as_ref().and_then(|info| info.mcfg.as_ref()),
+    ) {
+        (Some(inventory), Some(mcfg)) => match ahci::init(
+            inventory,
+            mcfg,
+            &mut frame_allocator,
+            physical_memory_offset,
+            physical_memory_end,
+        ) {
+            Ok(info) => {
+                serial_println!(
+                    "AHCI storage verified: controller={}, port={}, model=`{}`, serial=`{}`, firmware=`{}`, blocks={}, block_size={}, capacity_bytes={}, lba48={}, dma64={}, abar={:#x}, sector0_signature={:#06x}, sector0_checksum={:#010x}",
+                    info.controller_location,
+                    info.port,
+                    info.model,
+                    info.serial,
+                    info.firmware,
+                    info.logical_block_count,
+                    info.logical_block_size,
+                    info.capacity_bytes,
+                    info.lba48,
+                    info.supports_64_bit_dma,
+                    info.abar,
+                    info.sector_zero_signature,
+                    info.sector_zero_checksum
+                );
+                Some(info)
+            }
+            Err(error) => {
+                serial_println!("AHCI storage initialization failed: {error}");
+                None
+            }
+        },
+        _ => {
+            serial_println!("AHCI storage unavailable: PCIe inventory or MCFG is missing");
+            None
+        }
+    };
+
     let scheduler_initial = match scheduler::init() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -208,6 +249,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         println!("PCIe enumeration unavailable");
     }
+    if storage_info.is_some() {
+        println!("AHCI block storage ready");
+    } else {
+        println!("AHCI block storage unavailable");
+    }
     println!("Interactive shell initialized");
 
     let usable_frames = frame_allocator.usable_frame_count();
@@ -241,6 +287,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         acpi_info,
         interrupt_controller,
         pci_inventory,
+        storage_info,
     );
     let mut interactive_shell = shell::Shell::new(system_info);
     interactive_shell.start();
