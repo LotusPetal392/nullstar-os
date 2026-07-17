@@ -1,0 +1,72 @@
+name: Integrate process scheduling and fault isolation
+
+on:
+  push:
+    branches:
+      - agent/process-scheduling-isolation
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/process-scheduling-isolation
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Apply process milestone
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tools/apply_process_milestone.py 2>&1 | tee process-integration.log
+
+      - name: Format sources
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Generate workspace lockfile
+        run: cargo +nightly-2026-02-01 generate-lockfile
+
+      - name: Commit integrated sources
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock build.rs kernel/src src/main.rs userspace
+          if ! git diff --cached --quiet; then
+            git commit -m "Add process scheduling and fault isolation"
+            git push origin HEAD:agent/process-scheduling-isolation
+          fi
+
+      - name: Build bootable image
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 build --locked 2>&1 | tee process-build.log
+
+      - name: Upload integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: process-integration-log
+          path: process-integration.log
+          if-no-files-found: ignore
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: process-build-log
+          path: process-build.log
+          if-no-files-found: ignore
