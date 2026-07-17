@@ -74,7 +74,13 @@ fn qemu_command(options: &Options) -> Command {
     command
         .args(["-machine", "q35"])
         .arg("-drive")
-        .arg(format!("format=raw,file={bios_image}"))
+        .arg(format!(
+            "if=none,id=bootdisk,format=raw,file={bios_image}"
+        ))
+        .args([
+            "-device",
+            "ide-hd,drive=bootdisk,bus=ide.0,bootindex=1",
+        ])
         .args(["-serial", "stdio", "-monitor", "none", "-m", "128M"]);
 
     if options.headless {
