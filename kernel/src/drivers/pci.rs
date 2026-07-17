@@ -10,6 +10,8 @@ const ECAM_BYTES_PER_DEVICE: u64 = 1 << 15;
 const ECAM_BYTES_PER_FUNCTION: u64 = 1 << 12;
 const MAX_SCANNED_BUSES: usize = 256;
 const MAX_RECORDED_FUNCTIONS: usize = 256;
+const COMMAND_MEMORY_SPACE_ENABLE: u16 = 1 << 1;
+const COMMAND_BUS_MASTER_ENABLE: u16 = 1 << 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -18,6 +20,8 @@ pub enum Error {
     InvalidBaseAddress,
     AddressOverflow,
     RegionOutsidePhysicalMap,
+    FunctionOutsideConfigurationRegion,
+    ConfigurationWriteFailed,
     NoFunctionsFound,
 }
 
@@ -31,6 +35,10 @@ impl Error {
             Self::RegionOutsidePhysicalMap => {
                 "PCIe ECAM region is outside the bootloader physical mapping"
             }
+            Self::FunctionOutsideConfigurationRegion => {
+                "PCI function is outside the selected MCFG configuration region"
+            }
+            Self::ConfigurationWriteFailed => "PCI command-register update did not take effect",
             Self::NoFunctionsFound => "PCIe enumeration did not find any functions",
         }
     }
@@ -281,6 +289,14 @@ impl EcamRegion {
     }
 
     fn config_function(self, bus: u8, device: u8, function: u8) -> Option<ConfigFunction> {
+        if bus < self.info.start_bus
+            || bus > self.scan_end_bus
+            || device >= 32
+            || function >= 8
+        {
+            return None;
+        }
+
         let bus_index = u64::from(bus.checked_sub(self.info.start_bus)?);
         let offset = bus_index
             .checked_mul(ECAM_BYTES_PER_BUS)?
@@ -330,6 +346,14 @@ impl ConfigFunction {
             .checked_add(offset)
             .expect("validated PCIe configuration address overflowed");
         unsafe { ptr::read_volatile(address as *const u32) }
+    }
+
+    fn write_u16(self, offset: usize, value: u16) {
+        let address = self
+            .virtual_base
+            .checked_add(offset)
+            .expect("validated PCIe configuration address overflowed");
+        unsafe { ptr::write_volatile(address as *mut u16, value) };
     }
 
     fn vendor_id(self) -> u16 {
@@ -437,4 +461,43 @@ pub fn enumerate(
     }
 
     Ok(inventory)
+}
+
+pub fn enable_memory_and_bus_mastering(
+    mcfg: &McfgInfo,
+    location: Location,
+    physical_memory_offset: VirtAddr,
+    physical_memory_end: u64,
+) -> Result<u16, Error> {
+    let region_info = mcfg.first_region.ok_or(Error::MissingConfigurationRegion)?;
+    if location.segment != region_info.segment_group
+        || location.bus < region_info.start_bus
+        || location.bus > region_info.end_bus
+        || location.device >= 32
+        || location.function >= 8
+    {
+        return Err(Error::FunctionOutsideConfigurationRegion);
+    }
+
+    let (region, _) = EcamRegion::new(
+        region_info,
+        physical_memory_offset,
+        physical_memory_end,
+    )?;
+    let function = region
+        .config_function(location.bus, location.device, location.function)
+        .ok_or(Error::FunctionOutsideConfigurationRegion)?;
+    if function.vendor_id() == 0xffff {
+        return Err(Error::FunctionOutsideConfigurationRegion);
+    }
+
+    let required = COMMAND_MEMORY_SPACE_ENABLE | COMMAND_BUS_MASTER_ENABLE;
+    let command = function.read_u16(0x04) | required;
+    function.write_u16(0x04, command);
+    let updated = function.read_u16(0x04);
+    if updated & required != required {
+        return Err(Error::ConfigurationWriteFailed);
+    }
+
+    Ok(updated)
 }
