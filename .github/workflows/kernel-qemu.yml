@@ -29,7 +29,7 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Wait for AHCI port signature after COMRESET
+      - name: Select active AHCI link before device identification
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -37,11 +37,11 @@ jobs:
           path = Path("kernel/src/drivers/ahci.rs")
           source = path.read_text()
 
-          if "let mut signature_ready = false;" not in source:
+          if "fn wake_and_has_device(self) -> bool" not in source:
               start = source.index("    fn wake_and_is_sata(self) -> bool {")
               end = source.index("    fn link_is_active(self) -> bool {", start)
               replacement = "\n".join([
-                  "    fn wake_and_is_sata(self) -> bool {",
+                  "    fn wake_and_has_device(self) -> bool {",
                   "        self.write(",
                   "            PORT_COMMAND,",
                   "            self.read(PORT_COMMAND) | PORT_CMD_SPIN_UP_DEVICE | PORT_CMD_POWER_ON_DEVICE,",
@@ -65,39 +65,27 @@ jobs:
                   "            crate::interrupts::wait_for_timer_tick();",
                   "        }",
                   "",
-                  "        let mut signature_ready = false;",
-                  "        if link_ready {",
-                  "            for _ in 0..100 {",
-                  "                let task_file = self.read(PORT_TASK_FILE_DATA);",
-                  "                let signature = self.read(PORT_SIGNATURE);",
-                  "                if task_file & (PORT_TFD_BUSY | PORT_TFD_DATA_REQUEST) == 0",
-                  "                    && signature != u32::MAX",
-                  "                {",
-                  "                    signature_ready = true;",
-                  "                    break;",
-                  "                }",
-                  "                crate::interrupts::wait_for_timer_tick();",
-                  "            }",
-                  "        }",
-                  "",
-                  "        let sata_status = self.read(PORT_SATA_STATUS);",
-                  "        let signature = self.read(PORT_SIGNATURE);",
                   "        crate::serial_println!(",
                   "            \"AHCI port {}: ssts={:#010x}, sig={:#010x}, cmd={:#010x}, tfd={:#010x}\",",
                   "            self.index,",
-                  "            sata_status,",
-                  "            signature,",
+                  "            self.read(PORT_SATA_STATUS),",
+                  "            self.read(PORT_SIGNATURE),",
                   "            self.read(PORT_COMMAND),",
                   "            self.read(PORT_TASK_FILE_DATA)",
                   "        );",
                   "",
-                  "        link_ready && signature_ready && signature == SATA_DISK_SIGNATURE",
+                  "        link_ready",
                   "    }",
                   "",
               ])
               source = source[:start] + replacement + source[end:]
               source = source.replace(
-                  "const PORT_LINK_SPINS: usize = 2_000_000;\n",
+                  "if port.wake_and_is_sata() {",
+                  "if port.wake_and_has_device() {",
+                  1,
+              )
+              source = source.replace(
+                  "const SATA_DISK_SIGNATURE: u32 = 0x0000_0101;\n",
                   "",
                   1,
               )
@@ -105,13 +93,13 @@ jobs:
           PY
           cargo +nightly-2026-02-01 fmt --all
 
-      - name: Commit AHCI port readiness fix
+      - name: Commit AHCI active-link selection
         run: |
           git config user.name "lotuspetalagent"
           git config user.email "lotuspetalagent@users.noreply.github.com"
           git add kernel/src/drivers/ahci.rs
           if ! git diff --cached --quiet; then
-            git commit -m "Wait for AHCI port signature after COMRESET"
+            git commit -m "Identify devices after AHCI port setup"
             git push origin HEAD:${{ github.head_ref }}
           fi
 
@@ -124,4 +112,15 @@ jobs:
         run: cargo +nightly-2026-02-01 build --locked --quiet
 
       - name: Boot AHCI smoke test in QEMU
-        run: cargo +nightly-2026-02-01 run --locked --quiet -- --test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee ahci-qemu.log
+
+      - name: Upload AHCI smoke-test log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ahci-smoke-log
+          path: ahci-qemu.log
+          if-no-files-found: ignore
