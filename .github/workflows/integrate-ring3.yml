@@ -41,9 +41,9 @@ jobs:
         run: |
           git config user.name "lotuspetalagent"
           git config user.email "lotuspetalagent@users.noreply.github.com"
-          git add Cargo.lock kernel/src/main.rs kernel/src/shell.rs src/main.rs userspace
+          git add Cargo.lock kernel/src src/main.rs userspace
           if ! git diff --cached --quiet; then
-            git commit -m "Integrate first ring 3 process"
+            git commit -m "Format and integrate first ring 3 process"
             git push origin HEAD:${{ github.head_ref }}
           fi
 
