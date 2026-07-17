@@ -1,0 +1,47 @@
+name: Integrate ring 3 userspace
+
+on:
+  push:
+    branches:
+      - agent/ring3-userspace
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/ring3-userspace
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Integrate and format ring 3 support
+        run: |
+          python3 tools/integrate_ring3.py
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 generate-lockfile
+
+      - name: Commit integrated sources
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add Cargo.lock kernel/src/main.rs kernel/src/shell.rs src/main.rs userspace
+          if ! git diff --cached --quiet; then
+            git commit -m "Integrate first ring 3 process"
+            git push origin HEAD:agent/ring3-userspace
+          fi
+
+      - name: Build bootable image
+        run: cargo +nightly-2026-02-01 build --locked
