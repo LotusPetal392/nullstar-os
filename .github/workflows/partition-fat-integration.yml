@@ -1,0 +1,151 @@
+name: Integrate partition and FAT filesystem
+
+on:
+  push:
+    branches:
+      - agent/partition-fat-filesystem
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/partition-fat-filesystem
+
+      - name: Install pinned formatter
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component rustfmt
+
+      - name: Wire storage discovery and shell commands
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main_path = Path("kernel/src/main.rs")
+          main = main_path.read_text()
+          if "partition table initialized:" not in main:
+              main = main.replace(
+                  "mod scheduler;\nmod shell;\n",
+                  "mod scheduler;\nmod shell;\nmod storage;\n",
+                  1,
+              )
+              main = main.replace(
+                  "pub(crate) use memory::allocator;\n",
+                  "pub(crate) use memory::allocator;\npub(crate) use storage::{fat, partition};\n",
+                  1,
+              )
+              storage_block_end = '''    };\n\n    let scheduler_initial = match scheduler::init() {'''
+              storage_integration = '''    };\n\n    let partition_inventory = if storage_info.is_some() {\n        match partition::scan() {\n            Ok(inventory) => {\n                serial_println!(\n                    "partition table initialized: kind={}, partitions={}, protective_mbr={}, header_crc_valid={}, entry_crc_valid={}, truncated={}",\n                    inventory.table_kind,\n                    inventory.partitions().len(),\n                    inventory.protective_mbr,\n                    inventory.header_crc_valid,\n                    inventory.entry_array_crc_valid,\n                    inventory.truncated\n                );\n                for partition in inventory.partitions() {\n                    serial_println!(\n                        "partition: index={}, kind={}, start_lba={}, end_lba={}, blocks={}, bootable={}, name=`{}`",\n                        partition.index,\n                        partition.kind,\n                        partition.start_lba,\n                        partition.end_lba_inclusive(),\n                        partition.block_count,\n                        partition.bootable,\n                        partition.name\n                    );\n                }\n                Some(inventory)\n            }\n            Err(error) => {\n                serial_println!("partition discovery failed: {error}");\n                None\n            }\n        }\n    } else {\n        serial_println!("partition discovery unavailable: AHCI storage is missing");\n        None\n    };\n\n    let filesystem_info = match partition_inventory.as_ref() {\n        Some(partitions) => match fat::init(partitions) {\n            Ok(info) => {\n                let root_entries = fat::list_directory("/").unwrap_or_default();\n                let file_probe = root_entries\n                    .iter()\n                    .find(|entry| !entry.is_directory() && entry.size != 0)\n                    .and_then(|entry| fat::read_file(&entry.name, 64).ok());\n                let probe_bytes = file_probe\n                    .as_ref()\n                    .map(|data| data.bytes.len())\n                    .unwrap_or(0);\n                let probe_checksum = file_probe\n                    .as_ref()\n                    .map(|data| {\n                        data.bytes.iter().copied().fold(0x811c_9dc5_u32, |hash, byte| {\n                            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)\n                        })\n                    })\n                    .unwrap_or(0);\n                serial_println!(\n                    "FAT filesystem mounted: type={}, partition={}, start_lba={}, label=`{}`, sectors={}, cluster_bytes={}, root_entries={}, file_probe_bytes={}, file_probe_checksum={:#010x}",\n                    info.fat_type,\n                    info.partition_index,\n                    info.partition_start_lba,\n                    info.volume_label,\n                    info.total_sectors,\n                    info.bytes_per_cluster,\n                    root_entries.len(),\n                    probe_bytes,\n                    probe_checksum\n                );\n                Some(info)\n            }\n            Err(error) => {\n                serial_println!("FAT filesystem mount failed: {error}");\n                None\n            }\n        },\n        None => {\n            serial_println!("FAT filesystem unavailable: no partition inventory");\n            None\n        }\n    };\n\n    let scheduler_initial = match scheduler::init() {'''
+              if storage_block_end not in main:
+                  raise SystemExit("main storage insertion point not found")
+              main = main.replace(storage_block_end, storage_integration, 1)
+              main = main.replace(
+                  '''    if storage_info.is_some() {\n        println!("AHCI block storage ready");\n    } else {\n        println!("AHCI block storage unavailable");\n    }\n    println!("Interactive shell initialized");''',
+                  '''    if storage_info.is_some() {\n        println!("AHCI block storage ready");\n    } else {\n        println!("AHCI block storage unavailable");\n    }\n    if partition_inventory.is_some() {\n        println!("Partition table discovered");\n    } else {\n        println!("Partition table unavailable");\n    }\n    if filesystem_info.is_some() {\n        println!("Read-only FAT filesystem mounted");\n    } else {\n        println!("FAT filesystem unavailable");\n    }\n    println!("Interactive shell initialized");''',
+                  1,
+              )
+              main = main.replace(
+                  '''        pci_inventory,\n        storage_info,\n    );''',
+                  '''        pci_inventory,\n        storage_info,\n        partition_inventory,\n        filesystem_info,\n    );''',
+                  1,
+              )
+              main_path.write_text(main)
+
+          shell_path = Path("kernel/src/shell.rs")
+          shell = shell_path.read_text()
+          if '"partitions" => self.print_partitions()' not in shell:
+              shell = shell.replace(
+                  "use crate::{acpi, ahci, allocator, console, interrupts, memory, pci};",
+                  "use crate::{acpi, ahci, allocator, console, fat, interrupts, memory, partition, pci};",
+                  1,
+              )
+              shell = shell.replace(
+                  "const DISK_PREVIEW_BYTES: usize = 128;\n",
+                  "const DISK_PREVIEW_BYTES: usize = 128;\nconst FILE_PREVIEW_BYTES: usize = 16 * 1024;\n",
+                  1,
+              )
+              shell = shell.replace(
+                  '''    pci_inventory: Option<pci::Inventory>,\n    storage: Option<ahci::DiskInfo>,\n}''',
+                  '''    pci_inventory: Option<pci::Inventory>,\n    storage: Option<ahci::DiskInfo>,\n    partitions: Option<partition::Inventory>,\n    filesystem: Option<fat::VolumeInfo>,\n}''',
+                  1,
+              )
+              shell = shell.replace(
+                  '''        pci_inventory: Option<pci::Inventory>,\n        storage: Option<ahci::DiskInfo>,\n    ) -> Self {''',
+                  '''        pci_inventory: Option<pci::Inventory>,\n        storage: Option<ahci::DiskInfo>,\n        partitions: Option<partition::Inventory>,\n        filesystem: Option<fat::VolumeInfo>,\n    ) -> Self {''',
+                  1,
+              )
+              shell = shell.replace(
+                  '''            pci_inventory,\n            storage,\n        }''',
+                  '''            pci_inventory,\n            storage,\n            partitions,\n            filesystem,\n        }''',
+                  1,
+              )
+              shell = shell.replace(
+                  '''            "pci" => self.print_pci(),\n            "disk" => self.handle_disk_command(words.next(), words.next()),\n            "about" => {''',
+                  '''            "pci" => self.print_pci(),\n            "disk" => self.handle_disk_command(words.next(), words.next()),\n            "partitions" => self.print_partitions(),\n            "fs" => self.print_filesystem(),\n            "ls" => self.list_files(words.next().unwrap_or("/")),\n            "cat" => {\n                let Some(path) = words.next() else {\n                    shell_println!("usage: cat <path>");\n                    return ShellAction::Continue;\n                };\n                self.cat_file(path);\n            }\n            "about" => {''',
+                  1,
+              )
+              insertion = '''\n    fn print_partitions(&self) {\n        let Some(inventory) = self.system_info.partitions.as_ref() else {\n            shell_println!("partitions: unavailable");\n            return;\n        };\n\n        shell_println!(\n            "partition table: {}, {} partition(s), disk={} blocks x {} bytes",\n            inventory.table_kind,\n            inventory.partitions().len(),\n            inventory.disk_block_count,\n            inventory.disk_block_size\n        );\n        if inventory.table_kind == partition::TableKind::Gpt {\n            shell_println!(\n                "GPT validation: header CRC={}, entry-array CRC={}, protective MBR={}",\n                inventory.header_crc_valid,\n                inventory.entry_array_crc_valid,\n                inventory.protective_mbr\n            );\n        }\n        for entry in inventory.partitions() {\n            shell_println!(\n                "{}: {} LBA {}-{} ({} blocks, {} KiB) bootable={}",\n                entry.index,\n                entry.kind,\n                entry.start_lba,\n                entry.end_lba_inclusive(),\n                entry.block_count,\n                entry\n                    .block_count\n                    .saturating_mul(inventory.disk_block_size as u64)\n                    / 1024,\n                entry.bootable\n            );\n            if !entry.name.is_empty() {\n                shell_println!("  name: `{}`", entry.name);\n            }\n            if let Some(type_guid) = entry.type_guid {\n                shell_println!("  type GUID: {type_guid}");\n            }\n            if let Some(unique_guid) = entry.unique_guid {\n                shell_println!("  unique GUID: {unique_guid}");\n            }\n        }\n        if inventory.truncated {\n            shell_println!("warning: partition inventory reached its configured bound");\n        }\n    }\n\n    fn print_filesystem(&self) {\n        let Some(info) = self.system_info.filesystem.as_ref() else {\n            shell_println!("filesystem: unavailable");\n            return;\n        };\n\n        shell_println!(\n            "filesystem: {} on partition {} at LBA {}",\n            info.fat_type,\n            info.partition_index,\n            info.partition_start_lba\n        );\n        shell_println!(\n            "volume: label=`{}`, id={:#010x}, sectors={}",\n            info.volume_label,\n            info.volume_id,\n            info.total_sectors\n        );\n        shell_println!(\n            "geometry: {} bytes/sector, {} sectors/cluster, {} bytes/cluster",\n            info.bytes_per_sector,\n            info.sectors_per_cluster,\n            info.bytes_per_cluster\n        );\n        shell_println!(\n            "FAT: copies={}, sectors/copy={}, clusters={}, root entries={}",\n            info.fat_count,\n            info.sectors_per_fat,\n            info.cluster_count,\n            info.root_entry_count\n        );\n        shell_println!("mount: read-only at /");\n    }\n\n    fn list_files(&self, path: &str) {\n        if self.system_info.filesystem.is_none() {\n            shell_println!("filesystem: unavailable");\n            return;\n        }\n        let entries = match fat::list_directory(path) {\n            Ok(entries) => entries,\n            Err(error) => {\n                shell_println!("ls: {error}");\n                return;\n            }\n        };\n\n        shell_println!("{}: {} entr{}", path, entries.len(), if entries.len() == 1 { "y" } else { "ies" });\n        for entry in entries {\n            let kind = if entry.is_directory() { "d" } else { "-" };\n            let suffix = if entry.is_directory() { "/" } else { "" };\n            shell_println!(\n                "{}{}{}{} {:>10} {}{}",\n                kind,\n                if entry.is_read_only() { "r" } else { "-" },\n                if entry.is_hidden() { "h" } else { "-" },\n                if entry.is_system() { "s" } else { "-" },\n                entry.size,\n                entry.name,\n                suffix\n            );\n        }\n    }\n\n    fn cat_file(&self, path: &str) {\n        if self.system_info.filesystem.is_none() {\n            shell_println!("filesystem: unavailable");\n            return;\n        }\n        let data = match fat::read_file(path, FILE_PREVIEW_BYTES) {\n            Ok(data) => data,\n            Err(error) => {\n                shell_println!("cat: {error}");\n                return;\n            }\n        };\n\n        shell_println!(\n            "{}: {} bytes{}",\n            path,\n            data.total_size,\n            if data.truncated { " (preview truncated)" } else { "" }\n        );\n        let mut ended_with_newline = true;\n        for byte in data.bytes {\n            match byte {\n                b'\\n' => {\n                    shell_println!();\n                    ended_with_newline = true;\n                }\n                b'\\r' => {}\n                b'\\t' => {\n                    shell_print!("    ");\n                    ended_with_newline = false;\n                }\n                0x20..=0x7e => {\n                    shell_print!("{}", char::from(byte));\n                    ended_with_newline = false;\n                }\n                _ => {\n                    shell_print!(".");\n                    ended_with_newline = false;\n                }\n            }\n        }\n        if !ended_with_newline {\n            shell_println!();\n        }\n        if data.truncated {\n            shell_println!("cat: output limited to {} bytes", FILE_PREVIEW_BYTES);\n        }\n    }\n'''
+              marker = "\n    fn print_interrupts(&self) {"
+              if marker not in shell:
+                  raise SystemExit("shell method insertion point not found")
+              shell = shell.replace(marker, insertion + marker, 1)
+              shell = shell.replace(
+                  '''    shell_println!("  disk             show the AHCI disk");\n    shell_println!("  disk read <lba>  read and preview one logical block");\n    shell_println!("  about            describe GalacticOS");''',
+                  '''    shell_println!("  disk             show the AHCI disk");\n    shell_println!("  disk read <lba>  read and preview one logical block");\n    shell_println!("  partitions       list MBR/GPT partitions");\n    shell_println!("  fs               show the mounted FAT volume");\n    shell_println!("  ls [path]        list a FAT directory");\n    shell_println!("  cat <path>       preview a FAT file");\n    shell_println!("  about            describe GalacticOS");''',
+                  1,
+              )
+              shell_path.write_text(shell)
+
+          runner_path = Path("src/main.rs")
+          runner = runner_path.read_text()
+          if "PARTITION_TEST_MARKER" not in runner:
+              runner = runner.replace(
+                  'const AHCI_TEST_MARKER: &str = "AHCI storage verified:";\n',
+                  'const AHCI_TEST_MARKER: &str = "AHCI storage verified:";\nconst PARTITION_TEST_MARKER: &str = "partition table initialized:";\nconst FAT_TEST_MARKER: &str = "FAT filesystem mounted:";\n',
+                  1,
+              )
+              runner = runner.replace(
+                  "const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(30);",
+                  "const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(45);",
+                  1,
+              )
+              runner = runner.replace(
+                  'println!("  --test      Verify heap, ACPI, LAPIC timer, scheduler, PCIe, and AHCI startup");',
+                  'println!("  --test      Verify heap, ACPI, timers, scheduler, PCIe, AHCI, partitions, and FAT");',
+                  1,
+              )
+              runner = runner.replace(
+                  '''        let mut pcie_ready = false;\n        let mut ahci_ready = false;''',
+                  '''        let mut pcie_ready = false;\n        let mut ahci_ready = false;\n        let mut partitions_ready = false;\n        let mut fat_ready = false;''',
+                  1,
+              )
+              runner = runner.replace(
+                  '''            pcie_ready |= line.contains(PCIE_TEST_MARKER);\n            ahci_ready |= line.contains(AHCI_TEST_MARKER);''',
+                  '''            pcie_ready |= line.contains(PCIE_TEST_MARKER);\n            ahci_ready |= line.contains(AHCI_TEST_MARKER);\n            partitions_ready |= line.contains(PARTITION_TEST_MARKER);\n            fat_ready |= line.contains(FAT_TEST_MARKER);''',
+                  1,
+              )
+              runner = runner.replace(
+                  '''                && pcie_ready\n                && ahci_ready''',
+                  '''                && pcie_ready\n                && ahci_ready\n                && partitions_ready\n                && fat_ready''',
+                  1,
+              )
+              runner_path.write_text(runner)
+          PY
+          cargo +nightly-2026-02-01 fmt --all
+
+      - name: Commit integration
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add kernel/src/main.rs kernel/src/shell.rs kernel/src/storage src/main.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "Integrate partition and FAT filesystem"
+            git push origin HEAD:agent/partition-fat-filesystem
+          fi
