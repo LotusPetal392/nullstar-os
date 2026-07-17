@@ -13,7 +13,8 @@ use x86_64::{
 };
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 1024 * 1024;
+// Leave room for the cached framebuffer, filesystem buffers, and kernel services.
+pub const HEAP_SIZE: usize = 32 * 1024 * 1024;
 pub const HEAP_PAGE_COUNT: usize = HEAP_SIZE / 4096;
 
 #[global_allocator]
