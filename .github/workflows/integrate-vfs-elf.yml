@@ -22,9 +22,11 @@ jobs:
             --component rustfmt
 
       - name: Integrate VFS and ELF support
+        shell: bash
         run: |
-          python3 tools/integrate_vfs_elf.py
-          cargo +nightly-2026-02-01 fmt --all
+          set -o pipefail
+          python3 tools/integrate_vfs_elf.py 2>&1 | tee integration.log
+          cargo +nightly-2026-02-01 fmt --all 2>&1 | tee -a integration.log
 
       - name: Commit integration
         run: |
@@ -35,3 +37,11 @@ jobs:
             git commit -m "Integrate VFS and ELF validation"
             git push origin HEAD:${{ github.head_ref }}
           fi
+
+      - name: Upload integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: vfs-elf-integration-log
+          path: integration.log
+          if-no-files-found: ignore
