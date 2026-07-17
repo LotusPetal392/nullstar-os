@@ -6,8 +6,13 @@ use core::fmt;
 pub trait BlockDevice {
     type Error: fmt::Debug;
 
+    /// Number of bytes in one logical block.
     fn block_size(&self) -> usize;
+
+    /// Total addressable logical blocks.
     fn block_count(&self) -> u64;
+
+    /// Read exactly one logical block into `buffer`.
     fn read_block(
         &mut self,
         logical_block_address: u64,
