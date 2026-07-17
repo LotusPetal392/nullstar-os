@@ -89,7 +89,6 @@ const PRDT_INTERRUPT_ON_COMPLETION: u32 = 1 << 31;
 const BIOS_HANDOFF_SPINS: usize = 10_000_000;
 const HBA_RESET_SPINS: usize = 10_000_000;
 const PORT_TRANSITION_SPINS: usize = 10_000_000;
-const PORT_LINK_SPINS: usize = 2_000_000;
 const PORT_READY_SPINS: usize = 10_000_000;
 const COMMAND_COMPLETION_SPINS: usize = 50_000_000;
 
@@ -385,16 +384,36 @@ impl Port {
             self.read(PORT_COMMAND) | PORT_CMD_SPIN_UP_DEVICE | PORT_CMD_POWER_ON_DEVICE,
         );
 
-        if !self.link_is_active() {
-            let sata_control = self.read(PORT_SATA_CONTROL);
-            self.write(
-                PORT_SATA_CONTROL,
-                (sata_control & !SATA_CONTROL_DETECT_MASK) | SATA_CONTROL_COMRESET,
-            );
+        let sata_control = self.read(PORT_SATA_CONTROL);
+        self.write(
+            PORT_SATA_CONTROL,
+            (sata_control & !SATA_CONTROL_DETECT_MASK) | SATA_CONTROL_COMRESET,
+        );
+        crate::interrupts::wait_for_timer_tick();
+        self.write(PORT_SATA_CONTROL, sata_control & !SATA_CONTROL_DETECT_MASK);
+        self.write(PORT_SATA_ERROR, u32::MAX);
+
+        let mut link_ready = false;
+        for _ in 0..100 {
+            if self.link_is_active() {
+                link_ready = true;
+                break;
+            }
             crate::interrupts::wait_for_timer_tick();
-            self.write(PORT_SATA_CONTROL, sata_control & !SATA_CONTROL_DETECT_MASK);
-            self.write(PORT_SATA_ERROR, u32::MAX);
-            let _ = wait_until(PORT_LINK_SPINS, || self.link_is_active());
+        }
+
+        let mut signature_ready = false;
+        if link_ready {
+            for _ in 0..100 {
+                let task_file = self.read(PORT_TASK_FILE_DATA);
+                let signature = self.read(PORT_SIGNATURE);
+                if task_file & (PORT_TFD_BUSY | PORT_TFD_DATA_REQUEST) == 0 && signature != u32::MAX
+                {
+                    signature_ready = true;
+                    break;
+                }
+                crate::interrupts::wait_for_timer_tick();
+            }
         }
 
         let sata_status = self.read(PORT_SATA_STATUS);
@@ -408,9 +427,8 @@ impl Port {
             self.read(PORT_TASK_FILE_DATA)
         );
 
-        self.link_is_active() && signature == SATA_DISK_SIGNATURE
+        link_ready && signature_ready && signature == SATA_DISK_SIGNATURE
     }
-
     fn link_is_active(self) -> bool {
         let sata_status = self.read(PORT_SATA_STATUS);
         sata_status & 0x0f == SATA_STATUS_DEVICE_PRESENT
