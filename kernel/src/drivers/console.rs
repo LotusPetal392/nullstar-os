@@ -125,10 +125,7 @@ struct FramebufferWriter {
 }
 
 impl FramebufferWriter {
-    fn new(
-        framebuffer: &'static mut [u8],
-        info: FrameBufferInfo,
-    ) -> Result<Self, InitError> {
+    fn new(framebuffer: &'static mut [u8], info: FrameBufferInfo) -> Result<Self, InitError> {
         if info.width == 0
             || info.height == 0
             || info.bytes_per_pixel == 0
@@ -493,22 +490,15 @@ fn verify_shadow_scroll_algorithm() -> bool {
     sample[source] = 0x5a;
     sample[clear_end - 1] = 0xa5;
 
-    scroll_shadow_rows(
-        &mut sample,
-        BYTES_PER_ROW,
-        TOP_ROW,
-        BOTTOM_ROW,
-        SCROLL_ROWS,
-    ) && sample[destination] == 0x5a
+    scroll_shadow_rows(&mut sample, BYTES_PER_ROW, TOP_ROW, BOTTOM_ROW, SCROLL_ROWS)
+        && sample[destination] == 0x5a
         && sample[clear_start..clear_end].iter().all(|byte| *byte == 0)
 }
 
 unsafe fn volatile_copy(destination: *mut u8, source: *const u8, length: usize) {
     let mut offset = 0usize;
 
-    while offset < length
-        && ((destination as usize + offset) & (FLUSH_WORD_BYTES - 1)) != 0
-    {
+    while offset < length && ((destination as usize + offset) & (FLUSH_WORD_BYTES - 1)) != 0 {
         let value = unsafe { ptr::read(source.add(offset)) };
         unsafe { ptr::write_volatile(destination.add(offset), value) };
         offset += 1;
