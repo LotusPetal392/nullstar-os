@@ -16,7 +16,7 @@ _start:
     mov rax, 1
     mov rdi, 1
     lea rsi, [rip + prompt]
-    mov rdx, prompt_end - prompt
+    mov rdx, 5
     int 0x80
 
     mov rax, 5
@@ -70,7 +70,7 @@ _start:
     mov rax, 1
     mov rdi, 1
     lea rsi, [rip + help_message]
-    mov rdx, help_message_end - help_message
+    mov rdx, 40
     int 0x80
     jmp .Lprompt
 
@@ -78,7 +78,7 @@ _start:
     mov rax, 1
     mov rdi, 2
     lea rsi, [rip + spawn_failure]
-    mov rdx, spawn_failure_end - spawn_failure
+    mov rdx, 18
     int 0x80
     jmp .Lprompt
 
@@ -86,7 +86,7 @@ _start:
     mov rax, 1
     mov rdi, 2
     lea rsi, [rip + wait_failure]
-    mov rdx, wait_failure_end - wait_failure
+    mov rdx, 17
     int 0x80
     jmp .Lprompt
 
@@ -108,16 +108,12 @@ _start:
     .section .rodata,"a"
 prompt:
     .ascii "ush> "
-prompt_end:
 help_message:
     .ascii "builtins: help exit\nrun: cat /hello.txt\n"
-help_message_end:
 spawn_failure:
     .ascii "ush: spawn failed\n"
-spawn_failure_end:
 wait_failure:
     .ascii "ush: wait failed\n"
-wait_failure_end:
 "#,
 );
 
