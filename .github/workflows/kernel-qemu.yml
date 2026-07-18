@@ -44,9 +44,46 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Check formatting
+      - name: Capture formatting diagnostics
+        shell: bash
         run: |
-          cargo +nightly-2026-02-01 fmt --all
+          set +e
+          cargo +nightly-2026-02-01 fmt --all > format.log 2>&1
+          status=$?
+          cat format.log
+          printf '%s\n' "$status" > format.status
+          exit 0
+
+      - name: Package transformed product sources
+        shell: bash
+        run: |
+          tar -czf userspace-signals-product.tar.gz \
+            build.rs \
+            kernel/src/main.rs \
+            kernel/src/drivers/keyboard.rs \
+            kernel/src/process/terminal.rs \
+            kernel/src/process/userspace.rs \
+            kernel/src/scheduler.rs \
+            kernel/src/shell.rs \
+            src/main.rs \
+            userspace/Cargo.toml \
+            userspace/src/bin/signal_probe.rs \
+            userspace/src/bin/ush.rs
+
+      - name: Upload transformed sources and formatter output
+        uses: actions/upload-artifact@v6
+        with:
+          name: userspace-signals-diagnostics
+          path: |
+            userspace-signals-product.tar.gz
+            format.log
+            format.status
+          if-no-files-found: error
+
+      - name: Require successful formatting
+        shell: bash
+        run: |
+          test "$(cat format.status)" = 0
           cargo +nightly-2026-02-01 fmt --all -- --check
           git diff --check
 
@@ -63,29 +100,6 @@ jobs:
         run: |
           set -o pipefail
           cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee partition-fat-qemu.log
-
-      - name: Package validated product sources
-        shell: bash
-        run: |
-          tar -czf userspace-signals-product.tar.gz \
-            build.rs \
-            kernel/src/main.rs \
-            kernel/src/drivers/keyboard.rs \
-            kernel/src/process/terminal.rs \
-            kernel/src/process/userspace.rs \
-            kernel/src/scheduler.rs \
-            kernel/src/shell.rs \
-            src/main.rs \
-            userspace/Cargo.toml \
-            userspace/src/bin/signal_probe.rs \
-            userspace/src/bin/ush.rs
-
-      - name: Upload validated product sources
-        uses: actions/upload-artifact@v6
-        with:
-          name: userspace-signals-product
-          path: userspace-signals-product.tar.gz
-          if-no-files-found: error
 
       - name: Upload runtime diagnostics
         if: always()
