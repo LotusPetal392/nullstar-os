@@ -18,7 +18,8 @@ jobs:
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install nightly-2026-02-01 --profile minimal \
-            --component llvm-tools-preview --component rust-src
+            --component llvm-tools-preview --component rust-src \
+            --target x86_64-unknown-none
 
       - name: Build kernel with debug symbols
         run: cargo +nightly-2026-02-01 build --locked
