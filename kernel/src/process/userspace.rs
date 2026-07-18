@@ -45,6 +45,7 @@ const SYSCALL_CLOSE: u64 = 6;
 const SYSCALL_SPAWN_COMMAND: u64 = 7;
 const SYSCALL_WAIT_CHILD: u64 = 8;
 const SYSCALL_GETPID: u64 = 9;
+const SYSCALL_PIPE_PAIR: u64 = 10;
 
 const USER_MIN_ADDRESS: u64 = 0x0001_0000;
 const USER_PML4_SLOT_END: u64 = 0x0000_0080_0000_0000;
@@ -60,6 +61,8 @@ const MAX_ARGUMENTS: usize = 16;
 const MAX_ARGUMENT_BYTES: usize = 4096;
 const MAX_COMMAND_BYTES: usize = 512;
 const SPAWN_FOREGROUND: u64 = 1;
+const SPAWN_USE_DESCRIPTORS: u64 = 1 << 1;
+const DEFAULT_DESCRIPTOR: u64 = u64::MAX;
 const SHELL_PROCESS_TASK_NAME: &str = "user-shell-process";
 const USER_RFLAGS: u64 = 0x202;
 const PAGE_BYTES: u64 = Size4KiB::SIZE;
@@ -304,6 +307,9 @@ pub struct ProcessResult {
     pub blocked_pipe_write_count: u64,
     pub child_spawn_count: u64,
     pub child_wait_count: u64,
+    pub pipe_pair_count: u64,
+    pub pipe_descriptor_close_count: u64,
+    pub pipe_descriptor_inherit_count: u64,
     pub scheduled_count: u64,
     pub runtime_ticks: u64,
     pub frames_reclaimed: usize,
@@ -330,6 +336,8 @@ pub struct ManagerSnapshot {
     pub spawned: u64,
     pub child_spawns: u64,
     pub child_waits: u64,
+    pub pipe_pairs: u64,
+    pub pipe_descriptor_inherits: u64,
     pub active: usize,
     pub blocked: usize,
     pub exited: u64,
@@ -365,6 +373,7 @@ pub enum Error {
     TooManyArguments,
     ArgumentBytesTooLarge,
     InvalidArgument,
+    InvalidDescriptor(u64),
     TerminalBusy,
     Pipe(pipe::Error),
     ProcessNotFound(u64),
@@ -397,6 +406,7 @@ impl Error {
                 "userspace argument strings exceed the configured stack bound"
             }
             Self::InvalidArgument => "userspace argument contains an invalid byte",
+            Self::InvalidDescriptor(_) => "userspace file descriptor is invalid",
             Self::TerminalBusy => "another userspace process owns the terminal",
             Self::Pipe(_) => "kernel pipe operation failed",
             Self::ProcessNotFound(_) => "userspace process bookkeeping is missing",
@@ -422,6 +432,12 @@ impl fmt::Display for Error {
             }
             Self::ProcessNotFound(process_id) => {
                 write!(formatter, "userspace process {process_id} was not found")
+            }
+            Self::InvalidDescriptor(descriptor) => {
+                write!(
+                    formatter,
+                    "userspace file descriptor {descriptor} is invalid"
+                )
             }
             Self::Scheduler(error) => formatter.write_str(error.description()),
             Self::Elf(error) => write!(formatter, "ELF error: {error}"),
@@ -505,6 +521,8 @@ struct PendingChildSpawn {
     path: String,
     arguments: Vec<String>,
     foreground: bool,
+    stdin_descriptor: Option<u64>,
+    stdout_descriptor: Option<u64>,
     stack_pointer: usize,
 }
 
@@ -519,6 +537,19 @@ struct OpenFile {
     descriptor: u64,
     path: String,
     offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeDirection {
+    Reader,
+    Writer,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PipeDescriptor {
+    descriptor: u64,
+    pipe_id: PipeId,
+    direction: PipeDirection,
 }
 
 struct Process {
@@ -539,6 +570,7 @@ struct Process {
     kernel_stack: Box<[u128]>,
     owned_frames: Vec<PhysFrame<Size4KiB>>,
     open_files: Vec<OpenFile>,
+    pipe_descriptors: Vec<PipeDescriptor>,
     stdin_pipe: Option<PipeId>,
     stdout_pipe: Option<PipeId>,
     pending_terminal_read: Option<PendingTerminalRead>,
@@ -565,6 +597,9 @@ struct Process {
     blocked_pipe_write_count: u64,
     child_spawn_count: u64,
     child_wait_count: u64,
+    pipe_pair_count: u64,
+    pipe_descriptor_close_count: u64,
+    pipe_descriptor_inherit_count: u64,
 }
 
 impl Process {
@@ -610,6 +645,9 @@ impl Process {
             blocked_pipe_write_count: self.blocked_pipe_write_count,
             child_spawn_count: self.child_spawn_count,
             child_wait_count: self.child_wait_count,
+            pipe_pair_count: self.pipe_pair_count,
+            pipe_descriptor_close_count: self.pipe_descriptor_close_count,
+            pipe_descriptor_inherit_count: self.pipe_descriptor_inherit_count,
             scheduled_count,
             runtime_ticks,
             frames_reclaimed,
@@ -624,6 +662,8 @@ struct ProcessManager {
     spawned: u64,
     child_spawns: u64,
     child_waits: u64,
+    pipe_pairs: u64,
+    pipe_descriptor_inherits: u64,
     exited: u64,
     faulted: u64,
     reaped: u64,
@@ -639,6 +679,8 @@ impl ProcessManager {
             spawned: 0,
             child_spawns: 0,
             child_waits: 0,
+            pipe_pairs: 0,
+            pipe_descriptor_inherits: 0,
             exited: 0,
             faulted: 0,
             reaped: 0,
@@ -671,6 +713,8 @@ impl ProcessManager {
             spawned: self.spawned,
             child_spawns: self.child_spawns,
             child_waits: self.child_waits,
+            pipe_pairs: self.pipe_pairs,
+            pipe_descriptor_inherits: self.pipe_descriptor_inherits,
             active: self
                 .processes
                 .iter()
@@ -741,6 +785,51 @@ unsafe impl FrameAllocator<Size4KiB> for TrackingFrameAllocator<'_> {
         self.frames.push(frame);
         Some(frame)
     }
+}
+
+fn descriptor_in_use(process: &Process, descriptor: u64) -> bool {
+    process
+        .open_files
+        .iter()
+        .any(|file| file.descriptor == descriptor)
+        || process
+            .pipe_descriptors
+            .iter()
+            .any(|pipe| pipe.descriptor == descriptor)
+}
+
+fn descriptor_count(process: &Process) -> usize {
+    process
+        .open_files
+        .len()
+        .saturating_add(process.pipe_descriptors.len())
+}
+
+fn allocate_descriptor(process: &Process) -> Option<u64> {
+    (3..3 + MAX_OPEN_FILES as u64).find(|descriptor| !descriptor_in_use(process, *descriptor))
+}
+
+fn allocate_descriptor_pair(process: &Process) -> Option<(u64, u64)> {
+    let mut available = (3..3 + MAX_OPEN_FILES as u64)
+        .filter(|descriptor| !descriptor_in_use(process, *descriptor));
+    Some((available.next()?, available.next()?))
+}
+
+fn resolve_pipe_descriptor(
+    process: &Process,
+    descriptor: Option<u64>,
+    direction: PipeDirection,
+) -> Result<Option<PipeId>, Error> {
+    descriptor
+        .map(|descriptor| {
+            process
+                .pipe_descriptors
+                .iter()
+                .find(|pipe| pipe.descriptor == descriptor && pipe.direction == direction)
+                .map(|pipe| pipe.pipe_id)
+                .ok_or(Error::InvalidDescriptor(descriptor))
+        })
+        .transpose()
 }
 
 impl BuiltAddressSpace {
@@ -1041,6 +1130,7 @@ fn spawn_with_mode(
         kernel_stack,
         owned_frames: core::mem::take(&mut address_space.owned_frames),
         open_files: Vec::new(),
+        pipe_descriptors: Vec::new(),
         stdin_pipe,
         stdout_pipe,
         pending_terminal_read: None,
@@ -1067,6 +1157,9 @@ fn spawn_with_mode(
         blocked_pipe_write_count: 0,
         child_spawn_count: 0,
         child_wait_count: 0,
+        pipe_pair_count: 0,
+        pipe_descriptor_close_count: 0,
+        pipe_descriptor_inherit_count: 0,
     });
 
     let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
@@ -1264,24 +1357,90 @@ impl Runtime {
         parent_process_id: u64,
         request: &PendingChildSpawn,
     ) -> Result<SpawnInfo, Error> {
-        let image = elf::validate(&request.path)?;
+        let (stdin_pipe, stdout_pipe) = cpu_interrupts::without_interrupts(|| {
+            let manager = PROCESS_MANAGER.lock();
+            let parent = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == parent_process_id)
+                .ok_or(Error::ProcessNotFound(parent_process_id))?;
+            Ok::<_, Error>((
+                resolve_pipe_descriptor(parent, request.stdin_descriptor, PipeDirection::Reader)?,
+                resolve_pipe_descriptor(parent, request.stdout_descriptor, PipeDirection::Writer)?,
+            ))
+        })?;
+
+        if let Some(pipe_id) = stdin_pipe {
+            pipe::retain_reader(pipe_id)?;
+        }
+        if let Some(pipe_id) = stdout_pipe {
+            if let Err(error) = pipe::retain_writer(pipe_id) {
+                if let Some(stdin_pipe) = stdin_pipe {
+                    let _ = pipe::close_reader(stdin_pipe);
+                }
+                return Err(error.into());
+            }
+        }
+
+        let image = match elf::validate(&request.path) {
+            Ok(image) => image,
+            Err(error) => {
+                if let Some(pipe_id) = stdin_pipe {
+                    let _ = pipe::close_reader(pipe_id);
+                }
+                if let Some(pipe_id) = stdout_pipe {
+                    let _ = pipe::close_writer(pipe_id);
+                }
+                return Err(error.into());
+            }
+        };
         let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
         argv.push(request.path.as_str());
         argv.extend(request.arguments.iter().map(String::as_str));
-        spawn_with_mode(
+        let result = spawn_with_mode(
             &request.path,
             SHELL_PROCESS_TASK_NAME,
             &image,
             &argv,
             request.foreground,
-            None,
-            None,
+            stdin_pipe,
+            stdout_pipe,
             Some(parent_process_id),
             request.foreground.then_some(parent_process_id),
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
-        )
+        );
+
+        if result.is_err() {
+            if let Some(pipe_id) = stdin_pipe {
+                let _ = pipe::close_reader(pipe_id);
+            }
+            if let Some(pipe_id) = stdout_pipe {
+                let _ = pipe::close_writer(pipe_id);
+            }
+            return result;
+        }
+
+        let inherited = u64::from(stdin_pipe.is_some()) + u64::from(stdout_pipe.is_some());
+        if inherited > 0 {
+            cpu_interrupts::without_interrupts(|| {
+                let mut manager = PROCESS_MANAGER.lock();
+                let updated = if let Some(parent) = manager.process_mut(parent_process_id) {
+                    parent.pipe_descriptor_inherit_count = parent
+                        .pipe_descriptor_inherit_count
+                        .saturating_add(inherited);
+                    true
+                } else {
+                    false
+                };
+                if updated {
+                    manager.pipe_descriptor_inherits =
+                        manager.pipe_descriptor_inherits.saturating_add(inherited);
+                }
+            });
+        }
+        result
     }
 
     pub fn wait(&mut self, process_id: u64) -> Result<ProcessResult, Error> {
@@ -1587,6 +1746,16 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
         if let Some(pipe_id) = process.stdout_pipe.take() {
             let _ = pipe::close_writer(pipe_id);
         }
+        for descriptor in process.pipe_descriptors.drain(..) {
+            match descriptor.direction {
+                PipeDirection::Reader => {
+                    let _ = pipe::close_reader(descriptor.pipe_id);
+                }
+                PipeDirection::Writer => {
+                    let _ = pipe::close_writer(descriptor.pipe_id);
+                }
+            }
+        }
         let frames_reclaimed = process.owned_frames.len();
         for frame in process.owned_frames.drain(..) {
             frame_allocator.deallocate_frame(frame);
@@ -1693,6 +1862,8 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             registers.rdi,
             registers.rsi,
             registers.rdx,
+            registers.r10,
+            registers.r8,
             current_stack_pointer,
         ) {
             ControlOutcome::Ready(result) => {
@@ -1712,6 +1883,10 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
         }
         SYSCALL_GETPID => {
             registers.rax = process_id;
+            current_stack_pointer
+        }
+        SYSCALL_PIPE_PAIR => {
+            registers.rax = syscall_pipe_pair(process_id);
             current_stack_pointer
         }
         SYSCALL_EXIT => {
@@ -1874,9 +2049,11 @@ fn syscall_spawn_command(
     address: u64,
     length: u64,
     flags: u64,
+    stdin_descriptor: u64,
+    stdout_descriptor: u64,
     current_stack_pointer: usize,
 ) -> ControlOutcome {
-    if flags & !SPAWN_FOREGROUND != 0 {
+    if flags & !(SPAWN_FOREGROUND | SPAWN_USE_DESCRIPTORS) != 0 {
         return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
     }
     let command = match user_text(process_id, address, length, MAX_COMMAND_BYTES) {
@@ -1887,10 +2064,21 @@ fn syscall_spawn_command(
         Ok(command) => command,
         Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
+    let use_descriptors = flags & SPAWN_USE_DESCRIPTORS != 0;
+    let stdin_descriptor =
+        (use_descriptors && stdin_descriptor != DEFAULT_DESCRIPTOR).then_some(stdin_descriptor);
+    let stdout_descriptor =
+        (use_descriptors && stdout_descriptor != DEFAULT_DESCRIPTOR).then_some(stdout_descriptor);
+
     let mut manager = PROCESS_MANAGER.lock();
     let Some(process) = manager.process_mut(process_id) else {
         return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
     };
+    if resolve_pipe_descriptor(process, stdin_descriptor, PipeDirection::Reader).is_err()
+        || resolve_pipe_descriptor(process, stdout_descriptor, PipeDirection::Writer).is_err()
+    {
+        return ControlOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+    }
     if process.pending_child_spawn.is_some() || process.pending_child_wait.is_some() {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -1898,10 +2086,70 @@ fn syscall_spawn_command(
         path,
         arguments,
         foreground: flags & SPAWN_FOREGROUND != 0,
+        stdin_descriptor,
+        stdout_descriptor,
         stack_pointer: current_stack_pointer,
     });
     process.state = ProcessState::Blocked;
     ControlOutcome::Blocked
+}
+
+fn syscall_pipe_pair(process_id: u64) -> u64 {
+    let descriptor_pair = {
+        let manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+        else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        };
+        if descriptor_count(process).saturating_add(2) > MAX_OPEN_FILES {
+            return error_return(ERR_TOO_MANY_OPEN_FILES);
+        }
+        let Some(pair) = allocate_descriptor_pair(process) else {
+            return error_return(ERR_TOO_MANY_OPEN_FILES);
+        };
+        pair
+    };
+
+    let pipe_id = match pipe::create_pair() {
+        Ok(pipe_id) => pipe_id,
+        Err(_) => return error_return(ERR_IO),
+    };
+    let (reader_descriptor, writer_descriptor) = descriptor_pair;
+    let inserted = {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        };
+        if descriptor_in_use(process, reader_descriptor)
+            || descriptor_in_use(process, writer_descriptor)
+        {
+            false
+        } else {
+            process.pipe_descriptors.push(PipeDescriptor {
+                descriptor: reader_descriptor,
+                pipe_id,
+                direction: PipeDirection::Reader,
+            });
+            process.pipe_descriptors.push(PipeDescriptor {
+                descriptor: writer_descriptor,
+                pipe_id,
+                direction: PipeDirection::Writer,
+            });
+            process.pipe_pair_count = process.pipe_pair_count.saturating_add(1);
+            true
+        }
+    };
+    if !inserted {
+        let _ = pipe::discard_pair(pipe_id);
+        return error_return(ERR_TOO_MANY_OPEN_FILES);
+    }
+    let mut manager = PROCESS_MANAGER.lock();
+    manager.pipe_pairs = manager.pipe_pairs.saturating_add(1);
+    drop(manager);
+    reader_descriptor | (writer_descriptor << 32)
 }
 
 fn syscall_wait_child(
@@ -1994,6 +2242,13 @@ enum WriteOutcome {
     Blocked,
 }
 
+#[derive(Clone, Copy)]
+enum WriteTarget {
+    Console,
+    Pipe(PipeId),
+    Invalid,
+}
+
 fn syscall_write(
     process_id: u64,
     file_descriptor: u64,
@@ -2001,9 +2256,6 @@ fn syscall_write(
     length: u64,
     current_stack_pointer: usize,
 ) -> WriteOutcome {
-    if file_descriptor != 1 && file_descriptor != 2 {
-        return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
-    }
     let Ok(length) = usize::try_from(length) else {
         return WriteOutcome::Ready(error_return(ERR_ARGUMENT_TOO_LARGE));
     };
@@ -2014,64 +2266,78 @@ fn syscall_write(
         return WriteOutcome::Ready(0);
     }
 
-    let (readable, stdout_pipe) = PROCESS_MANAGER
+    let (readable, target) = PROCESS_MANAGER
         .lock()
         .processes
         .iter()
         .find(|process| process.process_id == process_id)
         .map(|process| {
-            (
-                process
-                    .ranges
+            let readable = process
+                .ranges
+                .iter()
+                .any(|range| range.readable && range.contains(address, length));
+            let target = match file_descriptor {
+                1 => process
+                    .stdout_pipe
+                    .map(WriteTarget::Pipe)
+                    .unwrap_or(WriteTarget::Console),
+                2 => WriteTarget::Console,
+                descriptor if descriptor >= 3 => process
+                    .pipe_descriptors
                     .iter()
-                    .any(|range| range.readable && range.contains(address, length)),
-                process.stdout_pipe,
-            )
+                    .find(|pipe| pipe.descriptor == descriptor)
+                    .map(|pipe| match pipe.direction {
+                        PipeDirection::Writer => WriteTarget::Pipe(pipe.pipe_id),
+                        PipeDirection::Reader => WriteTarget::Invalid,
+                    })
+                    .unwrap_or(WriteTarget::Invalid),
+                _ => WriteTarget::Invalid,
+            };
+            (readable, target)
         })
-        .unwrap_or((false, None));
+        .unwrap_or((false, WriteTarget::Invalid));
     if !readable {
         return WriteOutcome::Ready(error_return(ERR_BAD_ADDRESS));
     }
+    if matches!(target, WriteTarget::Invalid) {
+        return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+    }
 
     let bytes = unsafe { slice::from_raw_parts(address as *const u8, length) };
-    if file_descriptor == 1 {
-        if let Some(pipe_id) = stdout_pipe {
-            return match pipe::write(pipe_id, bytes) {
-                Ok(pipe::WriteOutcome::Written(count)) => {
-                    let mut manager = PROCESS_MANAGER.lock();
-                    if let Some(process) = manager.process_mut(process_id) {
-                        process.write_count = process.write_count.saturating_add(1);
-                        process.bytes_written = process.bytes_written.saturating_add(count as u64);
-                        process.pipe_write_count = process.pipe_write_count.saturating_add(1);
-                        process.pipe_bytes_written =
-                            process.pipe_bytes_written.saturating_add(count as u64);
-                    }
-                    WriteOutcome::Ready(count as u64)
+    if let WriteTarget::Pipe(pipe_id) = target {
+        return match pipe::write(pipe_id, bytes) {
+            Ok(pipe::WriteOutcome::Written(count)) => {
+                let mut manager = PROCESS_MANAGER.lock();
+                if let Some(process) = manager.process_mut(process_id) {
+                    process.write_count = process.write_count.saturating_add(1);
+                    process.bytes_written = process.bytes_written.saturating_add(count as u64);
+                    process.pipe_write_count = process.pipe_write_count.saturating_add(1);
+                    process.pipe_bytes_written =
+                        process.pipe_bytes_written.saturating_add(count as u64);
                 }
-                Ok(pipe::WriteOutcome::Full) => {
-                    let mut manager = PROCESS_MANAGER.lock();
-                    let Some(process) = manager.process_mut(process_id) else {
-                        return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
-                    };
-                    process.pending_pipe_write = Some(PendingPipeWrite {
-                        pipe_id,
-                        address,
-                        length,
-                        stack_pointer: current_stack_pointer,
-                    });
-                    process.state = ProcessState::Blocked;
-                    process.blocked_pipe_write_count =
-                        process.blocked_pipe_write_count.saturating_add(1);
-                    drop(manager);
-                    let _ = pipe::note_blocked_write(pipe_id);
-                    WriteOutcome::Blocked
-                }
-                Ok(pipe::WriteOutcome::NoReaders) => {
-                    WriteOutcome::Ready(error_return(ERR_BROKEN_PIPE))
-                }
-                Err(_) => WriteOutcome::Ready(error_return(ERR_IO)),
-            };
-        }
+                WriteOutcome::Ready(count as u64)
+            }
+            Ok(pipe::WriteOutcome::Full) => {
+                let mut manager = PROCESS_MANAGER.lock();
+                let Some(process) = manager.process_mut(process_id) else {
+                    return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+                };
+                process.pending_pipe_write = Some(PendingPipeWrite {
+                    pipe_id,
+                    address,
+                    length,
+                    stack_pointer: current_stack_pointer,
+                });
+                process.state = ProcessState::Blocked;
+                process.blocked_pipe_write_count =
+                    process.blocked_pipe_write_count.saturating_add(1);
+                drop(manager);
+                let _ = pipe::note_blocked_write(pipe_id);
+                WriteOutcome::Blocked
+            }
+            Ok(pipe::WriteOutcome::NoReaders) => WriteOutcome::Ready(error_return(ERR_BROKEN_PIPE)),
+            Err(_) => WriteOutcome::Ready(error_return(ERR_IO)),
+        };
     }
 
     if let Ok(text) = str::from_utf8(bytes) {
@@ -2153,20 +2419,12 @@ fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
     let Some(process) = manager.process_mut(process_id) else {
         return error_return(ERR_BAD_FILE_DESCRIPTOR);
     };
-    if process.open_files.len() >= MAX_OPEN_FILES {
+    if descriptor_count(process) >= MAX_OPEN_FILES {
         return error_return(ERR_TOO_MANY_OPEN_FILES);
     }
-    let descriptor = (3..3 + MAX_OPEN_FILES as u64)
-        .find(|descriptor| {
-            !process
-                .open_files
-                .iter()
-                .any(|file| file.descriptor == *descriptor)
-        })
-        .unwrap_or(3 + MAX_OPEN_FILES as u64);
-    if descriptor >= 3 + MAX_OPEN_FILES as u64 {
+    let Some(descriptor) = allocate_descriptor(process) else {
         return error_return(ERR_TOO_MANY_OPEN_FILES);
-    }
+    };
     process.open_files.push(OpenFile {
         descriptor,
         path: metadata.path,
@@ -2212,6 +2470,33 @@ fn syscall_read(
     }
     if descriptor < 3 {
         return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+    }
+
+    let pipe_descriptor = {
+        let manager = PROCESS_MANAGER.lock();
+        manager
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+            .and_then(|process| {
+                process
+                    .pipe_descriptors
+                    .iter()
+                    .find(|pipe| pipe.descriptor == descriptor)
+                    .copied()
+            })
+    };
+    if let Some(pipe_descriptor) = pipe_descriptor {
+        if pipe_descriptor.direction != PipeDirection::Reader {
+            return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+        }
+        return syscall_pipe_read(
+            process_id,
+            pipe_descriptor.pipe_id,
+            address,
+            length,
+            current_stack_pointer,
+        );
     }
 
     let (path, offset) = {
@@ -2545,20 +2830,43 @@ fn syscall_close(process_id: u64, descriptor: u64) -> u64 {
     if descriptor < 3 {
         return error_return(ERR_BAD_FILE_DESCRIPTOR);
     }
-    let mut manager = PROCESS_MANAGER.lock();
-    let Some(process) = manager.process_mut(process_id) else {
-        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+
+    let pipe_descriptor = {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        };
+        if let Some(index) = process
+            .pipe_descriptors
+            .iter()
+            .position(|pipe| pipe.descriptor == descriptor)
+        {
+            let descriptor = process.pipe_descriptors.remove(index);
+            process.close_count = process.close_count.saturating_add(1);
+            process.pipe_descriptor_close_count =
+                process.pipe_descriptor_close_count.saturating_add(1);
+            descriptor
+        } else if let Some(index) = process
+            .open_files
+            .iter()
+            .position(|file| file.descriptor == descriptor)
+        {
+            process.open_files.remove(index);
+            process.close_count = process.close_count.saturating_add(1);
+            return 0;
+        } else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        }
     };
-    let Some(index) = process
-        .open_files
-        .iter()
-        .position(|file| file.descriptor == descriptor)
-    else {
-        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+
+    let result = match pipe_descriptor.direction {
+        PipeDirection::Reader => pipe::close_reader(pipe_descriptor.pipe_id),
+        PipeDirection::Writer => pipe::close_writer(pipe_descriptor.pipe_id),
     };
-    process.open_files.remove(index);
-    process.close_count = process.close_count.saturating_add(1);
-    0
+    match result {
+        Ok(()) => 0,
+        Err(_) => error_return(ERR_IO),
+    }
 }
 
 fn vfs_errno(error: &vfs::Error) -> i64 {

@@ -14,6 +14,7 @@ static PIPE_MANAGER: Mutex<PipeManager> = Mutex::new(PipeManager::new());
 pub enum Error {
     TooManyPipes,
     NotFound(PipeId),
+    EndpointCountOverflow(PipeId),
 }
 
 impl fmt::Display for Error {
@@ -21,6 +22,9 @@ impl fmt::Display for Error {
         match self {
             Self::TooManyPipes => formatter.write_str("the kernel pipe limit was reached"),
             Self::NotFound(pipe_id) => write!(formatter, "pipe {pipe_id} was not found"),
+            Self::EndpointCountOverflow(pipe_id) => {
+                write!(formatter, "pipe {pipe_id} endpoint count overflowed")
+            }
         }
     }
 }
@@ -45,6 +49,8 @@ pub struct PipeSnapshot {
     pub buffered_bytes: usize,
     pub readers: usize,
     pub writers: usize,
+    pub reader_retains: u64,
+    pub writer_retains: u64,
     pub read_calls: u64,
     pub write_calls: u64,
     pub bytes_read: u64,
@@ -60,6 +66,8 @@ pub struct Snapshot {
     pub active_pipes: usize,
     pub total_created: u64,
     pub total_destroyed: u64,
+    pub total_reader_retains: u64,
+    pub total_writer_retains: u64,
     pub total_read_calls: u64,
     pub total_write_calls: u64,
     pub total_bytes_read: u64,
@@ -76,6 +84,8 @@ struct Pipe {
     buffer: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    reader_retains: u64,
+    writer_retains: u64,
     read_calls: u64,
     write_calls: u64,
     bytes_read: u64,
@@ -93,6 +103,8 @@ impl Pipe {
             buffer: VecDeque::with_capacity(PIPE_CAPACITY_BYTES),
             readers: 1,
             writers: 1,
+            reader_retains: 0,
+            writer_retains: 0,
             read_calls: 0,
             write_calls: 0,
             bytes_read: 0,
@@ -110,6 +122,8 @@ impl Pipe {
             buffered_bytes: self.buffer.len(),
             readers: self.readers,
             writers: self.writers,
+            reader_retains: self.reader_retains,
+            writer_retains: self.writer_retains,
             read_calls: self.read_calls,
             write_calls: self.write_calls,
             bytes_read: self.bytes_read,
@@ -127,6 +141,8 @@ struct PipeManager {
     pipes: Vec<Pipe>,
     total_created: u64,
     total_destroyed: u64,
+    total_reader_retains: u64,
+    total_writer_retains: u64,
     total_read_calls: u64,
     total_write_calls: u64,
     total_bytes_read: u64,
@@ -144,6 +160,8 @@ impl PipeManager {
             pipes: Vec::new(),
             total_created: 0,
             total_destroyed: 0,
+            total_reader_retains: 0,
+            total_writer_retains: 0,
             total_read_calls: 0,
             total_write_calls: 0,
             total_bytes_read: 0,
@@ -171,6 +189,37 @@ impl PipeManager {
             .iter_mut()
             .find(|pipe| pipe.id == pipe_id)
             .ok_or(Error::NotFound(pipe_id))
+    }
+
+    fn pipe_index(&self, pipe_id: PipeId) -> Result<usize, Error> {
+        self.pipes
+            .iter()
+            .position(|pipe| pipe.id == pipe_id)
+            .ok_or(Error::NotFound(pipe_id))
+    }
+
+    fn retain_reader(&mut self, pipe_id: PipeId) -> Result<(), Error> {
+        let index = self.pipe_index(pipe_id)?;
+        let readers = self.pipes[index]
+            .readers
+            .checked_add(1)
+            .ok_or(Error::EndpointCountOverflow(pipe_id))?;
+        self.pipes[index].readers = readers;
+        self.pipes[index].reader_retains = self.pipes[index].reader_retains.saturating_add(1);
+        self.total_reader_retains = self.total_reader_retains.saturating_add(1);
+        Ok(())
+    }
+
+    fn retain_writer(&mut self, pipe_id: PipeId) -> Result<(), Error> {
+        let index = self.pipe_index(pipe_id)?;
+        let writers = self.pipes[index]
+            .writers
+            .checked_add(1)
+            .ok_or(Error::EndpointCountOverflow(pipe_id))?;
+        self.pipes[index].writers = writers;
+        self.pipes[index].writer_retains = self.pipes[index].writer_retains.saturating_add(1);
+        self.total_writer_retains = self.total_writer_retains.saturating_add(1);
+        Ok(())
     }
 
     fn close_reader(&mut self, pipe_id: PipeId) -> Result<(), Error> {
@@ -208,13 +257,6 @@ impl PipeManager {
         self.pipes.remove(index);
         self.total_destroyed = self.total_destroyed.saturating_add(1);
         Ok(())
-    }
-
-    fn pipe_index(&self, pipe_id: PipeId) -> Result<usize, Error> {
-        self.pipes
-            .iter()
-            .position(|pipe| pipe.id == pipe_id)
-            .ok_or(Error::NotFound(pipe_id))
     }
 
     fn read(&mut self, pipe_id: PipeId, maximum: usize) -> Result<ReadOutcome, Error> {
@@ -300,6 +342,8 @@ impl PipeManager {
             active_pipes: self.pipes.len(),
             total_created: self.total_created,
             total_destroyed: self.total_destroyed,
+            total_reader_retains: self.total_reader_retains,
+            total_writer_retains: self.total_writer_retains,
             total_read_calls: self.total_read_calls,
             total_write_calls: self.total_write_calls,
             total_bytes_read: self.total_bytes_read,
@@ -320,6 +364,18 @@ pub fn create_pair() -> Result<PipeId, Error> {
 pub fn discard_pair(pipe_id: PipeId) -> Result<(), Error> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         PIPE_MANAGER.lock().discard_pair(pipe_id)
+    })
+}
+
+pub fn retain_reader(pipe_id: PipeId) -> Result<(), Error> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        PIPE_MANAGER.lock().retain_reader(pipe_id)
+    })
+}
+
+pub fn retain_writer(pipe_id: PipeId) -> Result<(), Error> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        PIPE_MANAGER.lock().retain_writer(pipe_id)
     })
 }
 
