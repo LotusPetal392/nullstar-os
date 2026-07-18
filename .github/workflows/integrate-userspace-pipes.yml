@@ -1,0 +1,54 @@
+name: Integrate userspace pipes
+
+on:
+  push:
+    branches:
+      - agent/userspace-pipes
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-pipes
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Apply userspace pipe milestone
+        run: |
+          python3 tools/apply_pipe_model.py
+          python3 tools/apply_pipe_syscalls.py
+          python3 tools/apply_pipe_integration.py
+          python3 tools/apply_pipe_runner.py
+
+      - name: Format sources
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Generate workspace lockfile
+        run: cargo +nightly-2026-02-01 generate-lockfile
+
+      - name: Commit integrated sources
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add Cargo.lock build.rs kernel/src src/main.rs userspace
+          if ! git diff --cached --quiet; then
+            git commit -m "Add blocking userspace pipes"
+            git push origin HEAD:agent/userspace-pipes
+          fi
+
+      - name: Build bootable image
+        run: cargo +nightly-2026-02-01 build --locked
