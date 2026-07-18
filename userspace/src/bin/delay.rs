@@ -3,6 +3,7 @@
 
 use core::{arch::global_asm, panic::PanicInfo};
 
+// Keep the probe alive across prompt recovery without making the smoke test slow.
 global_asm!(
     r#"
     .equ DELAY_YIELDS, 64
