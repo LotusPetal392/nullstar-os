@@ -1,60 +1,106 @@
-name: Diagnose double fault address
+name: Apply bootstrap stack overflow fix
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
+      - agent/multistage-userspace-pipelines
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  addr2line:
+  apply-fix:
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out repository
+      - name: Check out branch
         uses: actions/checkout@v7
+        with:
+          ref: agent/multistage-userspace-pipelines
+
+      - name: Increase and validate the bootstrap kernel stack
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("kernel/src/main.rs")
+          source = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one match, found {count}: {old!r}")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              "const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;\n",
+              "const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;\n"
+              "// The interactive kernel shell synchronously services userspace process-control\n"
+              "// requests on the bootstrap stack, so reserve explicit headroom beyond the\n"
+              "// bootloader's 80 KiB default.\n"
+              "const BOOTSTRAP_KERNEL_STACK_SIZE: u64 = 256 * 1024;\n",
+          )
+          replace_once(
+              "    config.mappings.physical_memory = Some(Mapping::Dynamic);\n    config\n",
+              "    config.mappings.physical_memory = Some(Mapping::Dynamic);\n"
+              "    config.kernel_stack_size = BOOTSTRAP_KERNEL_STACK_SIZE;\n"
+              "    config\n",
+          )
+          replace_once(
+              "    let rsdp_address = boot_info.rsdp_addr.into_option();\n\n    let mut mapper",
+              "    let rsdp_address = boot_info.rsdp_addr.into_option();\n"
+              "    let bootstrap_stack_bottom = boot_info.kernel_stack_bottom;\n"
+              "    let bootstrap_stack_len = boot_info.kernel_stack_len;\n"
+              "    let Some(bootstrap_stack_top) =\n"
+              "        bootstrap_stack_bottom.checked_add(bootstrap_stack_len)\n"
+              "    else {\n"
+              "        serial_println!(\"bootstrap kernel stack address overflowed\");\n"
+              "        hlt_loop();\n"
+              "    };\n"
+              "    if bootstrap_stack_len < BOOTSTRAP_KERNEL_STACK_SIZE {\n"
+              "        serial_println!(\n"
+              "            \"bootstrap kernel stack is too small: configured={}, provided={}\",\n"
+              "            BOOTSTRAP_KERNEL_STACK_SIZE,\n"
+              "            bootstrap_stack_len\n"
+              "        );\n"
+              "        hlt_loop();\n"
+              "    }\n"
+              "    serial_println!(\n"
+              "        \"bootstrap kernel stack initialized: bottom={:#x}, top={:#x}, bytes={}\",\n"
+              "        bootstrap_stack_bottom,\n"
+              "        bootstrap_stack_top,\n"
+              "        bootstrap_stack_len\n"
+              "    );\n\n"
+              "    let mut mapper",
+          )
+
+          path.write_text(source)
+          Path(".github/workflows/diagnose-double-fault.yml").unlink()
 
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install nightly-2026-02-01 --profile minimal \
-            --component llvm-tools-preview --component rust-src \
+            --component llvm-tools-preview --component rust-src --component rustfmt \
             --target x86_64-unknown-none
 
-      - name: Build kernel with debug symbols
-        run: cargo +nightly-2026-02-01 build --locked
-
-      - name: Capture reported double-fault address mapping
-        shell: bash
+      - name: Format and validate the product tree
         run: |
-          set -uo pipefail
-          toolchain=$(rustc +nightly-2026-02-01 --print sysroot)
-          addr2line=$(find "$toolchain" -type f -name llvm-addr2line | head -n 1)
-          nm=$(find "$toolchain" -type f -name llvm-nm | head -n 1)
-          objdump=$(find "$toolchain" -type f -name llvm-objdump | head -n 1)
-          {
-            echo "toolchain=$toolchain"
-            echo "addr2line=$addr2line"
-            echo "nm=$nm"
-            echo "objdump=$objdump"
-            echo "candidate files:"
-            find target -type f \( -name 'kernel' -o -name 'kernel-*' \) -print
-            while IFS= read -r candidate; do
-              if file "$candidate" | grep -q 'ELF 64-bit'; then
-                echo
-                echo "=== $candidate ==="
-                file "$candidate"
-                "$addr2line" -f -C -e "$candidate" 0xaac24 || true
-                "$nm" -n -C "$candidate" 2>/dev/null | awk '$1 >= "00000000000aa900" && $1 <= "00000000000aaf00" { print }' || true
-                "$objdump" -d -C --start-address=0xaab40 --stop-address=0xaad20 "$candidate" 2>/dev/null || true
-              fi
-            done < <(find target -type f \( -name 'kernel' -o -name 'kernel-*' \) -print)
-          } > double-fault-symbols.txt 2>&1
-          cat double-fault-symbols.txt
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
 
-      - name: Upload address diagnostics
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: double-fault-symbols
-          path: double-fault-symbols.txt
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+
+      - name: Build and boot the full smoke test
+        run: cargo +nightly-2026-02-01 run --locked -- --test
+
+      - name: Commit and push the fix
+        run: |
+          git config user.name lotuspetalagent
+          git config user.email lotuspetalagent@users.noreply.github.com
+          git add kernel/src/main.rs .github/workflows/diagnose-double-fault.yml
+          git commit -m "Increase bootstrap kernel stack"
+          git push origin HEAD:agent/multistage-userspace-pipelines
