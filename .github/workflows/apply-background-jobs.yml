@@ -1,9 +1,9 @@
 name: Apply userspace background jobs
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/userspace-background-jobs
+      - main
 
 permissions:
   contents: write
