@@ -71,4 +71,5 @@ jobs:
           path: |
             userspace-pipelines-apply.log
             userspace-pipelines-build.log
+            tools/userspace_pipelines_payload.txt
           if-no-files-found: error
