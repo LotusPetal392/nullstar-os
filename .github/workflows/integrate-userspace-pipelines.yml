@@ -28,7 +28,12 @@ jobs:
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
       - name: Apply userspace descriptor pipeline milestone
-        run: python3 tools/apply_userspace_pipelines.py
+        run: |
+          if grep -q '^const SYSCALL_PIPE_PAIR: u64 = 10;$' kernel/src/process/userspace.rs; then
+            echo "userspace descriptor pipeline milestone already integrated"
+          else
+            python3 tools/apply_userspace_pipelines.py
+          fi
 
       - name: Format sources
         run: cargo +nightly-2026-02-01 fmt --all
