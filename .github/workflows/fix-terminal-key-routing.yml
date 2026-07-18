@@ -1,0 +1,41 @@
+name: Fix foreground terminal key routing
+
+on:
+  push:
+    branches:
+      - agent/userspace-terminal
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-terminal
+
+      - name: Install pinned Rust formatter
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component rustfmt
+
+      - name: Route late keys to the foreground process
+        run: python3 tools/fix_terminal_key_routing.py
+
+      - name: Format sources
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Commit fix
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add kernel/src/process/terminal.rs kernel/src/process/userspace.rs kernel/src/shell.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "Route late keys to foreground userspace"
+            git push origin HEAD:agent/userspace-terminal
+          fi
