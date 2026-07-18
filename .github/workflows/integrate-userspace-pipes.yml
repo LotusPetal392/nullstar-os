@@ -39,8 +39,10 @@ jobs:
       - name: Format sources
         run: cargo +nightly-2026-02-01 fmt --all
 
-      - name: Generate workspace lockfile
-        run: cargo +nightly-2026-02-01 generate-lockfile
+      - name: Restore pinned dependency lockfile
+        run: |
+          git fetch origin main --depth=1
+          git checkout origin/main -- Cargo.lock
 
       - name: Commit integrated sources
         run: |
@@ -48,7 +50,7 @@ jobs:
           git config user.email "lotuspetalagent@users.noreply.github.com"
           git add Cargo.lock build.rs kernel/src src/main.rs userspace
           if ! git diff --cached --quiet; then
-            git commit -m "Add blocking userspace pipes"
+            git commit -m "Preserve pinned userspace pipe dependencies"
             git push origin HEAD:agent/userspace-pipes
           fi
 
