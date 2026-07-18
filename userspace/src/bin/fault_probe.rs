@@ -3,6 +3,7 @@
 
 use core::{arch::global_asm, panic::PanicInfo};
 
+// This process deliberately faults so the kernel can verify per-process exception isolation.
 global_asm!(
     r#"
     .section .text._start,"ax"
@@ -12,37 +13,22 @@ global_asm!(
 _start:
     mov rax, 1
     mov rdi, 1
-    lea rsi, [rip + first_message]
-    mov rdx, 29
+    lea rsi, [rip + fault_message]
+    mov rdx, 43
     int 0x80
 
-    mov rcx, 50000000
-.Linit_busy:
-    pause
-    dec rcx
-    jnz .Linit_busy
-
-    mov rax, 2
-    int 0x80
-
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [rip + second_message]
-    mov rdx, 31
-    int 0x80
+    mov rax, 0x00000000dead0000
+    mov rbx, qword ptr [rax]
 
     mov rax, 3
-    mov rdi, 42
+    mov rdi, 99
     int 0x80
-
     ud2
 .size _start, .-_start
 
     .section .rodata,"a"
-first_message:
-    .ascii "userspace: hello from ring 3\n"
-second_message:
-    .ascii "userspace: resumed after yield\n"
+fault_message:
+    .ascii "fault-probe: touching an unmapped page now\n"
 "#,
 );
 

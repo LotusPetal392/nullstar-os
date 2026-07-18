@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind, MemoryRegions};
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -39,12 +41,19 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 }
 
 /// Allocates unique 4 KiB frames from regions the bootloader marks as usable.
+///
+/// Returned process frames can be recycled after a task has stopped running and
+/// its address space has been detached from CR3. The allocator remains single-
+/// owner: callers must continue to use the one instance created during boot.
 pub struct BootInfoFrameAllocator {
     memory_regions: &'static [MemoryRegion],
     next_region: usize,
     next_frame_address: u64,
     allocated_frames: u64,
     usable_frames: u64,
+    recycled_frames: Vec<PhysFrame<Size4KiB>>,
+    reclaimed_frames: u64,
+    reused_frames: u64,
 }
 
 impl BootInfoFrameAllocator {
@@ -65,6 +74,9 @@ impl BootInfoFrameAllocator {
             next_frame_address: 0,
             allocated_frames: 0,
             usable_frames,
+            recycled_frames: Vec::new(),
+            reclaimed_frames: 0,
+            reused_frames: 0,
         }
     }
 
@@ -80,10 +92,34 @@ impl BootInfoFrameAllocator {
         self.usable_frames.saturating_sub(self.allocated_frames)
     }
 
+    pub fn recycled_frame_count(&self) -> usize {
+        self.recycled_frames.len()
+    }
+
+    pub fn reclaimed_frame_count(&self) -> u64 {
+        self.reclaimed_frames
+    }
+
+    pub fn reused_frame_count(&self) -> u64 {
+        self.reused_frames
+    }
+
+    /// Returns a frame to the allocator after every mapping that references it
+    /// has been removed and the frame is no longer reachable through an active
+    /// CR3. Process reaping is the first caller of this interface.
+    pub fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        debug_assert!(
+            !self.recycled_frames.contains(&frame),
+            "physical frame was returned to the allocator twice"
+        );
+        self.recycled_frames.push(frame);
+        self.allocated_frames = self.allocated_frames.saturating_sub(1);
+        self.reclaimed_frames = self.reclaimed_frames.saturating_add(1);
+    }
+
     fn next_usable_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         loop {
             let region = self.memory_regions.get(self.next_region)?;
-
             let Some((region_start, region_end)) = usable_frame_bounds(region) else {
                 self.advance_region();
                 continue;
@@ -96,7 +132,6 @@ impl BootInfoFrameAllocator {
             if self.next_frame_address < region_end {
                 let frame_address = self.next_frame_address;
                 self.next_frame_address = frame_address.saturating_add(FRAME_SIZE);
-                self.allocated_frames = self.allocated_frames.saturating_add(1);
 
                 return Some(PhysFrame::containing_address(PhysAddr::new(frame_address)));
             }
@@ -113,7 +148,14 @@ impl BootInfoFrameAllocator {
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        self.next_usable_frame()
+        let frame = if let Some(frame) = self.recycled_frames.pop() {
+            self.reused_frames = self.reused_frames.saturating_add(1);
+            frame
+        } else {
+            self.next_usable_frame()?
+        };
+        self.allocated_frames = self.allocated_frames.saturating_add(1);
+        Some(frame)
     }
 }
 

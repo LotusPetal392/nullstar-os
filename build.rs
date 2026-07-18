@@ -11,10 +11,15 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_init")
             .expect("userspace init artifact path was not set"),
     );
+    let userspace_fault_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_fault_probe")
+            .expect("userspace fault-probe artifact path was not set"),
+    );
 
     let bios_image = output_directory.join("galactic-os-bios.img");
     let mut image = bootloader::DiskImageBuilder::new(kernel_binary);
     image.set_file(String::from("init"), userspace_init);
+    image.set_file(String::from("fault-probe"), userspace_fault_probe);
     image
         .create_bios_image(&bios_image)
         .expect("failed to create BIOS disk image");

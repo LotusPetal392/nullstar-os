@@ -18,8 +18,8 @@ const PARTITION_TEST_MARKER: &str = "partition table initialized:";
 const FAT_TEST_MARKER: &str = "FAT filesystem mounted:";
 const VFS_TEST_MARKER: &str = "VFS initialized:";
 const ELF_TEST_MARKER: &str = "ELF image validated:";
-const USERSPACE_TEST_MARKER: &str = "userspace process exited: path=/init, exit_code=42";
-const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const USERSPACE_TEST_MARKER: &str = "process isolation verified:";
+const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Default)]
 struct Options {
@@ -70,7 +70,9 @@ fn parse_options() -> Result<Options, ExitCode> {
 fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
-    println!("  --test      Verify hardware, storage, VFS, ELF, and the first ring-3 process");
+    println!(
+        "  --test      Verify hardware, storage, VFS, ELF, process scheduling, and fault isolation"
+    );
 }
 
 fn qemu_command(options: &Options) -> Command {

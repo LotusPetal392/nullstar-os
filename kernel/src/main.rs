@@ -376,43 +376,145 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler_verified.probe_b_heartbeats
     );
 
-    let userspace_result = match elf::validate("/init") {
-        Ok(init_image) => match userspace::run(
-            "/init",
-            &init_image,
-            &mut mapper,
-            &mut frame_allocator,
-            physical_memory_offset,
-        ) {
-            Ok(result) => {
-                serial_println!(
-                    "userspace process exited: path={}, exit_code={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, load_segments={}, user_stack_bytes={}, guard_page={:#018x}, kernel_stack_bytes={}, syscalls={}, writes={}, yields={}, bytes_written={}",
-                    result.path,
-                    result.exit_code,
-                    result.entry_point,
-                    result.page_table_address,
-                    result.mapped_pages,
-                    result.load_segments,
-                    result.user_stack_bytes,
-                    result.guard_page_address,
-                    result.kernel_stack_bytes,
-                    result.syscall_count,
-                    result.write_count,
-                    result.yield_count,
-                    result.bytes_written
-                );
-                Some(result)
-            }
-            Err(error) => {
-                serial_println!("userspace process failed: {error}");
-                None
-            }
-        },
+    let process_frame_baseline = frame_allocator.allocated_frame_count();
+    let init_image = match elf::validate("/init") {
+        Ok(image) => image,
         Err(error) => {
             serial_println!("userspace init validation failed: {error}");
-            None
+            hlt_loop();
         }
     };
+    let fault_image = match elf::validate("/fault-probe") {
+        Ok(image) => image,
+        Err(error) => {
+            serial_println!("userspace fault-probe validation failed: {error}");
+            hlt_loop();
+        }
+    };
+
+    let init_spawn = match userspace::spawn(
+        "/init",
+        "user-init",
+        &init_image,
+        &mut mapper,
+        &mut frame_allocator,
+        physical_memory_offset,
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            serial_println!("failed to spawn /init: {error}");
+            hlt_loop();
+        }
+    };
+    serial_println!(
+        "userspace process spawned: pid={}, task={}, path={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, owned_frames={}",
+        init_spawn.process_id,
+        init_spawn.task_id,
+        init_spawn.path,
+        init_spawn.entry_point,
+        init_spawn.page_table_address,
+        init_spawn.mapped_pages,
+        init_spawn.owned_frames
+    );
+
+    let fault_spawn = match userspace::spawn(
+        "/fault-probe",
+        "user-fault-probe",
+        &fault_image,
+        &mut mapper,
+        &mut frame_allocator,
+        physical_memory_offset,
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            serial_println!("failed to spawn /fault-probe: {error}");
+            hlt_loop();
+        }
+    };
+    serial_println!(
+        "userspace process spawned: pid={}, task={}, path={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, owned_frames={}",
+        fault_spawn.process_id,
+        fault_spawn.task_id,
+        fault_spawn.path,
+        fault_spawn.entry_point,
+        fault_spawn.page_table_address,
+        fault_spawn.mapped_pages,
+        fault_spawn.owned_frames
+    );
+
+    let process_snapshot = userspace::wait_for_all(&mut frame_allocator, 2);
+    let process_frame_after = frame_allocator.allocated_frame_count();
+    for result in &process_snapshot.results {
+        serial_println!(
+            "process result: pid={}, task={}, path={}, termination={}, schedules={}, runtime_ticks={}, syscalls={}, writes={}, yields={}, bytes_written={}, frames_reclaimed={}",
+            result.process_id,
+            result.task_id,
+            result.path,
+            result.termination,
+            result.scheduled_count,
+            result.runtime_ticks,
+            result.syscall_count,
+            result.write_count,
+            result.yield_count,
+            result.bytes_written,
+            result.frames_reclaimed
+        );
+    }
+
+    let init_result = process_snapshot
+        .results
+        .iter()
+        .find(|result| result.path == "/init");
+    let fault_result = process_snapshot
+        .results
+        .iter()
+        .find(|result| result.path == "/fault-probe");
+    let init_valid = init_result
+        .map(|result| {
+            result.exit_code() == Some(42)
+                && result.scheduled_count >= 2
+                && result.runtime_ticks > 0
+        })
+        .unwrap_or(false);
+    let fault_valid = fault_result
+        .and_then(|result| result.fault())
+        .map(|fault| fault.vector == 14 && fault.address == 0x0000_0000_dead_0000)
+        .unwrap_or(false);
+    let frame_balance = process_frame_after == process_frame_baseline;
+    let process_verified = process_snapshot.spawned == 2
+        && process_snapshot.exited == 1
+        && process_snapshot.faulted == 1
+        && process_snapshot.reaped == 2
+        && init_valid
+        && fault_valid
+        && frame_balance;
+    if !process_verified {
+        serial_println!(
+            "process isolation verification failed: spawned={}, active={}, exited={}, faulted={}, reaped={}, baseline_frames={}, final_frames={}, init_valid={}, fault_valid={}",
+            process_snapshot.spawned,
+            process_snapshot.active,
+            process_snapshot.exited,
+            process_snapshot.faulted,
+            process_snapshot.reaped,
+            process_frame_baseline,
+            process_frame_after,
+            init_valid,
+            fault_valid
+        );
+        hlt_loop();
+    }
+    let init_result = init_result.expect("validated init result disappeared");
+    serial_println!(
+        "process isolation verified: spawned={}, exited={}, faulted={}, reaped={}, frames_reclaimed={}, frame_balance={}, init_schedules={}, init_runtime_ticks={}",
+        process_snapshot.spawned,
+        process_snapshot.exited,
+        process_snapshot.faulted,
+        process_snapshot.reaped,
+        process_snapshot.frames_reclaimed,
+        frame_balance,
+        init_result.scheduled_count,
+        init_result.runtime_ticks
+    );
 
     println!("GalacticOS");
     println!("-------------");
@@ -465,10 +567,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         println!("ELF64 validation unavailable");
     }
-    if userspace_result.is_some() {
-        println!("First ring-3 process exited");
+    if process_verified {
+        println!("Process scheduling and fault isolation verified");
     } else {
-        println!("Ring-3 process unavailable");
+        println!("Userspace process verification unavailable");
     }
     println!("Interactive shell initialized");
 
@@ -490,6 +592,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         allocator::HEAP_PAGE_COUNT,
         allocated_frames,
         remaining_frames
+    );
+    serial_println!(
+        "physical frame recycling: reclaimed={}, recycled={}, reused={}",
+        frame_allocator.reclaimed_frame_count(),
+        frame_allocator.recycled_frame_count(),
+        frame_allocator.reused_frame_count()
     );
     serial_println!("framebuffer console initialized");
     serial_println!("preemptive scheduler initialized");
