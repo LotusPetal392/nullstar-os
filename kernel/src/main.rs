@@ -551,6 +551,62 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cat_result.bytes_read
     );
 
+    const TERMINAL_TEST_LINE: &str = "hello from canonical stdin";
+    let terminal_spawn = match userspace_runtime.spawn_foreground("/readline", &[]) {
+        Ok(info) => info,
+        Err(error) => {
+            serial_println!("userspace terminal validation spawn failed: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) = userspace_runtime.wait_until_blocked(terminal_spawn.process_id) {
+        serial_println!("userspace terminal did not block: {error}");
+        hlt_loop();
+    }
+    let blocked_scheduler = scheduler::snapshot();
+    let blocked_terminal = userspace_runtime.terminal_snapshot();
+    if let Err(error) = userspace_runtime.inject_terminal_line(TERMINAL_TEST_LINE) {
+        serial_println!("userspace terminal injection failed: {error}");
+        hlt_loop();
+    }
+    let terminal_result = match userspace_runtime.wait(terminal_spawn.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace terminal wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    let terminal_snapshot = userspace_runtime.terminal_snapshot();
+    let expected_terminal_bytes = TERMINAL_TEST_LINE.len().saturating_add(1) as u64;
+    let terminal_verified = terminal_result.exit_code() == Some(0)
+        && terminal_result.terminal_read_count == 1
+        && terminal_result.terminal_bytes_read == expected_terminal_bytes
+        && terminal_result.blocked_read_count >= 1
+        && blocked_scheduler.blocked_task_count >= 1
+        && terminal_snapshot.wakeups > blocked_terminal.wakeups
+        && terminal_snapshot.foreground_process.is_none();
+    if !terminal_verified {
+        serial_println!(
+            "userspace terminal verification failed: exit={:?}, reads={}, bytes={}, blocked_reads={}, scheduler_blocked={}, wakeups_before={}, wakeups_after={}, foreground={:?}",
+            terminal_result.exit_code(),
+            terminal_result.terminal_read_count,
+            terminal_result.terminal_bytes_read,
+            terminal_result.blocked_read_count,
+            blocked_scheduler.blocked_task_count,
+            blocked_terminal.wakeups,
+            terminal_snapshot.wakeups,
+            terminal_snapshot.foreground_process
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace terminal verified: pid={}, blocked_reads={}, wakeups={}, bytes_read={}, exit_code=0",
+        terminal_result.process_id,
+        terminal_result.blocked_read_count,
+        terminal_snapshot.wakeups,
+        terminal_result.terminal_bytes_read
+    );
+
     println!("GalacticOS");
     println!("-------------");
     println!();
@@ -611,6 +667,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace file descriptors verified");
     } else {
         println!("Userspace file descriptors unavailable");
+    }
+    if terminal_verified {
+        println!("Blocking userspace terminal verified");
+    } else {
+        println!("Userspace terminal unavailable");
     }
     println!("Interactive shell initialized");
 

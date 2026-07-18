@@ -20,6 +20,7 @@ const VFS_TEST_MARKER: &str = "VFS initialized:";
 const ELF_TEST_MARKER: &str = "ELF image validated:";
 const USERSPACE_TEST_MARKER: &str = "process isolation verified:";
 const USER_FILE_IO_TEST_MARKER: &str = "userspace file I/O verified:";
+const USER_TERMINAL_TEST_MARKER: &str = "userspace terminal verified:";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Default)]
@@ -72,7 +73,7 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify hardware, storage, VFS, process isolation, and userspace file I/O"
+        "  --test      Verify hardware, storage, VFS, process isolation, file I/O, and terminal input"
     );
 }
 
@@ -140,6 +141,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut elf_ready = false;
         let mut userspace_ready = false;
         let mut user_file_io_ready = false;
+        let mut user_terminal_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -159,6 +161,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             elf_ready |= line.contains(ELF_TEST_MARKER);
             userspace_ready |= line.contains(USERSPACE_TEST_MARKER);
             user_file_io_ready |= line.contains(USER_FILE_IO_TEST_MARKER);
+            user_terminal_ready |= line.contains(USER_TERMINAL_TEST_MARKER);
 
             if heap_ready
                 && framebuffer_ready
@@ -173,6 +176,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && elf_ready
                 && userspace_ready
                 && user_file_io_ready
+                && user_terminal_ready
             {
                 let _ = marker_sender.send(());
                 break;

@@ -106,12 +106,19 @@ impl Shell {
     }
 
     pub fn poll(&mut self) {
-        if let Err(error) = self.runtime.reap() {
-            crate::serial_println!("background process reap failed: {error}");
+        if let Err(error) = self.runtime.poll() {
+            crate::serial_println!("userspace runtime poll failed: {error}");
         }
     }
 
     pub fn handle_key(&mut self, key: DecodedKey) -> ShellAction {
+        if self.runtime.terminal_active() {
+            if let Err(error) = self.runtime.handle_terminal_key(key) {
+                crate::serial_println!("terminal key routing failed: {error}");
+            }
+            return ShellAction::Continue;
+        }
+
         match key {
             DecodedKey::Unicode(character) => self.handle_character(character),
             DecodedKey::RawKey(key_code) => self.handle_raw_key(key_code),
@@ -232,6 +239,7 @@ impl Shell {
                 self.inspect_elf(path);
             }
             "process" | "userspace" => self.print_userspace(),
+            "terminal" | "tty" => self.print_terminal(),
             "spawn" | "run" => {
                 let Some(path) = words.next() else {
                     shell_println!("usage: {command} <path> [arguments...]");
@@ -636,17 +644,19 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, active={}, exited={}, faulted={}, reaped={}",
+            "process manager: spawned={}, active={}, blocked={}, exited={}, faulted={}, reaped={}",
             snapshot.spawned,
             snapshot.active,
+            snapshot.blocked,
             snapshot.exited,
             snapshot.faulted,
             snapshot.reaped
         );
         shell_println!(
-            "resources: frames reclaimed={}, scheduler users={}, zombies={}, address-space switches={}",
+            "resources: frames reclaimed={}, scheduler users={}, blocked={}, zombies={}, address-space switches={}",
             snapshot.frames_reclaimed,
             scheduler.user_task_count,
+            scheduler.blocked_task_count,
             scheduler.zombie_task_count,
             scheduler.address_space_switches
         );
@@ -679,7 +689,7 @@ impl Shell {
                 result.guard_page_address
             );
             shell_println!(
-                "  syscalls: total={}, writes={}, yields={}, bytes={}; open/read/close={}/{}/{}, file bytes={}; frames reclaimed={}",
+                "  syscalls: total={}, writes={}, yields={}, bytes={}; open/read/close={}/{}/{}, file bytes={}",
                 result.syscall_count,
                 result.write_count,
                 result.yield_count,
@@ -687,7 +697,13 @@ impl Shell {
                 result.open_count,
                 result.read_count,
                 result.close_count,
-                result.bytes_read,
+                result.bytes_read
+            );
+            shell_println!(
+                "  terminal: reads={}, bytes={}, blocked reads={}; frames reclaimed={}",
+                result.terminal_read_count,
+                result.terminal_bytes_read,
+                result.blocked_read_count,
                 result.frames_reclaimed
             );
             if let Some(fault) = result.fault() {
@@ -700,6 +716,29 @@ impl Shell {
                 );
             }
         }
+    }
+
+    fn print_terminal(&self) {
+        let terminal = self.runtime.terminal_snapshot();
+        shell_println!(
+            "terminal: foreground={:?}, editing={} bytes, committed={} bytes",
+            terminal.foreground_process,
+            terminal.editing_bytes,
+            terminal.committed_bytes
+        );
+        shell_println!(
+            "input: keys={}, lines={}, bytes={}, dropped={}, injected={}",
+            terminal.keys_received,
+            terminal.lines_committed,
+            terminal.bytes_committed,
+            terminal.dropped_bytes,
+            terminal.injected_lines
+        );
+        shell_println!(
+            "blocking: reads={}, wakeups={}",
+            terminal.blocked_reads,
+            terminal.wakeups
+        );
     }
 
     fn print_interrupts(&self) {
@@ -993,11 +1032,17 @@ fn print_process_result(result: &userspace::ProcessResult) {
         result.yield_count
     );
     shell_println!(
-        "  files: opens={}, reads={}, closes={}, bytes read={}; frames reclaimed={}",
+        "  files: opens={}, reads={}, closes={}, bytes read={}",
         result.open_count,
         result.read_count,
         result.close_count,
-        result.bytes_read,
+        result.bytes_read
+    );
+    shell_println!(
+        "  terminal: reads={}, bytes={}, blocked reads={}; frames reclaimed={}",
+        result.terminal_read_count,
+        result.terminal_bytes_read,
+        result.blocked_read_count,
         result.frames_reclaimed
     );
     if let Some(fault) = result.fault() {
@@ -1039,9 +1084,10 @@ fn print_help() {
     shell_println!("  cat <path>       preview a VFS file");
     shell_println!("  elf <path>       validate an ELF64 executable");
     shell_println!("  process          show process scheduling and fault results");
+    shell_println!("  terminal         show canonical terminal and wakeup statistics");
     shell_println!("  spawn <path> [args...]  launch a userspace process");
     shell_println!("  wait <pid>       wait for and reap a userspace process");
-    shell_println!("  run <path> [args...]    launch and wait for a process");
+    shell_println!("  run <path> [args...]    run in the foreground with stdin");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }
