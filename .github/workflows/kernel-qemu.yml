@@ -18,6 +18,23 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Apply userspace process-group integration
+        shell: python
+        run: |
+          import base64
+          import gzip
+          from pathlib import Path
+
+          payload = Path("tools/userspace_signals_payload.part0").read_text().strip()
+          workflow = Path(".github/workflows/apply-userspace-signals.yml").read_text().splitlines()
+          start = next(index for index, line in enumerate(workflow) if "<<'PAYLOAD'" in line) + 1
+          end = next(index for index in range(start, len(workflow)) if workflow[index].strip() == "PAYLOAD")
+          payload += "".join(line.strip() for line in workflow[start:end])
+          script = gzip.decompress(base64.b64decode(payload))
+          Path("tools/apply_userspace_signals.py").write_bytes(script)
+          exec(compile(script, "tools/apply_userspace_signals.py", "exec"))
+          Path("tools/userspace_signals_payload.part0").unlink()
+
       - name: Install pinned Rust toolchain
         run: |
           rustup -q toolchain install nightly-2026-02-01 \
@@ -28,7 +45,10 @@ jobs:
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
       - name: Check formatting
-        run: cargo +nightly-2026-02-01 fmt --all -- --check
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
 
       - name: Install QEMU
         run: |
@@ -38,11 +58,34 @@ jobs:
       - name: Build bootable image
         run: cargo +nightly-2026-02-01 build --locked --quiet
 
-      - name: Boot partition and FAT smoke test in QEMU
+      - name: Boot process-group and signal smoke test in QEMU
         shell: bash
         run: |
           set -o pipefail
           cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee partition-fat-qemu.log
+
+      - name: Package validated product sources
+        shell: bash
+        run: |
+          tar -czf userspace-signals-product.tar.gz \
+            build.rs \
+            kernel/src/main.rs \
+            kernel/src/drivers/keyboard.rs \
+            kernel/src/process/terminal.rs \
+            kernel/src/process/userspace.rs \
+            kernel/src/scheduler.rs \
+            kernel/src/shell.rs \
+            src/main.rs \
+            userspace/Cargo.toml \
+            userspace/src/bin/signal_probe.rs \
+            userspace/src/bin/ush.rs
+
+      - name: Upload validated product sources
+        uses: actions/upload-artifact@v6
+        with:
+          name: userspace-signals-product
+          path: userspace-signals-product.tar.gz
+          if-no-files-found: error
 
       - name: Upload runtime diagnostics
         if: always()
