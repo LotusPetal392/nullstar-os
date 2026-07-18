@@ -26,10 +26,15 @@ pub(crate) use process::{elf, userspace};
 pub(crate) use storage::{fat, partition};
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
+// The interactive kernel shell synchronously services userspace process-control
+// requests on the bootstrap stack, so reserve explicit headroom beyond the
+// bootloader's 80 KiB default.
+const BOOTSTRAP_KERNEL_STACK_SIZE: u64 = 256 * 1024;
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.kernel_stack_size = BOOTSTRAP_KERNEL_STACK_SIZE;
     config
 };
 
@@ -49,6 +54,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .unwrap_or(0)
         .max(BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END);
     let rsdp_address = boot_info.rsdp_addr.into_option();
+    let bootstrap_stack_bottom = boot_info.kernel_stack_bottom;
+    let bootstrap_stack_len = boot_info.kernel_stack_len;
+    let Some(bootstrap_stack_top) = bootstrap_stack_bottom.checked_add(bootstrap_stack_len) else {
+        serial_println!("bootstrap kernel stack address overflowed");
+        hlt_loop();
+    };
+    if bootstrap_stack_len < BOOTSTRAP_KERNEL_STACK_SIZE {
+        serial_println!(
+            "bootstrap kernel stack is too small: configured={}, provided={}",
+            BOOTSTRAP_KERNEL_STACK_SIZE,
+            bootstrap_stack_len
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "bootstrap kernel stack initialized: bottom={:#x}, top={:#x}, bytes={}",
+        bootstrap_stack_bottom,
+        bootstrap_stack_top,
+        bootstrap_stack_len
+    );
 
     let mut mapper = unsafe { memory::init(physical_memory_offset) };
     let mut frame_allocator =
