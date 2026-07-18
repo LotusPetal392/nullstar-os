@@ -653,6 +653,78 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pipe_after.total_reader_wakeups
     );
 
+    let userspace_shell = match userspace_runtime.spawn_foreground("/ush", &[]) {
+        Ok(info) => info,
+        Err(error) => {
+            serial_println!("userspace shell validation spawn failed: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not reach its prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("cat /hello.txt") {
+        serial_println!("userspace shell command injection failed: {error}");
+        hlt_loop();
+    }
+    let shell_child =
+        match userspace_runtime.wait_for_child_path(userspace_shell.process_id, "/cat") {
+            Ok(result) => result,
+            Err(error) => {
+                serial_println!("userspace shell child wait failed: {error}");
+                hlt_loop();
+            }
+        };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not regain its prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("exit") {
+        serial_println!("userspace shell exit injection failed: {error}");
+        hlt_loop();
+    }
+    let userspace_shell_result = match userspace_runtime.wait(userspace_shell.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace shell wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
+        && userspace_shell_result.child_spawn_count == 1
+        && userspace_shell_result.child_wait_count == 1
+        && shell_child.parent_process_id == Some(userspace_shell.process_id)
+        && shell_child.exit_code() == Some(0)
+        && shell_child.open_count == 1
+        && shell_child.bytes_read > 0
+        && userspace_runtime
+            .terminal_snapshot()
+            .foreground_process
+            .is_none();
+    if !userspace_shell_verified {
+        serial_println!(
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            userspace_shell_result.exit_code(),
+            userspace_shell_result.child_spawn_count,
+            userspace_shell_result.child_wait_count,
+            shell_child.parent_process_id,
+            shell_child.exit_code(),
+            shell_child.open_count,
+            shell_child.bytes_read,
+            userspace_runtime.terminal_snapshot().foreground_process
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, child_exit=0, child_bytes={}",
+        userspace_shell_result.process_id,
+        shell_child.process_id,
+        userspace_shell_result.child_spawn_count,
+        userspace_shell_result.child_wait_count,
+        shell_child.bytes_read
+    );
+
     println!("GalacticOS");
     println!("-------------");
     println!();
@@ -723,6 +795,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Blocking userspace pipes verified");
     } else {
         println!("Userspace pipes unavailable");
+    }
+    if userspace_shell_verified {
+        println!("Userspace process-control shell verified");
+    } else {
+        println!("Userspace process-control shell unavailable");
     }
     println!("Interactive shell initialized");
 

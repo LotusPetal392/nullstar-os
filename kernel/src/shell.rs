@@ -242,6 +242,7 @@ impl Shell {
             "terminal" | "tty" => self.print_terminal(),
             "pipes" => self.print_pipes(),
             "pipe" => self.run_pipeline(command_line),
+            "ush" => self.run_process("/ush", &[]),
             "spawn" | "run" => {
                 let Some(path) = words.next() else {
                     shell_println!("usage: {command} <path> [arguments...]");
@@ -680,8 +681,10 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, active={}, blocked={}, exited={}, faulted={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, active={}, blocked={}, exited={}, faulted={}, reaped={}",
             snapshot.spawned,
+            snapshot.child_spawns,
+            snapshot.child_waits,
             snapshot.active,
             snapshot.blocked,
             snapshot.exited,
@@ -703,8 +706,9 @@ impl Shell {
 
         for result in &snapshot.results {
             shell_println!(
-                "pid={} task={} `{}`: {}",
+                "pid={} parent={:?} task={} `{}`: {}",
                 result.process_id,
+                result.parent_process_id,
                 result.task_id,
                 result.path,
                 result.termination
@@ -742,13 +746,15 @@ impl Shell {
                 result.blocked_read_count
             );
             shell_println!(
-                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; frames reclaimed={}",
+                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; children: spawns={}, waits={}; frames reclaimed={}",
                 result.pipe_read_count,
                 result.pipe_write_count,
                 result.pipe_bytes_read,
                 result.pipe_bytes_written,
                 result.blocked_pipe_read_count,
                 result.blocked_pipe_write_count,
+                result.child_spawn_count,
+                result.child_wait_count,
                 result.frames_reclaimed
             );
             if let Some(fault) = result.fault() {
@@ -1174,6 +1180,7 @@ fn print_help() {
     shell_println!("  terminal         show canonical terminal and wakeup statistics");
     shell_println!("  pipes            show pipe buffers, blocking, and wakeups");
     shell_println!("  pipe <a> | <b>   run a userspace pipeline");
+    shell_println!("  ush              launch the userspace command shell");
     shell_println!("  spawn <path> [args...]  launch a userspace process");
     shell_println!("  wait <pid>       wait for and reap a userspace process");
     shell_println!("  run <path> [args...]    run in the foreground with stdin");

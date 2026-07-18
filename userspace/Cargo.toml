@@ -39,3 +39,9 @@ name = "pipe_consumer"
 path = "src/bin/pipe_consumer.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "ush"
+path = "src/bin/ush.rs"
+test = false
+bench = false
