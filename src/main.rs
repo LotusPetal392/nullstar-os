@@ -26,6 +26,7 @@ const USER_SHELL_TEST_MARKER: &str = "userspace shell verified:";
 const USER_PIPELINE_OUTPUT_MARKER: &str = "HELLO THROUGH A BLOCKING GALACTICOS PIPE.";
 const USER_PIPELINE_TEST_MARKER: &str = "userspace multi-stage pipeline verified:";
 const USER_BACKGROUND_TEST_MARKER: &str = "userspace background jobs verified:";
+const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals verified:";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Default)]
@@ -78,7 +79,7 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify hardware, storage, VFS, process control, terminal input, and multi-stage userspace pipelines"
+        "  --test      Verify hardware, storage, VFS, process control, pipelines, background jobs, and signals"
     );
 }
 
@@ -152,6 +153,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut user_pipeline_output_ready = false;
         let mut user_pipeline_ready = false;
         let mut user_background_ready = false;
+        let mut user_signal_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -177,6 +179,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             user_pipeline_output_ready |= line.contains(USER_PIPELINE_OUTPUT_MARKER);
             user_pipeline_ready |= line.contains(USER_PIPELINE_TEST_MARKER);
             user_background_ready |= line.contains(USER_BACKGROUND_TEST_MARKER);
+            user_signal_ready |= line.contains(USER_SIGNAL_TEST_MARKER);
 
             if heap_ready
                 && framebuffer_ready
@@ -197,6 +200,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && user_pipeline_output_ready
                 && user_pipeline_ready
                 && user_background_ready
+                && user_signal_ready
             {
                 let _ = marker_sender.send(());
                 break;

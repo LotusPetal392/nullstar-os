@@ -16,16 +16,22 @@ global_asm!(
     .equ CHILD_PIDS, PIPE_WRITES + MAX_PIPES * 8
     .equ JOB_STAGE_COUNTS, CHILD_PIDS + MAX_STAGES * 8
     .equ JOB_STATES, JOB_STAGE_COUNTS + MAX_JOBS * 8
-    .equ JOB_PIDS, JOB_STATES + MAX_JOBS * 8
+    .equ JOB_GROUPS, JOB_STATES + MAX_JOBS * 8
+    .equ JOB_PIDS, JOB_GROUPS + MAX_JOBS * 8
     .equ CURRENT_JOB_SLOT, JOB_PIDS + MAX_JOBS * MAX_STAGES * 8
     .equ BACKGROUND_FLAG, CURRENT_JOB_SLOT + 8
+    .equ CURRENT_GROUP, BACKGROUND_FLAG + 8
     .equ STACK_BYTES, 1280
     .equ PROMPT_BYTES, 5
-    .equ HELP_BYTES, 123
+    .equ HELP_BYTES, 174
     .equ SYNTAX_FAILURE_BYTES, 41
     .equ STAGE_FAILURE_BYTES, 40
     .equ JOB_LIMIT_FAILURE_BYTES, 34
     .equ BUILTIN_BACKGROUND_FAILURE_BYTES, 43
+    .equ KILL_USAGE_BYTES, 19
+    .equ KILL_MISSING_BYTES, 30
+    .equ KILL_FAILURE_BYTES, 17
+    .equ INTERRUPTED_BYTES, 17
     .equ PIPE_FAILURE_BYTES, 17
     .equ SPAWN_FAILURE_BYTES, 18
     .equ WAIT_FAILURE_BYTES, 17
@@ -37,6 +43,13 @@ global_asm!(
     .equ JOB_DONE_BYTES, 5
     .equ JOB_FAILED_BYTES, 7
     .equ JOB_STARTED_BYTES, 8
+    .equ JOB_SIGNALED_BYTES, 9
+
+    .equ SPAWN_FOREGROUND, 1
+    .equ SPAWN_USE_DESCRIPTORS, 2
+    .equ SPAWN_NEW_PROCESS_GROUP, 4
+    .equ SPAWN_JOIN_PROCESS_GROUP, 8
+    .equ SIGNAL_TERMINATE, 15
 
     .section .text._start,"ax"
     .p2align 4
@@ -49,7 +62,7 @@ _start:
     xor rax, rax
     xor rcx, rcx
 .Lclear_jobs:
-    cmp rcx, MAX_JOBS * (2 + MAX_STAGES)
+    cmp rcx, MAX_JOBS * (3 + MAX_STAGES)
     jae .Lprompt
     mov qword ptr [r9 + JOB_STAGE_COUNTS + rcx * 8], rax
     inc rcx
@@ -58,6 +71,7 @@ _start:
 .Lprompt:
     mov qword ptr [r9 + CURRENT_JOB_SLOT], -1
     mov qword ptr [r9 + BACKGROUND_FLAG], 0
+    mov qword ptr [r9 + CURRENT_GROUP], -1
 
     mov rax, 1
     mov rdi, 1
@@ -171,7 +185,7 @@ _start:
     mov rdi, qword ptr [r9 + STAGE_STARTS]
     mov rsi, qword ptr [r9 + STAGE_LENGTHS]
     cmp rsi, 4
-    jne .Lreserve_if_background
+    jne .Lcheck_kill_builtin
     cmp dword ptr [rdi], 0x74697865
     je .Lbuiltin_exit
     cmp dword ptr [rdi], 0x706c6568
@@ -180,6 +194,19 @@ _start:
     je .Lbuiltin_jobs
     cmp dword ptr [rdi], 0x74696177
     je .Lbuiltin_wait
+    cmp dword ptr [rdi], 0x6c6c696b
+    je .Lbuiltin_kill
+
+.Lcheck_kill_builtin:
+    cmp rsi, 6
+    jb .Lreserve_if_background
+    cmp dword ptr [rdi], 0x6c6c696b
+    jne .Lreserve_if_background
+    mov al, byte ptr [rdi + 4]
+    cmp al, 32
+    je .Lbuiltin_kill
+    cmp al, 9
+    je .Lbuiltin_kill
 
 .Lreserve_if_background:
     cmp qword ptr [r9 + BACKGROUND_FLAG], 0
@@ -195,13 +222,14 @@ _start:
 .Lspawn_single:
     mov rdi, qword ptr [r9 + STAGE_STARTS]
     mov rsi, qword ptr [r9 + STAGE_LENGTHS]
-    mov rdx, 1
+    mov rdx, SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND
     cmp qword ptr [r9 + BACKGROUND_FLAG], 0
     je .Lspawn_single_flags_ready
-    xor rdx, rdx
+    mov rdx, SPAWN_NEW_PROCESS_GROUP
 .Lspawn_single_flags_ready:
     mov r10, -1
     mov r8, -1
+    mov rbx, -1
     mov rax, 7
     int 0x80
     test rax, rax
@@ -214,6 +242,7 @@ _start:
     mov r12, qword ptr [r9 + CURRENT_JOB_SLOT]
     mov qword ptr [r9 + JOB_STAGE_COUNTS + r12 * 8], 1
     mov qword ptr [r9 + JOB_STATES + r12 * 8], 0
+    mov qword ptr [r9 + JOB_GROUPS + r12 * 8], r13
     mov rax, r12
     shl rax, 6
     mov qword ptr [r9 + JOB_PIDS + rax], r13
@@ -227,6 +256,8 @@ _start:
     int 0x80
     test rax, rax
     js .Lwait_failure
+    cmp rax, 130
+    je .Linterrupted
     jmp .Lprompt
 
 .Lcreate_pipeline:
@@ -257,14 +288,20 @@ _start:
 
     mov rdi, qword ptr [r9 + STAGE_STARTS + r14 * 8]
     mov rsi, qword ptr [r9 + STAGE_LENGTHS + r14 * 8]
-    mov rdx, 2
-    cmp qword ptr [r9 + BACKGROUND_FLAG], 0
-    jne .Lspawn_not_foreground
+    mov rdx, SPAWN_USE_DESCRIPTORS
     lea rax, [r15 - 1]
     cmp r14, rax
-    jne .Lspawn_not_foreground
-    or rdx, 1
-.Lspawn_not_foreground:
+    jne .Lspawn_join_group
+    or rdx, SPAWN_NEW_PROCESS_GROUP
+    mov rbx, -1
+    cmp qword ptr [r9 + BACKGROUND_FLAG], 0
+    jne .Lspawn_group_ready
+    or rdx, SPAWN_FOREGROUND
+    jmp .Lspawn_group_ready
+.Lspawn_join_group:
+    or rdx, SPAWN_JOIN_PROCESS_GROUP
+    mov rbx, qword ptr [r9 + CURRENT_GROUP]
+.Lspawn_group_ready:
 
     mov r10, -1
     test r14, r14
@@ -285,6 +322,10 @@ _start:
     test rax, rax
     js .Lpipeline_spawn_failure
     mov qword ptr [r9 + CHILD_PIDS + r14 * 8], rax
+    lea rdx, [r15 - 1]
+    cmp r14, rdx
+    jne .Lspawn_stage_loop
+    mov qword ptr [r9 + CURRENT_GROUP], rax
     jmp .Lspawn_stage_loop
 
 .Lpipeline_spawned:
@@ -311,6 +352,8 @@ _start:
     mov r12, qword ptr [r9 + CURRENT_JOB_SLOT]
     mov qword ptr [r9 + JOB_STAGE_COUNTS + r12 * 8], r15
     mov qword ptr [r9 + JOB_STATES + r12 * 8], 0
+    mov rax, qword ptr [r9 + CURRENT_GROUP]
+    mov qword ptr [r9 + JOB_GROUPS + r12 * 8], rax
     mov rax, r12
     shl rax, 6
     xor r13, r13
@@ -339,15 +382,22 @@ _start:
     mov rdi, qword ptr [r9 + CHILD_PIDS + r14 * 8]
     int 0x80
     test rax, rax
-    jns .Lwait_stage_next
+    js .Lwait_stage_error
+    cmp rax, 130
+    jne .Lwait_stage_next
+    mov r13, 2
+    jmp .Lwait_stage_next
+.Lwait_stage_error:
     mov r13, 1
 .Lwait_stage_next:
     inc r14
     jmp .Lwait_stage_loop
 
 .Lwait_pipeline_done:
-    test r13, r13
-    jnz .Lwait_failure
+    cmp r13, 1
+    je .Lwait_failure
+    cmp r13, 2
+    je .Linterrupted
     jmp .Lprompt
 
 .Lpipe_create_failure:
@@ -452,6 +502,7 @@ _start:
     js .Lrelease_current_job_done
     mov qword ptr [r9 + JOB_STAGE_COUNTS + rax * 8], 0
     mov qword ptr [r9 + JOB_STATES + rax * 8], 0
+    mov qword ptr [r9 + JOB_GROUPS + rax * 8], 0
     mov qword ptr [r9 + CURRENT_JOB_SLOT], -1
 .Lrelease_current_job_done:
     ret
@@ -554,10 +605,7 @@ _start:
     mov rdi, qword ptr [rdi + rcx * 8]
     int 0x80
     test rax, rax
-    js .Lwait_job_failed
-    test rax, rax
-    jz .Lwait_job_child_next
-.Lwait_job_failed:
+    jns .Lwait_job_child_next
     mov rbx, 1
 .Lwait_job_child_next:
     inc rcx
@@ -566,6 +614,7 @@ _start:
 .Lwait_job_clear:
     mov qword ptr [r9 + JOB_STAGE_COUNTS + r12 * 8], 0
     mov qword ptr [r9 + JOB_STATES + r12 * 8], 0
+    mov qword ptr [r9 + JOB_GROUPS + r12 * 8], 0
 .Lwait_job_next:
     inc r12
     jmp .Lwait_job_loop
@@ -599,6 +648,8 @@ _start:
     je .Lprint_job_failed
     cmp r13, 3
     je .Lprint_job_started
+    cmp r13, 4
+    je .Lprint_job_signaled
     lea rsi, [rip + job_running]
     mov rdx, JOB_RUNNING_BYTES
     jmp .Lprint_job_status
@@ -613,11 +664,91 @@ _start:
 .Lprint_job_started:
     lea rsi, [rip + job_started]
     mov rdx, JOB_STARTED_BYTES
+    jmp .Lprint_job_status
+.Lprint_job_signaled:
+    lea rsi, [rip + job_signaled]
+    mov rdx, JOB_SIGNALED_BYTES
 .Lprint_job_status:
     mov rax, 1
     mov rdi, 1
     int 0x80
     ret
+
+.Lbuiltin_kill:
+    cmp qword ptr [r9 + BACKGROUND_FLAG], 0
+    jne .Lbuiltin_background_failure
+    cmp rsi, 4
+    jbe .Lkill_usage
+    add rdi, 5
+    sub rsi, 5
+.Lkill_skip_space:
+    test rsi, rsi
+    jz .Lkill_usage
+    mov al, byte ptr [rdi]
+    cmp al, 32
+    je .Lkill_skip_one
+    cmp al, 9
+    jne .Lkill_optional_percent
+.Lkill_skip_one:
+    inc rdi
+    dec rsi
+    jmp .Lkill_skip_space
+.Lkill_optional_percent:
+    cmp al, 37
+    jne .Lkill_parse_digit
+    inc rdi
+    dec rsi
+.Lkill_parse_digit:
+    cmp rsi, 1
+    jne .Lkill_usage
+    movzx r12d, byte ptr [rdi]
+    sub r12, 49
+    cmp r12, MAX_JOBS
+    jae .Lkill_usage
+    cmp qword ptr [r9 + JOB_STAGE_COUNTS + r12 * 8], 0
+    jle .Lkill_missing
+    mov rax, 12
+    mov rdi, qword ptr [r9 + JOB_GROUPS + r12 * 8]
+    mov rsi, SIGNAL_TERMINATE
+    int 0x80
+    test rax, rax
+    js .Lkill_failure
+    mov qword ptr [r9 + JOB_STATES + r12 * 8], 4
+    mov r13, 4
+    call .Lprint_job_line
+    jmp .Lprompt
+
+.Lkill_usage:
+    mov rax, 1
+    mov rdi, 2
+    lea rsi, [rip + kill_usage]
+    mov rdx, KILL_USAGE_BYTES
+    int 0x80
+    jmp .Lprompt
+
+.Lkill_missing:
+    mov rax, 1
+    mov rdi, 2
+    lea rsi, [rip + kill_missing]
+    mov rdx, KILL_MISSING_BYTES
+    int 0x80
+    jmp .Lprompt
+
+.Lkill_failure:
+    mov rax, 1
+    mov rdi, 2
+    lea rsi, [rip + kill_failure]
+    mov rdx, KILL_FAILURE_BYTES
+    int 0x80
+    jmp .Lprompt
+
+.Linterrupted:
+    mov rax, 1
+    mov rdi, 2
+    lea rsi, [rip + interrupted]
+    mov rdx, INTERRUPTED_BYTES
+    int 0x80
+    jmp .Lprompt
 
 .Lpipeline_syntax:
     mov rax, 1
@@ -699,7 +830,7 @@ prompt:
     .ascii "ush> "
 prompt_end:
 help_message:
-    .ascii "builtins: help jobs wait exit\nbackground: command & (up to 4 jobs)\npipeline: producer | filter | consumer (up to 8 stages)\n"
+    .ascii "builtins: help jobs wait kill %N exit\nbackground: command & (up to 4 jobs)\nCtrl-C: interrupt foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n"
 help_message_end:
 syntax_failure:
     .ascii "ush: expected a non-empty pipeline stage\n"
@@ -713,6 +844,18 @@ job_limit_failure_end:
 builtin_background_failure:
     .ascii "ush: builtins cannot run in the background\n"
 builtin_background_failure_end:
+kill_usage:
+    .ascii "usage: kill %1..%4\n"
+kill_usage_end:
+kill_missing:
+    .ascii "ush: background job not found\n"
+kill_missing_end:
+kill_failure:
+    .ascii "ush: kill failed\n"
+kill_failure_end:
+interrupted:
+    .ascii "ush: interrupted\n"
+interrupted_end:
 pipe_failure:
     .ascii "ush: pipe failed\n"
 pipe_failure_end:
@@ -748,6 +891,9 @@ job_failed_end:
 job_started:
     .ascii "started\n"
 job_started_end:
+job_signaled:
+    .ascii "signaled\n"
+job_signaled_end:
 "#,
 );
 

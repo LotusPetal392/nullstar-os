@@ -53,6 +53,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "signal_probe"
+path = "src/bin/signal_probe.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "ush"
 path = "src/bin/ush.rs"
 test = false

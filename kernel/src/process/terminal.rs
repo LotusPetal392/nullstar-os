@@ -20,6 +20,7 @@ pub struct Snapshot {
     pub blocked_reads: u64,
     pub wakeups: u64,
     pub injected_lines: u64,
+    pub interrupts: u64,
 }
 
 struct Terminal {
@@ -33,6 +34,8 @@ struct Terminal {
     blocked_reads: u64,
     wakeups: u64,
     injected_lines: u64,
+    interrupt_pending: bool,
+    interrupts: u64,
 }
 
 impl Terminal {
@@ -48,6 +51,8 @@ impl Terminal {
             blocked_reads: 0,
             wakeups: 0,
             injected_lines: 0,
+            interrupt_pending: false,
+            interrupts: 0,
         }
     }
 
@@ -61,6 +66,7 @@ impl Terminal {
         self.foreground_process = Some(process_id);
         self.editing.clear();
         self.committed.clear();
+        self.interrupt_pending = false;
         true
     }
 
@@ -69,6 +75,7 @@ impl Terminal {
             self.foreground_process = None;
             self.editing.clear();
             self.committed.clear();
+            self.interrupt_pending = false;
         }
     }
 
@@ -79,12 +86,14 @@ impl Terminal {
         self.foreground_process = Some(next_process);
         self.editing.clear();
         self.committed.clear();
+        self.interrupt_pending = false;
         true
     }
 
     fn handle_key(&mut self, key: DecodedKey) {
         self.keys_received = self.keys_received.saturating_add(1);
         match key {
+            DecodedKey::Unicode('\u{3}') => self.interrupt(true),
             DecodedKey::Unicode('\n' | '\r') => self.commit_editing(true),
             DecodedKey::Unicode('\u{8}' | '\u{7f}') => self.backspace(),
             DecodedKey::Unicode('\t') => self.push_character('\t'),
@@ -94,6 +103,33 @@ impl Terminal {
             DecodedKey::RawKey(KeyCode::Backspace | KeyCode::Delete) => self.backspace(),
             DecodedKey::RawKey(_) => {}
         }
+    }
+
+    fn interrupt(&mut self, echo: bool) {
+        if self.foreground_process.is_none() {
+            return;
+        }
+        self.editing.clear();
+        self.committed.clear();
+        self.committed.push_back(b'\n');
+        self.lines_committed = self.lines_committed.saturating_add(1);
+        self.bytes_committed = self.bytes_committed.saturating_add(1);
+        self.interrupt_pending = true;
+        self.interrupts = self.interrupts.saturating_add(1);
+        if echo {
+            crate::print!("^C");
+            crate::serial_print!("^C");
+            crate::println!();
+            crate::serial_println!();
+        }
+    }
+
+    fn take_interrupt(&mut self) -> Option<u64> {
+        if !self.interrupt_pending {
+            return None;
+        }
+        self.interrupt_pending = false;
+        self.foreground_process
     }
 
     fn push_character(&mut self, character: char) {
@@ -174,6 +210,7 @@ impl Terminal {
             blocked_reads: self.blocked_reads,
             wakeups: self.wakeups,
             injected_lines: self.injected_lines,
+            interrupts: self.interrupts,
         }
     }
 }
@@ -231,6 +268,10 @@ pub fn poll_keyboard() -> usize {
 
 pub fn inject_line(line: &str) {
     x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().inject_line(line));
+}
+
+pub fn take_interrupt() -> Option<u64> {
+    x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().take_interrupt())
 }
 
 pub fn take_committed(maximum: usize) -> Option<Vec<u8>> {
