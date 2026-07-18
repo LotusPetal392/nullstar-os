@@ -1,13 +1,13 @@
-name: Integrate userspace pipes
+name: Validate userspace pipes
 
 on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  integrate:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -25,34 +25,13 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Apply userspace pipe milestone
-        run: |
-          if grep -q '^pub(crate) mod pipe;$' kernel/src/process/mod.rs; then
-            echo "pipe milestone already integrated"
-          else
-            python3 tools/apply_pipe_model.py
-            python3 tools/apply_pipe_syscalls.py
-            python3 tools/apply_pipe_integration.py
-            python3 tools/apply_pipe_runner.py
-          fi
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
 
-      - name: Format sources
-        run: cargo +nightly-2026-02-01 fmt --all
-
-      - name: Restore pinned dependency lockfile
+      - name: Verify pinned dependency lockfile
         run: |
           git fetch origin main --depth=1
-          git checkout origin/main -- Cargo.lock
-
-      - name: Commit integrated sources
-        run: |
-          git config user.name "lotuspetalagent"
-          git config user.email "lotuspetalagent@users.noreply.github.com"
-          git add Cargo.lock build.rs kernel/src src/main.rs userspace
-          if ! git diff --cached --quiet; then
-            git commit -m "Preserve pinned userspace pipe dependencies"
-            git push origin HEAD:agent/userspace-pipes
-          fi
+          test "$(git hash-object Cargo.lock)" = "$(git show origin/main:Cargo.lock | git hash-object --stdin)"
 
       - name: Build bootable image
         shell: bash
