@@ -49,9 +49,9 @@ dependencies = [
 
 [[package]]
 name = "bootloader"
-version = "0.11.16"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "873ecb966ce2cf2d9e56247422f892f7daee8dbdac58945035d348885e582b74"
+checksum = "b5fb69232f250c0d5b74eeb285702b4b0479f574980f45dc9bef97b2c65e2021"
 dependencies = [
  "anyhow",
  "bootloader-boot-config",
@@ -65,18 +65,18 @@ dependencies = [
 
 [[package]]
 name = "bootloader-boot-config"
-version = "0.11.16"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae46c9f7079e4d28b86015cdc2588c7e3d77441fe96449858c44644a78960f34"
+checksum = "10a5e475c13d3d988e105b76b92aeea94614c12590c33495165c02b16e895375"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bootloader_api"
-version = "0.11.16"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "895bece39f47cd2063425b9361c0be662c7e2cf0922471ea16312d853600feb3"
+checksum = "5c074a3d1075b26ed77e502d6af8ab1263abbdc3d026c166e46480f973287293"
 
 [[package]]
 name = "bumpalo"
@@ -152,21 +152,21 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "futures-core"
-version = "0.3.33"
+version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
+checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
 name = "futures-task"
-version = "0.3.33"
+version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b231ed28831efb4a61a08580c4bc233ec56bc009f4cd8f52da2c3cb97df0c109"
+checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
 
 [[package]]
 name = "futures-util"
-version = "0.3.33"
+version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
+checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
  "futures-task",
