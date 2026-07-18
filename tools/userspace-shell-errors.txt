@@ -1,0 +1,166 @@
+cargo build exit status: 101
+
+503-    |                                                    ^^^^^^^^
+504-    |
+505-help: first cast to a pointer `as *const ()`
+506-    |
+507-827 |     VirtAddr::new(galactic_thread_entry_trampoline as *const () as usize as u64)
+508-    |                                                    ++++++++++++
+509-
+510-warning: `kernel` (bin "kernel") generated 33 warnings (run `cargo fix --bin "kernel" -p kernel` to apply 9 suggestions)
+511:error: cannot use more than one symbol in memory operand
+512-   |
+513-note: instantiated into assembly here
+514-  --> <inline asm>:14:27
+515-   |
+516-14 |     mov rdx, prompt_end - prompt
+517-   |                           ^
+518-
+519:error: cannot use more than one symbol in memory operand
+520-   |
+521-note: instantiated into assembly here
+522-  --> <inline asm>:68:33
+523-   |
+524-68 |     mov rdx, help_message_end - help_message
+525-   |                                 ^
+526-
+527:error: cannot use more than one symbol in memory operand
+528-   |
+529-note: instantiated into assembly here
+530-  --> <inline asm>:76:34
+531-   |
+532-76 |     mov rdx, spawn_failure_end - spawn_failure
+533-   |                                  ^
+534-
+535:error: cannot use more than one symbol in memory operand
+536-   |
+537-note: instantiated into assembly here
+538-  --> <inline asm>:84:33
+539-   |
+540-84 |     mov rdx, wait_failure_end - wait_failure
+541-   |                                 ^
+542-
+543:error: could not compile `userspace` (bin "ush") due to 4 previous errors
+544-warning: build failed, waiting for other jobs to finish...
+
+tail:
+    |                                          ^^^^^^^^
+    |
+    = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+    |
+977 |         galactic_syscall_interrupt_entry as *const () as usize as u64,
+    |                                          ++++++++++++
+
+warning: direct cast of function item into an integer
+   --> kernel/src/process/userspace.rs:978:45
+    |
+978 |         galactic_page_fault_interrupt_entry as usize as u64,
+    |                                             ^^^^^^^^
+    |
+help: first cast to a pointer `as *const ()`
+    |
+978 |         galactic_page_fault_interrupt_entry as *const () as usize as u64,
+    |                                             ++++++++++++
+
+warning: direct cast of function item into an integer
+   --> kernel/src/process/userspace.rs:979:53
+    |
+979 |         galactic_general_protection_interrupt_entry as usize as u64,
+    |                                                     ^^^^^^^^
+    |
+help: first cast to a pointer `as *const ()`
+    |
+979 |         galactic_general_protection_interrupt_entry as *const () as usize as u64,
+    |                                                     ++++++++++++
+
+warning: direct cast of function item into an integer
+    --> kernel/src/process/userspace.rs:1618:52
+     |
+1618 |     VirtAddr::new(galactic_syscall_interrupt_entry as usize as u64)
+     |                                                    ^^^^^^^^
+     |
+help: first cast to a pointer `as *const ()`
+     |
+1618 |     VirtAddr::new(galactic_syscall_interrupt_entry as *const () as usize as u64)
+     |                                                    ++++++++++++
+
+warning: direct cast of function item into an integer
+    --> kernel/src/process/userspace.rs:1622:55
+     |
+1622 |     VirtAddr::new(galactic_page_fault_interrupt_entry as usize as u64)
+     |                                                       ^^^^^^^^
+     |
+help: first cast to a pointer `as *const ()`
+     |
+1622 |     VirtAddr::new(galactic_page_fault_interrupt_entry as *const () as usize as u64)
+     |                                                       ++++++++++++
+
+warning: direct cast of function item into an integer
+    --> kernel/src/process/userspace.rs:1626:63
+     |
+1626 |     VirtAddr::new(galactic_general_protection_interrupt_entry as usize as u64)
+     |                                                               ^^^^^^^^
+     |
+help: first cast to a pointer `as *const ()`
+     |
+1626 |     VirtAddr::new(galactic_general_protection_interrupt_entry as *const () as usize as u64)
+     |                                                               ++++++++++++
+
+warning: direct cast of function item into an integer
+   --> kernel/src/scheduler.rs:823:50
+    |
+823 |     VirtAddr::new(galactic_timer_interrupt_entry as usize as u64)
+    |                                                  ^^^^^^^^
+    |
+help: first cast to a pointer `as *const ()`
+    |
+823 |     VirtAddr::new(galactic_timer_interrupt_entry as *const () as usize as u64)
+    |                                                  ++++++++++++
+
+warning: direct cast of function item into an integer
+   --> kernel/src/scheduler.rs:827:52
+    |
+827 |     VirtAddr::new(galactic_thread_entry_trampoline as usize as u64)
+    |                                                    ^^^^^^^^
+    |
+help: first cast to a pointer `as *const ()`
+    |
+827 |     VirtAddr::new(galactic_thread_entry_trampoline as *const () as usize as u64)
+    |                                                    ++++++++++++
+
+warning: `kernel` (bin "kernel") generated 33 warnings (run `cargo fix --bin "kernel" -p kernel` to apply 9 suggestions)
+error: cannot use more than one symbol in memory operand
+   |
+note: instantiated into assembly here
+  --> <inline asm>:14:27
+   |
+14 |     mov rdx, prompt_end - prompt
+   |                           ^
+
+error: cannot use more than one symbol in memory operand
+   |
+note: instantiated into assembly here
+  --> <inline asm>:68:33
+   |
+68 |     mov rdx, help_message_end - help_message
+   |                                 ^
+
+error: cannot use more than one symbol in memory operand
+   |
+note: instantiated into assembly here
+  --> <inline asm>:76:34
+   |
+76 |     mov rdx, spawn_failure_end - spawn_failure
+   |                                  ^
+
+error: cannot use more than one symbol in memory operand
+   |
+note: instantiated into assembly here
+  --> <inline asm>:84:33
+   |
+84 |     mov rdx, wait_failure_end - wait_failure
+   |                                 ^
+
+error: could not compile `userspace` (bin "ush") due to 4 previous errors
+warning: build failed, waiting for other jobs to finish...
