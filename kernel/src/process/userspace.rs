@@ -2845,7 +2845,7 @@ fn syscall_close(process_id: u64, descriptor: u64) -> u64 {
             process.close_count = process.close_count.saturating_add(1);
             process.pipe_descriptor_close_count =
                 process.pipe_descriptor_close_count.saturating_add(1);
-            Some(descriptor)
+            descriptor
         } else if let Some(index) = process
             .open_files
             .iter()
