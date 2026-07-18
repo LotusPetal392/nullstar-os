@@ -5,7 +5,7 @@ use core::{arch::global_asm, panic::PanicInfo};
 
 global_asm!(
     r#"
-    .equ DELAY_YIELDS, 8192
+    .equ DELAY_YIELDS, 64
     .equ MESSAGE_BYTES, 24
 
     .section .text._start,"ax"
