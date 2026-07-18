@@ -1,9 +1,7 @@
 name: Integrate userspace pipes
 
 on:
-  push:
-    branches:
-      - agent/userspace-pipes
+  pull_request:
 
 permissions:
   contents: write
@@ -29,10 +27,14 @@ jobs:
 
       - name: Apply userspace pipe milestone
         run: |
-          python3 tools/apply_pipe_model.py
-          python3 tools/apply_pipe_syscalls.py
-          python3 tools/apply_pipe_integration.py
-          python3 tools/apply_pipe_runner.py
+          if grep -q '^pub(crate) mod pipe;$' kernel/src/process/mod.rs; then
+            echo "pipe milestone already integrated"
+          else
+            python3 tools/apply_pipe_model.py
+            python3 tools/apply_pipe_syscalls.py
+            python3 tools/apply_pipe_integration.py
+            python3 tools/apply_pipe_runner.py
+          fi
 
       - name: Format sources
         run: cargo +nightly-2026-02-01 fmt --all
