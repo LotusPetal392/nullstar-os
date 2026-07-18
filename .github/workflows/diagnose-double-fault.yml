@@ -1,0 +1,42 @@
+name: Diagnose double fault address
+
+on:
+  push:
+    branches:
+      - agent/multistage-userspace-pipelines
+
+permissions:
+  contents: read
+
+jobs:
+  addr2line:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-02-01 --profile minimal \
+            --component llvm-tools-preview --component rust-src
+
+      - name: Build kernel with debug symbols
+        run: cargo +nightly-2026-02-01 build --locked
+
+      - name: Map reported double-fault address
+        shell: bash
+        run: |
+          set -euxo pipefail
+          kernel=$(find target -type f -name kernel -perm -111 | head -n 1)
+          test -n "$kernel"
+          toolchain=$(rustc +nightly-2026-02-01 --print sysroot)
+          addr2line=$(find "$toolchain" -type f -name llvm-addr2line | head -n 1)
+          nm=$(find "$toolchain" -type f -name llvm-nm | head -n 1)
+          objdump=$(find "$toolchain" -type f -name llvm-objdump | head -n 1)
+          test -x "$addr2line"
+          test -x "$nm"
+          test -x "$objdump"
+          echo "kernel=$kernel"
+          "$addr2line" -f -C -e "$kernel" 0xaac24
+          "$nm" -n -C "$kernel" | awk '$1 >= "00000000000aa900" && $1 <= "00000000000aaf00" { print }'
+          "$objdump" -d -C --start-address=0xaab40 --stop-address=0xaad20 "$kernel"
