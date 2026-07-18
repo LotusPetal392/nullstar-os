@@ -26,12 +26,18 @@ jobs:
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
       - name: Apply userspace descriptor pipeline milestone
+        shell: bash
         run: |
+          set +e
+          set -o pipefail
           if grep -q '^const SYSCALL_PIPE_PAIR: u64 = 10;$' kernel/src/process/userspace.rs; then
-            echo "userspace descriptor pipeline milestone already integrated"
+            echo "userspace descriptor pipeline milestone already integrated" | tee userspace-pipelines-apply.log
+            status=0
           else
-            python3 tools/apply_userspace_pipelines.py
+            python3 tools/apply_userspace_pipelines.py 2>&1 | tee userspace-pipelines-apply.log
+            status=${PIPESTATUS[0]}
           fi
+          exit "$status"
 
       - name: Format sources
         run: cargo +nightly-2026-02-01 fmt --all
@@ -61,6 +67,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: userspace-pipelines-build-log
-          path: userspace-pipelines-build.log
-          if-no-files-found: ignore
+          name: userspace-pipelines-integration-log
+          path: |
+            userspace-pipelines-apply.log
+            userspace-pipelines-build.log
+          if-no-files-found: error
