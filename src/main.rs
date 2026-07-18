@@ -25,6 +25,7 @@ const USER_PIPE_TEST_MARKER: &str = "userspace pipe verified:";
 const USER_SHELL_TEST_MARKER: &str = "userspace shell verified:";
 const USER_PIPELINE_OUTPUT_MARKER: &str = "HELLO THROUGH A BLOCKING GALACTICOS PIPE.";
 const USER_PIPELINE_TEST_MARKER: &str = "userspace multi-stage pipeline verified:";
+const USER_BACKGROUND_TEST_MARKER: &str = "userspace background jobs verified:";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Default)]
@@ -150,6 +151,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut user_shell_ready = false;
         let mut user_pipeline_output_ready = false;
         let mut user_pipeline_ready = false;
+        let mut user_background_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -174,6 +176,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             user_shell_ready |= line.contains(USER_SHELL_TEST_MARKER);
             user_pipeline_output_ready |= line.contains(USER_PIPELINE_OUTPUT_MARKER);
             user_pipeline_ready |= line.contains(USER_PIPELINE_TEST_MARKER);
+            user_background_ready |= line.contains(USER_BACKGROUND_TEST_MARKER);
 
             if heap_ready
                 && framebuffer_ready
@@ -193,6 +196,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && user_shell_ready
                 && user_pipeline_output_ready
                 && user_pipeline_ready
+                && user_background_ready
             {
                 let _ = marker_sender.send(());
                 break;

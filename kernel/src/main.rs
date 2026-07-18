@@ -743,6 +743,56 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     let userspace_pipeline_after = userspace_runtime.pipe_snapshot();
 
+    const BACKGROUND_DELAY_YIELDS: u64 = 64;
+    if let Err(error) = userspace_runtime.inject_terminal_line("delay &") {
+        serial_println!("userspace background command injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!(
+            "userspace shell did not regain its prompt after background spawn: {error}"
+        );
+        hlt_loop();
+    }
+    let background_was_active =
+        match userspace_runtime.child_is_active(userspace_shell.process_id, "/delay") {
+            Ok(active) => active,
+            Err(error) => {
+                serial_println!("userspace background child inspection failed: {error}");
+                hlt_loop();
+            }
+        };
+    if !background_was_active {
+        serial_println!("userspace background child completed before the shell prompt returned");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("jobs") {
+        serial_println!("userspace jobs command injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace jobs command did not return to the prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("wait") {
+        serial_println!("userspace background wait injection failed: {error}");
+        hlt_loop();
+    }
+    let background_child =
+        match userspace_runtime.wait_for_child_path(userspace_shell.process_id, "/delay") {
+            Ok(result) => result,
+            Err(error) => {
+                serial_println!("userspace background child wait failed: {error}");
+                hlt_loop();
+            }
+        };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!(
+            "userspace shell did not regain its prompt after waiting for jobs: {error}"
+        );
+        hlt_loop();
+    }
+
     if let Err(error) = userspace_runtime.inject_terminal_line("exit") {
         serial_println!("userspace shell exit injection failed: {error}");
         hlt_loop();
@@ -839,24 +889,54 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         userspace_shell_result.pipe_descriptor_inherit_count
     );
 
+    let userspace_background_verified = background_was_active
+        && background_child.parent_process_id == Some(userspace_shell.process_id)
+        && background_child.exit_code() == Some(0)
+        && background_child.yield_count == BACKGROUND_DELAY_YIELDS
+        && userspace_shell_result.child_poll_count >= 1
+        && userspace_shell_result.child_poll_pending_count >= 1;
+    if !userspace_background_verified {
+        serial_println!(
+            "userspace background job verification failed: active_at_prompt={}, child_parent={:?}, child_exit={:?}, yields={}, polls={}, pending_polls={}",
+            background_was_active,
+            background_child.parent_process_id,
+            background_child.exit_code(),
+            background_child.yield_count,
+            userspace_shell_result.child_poll_count,
+            userspace_shell_result.child_poll_pending_count
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace background jobs verified: shell_pid={}, child_pid={}, active_at_prompt=true, yields={}, polls={}, pending_polls={}, jobs=1",
+        userspace_shell_result.process_id,
+        background_child.process_id,
+        background_child.yield_count,
+        userspace_shell_result.child_poll_count,
+        userspace_shell_result.child_poll_pending_count
+    );
+
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 4
-        && userspace_shell_result.child_wait_count == 4
+        && userspace_shell_result.child_spawn_count == 5
+        && userspace_shell_result.child_wait_count == 5
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
         && shell_child.bytes_read > 0
         && userspace_pipeline_verified
+        && userspace_background_verified
         && userspace_runtime
             .terminal_snapshot()
             .foreground_process
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
             userspace_shell_result.child_wait_count,
+            userspace_shell_result.child_poll_count,
+            userspace_shell_result.child_poll_pending_count,
             shell_child.parent_process_id,
             shell_child.exit_code(),
             shell_child.open_count,
@@ -866,11 +946,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
     serial_println!(
-        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, child_exit=0, child_bytes={}",
+        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, child_exit=0, child_bytes={}",
         userspace_shell_result.process_id,
         shell_child.process_id,
         userspace_shell_result.child_spawn_count,
         userspace_shell_result.child_wait_count,
+        userspace_shell_result.child_poll_count,
+        userspace_shell_result.child_poll_pending_count,
         shell_child.bytes_read
     );
 
@@ -954,6 +1036,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace multi-stage descriptor pipelines verified");
     } else {
         println!("Userspace descriptor pipelines unavailable");
+    }
+    if userspace_background_verified {
+        println!("Userspace background jobs verified");
+    } else {
+        println!("Userspace background jobs unavailable");
     }
     println!("Interactive shell initialized");
 
