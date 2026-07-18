@@ -1,0 +1,413 @@
+name: Apply userspace background jobs
+
+on:
+  push:
+    branches:
+      - agent/userspace-background-jobs
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-background-jobs
+
+      - name: Add nonblocking child status and background-job validation
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def update(path: str, replacements: list[tuple[str, str]]) -> None:
+              source_path = Path(path)
+              source = source_path.read_text()
+              for old, new in replacements:
+                  count = source.count(old)
+                  if count != 1:
+                      raise SystemExit(
+                          f"{path}: expected one match, found {count}: {old!r}"
+                      )
+                  source = source.replace(old, new, 1)
+              source_path.write_text(source)
+
+          update(
+              "kernel/src/process/userspace.rs",
+              [
+                  (
+                      "const SYSCALL_PIPE_PAIR: u64 = 10;\n",
+                      "const SYSCALL_PIPE_PAIR: u64 = 10;\n"
+                      "const SYSCALL_TRY_WAIT_CHILD: u64 = 11;\n",
+                  ),
+                  (
+                      "const ERR_NO_CHILD: i64 = -10;\n",
+                      "const ERR_NO_CHILD: i64 = -10;\n"
+                      "const ERR_TRY_AGAIN: i64 = -11;\n",
+                  ),
+                  (
+                      "    pub child_spawn_count: u64;\n"
+                      "    pub child_wait_count: u64;\n"
+                      "    pub pipe_pair_count: u64;\n",
+                      "    pub child_spawn_count: u64;\n"
+                      "    pub child_wait_count: u64;\n"
+                      "    pub child_poll_count: u64;\n"
+                      "    pub child_poll_pending_count: u64;\n"
+                      "    pub pipe_pair_count: u64;\n",
+                  ),
+                  (
+                      "    child_spawn_count: u64,\n"
+                      "    child_wait_count: u64,\n"
+                      "    pipe_pair_count: u64,\n",
+                      "    child_spawn_count: u64,\n"
+                      "    child_wait_count: u64,\n"
+                      "    child_poll_count: u64,\n"
+                      "    child_poll_pending_count: u64,\n"
+                      "    pipe_pair_count: u64,\n",
+                  ),
+                  (
+                      "            child_spawn_count: self.child_spawn_count,\n"
+                      "            child_wait_count: self.child_wait_count,\n"
+                      "            pipe_pair_count: self.pipe_pair_count,\n",
+                      "            child_spawn_count: self.child_spawn_count,\n"
+                      "            child_wait_count: self.child_wait_count,\n"
+                      "            child_poll_count: self.child_poll_count,\n"
+                      "            child_poll_pending_count: self.child_poll_pending_count,\n"
+                      "            pipe_pair_count: self.pipe_pair_count,\n",
+                  ),
+                  (
+                      "        child_spawn_count: 0,\n"
+                      "        child_wait_count: 0,\n"
+                      "        pipe_pair_count: 0,\n",
+                      "        child_spawn_count: 0,\n"
+                      "        child_wait_count: 0,\n"
+                      "        child_poll_count: 0,\n"
+                      "        child_poll_pending_count: 0,\n"
+                      "        pipe_pair_count: 0,\n",
+                  ),
+                  (
+                      "        SYSCALL_PIPE_PAIR => {\n"
+                      "            registers.rax = syscall_pipe_pair(process_id);\n"
+                      "            current_stack_pointer\n"
+                      "        }\n",
+                      "        SYSCALL_PIPE_PAIR => {\n"
+                      "            registers.rax = syscall_pipe_pair(process_id);\n"
+                      "            current_stack_pointer\n"
+                      "        }\n"
+                      "        SYSCALL_TRY_WAIT_CHILD => {\n"
+                      "            registers.rax = syscall_try_wait_child(process_id, registers.rdi);\n"
+                      "            current_stack_pointer\n"
+                      "        }\n",
+                  ),
+                  (
+                      "    ControlOutcome::Blocked\n"
+                      "}\n\n"
+                      "fn parse_command_line(command: &str) -> Result<(String, Vec<String>), i64> {\n",
+                      "    ControlOutcome::Blocked\n"
+                      "}\n\n"
+                      "fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {\n"
+                      "    let mut manager = PROCESS_MANAGER.lock();\n"
+                      "    let completed = manager\n"
+                      "        .completed\n"
+                      "        .iter()\n"
+                      "        .find(|result| {\n"
+                      "            result.process_id == child_process_id\n"
+                      "                && result.parent_process_id == Some(process_id)\n"
+                      "        })\n"
+                      "        .cloned();\n"
+                      "    let active = manager.processes.iter().any(|child| {\n"
+                      "        child.process_id == child_process_id\n"
+                      "            && child.parent_process_id == Some(process_id)\n"
+                      "    });\n"
+                      "    if completed.is_none() && !active {\n"
+                      "        return error_return(ERR_NO_CHILD);\n"
+                      "    }\n\n"
+                      "    let pending = completed.is_none();\n"
+                      "    let Some(process) = manager.process_mut(process_id) else {\n"
+                      "        return error_return(ERR_NO_CHILD);\n"
+                      "    };\n"
+                      "    process.child_poll_count = process.child_poll_count.saturating_add(1);\n"
+                      "    if pending {\n"
+                      "        process.child_poll_pending_count =\n"
+                      "            process.child_poll_pending_count.saturating_add(1);\n"
+                      "    }\n\n"
+                      "    completed\n"
+                      "        .as_ref()\n"
+                      "        .map(child_status)\n"
+                      "        .unwrap_or_else(|| error_return(ERR_TRY_AGAIN))\n"
+                      "}\n\n"
+                      "fn parse_command_line(command: &str) -> Result<(String, Vec<String>), i64> {\n",
+                  ),
+                  (
+                      "    pub fn inject_terminal_line(&mut self, line: &str) -> Result<usize, Error> {\n",
+                      "    pub fn child_is_active(\n"
+                      "        &mut self,\n"
+                      "        parent_process_id: u64,\n"
+                      "        path: &str,\n"
+                      "    ) -> Result<bool, Error> {\n"
+                      "        self.poll()?;\n"
+                      "        Ok(cpu_interrupts::without_interrupts(|| {\n"
+                      "            PROCESS_MANAGER.lock().processes.iter().any(|process| {\n"
+                      "                process.parent_process_id == Some(parent_process_id)\n"
+                      "                    && process.path == path\n"
+                      "            })\n"
+                      "        }))\n"
+                      "    }\n\n"
+                      "    pub fn inject_terminal_line(&mut self, line: &str) -> Result<usize, Error> {\n",
+                  ),
+              ],
+          )
+
+          update(
+              "kernel/src/shell.rs",
+              [
+                  (
+                      '                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; children: spawns={}, waits={}; frames reclaimed={}",\n'
+                      "                result.pipe_read_count,\n"
+                      "                result.pipe_write_count,\n"
+                      "                result.pipe_bytes_read,\n"
+                      "                result.pipe_bytes_written,\n"
+                      "                result.blocked_pipe_read_count,\n"
+                      "                result.blocked_pipe_write_count,\n"
+                      "                result.pipe_pair_count,\n"
+                      "                result.pipe_descriptor_close_count,\n"
+                      "                result.pipe_descriptor_inherit_count,\n"
+                      "                result.child_spawn_count,\n"
+                      "                result.child_wait_count,\n"
+                      "                result.frames_reclaimed\n",
+                      '                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; children: spawns={}, waits={}, polls={} (pending={}); frames reclaimed={}",\n'
+                      "                result.pipe_read_count,\n"
+                      "                result.pipe_write_count,\n"
+                      "                result.pipe_bytes_read,\n"
+                      "                result.pipe_bytes_written,\n"
+                      "                result.blocked_pipe_read_count,\n"
+                      "                result.blocked_pipe_write_count,\n"
+                      "                result.pipe_pair_count,\n"
+                      "                result.pipe_descriptor_close_count,\n"
+                      "                result.pipe_descriptor_inherit_count,\n"
+                      "                result.child_spawn_count,\n"
+                      "                result.child_wait_count,\n"
+                      "                result.child_poll_count,\n"
+                      "                result.child_poll_pending_count,\n"
+                      "                result.frames_reclaimed\n",
+                  ),
+              ],
+          )
+
+          update(
+              "kernel/src/main.rs",
+              [
+                  (
+                      "    let userspace_pipeline_after = userspace_runtime.pipe_snapshot();\n\n"
+                      '    if let Err(error) = userspace_runtime.inject_terminal_line("exit") {\n',
+                      "    let userspace_pipeline_after = userspace_runtime.pipe_snapshot();\n\n"
+                      "    const BACKGROUND_DELAY_YIELDS: u64 = 8192;\n"
+                      '    if let Err(error) = userspace_runtime.inject_terminal_line("delay &") {\n'
+                      '        serial_println!("userspace background command injection failed: {error}");\n'
+                      "        hlt_loop();\n"
+                      "    }\n"
+                      "    if let Err(error) =\n"
+                      "        userspace_runtime.wait_until_terminal_read(userspace_shell.process_id)\n"
+                      "    {\n"
+                      '        serial_println!("userspace shell did not regain its prompt after background spawn: {error}");\n'
+                      "        hlt_loop();\n"
+                      "    }\n"
+                      "    let background_was_active = match userspace_runtime\n"
+                      '        .child_is_active(userspace_shell.process_id, "/delay")\n'
+                      "    {\n"
+                      "        Ok(active) => active,\n"
+                      "        Err(error) => {\n"
+                      '            serial_println!("userspace background child inspection failed: {error}");\n'
+                      "            hlt_loop();\n"
+                      "        }\n"
+                      "    };\n"
+                      "    if !background_was_active {\n"
+                      '        serial_println!("userspace background child completed before the shell prompt returned");\n'
+                      "        hlt_loop();\n"
+                      "    }\n"
+                      '    if let Err(error) = userspace_runtime.inject_terminal_line("jobs") {\n'
+                      '        serial_println!("userspace jobs command injection failed: {error}");\n'
+                      "        hlt_loop();\n"
+                      "    }\n"
+                      "    if let Err(error) =\n"
+                      "        userspace_runtime.wait_until_terminal_read(userspace_shell.process_id)\n"
+                      "    {\n"
+                      '        serial_println!("userspace jobs command did not return to the prompt: {error}");\n'
+                      "        hlt_loop();\n"
+                      "    }\n"
+                      '    if let Err(error) = userspace_runtime.inject_terminal_line("wait") {\n'
+                      '        serial_println!("userspace background wait injection failed: {error}");\n'
+                      "        hlt_loop();\n"
+                      "    }\n"
+                      "    let background_child =\n"
+                      '        match userspace_runtime.wait_for_child_path(userspace_shell.process_id, "/delay") {\n'
+                      "            Ok(result) => result,\n"
+                      "            Err(error) => {\n"
+                      '                serial_println!("userspace background child wait failed: {error}");\n'
+                      "                hlt_loop();\n"
+                      "            }\n"
+                      "        };\n"
+                      "    if let Err(error) =\n"
+                      "        userspace_runtime.wait_until_terminal_read(userspace_shell.process_id)\n"
+                      "    {\n"
+                      '        serial_println!("userspace shell did not regain its prompt after waiting for jobs: {error}");\n'
+                      "        hlt_loop();\n"
+                      "    }\n\n"
+                      '    if let Err(error) = userspace_runtime.inject_terminal_line("exit") {\n',
+                  ),
+                  (
+                      "    let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)\n"
+                      "        && userspace_shell_result.child_spawn_count == 4\n"
+                      "        && userspace_shell_result.child_wait_count == 4\n",
+                      "    let userspace_background_verified = background_was_active\n"
+                      "        && background_child.parent_process_id == Some(userspace_shell.process_id)\n"
+                      "        && background_child.exit_code() == Some(0)\n"
+                      "        && background_child.yield_count == BACKGROUND_DELAY_YIELDS\n"
+                      "        && userspace_shell_result.child_poll_count >= 1\n"
+                      "        && userspace_shell_result.child_poll_pending_count >= 1;\n"
+                      "    if !userspace_background_verified {\n"
+                      "        serial_println!(\n"
+                      '            "userspace background job verification failed: active_at_prompt={}, child_parent={:?}, child_exit={:?}, yields={}, polls={}, pending_polls={}",\n'
+                      "            background_was_active,\n"
+                      "            background_child.parent_process_id,\n"
+                      "            background_child.exit_code(),\n"
+                      "            background_child.yield_count,\n"
+                      "            userspace_shell_result.child_poll_count,\n"
+                      "            userspace_shell_result.child_poll_pending_count\n"
+                      "        );\n"
+                      "        hlt_loop();\n"
+                      "    }\n"
+                      "    serial_println!(\n"
+                      '        "userspace background jobs verified: shell_pid={}, child_pid={}, active_at_prompt=true, yields={}, polls={}, pending_polls={}, jobs=1",\n'
+                      "        userspace_shell_result.process_id,\n"
+                      "        background_child.process_id,\n"
+                      "        background_child.yield_count,\n"
+                      "        userspace_shell_result.child_poll_count,\n"
+                      "        userspace_shell_result.child_poll_pending_count\n"
+                      "    );\n\n"
+                      "    let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)\n"
+                      "        && userspace_shell_result.child_spawn_count == 5\n"
+                      "        && userspace_shell_result.child_wait_count == 5\n",
+                  ),
+                  (
+                      "        && shell_child.bytes_read > 0\n"
+                      "        && userspace_pipeline_verified\n",
+                      "        && shell_child.bytes_read > 0\n"
+                      "        && userspace_pipeline_verified\n"
+                      "        && userspace_background_verified\n",
+                  ),
+                  (
+                      '            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",\n'
+                      "            userspace_shell_result.exit_code(),\n"
+                      "            userspace_shell_result.child_spawn_count,\n"
+                      "            userspace_shell_result.child_wait_count,\n",
+                      '            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",\n'
+                      "            userspace_shell_result.exit_code(),\n"
+                      "            userspace_shell_result.child_spawn_count,\n"
+                      "            userspace_shell_result.child_wait_count,\n"
+                      "            userspace_shell_result.child_poll_count,\n"
+                      "            userspace_shell_result.child_poll_pending_count,\n",
+                  ),
+                  (
+                      '        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, child_exit=0, child_bytes={}",\n'
+                      "        userspace_shell_result.process_id,\n"
+                      "        shell_child.process_id,\n"
+                      "        userspace_shell_result.child_spawn_count,\n"
+                      "        userspace_shell_result.child_wait_count,\n"
+                      "        shell_child.bytes_read\n",
+                      '        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, child_exit=0, child_bytes={}",\n'
+                      "        userspace_shell_result.process_id,\n"
+                      "        shell_child.process_id,\n"
+                      "        userspace_shell_result.child_spawn_count,\n"
+                      "        userspace_shell_result.child_wait_count,\n"
+                      "        userspace_shell_result.child_poll_count,\n"
+                      "        userspace_shell_result.child_poll_pending_count,\n"
+                      "        shell_child.bytes_read\n",
+                  ),
+                  (
+                      "    if userspace_pipeline_verified {\n"
+                      '        println!("Userspace multi-stage descriptor pipelines verified");\n'
+                      "    } else {\n"
+                      '        println!("Userspace descriptor pipelines unavailable");\n'
+                      "    }\n"
+                      '    println!("Interactive shell initialized");\n',
+                      "    if userspace_pipeline_verified {\n"
+                      '        println!("Userspace multi-stage descriptor pipelines verified");\n'
+                      "    } else {\n"
+                      '        println!("Userspace descriptor pipelines unavailable");\n'
+                      "    }\n"
+                      "    if userspace_background_verified {\n"
+                      '        println!("Userspace background jobs verified");\n'
+                      "    } else {\n"
+                      '        println!("Userspace background jobs unavailable");\n'
+                      "    }\n"
+                      '    println!("Interactive shell initialized");\n',
+                  ),
+              ],
+          )
+
+          update(
+              "src/main.rs",
+              [
+                  (
+                      'const USER_PIPELINE_TEST_MARKER: &str = "userspace multi-stage pipeline verified:";\n',
+                      'const USER_PIPELINE_TEST_MARKER: &str = "userspace multi-stage pipeline verified:";\n'
+                      'const USER_BACKGROUND_TEST_MARKER: &str = "userspace background jobs verified:";\n',
+                  ),
+                  (
+                      "        let mut user_pipeline_ready = false;\n",
+                      "        let mut user_pipeline_ready = false;\n"
+                      "        let mut user_background_ready = false;\n",
+                  ),
+                  (
+                      "            user_pipeline_ready |= line.contains(USER_PIPELINE_TEST_MARKER);\n",
+                      "            user_pipeline_ready |= line.contains(USER_PIPELINE_TEST_MARKER);\n"
+                      "            user_background_ready |= line.contains(USER_BACKGROUND_TEST_MARKER);\n",
+                  ),
+                  (
+                      "                && user_pipeline_ready\n",
+                      "                && user_pipeline_ready\n"
+                      "                && user_background_ready\n",
+                  ),
+              ],
+          )
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-02-01 --profile minimal \
+            --component llvm-tools-preview --component rust-src --component rustfmt \
+            --target x86_64-unknown-none
+
+      - name: Format and validate
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+
+      - name: Build and boot the full smoke test
+        run: cargo +nightly-2026-02-01 run --locked -- --test
+
+      - name: Commit and push product changes
+        run: |
+          rm .github/workflows/apply-background-jobs.yml
+          git config user.name lotuspetalagent
+          git config user.email lotuspetalagent@users.noreply.github.com
+          git add \
+            build.rs \
+            kernel/src/main.rs \
+            kernel/src/process/userspace.rs \
+            kernel/src/shell.rs \
+            src/main.rs \
+            userspace/Cargo.toml \
+            userspace/src/bin/delay.rs \
+            userspace/src/bin/ush.rs \
+            .github/workflows/apply-background-jobs.yml
+          git commit -m "Add bounded userspace background jobs"
+          git push origin HEAD:agent/userspace-background-jobs
