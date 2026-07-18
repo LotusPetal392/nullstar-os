@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - agent/userspace-shell
+    paths-ignore:
+      - tools/userspace-shell-errors.txt
 
 permissions:
   contents: write
@@ -28,7 +30,12 @@ jobs:
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
       - name: Apply userspace shell milestone
-        run: python3 tools/apply_userspace_shell.py
+        run: |
+          if grep -q '^const SYSCALL_SPAWN_COMMAND: u64 = 7;$' kernel/src/process/userspace.rs; then
+            echo "userspace shell milestone already integrated"
+          else
+            python3 tools/apply_userspace_shell.py
+          fi
 
       - name: Format sources
         run: cargo +nightly-2026-02-01 fmt --all
@@ -51,8 +58,24 @@ jobs:
       - name: Build bootable image
         shell: bash
         run: |
+          set +e
           set -o pipefail
           cargo +nightly-2026-02-01 build --locked 2>&1 | tee userspace-shell-build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "cargo build exit status: $status"
+              echo
+              grep -n -C 8 -E 'error(\[[A-Z0-9]+\])?:|error: could not compile' userspace-shell-build.log || true
+              echo
+              echo "tail:"
+              tail -n 120 userspace-shell-build.log
+            } > tools/userspace-shell-errors.txt
+            git add tools/userspace-shell-errors.txt
+            git commit -m "Record userspace shell compiler errors"
+            git push origin HEAD:agent/userspace-shell
+          fi
+          exit "$status"
 
       - name: Upload integration diagnostics
         if: always()
