@@ -34,6 +34,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_pipe_consumer")
             .expect("userspace pipe-consumer artifact path was not set"),
     );
+    let userspace_upper = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_upper")
+            .expect("userspace upper artifact path was not set"),
+    );
     let userspace_shell = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_ush")
             .expect("userspace shell artifact path was not set"),
@@ -49,6 +53,7 @@ fn main() {
     image.set_file(String::from("readline"), userspace_readline);
     image.set_file(String::from("pipe-producer"), userspace_pipe_producer);
     image.set_file(String::from("pipe-consumer"), userspace_pipe_consumer);
+    image.set_file(String::from("upper"), userspace_upper);
     image.set_file(String::from("ush"), userspace_shell);
     image.set_file(String::from("hello.txt"), hello_text);
     image
