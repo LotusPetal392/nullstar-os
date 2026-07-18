@@ -240,6 +240,8 @@ impl Shell {
             }
             "process" | "userspace" => self.print_userspace(),
             "terminal" | "tty" => self.print_terminal(),
+            "pipes" => self.print_pipes(),
+            "pipe" => self.run_pipeline(command_line),
             "spawn" | "run" => {
                 let Some(path) = words.next() else {
                     shell_println!("usage: {command} <path> [arguments...]");
@@ -640,6 +642,40 @@ impl Shell {
         }
     }
 
+    fn run_pipeline(&mut self, command_line: &str) {
+        let pipeline = command_line.strip_prefix("pipe").unwrap_or_default().trim();
+        let Some((producer, consumer)) = pipeline.split_once('|') else {
+            shell_println!("usage: pipe <producer> [args...] | <consumer> [args...]");
+            return;
+        };
+        let mut producer_words = producer.split_whitespace();
+        let Some(producer_path) = producer_words.next() else {
+            shell_println!("pipe: producer path is missing");
+            return;
+        };
+        let producer_arguments: Vec<&str> = producer_words.collect();
+        let mut consumer_words = consumer.split_whitespace();
+        let Some(consumer_path) = consumer_words.next() else {
+            shell_println!("pipe: consumer path is missing");
+            return;
+        };
+        let consumer_arguments: Vec<&str> = consumer_words.collect();
+
+        match self.runtime.pipeline(
+            producer_path,
+            &producer_arguments,
+            consumer_path,
+            &consumer_arguments,
+        ) {
+            Ok(result) => {
+                shell_println!("pipeline {} completed", result.pipe_id);
+                print_process_result(&result.producer);
+                print_process_result(&result.consumer);
+            }
+            Err(error) => shell_println!("pipe: {error}"),
+        }
+    }
+
     fn print_userspace(&self) {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
@@ -700,10 +736,19 @@ impl Shell {
                 result.bytes_read
             );
             shell_println!(
-                "  terminal: reads={}, bytes={}, blocked reads={}; frames reclaimed={}",
+                "  terminal: reads={}, bytes={}, blocked reads={}",
                 result.terminal_read_count,
                 result.terminal_bytes_read,
-                result.blocked_read_count,
+                result.blocked_read_count
+            );
+            shell_println!(
+                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; frames reclaimed={}",
+                result.pipe_read_count,
+                result.pipe_write_count,
+                result.pipe_bytes_read,
+                result.pipe_bytes_written,
+                result.blocked_pipe_read_count,
+                result.blocked_pipe_write_count,
                 result.frames_reclaimed
             );
             if let Some(fault) = result.fault() {
@@ -739,6 +784,39 @@ impl Shell {
             terminal.blocked_reads,
             terminal.wakeups
         );
+    }
+
+    fn print_pipes(&self) {
+        let pipes = self.runtime.pipe_snapshot();
+        shell_println!(
+            "pipes: active={}, created={}, destroyed={}, capacity={} bytes",
+            pipes.active_pipes,
+            pipes.total_created,
+            pipes.total_destroyed,
+            crate::process::pipe::PIPE_CAPACITY_BYTES
+        );
+        shell_println!(
+            "I/O: reads={}, writes={}, bytes={}/{}, blocked={}/{}, wakeups={}/{}",
+            pipes.total_read_calls,
+            pipes.total_write_calls,
+            pipes.total_bytes_read,
+            pipes.total_bytes_written,
+            pipes.total_blocked_reads,
+            pipes.total_blocked_writes,
+            pipes.total_reader_wakeups,
+            pipes.total_writer_wakeups
+        );
+        for pipe in &pipes.pipes {
+            shell_println!(
+                "pipe {}: buffered={}, readers={}, writers={}, bytes={}/{}",
+                pipe.id,
+                pipe.buffered_bytes,
+                pipe.readers,
+                pipe.writers,
+                pipe.bytes_read,
+                pipe.bytes_written
+            );
+        }
     }
 
     fn print_interrupts(&self) {
@@ -1039,10 +1117,19 @@ fn print_process_result(result: &userspace::ProcessResult) {
         result.bytes_read
     );
     shell_println!(
-        "  terminal: reads={}, bytes={}, blocked reads={}; frames reclaimed={}",
+        "  terminal: reads={}, bytes={}, blocked reads={}",
         result.terminal_read_count,
         result.terminal_bytes_read,
-        result.blocked_read_count,
+        result.blocked_read_count
+    );
+    shell_println!(
+        "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; frames reclaimed={}",
+        result.pipe_read_count,
+        result.pipe_write_count,
+        result.pipe_bytes_read,
+        result.pipe_bytes_written,
+        result.blocked_pipe_read_count,
+        result.blocked_pipe_write_count,
         result.frames_reclaimed
     );
     if let Some(fault) = result.fault() {
@@ -1085,6 +1172,8 @@ fn print_help() {
     shell_println!("  elf <path>       validate an ELF64 executable");
     shell_println!("  process          show process scheduling and fault results");
     shell_println!("  terminal         show canonical terminal and wakeup statistics");
+    shell_println!("  pipes            show pipe buffers, blocking, and wakeups");
+    shell_println!("  pipe <a> | <b>   run a userspace pipeline");
     shell_println!("  spawn <path> [args...]  launch a userspace process");
     shell_println!("  wait <pid>       wait for and reap a userspace process");
     shell_println!("  run <path> [args...]    run in the foreground with stdin");

@@ -607,6 +607,52 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         terminal_result.terminal_bytes_read
     );
 
+    const PIPE_TEST_BYTES: u64 = 42;
+    let pipe_before = userspace_runtime.pipe_snapshot();
+    let pipeline_result =
+        match userspace_runtime.pipeline("/pipe-producer", &[], "/pipe-consumer", &[]) {
+            Ok(result) => result,
+            Err(error) => {
+                serial_println!("userspace pipe validation failed: {error}");
+                hlt_loop();
+            }
+        };
+    let pipe_after = userspace_runtime.pipe_snapshot();
+    let pipe_verified = pipeline_result.producer.exit_code() == Some(0)
+        && pipeline_result.consumer.exit_code() == Some(0)
+        && pipeline_result.producer.pipe_write_count >= 1
+        && pipeline_result.producer.pipe_bytes_written == PIPE_TEST_BYTES
+        && pipeline_result.consumer.pipe_read_count >= 2
+        && pipeline_result.consumer.pipe_bytes_read == PIPE_TEST_BYTES
+        && pipeline_result.consumer.blocked_pipe_read_count >= 1
+        && pipe_after.total_reader_wakeups > pipe_before.total_reader_wakeups
+        && pipe_after.active_pipes == 0;
+    if !pipe_verified {
+        serial_println!(
+            "userspace pipe verification failed: producer_exit={:?}, consumer_exit={:?}, writes={}, written={}, reads={}, read={}, blocked_reads={}, wakeups_before={}, wakeups_after={}, active={}",
+            pipeline_result.producer.exit_code(),
+            pipeline_result.consumer.exit_code(),
+            pipeline_result.producer.pipe_write_count,
+            pipeline_result.producer.pipe_bytes_written,
+            pipeline_result.consumer.pipe_read_count,
+            pipeline_result.consumer.pipe_bytes_read,
+            pipeline_result.consumer.blocked_pipe_read_count,
+            pipe_before.total_reader_wakeups,
+            pipe_after.total_reader_wakeups,
+            pipe_after.active_pipes
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace pipe verified: pipe={}, bytes={}, producer_writes={}, consumer_reads={}, blocked_reads={}, reader_wakeups={}, active_pipes=0",
+        pipeline_result.pipe_id,
+        pipeline_result.consumer.pipe_bytes_read,
+        pipeline_result.producer.pipe_write_count,
+        pipeline_result.consumer.pipe_read_count,
+        pipeline_result.consumer.blocked_pipe_read_count,
+        pipe_after.total_reader_wakeups
+    );
+
     println!("GalacticOS");
     println!("-------------");
     println!();
@@ -672,6 +718,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Blocking userspace terminal verified");
     } else {
         println!("Userspace terminal unavailable");
+    }
+    if pipe_verified {
+        println!("Blocking userspace pipes verified");
+    } else {
+        println!("Userspace pipes unavailable");
     }
     println!("Interactive shell initialized");
 

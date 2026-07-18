@@ -210,10 +210,18 @@ impl PipeManager {
         Ok(())
     }
 
+    fn pipe_index(&self, pipe_id: PipeId) -> Result<usize, Error> {
+        self.pipes
+            .iter()
+            .position(|pipe| pipe.id == pipe_id)
+            .ok_or(Error::NotFound(pipe_id))
+    }
+
     fn read(&mut self, pipe_id: PipeId, maximum: usize) -> Result<ReadOutcome, Error> {
-        let pipe = self.pipe_mut(pipe_id)?;
-        pipe.read_calls = pipe.read_calls.saturating_add(1);
+        let index = self.pipe_index(pipe_id)?;
         self.total_read_calls = self.total_read_calls.saturating_add(1);
+        let pipe = &mut self.pipes[index];
+        pipe.read_calls = pipe.read_calls.saturating_add(1);
 
         if !pipe.buffer.is_empty() {
             let count = maximum.min(pipe.buffer.len());
@@ -236,9 +244,10 @@ impl PipeManager {
     }
 
     fn write(&mut self, pipe_id: PipeId, bytes: &[u8]) -> Result<WriteOutcome, Error> {
-        let pipe = self.pipe_mut(pipe_id)?;
-        pipe.write_calls = pipe.write_calls.saturating_add(1);
+        let index = self.pipe_index(pipe_id)?;
         self.total_write_calls = self.total_write_calls.saturating_add(1);
+        let pipe = &mut self.pipes[index];
+        pipe.write_calls = pipe.write_calls.saturating_add(1);
 
         if pipe.readers == 0 {
             return Ok(WriteOutcome::NoReaders);
@@ -255,30 +264,34 @@ impl PipeManager {
     }
 
     fn note_blocked_read(&mut self, pipe_id: PipeId) -> Result<(), Error> {
-        let pipe = self.pipe_mut(pipe_id)?;
-        pipe.blocked_reads = pipe.blocked_reads.saturating_add(1);
+        let index = self.pipe_index(pipe_id)?;
         self.total_blocked_reads = self.total_blocked_reads.saturating_add(1);
+        let pipe = &mut self.pipes[index];
+        pipe.blocked_reads = pipe.blocked_reads.saturating_add(1);
         Ok(())
     }
 
     fn note_blocked_write(&mut self, pipe_id: PipeId) -> Result<(), Error> {
-        let pipe = self.pipe_mut(pipe_id)?;
-        pipe.blocked_writes = pipe.blocked_writes.saturating_add(1);
+        let index = self.pipe_index(pipe_id)?;
         self.total_blocked_writes = self.total_blocked_writes.saturating_add(1);
+        let pipe = &mut self.pipes[index];
+        pipe.blocked_writes = pipe.blocked_writes.saturating_add(1);
         Ok(())
     }
 
     fn note_reader_wakeup(&mut self, pipe_id: PipeId) -> Result<(), Error> {
-        let pipe = self.pipe_mut(pipe_id)?;
-        pipe.reader_wakeups = pipe.reader_wakeups.saturating_add(1);
+        let index = self.pipe_index(pipe_id)?;
         self.total_reader_wakeups = self.total_reader_wakeups.saturating_add(1);
+        let pipe = &mut self.pipes[index];
+        pipe.reader_wakeups = pipe.reader_wakeups.saturating_add(1);
         Ok(())
     }
 
     fn note_writer_wakeup(&mut self, pipe_id: PipeId) -> Result<(), Error> {
-        let pipe = self.pipe_mut(pipe_id)?;
-        pipe.writer_wakeups = pipe.writer_wakeups.saturating_add(1);
+        let index = self.pipe_index(pipe_id)?;
         self.total_writer_wakeups = self.total_writer_wakeups.saturating_add(1);
+        let pipe = &mut self.pipes[index];
+        pipe.writer_wakeups = pipe.writer_wakeups.saturating_add(1);
         Ok(())
     }
 
