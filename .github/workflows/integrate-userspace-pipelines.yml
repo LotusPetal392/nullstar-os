@@ -39,6 +39,25 @@ jobs:
           fi
           exit "$status"
 
+      - name: Fix pipe descriptor close result
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("kernel/src/process/userspace.rs")
+          source = path.read_text()
+          old = '''            Some(descriptor)
+          } else if let Some(index) = process
+          '''
+          new = '''            descriptor
+          } else if let Some(index) = process
+          '''
+          if old in source:
+              path.write_text(source.replace(old, new, 1))
+          elif new not in source:
+              raise SystemExit("pipe descriptor close target was not found")
+          PY
+
       - name: Format sources
         run: cargo +nightly-2026-02-01 fmt --all
 
@@ -53,7 +72,7 @@ jobs:
           git config user.email "lotuspetalagent@users.noreply.github.com"
           git add Cargo.lock kernel/src/main.rs kernel/src/process kernel/src/shell.rs src/main.rs userspace/src/bin/ush.rs
           if ! git diff --cached --quiet; then
-            git commit -m "Format userspace descriptor pipelines"
+            git commit -m "Fix userspace pipe descriptor close"
             git push origin HEAD:agent/userspace-pipelines
           fi
 
