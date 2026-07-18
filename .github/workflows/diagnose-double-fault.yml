@@ -24,20 +24,37 @@ jobs:
       - name: Build kernel with debug symbols
         run: cargo +nightly-2026-02-01 build --locked
 
-      - name: Map reported double-fault address
+      - name: Capture reported double-fault address mapping
         shell: bash
         run: |
-          set -euxo pipefail
-          kernel=$(find target -type f -name kernel -perm -111 | head -n 1)
-          test -n "$kernel"
+          set -uo pipefail
           toolchain=$(rustc +nightly-2026-02-01 --print sysroot)
           addr2line=$(find "$toolchain" -type f -name llvm-addr2line | head -n 1)
           nm=$(find "$toolchain" -type f -name llvm-nm | head -n 1)
           objdump=$(find "$toolchain" -type f -name llvm-objdump | head -n 1)
-          test -x "$addr2line"
-          test -x "$nm"
-          test -x "$objdump"
-          echo "kernel=$kernel"
-          "$addr2line" -f -C -e "$kernel" 0xaac24
-          "$nm" -n -C "$kernel" | awk '$1 >= "00000000000aa900" && $1 <= "00000000000aaf00" { print }'
-          "$objdump" -d -C --start-address=0xaab40 --stop-address=0xaad20 "$kernel"
+          {
+            echo "toolchain=$toolchain"
+            echo "addr2line=$addr2line"
+            echo "nm=$nm"
+            echo "objdump=$objdump"
+            echo "candidate files:"
+            find target -type f \( -name 'kernel' -o -name 'kernel-*' \) -print
+            while IFS= read -r candidate; do
+              if file "$candidate" | grep -q 'ELF 64-bit'; then
+                echo
+                echo "=== $candidate ==="
+                file "$candidate"
+                "$addr2line" -f -C -e "$candidate" 0xaac24 || true
+                "$nm" -n -C "$candidate" 2>/dev/null | awk '$1 >= "00000000000aa900" && $1 <= "00000000000aaf00" { print }' || true
+                "$objdump" -d -C --start-address=0xaab40 --stop-address=0xaad20 "$candidate" 2>/dev/null || true
+              fi
+            done < <(find target -type f \( -name 'kernel' -o -name 'kernel-*' \) -print)
+          } > double-fault-symbols.txt 2>&1
+          cat double-fault-symbols.txt
+
+      - name: Upload address diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: double-fault-symbols
+          path: double-fault-symbols.txt
