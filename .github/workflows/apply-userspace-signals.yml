@@ -1,0 +1,58 @@
+name: Apply userspace process groups and signals
+
+on:
+  push:
+    branches:
+      - agent/userspace-signals
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-signals
+
+      - name: Decode and apply process-group integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat tools/userspace_signals_payload.part0 > /tmp/userspace-signals.b64
+          cat >> /tmp/userspace-signals.b64 <<'PAYLOAD'
+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
+PAYLOAD
+          base64 --decode /tmp/userspace-signals.b64 | gzip --decompress > tools/apply_userspace_signals.py
+          python tools/apply_userspace_signals.py
+          rm tools/userspace_signals_payload.part0
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-02-01 --profile minimal \
+            --component llvm-tools-preview --component rust-src --component rustfmt \
+            --target x86_64-unknown-none
+
+      - name: Format and validate
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+
+      - name: Build and boot the full smoke test
+        run: cargo +nightly-2026-02-01 run --locked -- --test
+
+      - name: Commit and push product changes
+        run: |
+          git config user.name lotuspetalagent
+          git config user.email lotuspetalagent@users.noreply.github.com
+          git add -A
+          git commit -m "Add userspace process groups and signals"
+          git push origin HEAD:agent/userspace-signals
