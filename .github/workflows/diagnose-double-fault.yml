@@ -1,9 +1,9 @@
 name: Diagnose double fault address
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/multistage-userspace-pipelines
+      - main
 
 permissions:
   contents: read
