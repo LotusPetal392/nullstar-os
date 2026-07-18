@@ -112,6 +112,13 @@ impl Shell {
     }
 
     pub fn handle_key(&mut self, key: DecodedKey) -> ShellAction {
+        if self.runtime.terminal_active() {
+            if let Err(error) = self.runtime.handle_terminal_key(key) {
+                crate::serial_println!("terminal key routing failed: {error}");
+            }
+            return ShellAction::Continue;
+        }
+
         match key {
             DecodedKey::Unicode(character) => self.handle_character(character),
             DecodedKey::RawKey(key_code) => self.handle_raw_key(key_code),

@@ -1095,6 +1095,18 @@ impl Runtime {
         reap(&mut self.frame_allocator)
     }
 
+    pub fn terminal_active(&self) -> bool {
+        terminal::foreground_process().is_some()
+    }
+
+    pub fn handle_terminal_key(&mut self, key: pc_keyboard::DecodedKey) -> Result<bool, Error> {
+        let handled = terminal::handle_key(key);
+        if handled {
+            service_terminal_reads(self.physical_memory_offset)?;
+        }
+        Ok(handled)
+    }
+
     pub fn reap(&mut self) -> Result<usize, Error> {
         self.poll()
     }

@@ -188,13 +188,26 @@ pub fn foreground_process() -> Option<u64> {
     x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().foreground_process)
 }
 
+pub fn handle_key(key: DecodedKey) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut terminal = TERMINAL.lock();
+        if terminal.foreground_process.is_none() {
+            return false;
+        }
+        terminal.handle_key(key);
+        true
+    })
+}
+
 pub fn poll_keyboard() -> usize {
     if foreground_process().is_none() {
         return 0;
     }
     let mut handled = 0usize;
     while let Some(key) = keyboard::poll_key() {
-        x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().handle_key(key));
+        if !handle_key(key) {
+            break;
+        }
         handled = handled.saturating_add(1);
     }
     handled
