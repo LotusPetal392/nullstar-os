@@ -42,6 +42,9 @@ const SYSCALL_EXIT: u64 = 3;
 const SYSCALL_OPEN: u64 = 4;
 const SYSCALL_READ: u64 = 5;
 const SYSCALL_CLOSE: u64 = 6;
+const SYSCALL_SPAWN_COMMAND: u64 = 7;
+const SYSCALL_WAIT_CHILD: u64 = 8;
+const SYSCALL_GETPID: u64 = 9;
 
 const USER_MIN_ADDRESS: u64 = 0x0001_0000;
 const USER_PML4_SLOT_END: u64 = 0x0000_0080_0000_0000;
@@ -55,6 +58,8 @@ const MAX_SYSCALL_READ_BYTES: usize = 4096;
 const MAX_OPEN_FILES: usize = 16;
 const MAX_ARGUMENTS: usize = 16;
 const MAX_ARGUMENT_BYTES: usize = 4096;
+const MAX_COMMAND_BYTES: usize = 512;
+const SPAWN_FOREGROUND: u64 = 1;
 const SHELL_PROCESS_TASK_NAME: &str = "user-shell-process";
 const USER_RFLAGS: u64 = 0x202;
 const PAGE_BYTES: u64 = Size4KiB::SIZE;
@@ -63,6 +68,7 @@ const ERR_NO_ENTRY: i64 = -2;
 const ERR_IO: i64 = -5;
 const ERR_ARGUMENT_TOO_LARGE: i64 = -7;
 const ERR_BAD_FILE_DESCRIPTOR: i64 = -9;
+const ERR_NO_CHILD: i64 = -10;
 const ERR_BAD_ADDRESS: i64 = -14;
 const ERR_IS_DIRECTORY: i64 = -21;
 const ERR_INVALID_ARGUMENT: i64 = -22;
@@ -268,6 +274,7 @@ impl fmt::Display for TerminationReason {
 #[derive(Debug, Clone)]
 pub struct ProcessResult {
     pub process_id: u64,
+    pub parent_process_id: Option<u64>,
     pub task_id: u64,
     pub path: String,
     pub termination: TerminationReason,
@@ -295,6 +302,8 @@ pub struct ProcessResult {
     pub pipe_bytes_written: u64,
     pub blocked_pipe_read_count: u64,
     pub blocked_pipe_write_count: u64,
+    pub child_spawn_count: u64,
+    pub child_wait_count: u64,
     pub scheduled_count: u64,
     pub runtime_ticks: u64,
     pub frames_reclaimed: usize,
@@ -319,6 +328,8 @@ impl ProcessResult {
 #[derive(Debug, Clone)]
 pub struct ManagerSnapshot {
     pub spawned: u64,
+    pub child_spawns: u64,
+    pub child_waits: u64,
     pub active: usize,
     pub blocked: usize,
     pub exited: u64,
@@ -490,6 +501,20 @@ struct PendingPipeWrite {
 }
 
 #[derive(Debug, Clone)]
+struct PendingChildSpawn {
+    path: String,
+    arguments: Vec<String>,
+    foreground: bool,
+    stack_pointer: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingChildWait {
+    child_process_id: u64,
+    stack_pointer: usize,
+}
+
+#[derive(Debug, Clone)]
 struct OpenFile {
     descriptor: u64,
     path: String,
@@ -498,6 +523,8 @@ struct OpenFile {
 
 struct Process {
     process_id: u64,
+    parent_process_id: Option<u64>,
+    terminal_parent: Option<u64>,
     task_id: u64,
     path: String,
     state: ProcessState,
@@ -517,6 +544,8 @@ struct Process {
     pending_terminal_read: Option<PendingTerminalRead>,
     pending_pipe_read: Option<PendingPipeRead>,
     pending_pipe_write: Option<PendingPipeWrite>,
+    pending_child_spawn: Option<PendingChildSpawn>,
+    pending_child_wait: Option<PendingChildWait>,
     syscall_count: u64,
     write_count: u64,
     yield_count: u64,
@@ -534,6 +563,8 @@ struct Process {
     pipe_bytes_written: u64,
     blocked_pipe_read_count: u64,
     blocked_pipe_write_count: u64,
+    child_spawn_count: u64,
+    child_wait_count: u64,
 }
 
 impl Process {
@@ -549,6 +580,7 @@ impl Process {
             .ok_or(Error::ProcessNotFound(self.process_id))?;
         Ok(ProcessResult {
             process_id: self.process_id,
+            parent_process_id: self.parent_process_id,
             task_id: self.task_id,
             path: self.path.clone(),
             termination,
@@ -576,6 +608,8 @@ impl Process {
             pipe_bytes_written: self.pipe_bytes_written,
             blocked_pipe_read_count: self.blocked_pipe_read_count,
             blocked_pipe_write_count: self.blocked_pipe_write_count,
+            child_spawn_count: self.child_spawn_count,
+            child_wait_count: self.child_wait_count,
             scheduled_count,
             runtime_ticks,
             frames_reclaimed,
@@ -588,6 +622,8 @@ struct ProcessManager {
     processes: Vec<Process>,
     completed: Vec<ProcessResult>,
     spawned: u64,
+    child_spawns: u64,
+    child_waits: u64,
     exited: u64,
     faulted: u64,
     reaped: u64,
@@ -601,6 +637,8 @@ impl ProcessManager {
             processes: Vec::new(),
             completed: Vec::new(),
             spawned: 0,
+            child_spawns: 0,
+            child_waits: 0,
             exited: 0,
             faulted: 0,
             reaped: 0,
@@ -631,6 +669,8 @@ impl ProcessManager {
     fn snapshot(&self) -> ManagerSnapshot {
         ManagerSnapshot {
             spawned: self.spawned,
+            child_spawns: self.child_spawns,
+            child_waits: self.child_waits,
             active: self
                 .processes
                 .iter()
@@ -888,6 +928,8 @@ pub fn spawn_with_args(
         false,
         None,
         None,
+        None,
+        None,
         kernel_mapper,
         frame_allocator,
         physical_memory_offset,
@@ -902,6 +944,8 @@ fn spawn_with_mode(
     foreground: bool,
     stdin_pipe: Option<PipeId>,
     stdout_pipe: Option<PipeId>,
+    parent_process_id: Option<u64>,
+    terminal_parent: Option<u64>,
     kernel_mapper: &mut OffsetPageTable<'_>,
     frame_allocator: &mut BootInfoFrameAllocator,
     physical_memory_offset: VirtAddr,
@@ -981,6 +1025,8 @@ fn spawn_with_mode(
     let process_id = PROCESS_MANAGER.lock().allocate_process_id();
     let mut pending_process = Some(Process {
         process_id,
+        parent_process_id,
+        terminal_parent,
         task_id: 0,
         path: path.to_string(),
         state: ProcessState::Runnable,
@@ -1000,6 +1046,8 @@ fn spawn_with_mode(
         pending_terminal_read: None,
         pending_pipe_read: None,
         pending_pipe_write: None,
+        pending_child_spawn: None,
+        pending_child_wait: None,
         syscall_count: 0,
         write_count: 0,
         yield_count: 0,
@@ -1017,11 +1065,19 @@ fn spawn_with_mode(
         pipe_bytes_written: 0,
         blocked_pipe_read_count: 0,
         blocked_pipe_write_count: 0,
+        child_spawn_count: 0,
+        child_wait_count: 0,
     });
 
     let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
-        if foreground && !terminal::attach(process_id) {
-            return Err(Error::TerminalBusy);
+        if foreground {
+            let attached = match terminal_parent {
+                Some(parent_process) => terminal::transfer(parent_process, process_id),
+                None => terminal::attach(process_id),
+            };
+            if !attached {
+                return Err(Error::TerminalBusy);
+            }
         }
         let task_id = scheduler::spawn_user_process(
             task_name,
@@ -1044,7 +1100,13 @@ fn spawn_with_mode(
     let task_id = match task_result {
         Ok(task_id) => task_id,
         Err(error) => {
-            terminal::detach(process_id);
+            if foreground {
+                if let Some(parent_process) = terminal_parent {
+                    let _ = terminal::transfer(process_id, parent_process);
+                } else {
+                    terminal::detach(process_id);
+                }
+            }
             if let Some(mut process) = pending_process.take() {
                 for frame in process.owned_frames.drain(..) {
                     frame_allocator.deallocate_frame(frame);
@@ -1127,6 +1189,8 @@ impl Runtime {
             foreground,
             None,
             None,
+            None,
+            None,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -1152,6 +1216,8 @@ impl Runtime {
             false,
             stdin_pipe,
             stdout_pipe,
+            None,
+            None,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -1193,6 +1259,31 @@ impl Runtime {
         })
     }
 
+    fn spawn_child(
+        &mut self,
+        parent_process_id: u64,
+        request: &PendingChildSpawn,
+    ) -> Result<SpawnInfo, Error> {
+        let image = elf::validate(&request.path)?;
+        let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
+        argv.push(request.path.as_str());
+        argv.extend(request.arguments.iter().map(String::as_str));
+        spawn_with_mode(
+            &request.path,
+            SHELL_PROCESS_TASK_NAME,
+            &image,
+            &argv,
+            request.foreground,
+            None,
+            None,
+            Some(parent_process_id),
+            request.foreground.then_some(parent_process_id),
+            &mut self.mapper,
+            &mut self.frame_allocator,
+            self.physical_memory_offset,
+        )
+    }
+
     pub fn wait(&mut self, process_id: u64) -> Result<ProcessResult, Error> {
         loop {
             self.poll()?;
@@ -1226,7 +1317,102 @@ impl Runtime {
         let reaped = reap(&mut self.frame_allocator)?;
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;
+        self.service_child_requests()?;
         Ok(reaped)
+    }
+
+    fn service_child_requests(&mut self) -> Result<usize, Error> {
+        let spawn_requests: Vec<(u64, PendingChildSpawn)> =
+            cpu_interrupts::without_interrupts(|| {
+                PROCESS_MANAGER
+                    .lock()
+                    .processes
+                    .iter()
+                    .filter_map(|process| {
+                        process
+                            .pending_child_spawn
+                            .clone()
+                            .map(|request| (process.process_id, request))
+                    })
+                    .collect()
+            });
+        let mut completed = 0usize;
+        for (parent_process_id, request) in spawn_requests {
+            let result = self.spawn_child(parent_process_id, &request);
+            let return_value = match result {
+                Ok(info) => info.process_id,
+                Err(error) => error_return(process_error_number(&error)),
+            };
+            cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
+                let mut manager = PROCESS_MANAGER.lock();
+                let process = manager
+                    .process_mut(parent_process_id)
+                    .ok_or(Error::ProcessNotFound(parent_process_id))?;
+                let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
+                registers.rax = return_value;
+                process.pending_child_spawn = None;
+                process.state = ProcessState::Runnable;
+                if (return_value as i64) >= 0 {
+                    process.child_spawn_count = process.child_spawn_count.saturating_add(1);
+                    manager.child_spawns = manager.child_spawns.saturating_add(1);
+                }
+                drop(manager);
+                if !scheduler::wake_process(parent_process_id) {
+                    return Err(Error::ProcessNotFound(parent_process_id));
+                }
+                Ok(())
+            })?;
+            completed = completed.saturating_add(1);
+        }
+
+        let wait_requests: Vec<(u64, PendingChildWait)> =
+            cpu_interrupts::without_interrupts(|| {
+                PROCESS_MANAGER
+                    .lock()
+                    .processes
+                    .iter()
+                    .filter_map(|process| {
+                        process
+                            .pending_child_wait
+                            .map(|request| (process.process_id, request))
+                    })
+                    .collect()
+            });
+        for (parent_process_id, request) in wait_requests {
+            let result = cpu_interrupts::without_interrupts(|| {
+                PROCESS_MANAGER
+                    .lock()
+                    .completed
+                    .iter()
+                    .find(|result| {
+                        result.process_id == request.child_process_id
+                            && result.parent_process_id == Some(parent_process_id)
+                    })
+                    .cloned()
+            });
+            let Some(result) = result else {
+                continue;
+            };
+            cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
+                let mut manager = PROCESS_MANAGER.lock();
+                let process = manager
+                    .process_mut(parent_process_id)
+                    .ok_or(Error::ProcessNotFound(parent_process_id))?;
+                let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
+                registers.rax = child_status(&result);
+                process.pending_child_wait = None;
+                process.state = ProcessState::Runnable;
+                process.child_wait_count = process.child_wait_count.saturating_add(1);
+                manager.child_waits = manager.child_waits.saturating_add(1);
+                drop(manager);
+                if !scheduler::wake_process(parent_process_id) {
+                    return Err(Error::ProcessNotFound(parent_process_id));
+                }
+                Ok(())
+            })?;
+            completed = completed.saturating_add(1);
+        }
+        Ok(completed)
     }
 
     pub fn terminal_active(&self) -> bool {
@@ -1260,6 +1446,50 @@ impl Runtime {
                 return Err(Error::ProcessNotFound(process_id));
             }
             drop(manager);
+            hlt();
+        }
+    }
+
+    pub fn wait_until_terminal_read(&mut self, process_id: u64) -> Result<(), Error> {
+        loop {
+            self.poll()?;
+            let ready = cpu_interrupts::without_interrupts(|| {
+                PROCESS_MANAGER
+                    .lock()
+                    .processes
+                    .iter()
+                    .find(|process| process.process_id == process_id)
+                    .is_some_and(|process| {
+                        process.pending_terminal_read.is_some()
+                            && process.state == ProcessState::Blocked
+                    })
+            });
+            if ready && terminal::is_foreground(process_id) {
+                return Ok(());
+            }
+            hlt();
+        }
+    }
+
+    pub fn wait_for_child_path(
+        &mut self,
+        parent_process_id: u64,
+        path: &str,
+    ) -> Result<ProcessResult, Error> {
+        loop {
+            self.poll()?;
+            if let Some(result) = cpu_interrupts::without_interrupts(|| {
+                PROCESS_MANAGER
+                    .lock()
+                    .completed
+                    .iter()
+                    .find(|result| {
+                        result.parent_process_id == Some(parent_process_id) && result.path == path
+                    })
+                    .cloned()
+            }) {
+                return Ok(result);
+            }
             hlt();
         }
     }
@@ -1339,7 +1569,18 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
             PROCESS_MANAGER.lock().remove_process(process_id)
         })
         .ok_or(Error::ProcessNotFound(process_id))?;
+        let terminal_parent = process.terminal_parent;
         terminal::detach(process_id);
+        if let Some(parent_process_id) = terminal_parent {
+            let parent_exists = PROCESS_MANAGER
+                .lock()
+                .processes
+                .iter()
+                .any(|candidate| candidate.process_id == parent_process_id);
+            if parent_exists {
+                let _ = terminal::attach(parent_process_id);
+            }
+        }
         if let Some(pipe_id) = process.stdin_pipe.take() {
             let _ = pipe::close_reader(pipe_id);
         }
@@ -1445,6 +1686,32 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
         },
         SYSCALL_CLOSE => {
             registers.rax = syscall_close(process_id, registers.rdi);
+            current_stack_pointer
+        }
+        SYSCALL_SPAWN_COMMAND => match syscall_spawn_command(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        },
+        SYSCALL_WAIT_CHILD => {
+            match syscall_wait_child(process_id, registers.rdi, current_stack_pointer) {
+                ControlOutcome::Ready(result) => {
+                    registers.rax = result;
+                    current_stack_pointer
+                }
+                ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+            }
+        }
+        SYSCALL_GETPID => {
+            registers.rax = process_id;
             current_stack_pointer
         }
         SYSCALL_EXIT => {
@@ -1597,6 +1864,131 @@ fn process_path(process_id: u64) -> String {
         .unwrap_or_else(|| String::from("<unknown>"))
 }
 
+enum ControlOutcome {
+    Ready(u64),
+    Blocked,
+}
+
+fn syscall_spawn_command(
+    process_id: u64,
+    address: u64,
+    length: u64,
+    flags: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
+    if flags & !SPAWN_FOREGROUND != 0 {
+        return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
+    }
+    let command = match user_text(process_id, address, length, MAX_COMMAND_BYTES) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let (path, arguments) = match parse_command_line(&command) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
+    };
+    if process.pending_child_spawn.is_some() || process.pending_child_wait.is_some() {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_child_spawn = Some(PendingChildSpawn {
+        path,
+        arguments,
+        foreground: flags & SPAWN_FOREGROUND != 0,
+        stack_pointer: current_stack_pointer,
+    });
+    process.state = ProcessState::Blocked;
+    ControlOutcome::Blocked
+}
+
+fn syscall_wait_child(
+    process_id: u64,
+    child_process_id: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
+    let mut manager = PROCESS_MANAGER.lock();
+    if let Some(result) = manager
+        .completed
+        .iter()
+        .find(|result| {
+            result.process_id == child_process_id && result.parent_process_id == Some(process_id)
+        })
+        .cloned()
+    {
+        if let Some(process) = manager.process_mut(process_id) {
+            process.child_wait_count = process.child_wait_count.saturating_add(1);
+        }
+        manager.child_waits = manager.child_waits.saturating_add(1);
+        return ControlOutcome::Ready(child_status(&result));
+    }
+    let child_exists = manager.processes.iter().any(|child| {
+        child.process_id == child_process_id && child.parent_process_id == Some(process_id)
+    });
+    if !child_exists {
+        return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
+    }
+    let Some(process) = manager.process_mut(process_id) else {
+        return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
+    };
+    if process.pending_child_spawn.is_some() || process.pending_child_wait.is_some() {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_child_wait = Some(PendingChildWait {
+        child_process_id,
+        stack_pointer: current_stack_pointer,
+    });
+    process.state = ProcessState::Blocked;
+    ControlOutcome::Blocked
+}
+
+fn parse_command_line(command: &str) -> Result<(String, Vec<String>), i64> {
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return Err(ERR_INVALID_ARGUMENT);
+    };
+    let path = if program.starts_with('/') {
+        String::from(program)
+    } else {
+        let mut path = String::from("/");
+        path.push_str(program);
+        path
+    };
+    let mut arguments = Vec::new();
+    let mut argument_bytes = path.len().saturating_add(1);
+    for argument in words {
+        if arguments.len().saturating_add(1) >= MAX_ARGUMENTS {
+            return Err(ERR_ARGUMENT_TOO_LARGE);
+        }
+        argument_bytes = argument_bytes.saturating_add(argument.len().saturating_add(1));
+        if argument_bytes > MAX_ARGUMENT_BYTES {
+            return Err(ERR_ARGUMENT_TOO_LARGE);
+        }
+        arguments.push(String::from(argument));
+    }
+    Ok((path, arguments))
+}
+
+fn child_status(result: &ProcessResult) -> u64 {
+    match &result.termination {
+        TerminationReason::Exit(code) => *code,
+        TerminationReason::Fault(fault) => 128_u64.saturating_add(fault.vector),
+    }
+}
+
+fn process_error_number(error: &Error) -> i64 {
+    match error {
+        Error::Vfs(vfs::Error::NotFound) => ERR_NO_ENTRY,
+        Error::InvalidArgument | Error::TooManyArguments | Error::ArgumentBytesTooLarge => {
+            ERR_INVALID_ARGUMENT
+        }
+        Error::TerminalBusy => ERR_IO,
+        _ => ERR_IO,
+    }
+}
+
 enum WriteOutcome {
     Ready(u64),
     Blocked,
@@ -1722,8 +2114,12 @@ fn user_range_allows(process_id: u64, address: u64, length: usize, require_write
 }
 
 fn user_string(process_id: u64, address: u64, length: u64) -> Result<String, i64> {
+    user_text(process_id, address, length, vfs::MAX_PATH_BYTES)
+}
+
+fn user_text(process_id: u64, address: u64, length: u64, maximum: usize) -> Result<String, i64> {
     let length = usize::try_from(length).map_err(|_| ERR_ARGUMENT_TOO_LARGE)?;
-    if length == 0 || length > vfs::MAX_PATH_BYTES {
+    if length == 0 || length > maximum {
         return Err(ERR_ARGUMENT_TOO_LARGE);
     }
     if !user_range_allows(process_id, address, length, false) {

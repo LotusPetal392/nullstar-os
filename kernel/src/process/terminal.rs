@@ -72,6 +72,16 @@ impl Terminal {
         }
     }
 
+    fn transfer(&mut self, current_process: u64, next_process: u64) -> bool {
+        if self.foreground_process != Some(current_process) {
+            return false;
+        }
+        self.foreground_process = Some(next_process);
+        self.editing.clear();
+        self.committed.clear();
+        true
+    }
+
     fn handle_key(&mut self, key: DecodedKey) {
         self.keys_received = self.keys_received.saturating_add(1);
         match key {
@@ -176,6 +186,12 @@ pub fn attach(process_id: u64) -> bool {
 
 pub fn detach(process_id: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().detach(process_id));
+}
+
+pub fn transfer(current_process: u64, next_process: u64) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        TERMINAL.lock().transfer(current_process, next_process)
+    })
 }
 
 pub fn is_foreground(process_id: u64) -> bool {
