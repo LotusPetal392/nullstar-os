@@ -26,10 +26,15 @@ pub(crate) use process::{elf, userspace};
 pub(crate) use storage::{fat, partition};
 
 const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
+// The interactive kernel shell synchronously services userspace process-control
+// requests on the bootstrap stack, so reserve explicit headroom beyond the
+// bootloader's 80 KiB default.
+const BOOTSTRAP_KERNEL_STACK_SIZE: u64 = 256 * 1024;
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.kernel_stack_size = BOOTSTRAP_KERNEL_STACK_SIZE;
     config
 };
 
@@ -49,6 +54,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .unwrap_or(0)
         .max(BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END);
     let rsdp_address = boot_info.rsdp_addr.into_option();
+    let bootstrap_stack_bottom = boot_info.kernel_stack_bottom;
+    let bootstrap_stack_len = boot_info.kernel_stack_len;
+    let Some(bootstrap_stack_top) = bootstrap_stack_bottom.checked_add(bootstrap_stack_len) else {
+        serial_println!("bootstrap kernel stack address overflowed");
+        hlt_loop();
+    };
+    if bootstrap_stack_len < BOOTSTRAP_KERNEL_STACK_SIZE {
+        serial_println!(
+            "bootstrap kernel stack is too small: configured={}, provided={}",
+            BOOTSTRAP_KERNEL_STACK_SIZE,
+            bootstrap_stack_len
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "bootstrap kernel stack initialized: bottom={:#x}, top={:#x}, bytes={}",
+        bootstrap_stack_bottom,
+        bootstrap_stack_top,
+        bootstrap_stack_len
+    );
 
     let mut mapper = unsafe { memory::init(physical_memory_offset) };
     let mut frame_allocator =
@@ -682,8 +707,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     let userspace_pipeline_before = userspace_runtime.pipe_snapshot();
-    if let Err(error) = userspace_runtime.inject_terminal_line("pipe-producer | pipe-consumer") {
-        serial_println!("userspace pipeline command injection failed: {error}");
+    if let Err(error) =
+        userspace_runtime.inject_terminal_line("pipe-producer | upper | pipe-consumer")
+    {
+        serial_println!("userspace multi-stage pipeline command injection failed: {error}");
         hlt_loop();
     }
     let shell_producer =
@@ -691,6 +718,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             Ok(result) => result,
             Err(error) => {
                 serial_println!("userspace pipeline producer wait failed: {error}");
+                hlt_loop();
+            }
+        };
+    let shell_filter =
+        match userspace_runtime.wait_for_child_path(userspace_shell.process_id, "/upper") {
+            Ok(result) => result,
+            Err(error) => {
+                serial_println!("userspace pipeline filter wait failed: {error}");
                 hlt_loop();
             }
         };
@@ -719,47 +754,84 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             hlt_loop();
         }
     };
+    let created_pipe_delta = userspace_pipeline_after
+        .total_created
+        .saturating_sub(userspace_pipeline_before.total_created);
+    let destroyed_pipe_delta = userspace_pipeline_after
+        .total_destroyed
+        .saturating_sub(userspace_pipeline_before.total_destroyed);
+    let reader_retain_delta = userspace_pipeline_after
+        .total_reader_retains
+        .saturating_sub(userspace_pipeline_before.total_reader_retains);
+    let writer_retain_delta = userspace_pipeline_after
+        .total_writer_retains
+        .saturating_sub(userspace_pipeline_before.total_writer_retains);
+    let pipe_bytes_read_delta = userspace_pipeline_after
+        .total_bytes_read
+        .saturating_sub(userspace_pipeline_before.total_bytes_read);
+    let pipe_bytes_written_delta = userspace_pipeline_after
+        .total_bytes_written
+        .saturating_sub(userspace_pipeline_before.total_bytes_written);
     let userspace_pipeline_verified = shell_producer.parent_process_id
         == Some(userspace_shell.process_id)
+        && shell_filter.parent_process_id == Some(userspace_shell.process_id)
         && shell_consumer.parent_process_id == Some(userspace_shell.process_id)
         && shell_producer.exit_code() == Some(0)
+        && shell_filter.exit_code() == Some(0)
         && shell_consumer.exit_code() == Some(0)
         && shell_producer.pipe_write_count >= 1
         && shell_producer.pipe_bytes_written == PIPE_TEST_BYTES
+        && shell_filter.pipe_read_count >= 2
+        && shell_filter.pipe_write_count >= 1
+        && shell_filter.pipe_bytes_read == PIPE_TEST_BYTES
+        && shell_filter.pipe_bytes_written == PIPE_TEST_BYTES
+        && shell_filter.blocked_pipe_read_count >= 1
         && shell_consumer.pipe_read_count >= 2
         && shell_consumer.pipe_bytes_read == PIPE_TEST_BYTES
         && shell_consumer.blocked_pipe_read_count >= 1
-        && userspace_shell_result.pipe_pair_count == 1
-        && userspace_shell_result.pipe_descriptor_close_count == 2
-        && userspace_shell_result.pipe_descriptor_inherit_count == 2
-        && userspace_pipeline_after.total_reader_retains
-            > userspace_pipeline_before.total_reader_retains
-        && userspace_pipeline_after.total_writer_retains
-            > userspace_pipeline_before.total_writer_retains
+        && userspace_shell_result.pipe_pair_count == 2
+        && userspace_shell_result.pipe_descriptor_close_count == 4
+        && userspace_shell_result.pipe_descriptor_inherit_count == 4
+        && created_pipe_delta == 2
+        && destroyed_pipe_delta == 2
+        && reader_retain_delta == 2
+        && writer_retain_delta == 2
+        && pipe_bytes_read_delta == PIPE_TEST_BYTES.saturating_mul(2)
+        && pipe_bytes_written_delta == PIPE_TEST_BYTES.saturating_mul(2)
         && userspace_pipeline_after.active_pipes == 0;
     if !userspace_pipeline_verified {
         serial_println!(
-            "userspace pipeline verification failed: producer_exit={:?}, consumer_exit={:?}, producer_parent={:?}, consumer_parent={:?}, written={}, read={}, blocked_reads={}, pairs={}, closes={}, inherited={}, retains={}/{}, active={}",
+            "userspace multi-stage pipeline verification failed: producer_exit={:?}, filter_exit={:?}, consumer_exit={:?}, parents={:?}/{:?}/{:?}, producer_written={}, filter_read={}, filter_written={}, consumer_read={}, blocked_reads={}/{}, pairs={}, closes={}, inherited={}, created={}, destroyed={}, retains={}/{}, pipe_bytes={}/{}, active={}",
             shell_producer.exit_code(),
+            shell_filter.exit_code(),
             shell_consumer.exit_code(),
             shell_producer.parent_process_id,
+            shell_filter.parent_process_id,
             shell_consumer.parent_process_id,
             shell_producer.pipe_bytes_written,
+            shell_filter.pipe_bytes_read,
+            shell_filter.pipe_bytes_written,
             shell_consumer.pipe_bytes_read,
+            shell_filter.blocked_pipe_read_count,
             shell_consumer.blocked_pipe_read_count,
             userspace_shell_result.pipe_pair_count,
             userspace_shell_result.pipe_descriptor_close_count,
             userspace_shell_result.pipe_descriptor_inherit_count,
-            userspace_pipeline_after.total_reader_retains,
-            userspace_pipeline_after.total_writer_retains,
+            created_pipe_delta,
+            destroyed_pipe_delta,
+            reader_retain_delta,
+            writer_retain_delta,
+            pipe_bytes_read_delta,
+            pipe_bytes_written_delta,
             userspace_pipeline_after.active_pipes
         );
         hlt_loop();
     }
     serial_println!(
-        "userspace pipeline verified: shell_pid={}, producer_pid={}, consumer_pid={}, bytes={}, pairs={}, closes={}, inherited={}, active_pipes=0",
+        "userspace multi-stage pipeline verified: shell_pid={}, producer_pid={}, filter_pid={}, consumer_pid={}, stages=3, bytes={}, pairs={}, closes={}, inherited={}, active_pipes=0",
         userspace_shell_result.process_id,
         shell_producer.process_id,
+        shell_filter.process_id,
         shell_consumer.process_id,
         shell_consumer.pipe_bytes_read,
         userspace_shell_result.pipe_pair_count,
@@ -768,8 +840,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 3
-        && userspace_shell_result.child_wait_count == 3
+        && userspace_shell_result.child_spawn_count == 4
+        && userspace_shell_result.child_wait_count == 4
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
@@ -879,7 +951,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace process-control shell unavailable");
     }
     if userspace_pipeline_verified {
-        println!("Userspace descriptor pipelines verified");
+        println!("Userspace multi-stage descriptor pipelines verified");
     } else {
         println!("Userspace descriptor pipelines unavailable");
     }
