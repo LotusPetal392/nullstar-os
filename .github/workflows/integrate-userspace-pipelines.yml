@@ -1,0 +1,63 @@
+name: Integrate userspace descriptor pipelines
+
+on:
+  push:
+    branches:
+      - agent/userspace-pipelines
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-pipelines
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Apply userspace descriptor pipeline milestone
+        run: python3 tools/apply_userspace_pipelines.py
+
+      - name: Format sources
+        run: cargo +nightly-2026-02-01 fmt --all
+
+      - name: Preserve pinned dependency lockfile
+        run: |
+          git fetch origin main --depth=1
+          git checkout origin/main -- Cargo.lock
+
+      - name: Commit integrated sources
+        run: |
+          git config user.name "lotuspetalagent"
+          git config user.email "lotuspetalagent@users.noreply.github.com"
+          git add Cargo.lock kernel/src/main.rs kernel/src/process kernel/src/shell.rs src/main.rs userspace/src/bin/ush.rs
+          if ! git diff --cached --quiet; then
+            git commit -m "Add userspace descriptor pipelines"
+            git push origin HEAD:agent/userspace-pipelines
+          fi
+
+      - name: Build bootable image
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 build --locked 2>&1 | tee userspace-pipelines-build.log
+
+      - name: Upload integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: userspace-pipelines-build-log
+          path: userspace-pipelines-build.log
+          if-no-files-found: ignore
