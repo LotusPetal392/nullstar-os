@@ -53,4 +53,15 @@ jobs:
           fi
 
       - name: Build bootable image
-        run: cargo +nightly-2026-02-01 build --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 build --locked 2>&1 | tee userspace-pipes-build.log
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: userspace-pipes-build-log
+          path: userspace-pipes-build.log
+          if-no-files-found: ignore
