@@ -1,4 +1,4 @@
-name: Integrate userspace descriptor pipelines
+name: Validate userspace descriptor pipelines
 
 on:
   pull_request:
@@ -25,7 +25,7 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Apply userspace descriptor pipeline milestone
+      - name: Confirm userspace descriptor pipeline milestone
         shell: bash
         run: |
           set +e
@@ -53,7 +53,7 @@ jobs:
           git config user.email "lotuspetalagent@users.noreply.github.com"
           git add Cargo.lock kernel/src/main.rs kernel/src/process kernel/src/shell.rs src/main.rs userspace/src/bin/ush.rs
           if ! git diff --cached --quiet; then
-            git commit -m "Add userspace descriptor pipelines"
+            git commit -m "Format userspace descriptor pipelines"
             git push origin HEAD:agent/userspace-pipelines
           fi
 
