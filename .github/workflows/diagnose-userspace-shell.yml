@@ -1,0 +1,41 @@
+name: Diagnose userspace shell build
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
+
+      - name: Build bootable image
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 build --locked 2>&1 | tee userspace-shell-diagnostic.log
+
+      - name: Upload compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: userspace-shell-diagnostic
+          path: userspace-shell-diagnostic.log
+          if-no-files-found: error
