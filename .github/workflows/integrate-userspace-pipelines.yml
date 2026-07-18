@@ -1,9 +1,7 @@
 name: Integrate userspace descriptor pipelines
 
 on:
-  push:
-    branches:
-      - agent/userspace-pipelines
+  pull_request:
 
 permissions:
   contents: write
