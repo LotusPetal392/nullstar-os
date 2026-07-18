@@ -26,10 +26,11 @@ use crate::{gdt, memory::BootInfoFrameAllocator, scheduler, vfs};
 
 use super::{
     elf::{self, Image, ImageType, LoadSegment},
+    pipe::{self, PipeId},
     terminal,
 };
 
-pub use super::terminal::Snapshot as TerminalSnapshot;
+pub use super::{pipe::Snapshot as PipeSnapshot, terminal::Snapshot as TerminalSnapshot};
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
@@ -66,6 +67,7 @@ const ERR_BAD_ADDRESS: i64 = -14;
 const ERR_IS_DIRECTORY: i64 = -21;
 const ERR_INVALID_ARGUMENT: i64 = -22;
 const ERR_TOO_MANY_OPEN_FILES: i64 = -24;
+const ERR_BROKEN_PIPE: i64 = -32;
 const ERR_NOT_IMPLEMENTED: i64 = -38;
 
 static PROCESS_MANAGER: Mutex<ProcessManager> = Mutex::new(ProcessManager::new());
@@ -287,6 +289,12 @@ pub struct ProcessResult {
     pub terminal_read_count: u64,
     pub terminal_bytes_read: u64,
     pub blocked_read_count: u64,
+    pub pipe_read_count: u64,
+    pub pipe_write_count: u64,
+    pub pipe_bytes_read: u64,
+    pub pipe_bytes_written: u64,
+    pub blocked_pipe_read_count: u64,
+    pub blocked_pipe_write_count: u64,
     pub scheduled_count: u64,
     pub runtime_ticks: u64,
     pub frames_reclaimed: usize,
@@ -347,6 +355,7 @@ pub enum Error {
     ArgumentBytesTooLarge,
     InvalidArgument,
     TerminalBusy,
+    Pipe(pipe::Error),
     ProcessNotFound(u64),
     Scheduler(scheduler::InitError),
     Elf(elf::Error),
@@ -378,6 +387,7 @@ impl Error {
             }
             Self::InvalidArgument => "userspace argument contains an invalid byte",
             Self::TerminalBusy => "another userspace process owns the terminal",
+            Self::Pipe(_) => "kernel pipe operation failed",
             Self::ProcessNotFound(_) => "userspace process bookkeeping is missing",
             Self::Scheduler(_) => "scheduler rejected the userspace task",
             Self::Elf(_) => "userspace executable validation failed",
@@ -404,6 +414,7 @@ impl fmt::Display for Error {
             }
             Self::Scheduler(error) => formatter.write_str(error.description()),
             Self::Elf(error) => write!(formatter, "ELF error: {error}"),
+            Self::Pipe(error) => write!(formatter, "pipe error: {error}"),
             Self::Vfs(error) => write!(formatter, "VFS error: {error}"),
             _ => formatter.write_str(self.description()),
         }
@@ -419,6 +430,12 @@ impl From<vfs::Error> for Error {
 impl From<elf::Error> for Error {
     fn from(error: elf::Error) -> Self {
         Self::Elf(error)
+    }
+}
+
+impl From<pipe::Error> for Error {
+    fn from(error: pipe::Error) -> Self {
+        Self::Pipe(error)
     }
 }
 
@@ -456,6 +473,22 @@ struct PendingTerminalRead {
     stack_pointer: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingPipeRead {
+    pipe_id: PipeId,
+    address: u64,
+    length: usize,
+    stack_pointer: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPipeWrite {
+    pipe_id: PipeId,
+    address: u64,
+    length: usize,
+    stack_pointer: usize,
+}
+
 #[derive(Debug, Clone)]
 struct OpenFile {
     descriptor: u64,
@@ -479,7 +512,11 @@ struct Process {
     kernel_stack: Box<[u128]>,
     owned_frames: Vec<PhysFrame<Size4KiB>>,
     open_files: Vec<OpenFile>,
+    stdin_pipe: Option<PipeId>,
+    stdout_pipe: Option<PipeId>,
     pending_terminal_read: Option<PendingTerminalRead>,
+    pending_pipe_read: Option<PendingPipeRead>,
+    pending_pipe_write: Option<PendingPipeWrite>,
     syscall_count: u64,
     write_count: u64,
     yield_count: u64,
@@ -491,6 +528,12 @@ struct Process {
     terminal_read_count: u64,
     terminal_bytes_read: u64,
     blocked_read_count: u64,
+    pipe_read_count: u64,
+    pipe_write_count: u64,
+    pipe_bytes_read: u64,
+    pipe_bytes_written: u64,
+    blocked_pipe_read_count: u64,
+    blocked_pipe_write_count: u64,
 }
 
 impl Process {
@@ -527,6 +570,12 @@ impl Process {
             terminal_read_count: self.terminal_read_count,
             terminal_bytes_read: self.terminal_bytes_read,
             blocked_read_count: self.blocked_read_count,
+            pipe_read_count: self.pipe_read_count,
+            pipe_write_count: self.pipe_write_count,
+            pipe_bytes_read: self.pipe_bytes_read,
+            pipe_bytes_written: self.pipe_bytes_written,
+            blocked_pipe_read_count: self.blocked_pipe_read_count,
+            blocked_pipe_write_count: self.blocked_pipe_write_count,
             scheduled_count,
             runtime_ticks,
             frames_reclaimed,
@@ -837,6 +886,8 @@ pub fn spawn_with_args(
         image,
         arguments,
         false,
+        None,
+        None,
         kernel_mapper,
         frame_allocator,
         physical_memory_offset,
@@ -849,6 +900,8 @@ fn spawn_with_mode(
     image: &Image,
     arguments: &[&str],
     foreground: bool,
+    stdin_pipe: Option<PipeId>,
+    stdout_pipe: Option<PipeId>,
     kernel_mapper: &mut OffsetPageTable<'_>,
     frame_allocator: &mut BootInfoFrameAllocator,
     physical_memory_offset: VirtAddr,
@@ -942,7 +995,11 @@ fn spawn_with_mode(
         kernel_stack,
         owned_frames: core::mem::take(&mut address_space.owned_frames),
         open_files: Vec::new(),
+        stdin_pipe,
+        stdout_pipe,
         pending_terminal_read: None,
+        pending_pipe_read: None,
+        pending_pipe_write: None,
         syscall_count: 0,
         write_count: 0,
         yield_count: 0,
@@ -954,6 +1011,12 @@ fn spawn_with_mode(
         terminal_read_count: 0,
         terminal_bytes_read: 0,
         blocked_read_count: 0,
+        pipe_read_count: 0,
+        pipe_write_count: 0,
+        pipe_bytes_read: 0,
+        pipe_bytes_written: 0,
+        blocked_pipe_read_count: 0,
+        blocked_pipe_write_count: 0,
     });
 
     let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
@@ -1012,6 +1075,13 @@ pub struct MemoryStats {
     pub reused_frames: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PipelineResult {
+    pub pipe_id: PipeId,
+    pub producer: ProcessResult,
+    pub consumer: ProcessResult,
+}
+
 pub struct Runtime {
     mapper: OffsetPageTable<'static>,
     frame_allocator: BootInfoFrameAllocator,
@@ -1055,10 +1125,72 @@ impl Runtime {
             &image,
             &argv,
             foreground,
+            None,
+            None,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
         )
+    }
+
+    fn spawn_streams(
+        &mut self,
+        path: &str,
+        arguments: &[&str],
+        stdin_pipe: Option<PipeId>,
+        stdout_pipe: Option<PipeId>,
+    ) -> Result<SpawnInfo, Error> {
+        let image = elf::validate(path)?;
+        let mut argv = Vec::with_capacity(arguments.len().saturating_add(1));
+        argv.push(path);
+        argv.extend_from_slice(arguments);
+        spawn_with_mode(
+            path,
+            SHELL_PROCESS_TASK_NAME,
+            &image,
+            &argv,
+            false,
+            stdin_pipe,
+            stdout_pipe,
+            &mut self.mapper,
+            &mut self.frame_allocator,
+            self.physical_memory_offset,
+        )
+    }
+
+    pub fn pipeline(
+        &mut self,
+        producer_path: &str,
+        producer_arguments: &[&str],
+        consumer_path: &str,
+        consumer_arguments: &[&str],
+    ) -> Result<PipelineResult, Error> {
+        let pipe_id = pipe::create_pair()?;
+        let consumer =
+            match self.spawn_streams(consumer_path, consumer_arguments, Some(pipe_id), None) {
+                Ok(info) => info,
+                Err(error) => {
+                    let _ = pipe::discard_pair(pipe_id);
+                    return Err(error);
+                }
+            };
+        let producer =
+            match self.spawn_streams(producer_path, producer_arguments, None, Some(pipe_id)) {
+                Ok(info) => info,
+                Err(error) => {
+                    let _ = pipe::close_writer(pipe_id);
+                    let _ = self.wait(consumer.process_id);
+                    return Err(error);
+                }
+            };
+
+        let producer_result = self.wait(producer.process_id)?;
+        let consumer_result = self.wait(consumer.process_id)?;
+        Ok(PipelineResult {
+            pipe_id,
+            producer: producer_result,
+            consumer: consumer_result,
+        })
     }
 
     pub fn wait(&mut self, process_id: u64) -> Result<ProcessResult, Error> {
@@ -1091,8 +1223,10 @@ impl Runtime {
 
     pub fn poll(&mut self) -> Result<usize, Error> {
         terminal::poll_keyboard();
+        let reaped = reap(&mut self.frame_allocator)?;
         service_terminal_reads(self.physical_memory_offset)?;
-        reap(&mut self.frame_allocator)
+        service_pipe_waiters(self.physical_memory_offset)?;
+        Ok(reaped)
     }
 
     pub fn terminal_active(&self) -> bool {
@@ -1137,6 +1271,10 @@ impl Runtime {
 
     pub fn terminal_snapshot(&self) -> TerminalSnapshot {
         terminal::snapshot()
+    }
+
+    pub fn pipe_snapshot(&self) -> PipeSnapshot {
+        pipe::snapshot()
     }
 
     pub fn memory_stats(&self) -> MemoryStats {
@@ -1202,6 +1340,12 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
         })
         .ok_or(Error::ProcessNotFound(process_id))?;
         terminal::detach(process_id);
+        if let Some(pipe_id) = process.stdin_pipe.take() {
+            let _ = pipe::close_reader(pipe_id);
+        }
+        if let Some(pipe_id) = process.stdout_pipe.take() {
+            let _ = pipe::close_writer(pipe_id);
+        }
         let frames_reclaimed = process.owned_frames.len();
         for frame in process.owned_frames.drain(..) {
             frame_allocator.deallocate_frame(frame);
@@ -1259,11 +1403,19 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
     }
 
     match registers.rax {
-        SYSCALL_WRITE => {
-            let result = syscall_write(process_id, registers.rdi, registers.rsi, registers.rdx);
-            registers.rax = result;
-            current_stack_pointer
-        }
+        SYSCALL_WRITE => match syscall_write(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            current_stack_pointer,
+        ) {
+            WriteOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            WriteOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        },
         SYSCALL_YIELD => {
             {
                 let mut manager = PROCESS_MANAGER.lock();
@@ -1445,34 +1597,91 @@ fn process_path(process_id: u64) -> String {
         .unwrap_or_else(|| String::from("<unknown>"))
 }
 
-fn syscall_write(process_id: u64, file_descriptor: u64, address: u64, length: u64) -> u64 {
+enum WriteOutcome {
+    Ready(u64),
+    Blocked,
+}
+
+fn syscall_write(
+    process_id: u64,
+    file_descriptor: u64,
+    address: u64,
+    length: u64,
+    current_stack_pointer: usize,
+) -> WriteOutcome {
     if file_descriptor != 1 && file_descriptor != 2 {
-        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
     }
     let Ok(length) = usize::try_from(length) else {
-        return error_return(ERR_ARGUMENT_TOO_LARGE);
+        return WriteOutcome::Ready(error_return(ERR_ARGUMENT_TOO_LARGE));
     };
     if length > MAX_SYSCALL_WRITE_BYTES {
-        return error_return(ERR_ARGUMENT_TOO_LARGE);
+        return WriteOutcome::Ready(error_return(ERR_ARGUMENT_TOO_LARGE));
+    }
+    if length == 0 {
+        return WriteOutcome::Ready(0);
     }
 
-    let readable = PROCESS_MANAGER
+    let (readable, stdout_pipe) = PROCESS_MANAGER
         .lock()
         .processes
         .iter()
         .find(|process| process.process_id == process_id)
         .map(|process| {
-            process
-                .ranges
-                .iter()
-                .any(|range| range.readable && range.contains(address, length))
+            (
+                process
+                    .ranges
+                    .iter()
+                    .any(|range| range.readable && range.contains(address, length)),
+                process.stdout_pipe,
+            )
         })
-        .unwrap_or(false);
+        .unwrap_or((false, None));
     if !readable {
-        return error_return(ERR_BAD_ADDRESS);
+        return WriteOutcome::Ready(error_return(ERR_BAD_ADDRESS));
     }
 
     let bytes = unsafe { slice::from_raw_parts(address as *const u8, length) };
+    if file_descriptor == 1 {
+        if let Some(pipe_id) = stdout_pipe {
+            return match pipe::write(pipe_id, bytes) {
+                Ok(pipe::WriteOutcome::Written(count)) => {
+                    let mut manager = PROCESS_MANAGER.lock();
+                    if let Some(process) = manager.process_mut(process_id) {
+                        process.write_count = process.write_count.saturating_add(1);
+                        process.bytes_written = process.bytes_written.saturating_add(count as u64);
+                        process.pipe_write_count = process.pipe_write_count.saturating_add(1);
+                        process.pipe_bytes_written =
+                            process.pipe_bytes_written.saturating_add(count as u64);
+                    }
+                    WriteOutcome::Ready(count as u64)
+                }
+                Ok(pipe::WriteOutcome::Full) => {
+                    let mut manager = PROCESS_MANAGER.lock();
+                    let Some(process) = manager.process_mut(process_id) else {
+                        return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+                    };
+                    process.pending_pipe_write = Some(PendingPipeWrite {
+                        pipe_id,
+                        address,
+                        length,
+                        stack_pointer: current_stack_pointer,
+                    });
+                    process.state = ProcessState::Blocked;
+                    process.blocked_pipe_write_count =
+                        process.blocked_pipe_write_count.saturating_add(1);
+                    drop(manager);
+                    let _ = pipe::note_blocked_write(pipe_id);
+                    WriteOutcome::Blocked
+                }
+                Ok(pipe::WriteOutcome::NoReaders) => {
+                    WriteOutcome::Ready(error_return(ERR_BROKEN_PIPE))
+                }
+                Err(_) => WriteOutcome::Ready(error_return(ERR_IO)),
+            };
+        }
+    }
+
     if let Ok(text) = str::from_utf8(bytes) {
         crate::print!("{text}");
         crate::serial_print!("{text}");
@@ -1493,7 +1702,7 @@ fn syscall_write(process_id: u64, file_descriptor: u64, address: u64, length: u6
         process.write_count = process.write_count.saturating_add(1);
         process.bytes_written = process.bytes_written.saturating_add(length as u64);
     }
-    length as u64
+    WriteOutcome::Ready(length as u64)
 }
 
 fn user_range_allows(process_id: u64, address: u64, length: usize, require_write: bool) -> bool {
@@ -1594,6 +1803,15 @@ fn syscall_read(
         return ReadOutcome::Ready(error_return(ERR_BAD_ADDRESS));
     }
     if descriptor == 0 {
+        let stdin_pipe = PROCESS_MANAGER
+            .lock()
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+            .and_then(|process| process.stdin_pipe);
+        if let Some(pipe_id) = stdin_pipe {
+            return syscall_pipe_read(process_id, pipe_id, address, length, current_stack_pointer);
+        }
         return syscall_terminal_read(process_id, address, length, current_stack_pointer);
     }
     if descriptor < 3 {
@@ -1641,6 +1859,54 @@ fn syscall_read(
         process.bytes_read = process.bytes_read.saturating_add(count as u64);
     }
     ReadOutcome::Ready(count as u64)
+}
+
+fn syscall_pipe_read(
+    process_id: u64,
+    pipe_id: PipeId,
+    address: u64,
+    length: usize,
+    current_stack_pointer: usize,
+) -> ReadOutcome {
+    match pipe::read(pipe_id, length) {
+        Ok(pipe::ReadOutcome::Data(bytes)) => {
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
+            }
+            let mut manager = PROCESS_MANAGER.lock();
+            if let Some(process) = manager.process_mut(process_id) {
+                process.pipe_read_count = process.pipe_read_count.saturating_add(1);
+                process.pipe_bytes_read =
+                    process.pipe_bytes_read.saturating_add(bytes.len() as u64);
+            }
+            ReadOutcome::Ready(bytes.len() as u64)
+        }
+        Ok(pipe::ReadOutcome::EndOfFile) => {
+            let mut manager = PROCESS_MANAGER.lock();
+            if let Some(process) = manager.process_mut(process_id) {
+                process.pipe_read_count = process.pipe_read_count.saturating_add(1);
+            }
+            ReadOutcome::Ready(0)
+        }
+        Ok(pipe::ReadOutcome::Empty) => {
+            let mut manager = PROCESS_MANAGER.lock();
+            let Some(process) = manager.process_mut(process_id) else {
+                return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+            };
+            process.pending_pipe_read = Some(PendingPipeRead {
+                pipe_id,
+                address,
+                length,
+                stack_pointer: current_stack_pointer,
+            });
+            process.state = ProcessState::Blocked;
+            process.blocked_pipe_read_count = process.blocked_pipe_read_count.saturating_add(1);
+            drop(manager);
+            let _ = pipe::note_blocked_read(pipe_id);
+            ReadOutcome::Blocked
+        }
+        Err(_) => ReadOutcome::Ready(error_return(ERR_IO)),
+    }
 }
 
 fn syscall_terminal_read(
@@ -1732,6 +1998,151 @@ fn service_terminal_reads(physical_memory_offset: VirtAddr) -> Result<usize, Err
         Ok(())
     })?;
     Ok(bytes.len())
+}
+
+fn service_pipe_waiters(physical_memory_offset: VirtAddr) -> Result<usize, Error> {
+    let pending_reads: Vec<(u64, PendingPipeRead)> = cpu_interrupts::without_interrupts(|| {
+        PROCESS_MANAGER
+            .lock()
+            .processes
+            .iter()
+            .filter_map(|process| {
+                process
+                    .pending_pipe_read
+                    .map(|pending| (process.process_id, pending))
+            })
+            .collect()
+    });
+    let pending_writes: Vec<(u64, PendingPipeWrite)> = cpu_interrupts::without_interrupts(|| {
+        PROCESS_MANAGER
+            .lock()
+            .processes
+            .iter()
+            .filter_map(|process| {
+                process
+                    .pending_pipe_write
+                    .map(|pending| (process.process_id, pending))
+            })
+            .collect()
+    });
+
+    let mut wakeups = 0usize;
+    for (process_id, pending) in pending_reads {
+        let result = match pipe::read(pending.pipe_id, pending.length) {
+            Ok(pipe::ReadOutcome::Data(bytes)) => Some(bytes),
+            Ok(pipe::ReadOutcome::EndOfFile) => Some(Vec::new()),
+            Ok(pipe::ReadOutcome::Empty) => None,
+            Err(_) => {
+                complete_pipe_read_error(process_id, pending, ERR_IO)?;
+                wakeups = wakeups.saturating_add(1);
+                continue;
+            }
+        };
+        let Some(bytes) = result else {
+            continue;
+        };
+        cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
+            let mut manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .process_mut(process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            if !bytes.is_empty() {
+                write_user_bytes(
+                    pending.address,
+                    &bytes,
+                    physical_memory_offset,
+                    &process.pages,
+                )?;
+            }
+            let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+            registers.rax = bytes.len() as u64;
+            process.pending_pipe_read = None;
+            process.state = ProcessState::Runnable;
+            process.pipe_read_count = process.pipe_read_count.saturating_add(1);
+            process.pipe_bytes_read = process.pipe_bytes_read.saturating_add(bytes.len() as u64);
+            drop(manager);
+            if !scheduler::wake_process(process_id) {
+                return Err(Error::ProcessNotFound(process_id));
+            }
+            let _ = pipe::note_reader_wakeup(pending.pipe_id);
+            Ok(())
+        })?;
+        wakeups = wakeups.saturating_add(1);
+    }
+
+    for (process_id, pending) in pending_writes {
+        let bytes = cpu_interrupts::without_interrupts(|| -> Result<Vec<u8>, Error> {
+            let manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            read_user_bytes(
+                pending.address,
+                pending.length,
+                physical_memory_offset,
+                &process.pages,
+            )
+        })?;
+        let result = match pipe::write(pending.pipe_id, &bytes) {
+            Ok(pipe::WriteOutcome::Written(count)) => Ok(count as u64),
+            Ok(pipe::WriteOutcome::Full) => continue,
+            Ok(pipe::WriteOutcome::NoReaders) => Err(ERR_BROKEN_PIPE),
+            Err(_) => Err(ERR_IO),
+        };
+        cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
+            let mut manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .process_mut(process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+            match result {
+                Ok(count) => {
+                    registers.rax = count;
+                    process.write_count = process.write_count.saturating_add(1);
+                    process.bytes_written = process.bytes_written.saturating_add(count);
+                    process.pipe_write_count = process.pipe_write_count.saturating_add(1);
+                    process.pipe_bytes_written = process.pipe_bytes_written.saturating_add(count);
+                }
+                Err(error) => registers.rax = error_return(error),
+            }
+            process.pending_pipe_write = None;
+            process.state = ProcessState::Runnable;
+            drop(manager);
+            if !scheduler::wake_process(process_id) {
+                return Err(Error::ProcessNotFound(process_id));
+            }
+            let _ = pipe::note_writer_wakeup(pending.pipe_id);
+            Ok(())
+        })?;
+        wakeups = wakeups.saturating_add(1);
+    }
+
+    Ok(wakeups)
+}
+
+fn complete_pipe_read_error(
+    process_id: u64,
+    pending: PendingPipeRead,
+    error: i64,
+) -> Result<(), Error> {
+    cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
+        let mut manager = PROCESS_MANAGER.lock();
+        let process = manager
+            .process_mut(process_id)
+            .ok_or(Error::ProcessNotFound(process_id))?;
+        let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+        registers.rax = error_return(error);
+        process.pending_pipe_read = None;
+        process.state = ProcessState::Runnable;
+        drop(manager);
+        if !scheduler::wake_process(process_id) {
+            return Err(Error::ProcessNotFound(process_id));
+        }
+        let _ = pipe::note_reader_wakeup(pending.pipe_id);
+        Ok(())
+    })
 }
 
 fn syscall_close(process_id: u64, descriptor: u64) -> u64 {
@@ -1861,6 +2272,37 @@ fn write_user_bytes(
         bytes = &bytes[chunk..];
     }
     Ok(())
+}
+
+fn read_user_bytes(
+    mut virtual_address: u64,
+    mut length: usize,
+    physical_memory_offset: VirtAddr,
+    pages: &[UserPage],
+) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::with_capacity(length);
+    while length > 0 {
+        let page_address = align_down(virtual_address);
+        let page = pages
+            .iter()
+            .find(|page| page.virtual_address == page_address)
+            .ok_or(Error::InvalidUserRange)?;
+        let within_page =
+            usize::try_from(virtual_address - page_address).map_err(|_| Error::AddressOverflow)?;
+        let chunk = length.min(Size4KiB::SIZE as usize - within_page);
+        let source_address = physical_memory_offset
+            .as_u64()
+            .checked_add(page.frame.start_address().as_u64())
+            .and_then(|address| address.checked_add(within_page as u64))
+            .ok_or(Error::AddressOverflow)?;
+        let source = unsafe { slice::from_raw_parts(source_address as *const u8, chunk) };
+        bytes.extend_from_slice(source);
+        virtual_address = virtual_address
+            .checked_add(chunk as u64)
+            .ok_or(Error::AddressOverflow)?;
+        length -= chunk;
+    }
+    Ok(bytes)
 }
 
 fn map_range(

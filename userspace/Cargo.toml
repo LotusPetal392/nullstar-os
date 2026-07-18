@@ -27,3 +27,15 @@ name = "readline"
 path = "src/bin/readline.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "pipe_producer"
+path = "src/bin/pipe_producer.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "pipe_consumer"
+path = "src/bin/pipe_consumer.rs"
+test = false
+bench = false
