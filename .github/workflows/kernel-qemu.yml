@@ -33,6 +33,14 @@ jobs:
           script = gzip.decompress(base64.b64decode(payload))
           Path("tools/apply_userspace_signals.py").write_bytes(script)
           exec(compile(script, "tools/apply_userspace_signals.py", "exec"))
+
+          terminal_path = Path("kernel/src/process/terminal.rs")
+          terminal = terminal_path.read_text()
+          broken = "self.committed.push_back(b'\n');"
+          fixed = r"self.committed.push_back(b'\n');"
+          if terminal.count(broken) != 1:
+              raise SystemExit("expected one generated newline byte literal")
+          terminal_path.write_text(terminal.replace(broken, fixed, 1))
           Path("tools/userspace_signals_payload.part0").unlink()
 
       - name: Install pinned Rust toolchain
