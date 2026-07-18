@@ -4,17 +4,15 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  integrate:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Check out feature branch
+      - name: Check out repository
         uses: actions/checkout@v7
-        with:
-          ref: agent/userspace-pipelines
 
       - name: Install pinned Rust toolchain
         run: |
@@ -25,52 +23,8 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Confirm userspace descriptor pipeline milestone
-        shell: bash
-        run: |
-          set +e
-          set -o pipefail
-          if grep -q '^const SYSCALL_PIPE_PAIR: u64 = 10;$' kernel/src/process/userspace.rs; then
-            echo "userspace descriptor pipeline milestone already integrated" | tee userspace-pipelines-apply.log
-            status=0
-          else
-            python3 tools/apply_userspace_pipelines.py 2>&1 | tee userspace-pipelines-apply.log
-            status=${PIPESTATUS[0]}
-          fi
-          exit "$status"
-
-      - name: Fix pipe descriptor close result
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("kernel/src/process/userspace.rs")
-          source = path.read_text()
-          old = "            Some(descriptor)\n        } else if let Some(index) = process\n"
-          new = "            descriptor\n        } else if let Some(index) = process\n"
-          if old in source:
-              path.write_text(source.replace(old, new, 1))
-          elif new not in source:
-              raise SystemExit("pipe descriptor close target was not found")
-          PY
-
-      - name: Format sources
-        run: cargo +nightly-2026-02-01 fmt --all
-
-      - name: Preserve pinned dependency lockfile
-        run: |
-          git fetch origin main --depth=1
-          git checkout origin/main -- Cargo.lock
-
-      - name: Commit integrated sources
-        run: |
-          git config user.name "lotuspetalagent"
-          git config user.email "lotuspetalagent@users.noreply.github.com"
-          git add Cargo.lock kernel/src/main.rs kernel/src/process kernel/src/shell.rs src/main.rs userspace/src/bin/ush.rs
-          if ! git diff --cached --quiet; then
-            git commit -m "Fix userspace pipe descriptor close"
-            git push origin HEAD:agent/userspace-pipelines
-          fi
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
 
       - name: Build bootable image
         shell: bash
@@ -78,13 +32,10 @@ jobs:
           set -o pipefail
           cargo +nightly-2026-02-01 build --locked 2>&1 | tee userspace-pipelines-build.log
 
-      - name: Upload integration diagnostics
+      - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: userspace-pipelines-integration-log
-          path: |
-            userspace-pipelines-apply.log
-            userspace-pipelines-build.log
-            tools/userspace_pipelines_payload.txt
-          if-no-files-found: error
+          name: userspace-pipelines-build-log
+          path: userspace-pipelines-build.log
+          if-no-files-found: ignore
