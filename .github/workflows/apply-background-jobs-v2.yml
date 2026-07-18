@@ -1,0 +1,53 @@
+name: Apply userspace background jobs v2
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-background-jobs
+
+      - name: Apply background-job integration
+        run: python .github/modify_background.py
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-02-01 --profile minimal \
+            --component llvm-tools-preview --component rust-src --component rustfmt \
+            --target x86_64-unknown-none
+
+      - name: Format and validate
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+
+      - name: Build and boot the full smoke test
+        run: cargo +nightly-2026-02-01 run --locked -- --test
+
+      - name: Commit and push product changes
+        run: |
+          rm \
+            .github/modify_background.py \
+            .github/workflows/apply-background-jobs.yml \
+            .github/workflows/apply-background-jobs-v2.yml
+          git config user.name lotuspetalagent
+          git config user.email lotuspetalagent@users.noreply.github.com
+          git add -A
+          git commit -m "Add bounded userspace background jobs"
+          git push origin HEAD:agent/userspace-background-jobs
