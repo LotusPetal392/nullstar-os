@@ -1,4 +1,4 @@
-use alloc::{string::String, vec};
+use alloc::{string::String, vec, vec::Vec};
 
 use pc_keyboard::{DecodedKey, KeyCode};
 
@@ -80,10 +80,11 @@ pub struct Shell {
     input: String,
     max_input_chars: usize,
     system_info: SystemInfo,
+    runtime: userspace::Runtime,
 }
 
 impl Shell {
-    pub fn new(system_info: SystemInfo) -> Self {
+    pub fn new(system_info: SystemInfo, runtime: userspace::Runtime) -> Self {
         let console_columns = console::text_columns().unwrap_or(DEFAULT_CONSOLE_COLUMNS);
         let max_input_chars = console_columns
             .saturating_sub(PROMPT.len() + 1)
@@ -94,6 +95,7 @@ impl Shell {
             input: String::new(),
             max_input_chars,
             system_info,
+            runtime,
         }
     }
 
@@ -101,6 +103,12 @@ impl Shell {
         shell_println!();
         shell_println!("Interactive shell ready. Type `help` for commands.");
         self.print_prompt();
+    }
+
+    pub fn poll(&mut self) {
+        if let Err(error) = self.runtime.reap() {
+            crate::serial_println!("background process reap failed: {error}");
+        }
     }
 
     pub fn handle_key(&mut self, key: DecodedKey) -> ShellAction {
@@ -158,8 +166,8 @@ impl Shell {
     fn submit(&mut self) -> ShellAction {
         shell_println!();
 
-        let action = self.execute(self.input.trim());
-        self.input.clear();
+        let command_line = core::mem::take(&mut self.input);
+        let action = self.execute(command_line.trim());
 
         if action == ShellAction::Continue {
             self.print_prompt();
@@ -168,7 +176,7 @@ impl Shell {
         action
     }
 
-    fn execute(&self, command_line: &str) -> ShellAction {
+    fn execute(&mut self, command_line: &str) -> ShellAction {
         let mut words = command_line.split_whitespace();
         let Some(command) = words.next() else {
             return ShellAction::Continue;
@@ -224,6 +232,25 @@ impl Shell {
                 self.inspect_elf(path);
             }
             "process" | "userspace" => self.print_userspace(),
+            "spawn" | "run" => {
+                let Some(path) = words.next() else {
+                    shell_println!("usage: {command} <path> [arguments...]");
+                    return ShellAction::Continue;
+                };
+                let arguments: Vec<&str> = words.collect();
+                if command == "spawn" {
+                    self.spawn_process(path, &arguments);
+                } else {
+                    self.run_process(path, &arguments);
+                }
+            }
+            "wait" => {
+                let Some(process_id) = words.next().and_then(parse_u64) else {
+                    shell_println!("usage: wait <pid>");
+                    return ShellAction::Continue;
+                };
+                self.wait_process(process_id);
+            }
             "about" => {
                 shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
             }
@@ -241,21 +268,22 @@ impl Shell {
     }
 
     fn print_memory(&self) {
-        let usable_mebibytes = self
-            .system_info
-            .usable_frames
-            .saturating_mul(memory::FRAME_SIZE)
-            / (1024 * 1024);
+        let stats = self.runtime.memory_stats();
+        let usable_mebibytes =
+            stats.usable_frames.saturating_mul(memory::FRAME_SIZE) / (1024 * 1024);
 
         shell_println!(
             "physical memory: {} MiB usable ({} frames)",
             usable_mebibytes,
-            self.system_info.usable_frames
+            stats.usable_frames
         );
         shell_println!(
-            "frames: {} allocated, {} remaining",
-            self.system_info.allocated_frames,
-            self.system_info.remaining_frames
+            "frames: {} allocated, {} remaining; recycled={}, reclaimed={}, reused={}",
+            stats.allocated_frames,
+            stats.remaining_frames,
+            stats.recycled_frames,
+            stats.reclaimed_frames,
+            stats.reused_frames
         );
     }
 
@@ -575,6 +603,35 @@ impl Shell {
         }
     }
 
+    fn spawn_process(&mut self, path: &str, arguments: &[&str]) {
+        match self.runtime.spawn(path, arguments) {
+            Ok(info) => shell_println!(
+                "spawned pid={} task={} `{}` entry={:#018x}, pages={}, frames={}",
+                info.process_id,
+                info.task_id,
+                info.path,
+                info.entry_point,
+                info.mapped_pages,
+                info.owned_frames
+            ),
+            Err(error) => shell_println!("spawn: {error}"),
+        }
+    }
+
+    fn run_process(&mut self, path: &str, arguments: &[&str]) {
+        match self.runtime.run(path, arguments) {
+            Ok(result) => print_process_result(&result),
+            Err(error) => shell_println!("run: {error}"),
+        }
+    }
+
+    fn wait_process(&mut self, process_id: u64) {
+        match self.runtime.wait(process_id) {
+            Ok(result) => print_process_result(&result),
+            Err(error) => shell_println!("wait: {error}"),
+        }
+    }
+
     fn print_userspace(&self) {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
@@ -622,11 +679,15 @@ impl Shell {
                 result.guard_page_address
             );
             shell_println!(
-                "  syscalls: total={}, writes={}, yields={}, bytes={}; frames reclaimed={}",
+                "  syscalls: total={}, writes={}, yields={}, bytes={}; open/read/close={}/{}/{}, file bytes={}; frames reclaimed={}",
                 result.syscall_count,
                 result.write_count,
                 result.yield_count,
                 result.bytes_written,
+                result.open_count,
+                result.read_count,
+                result.close_count,
+                result.bytes_read,
                 result.frames_reclaimed
             );
             if let Some(fault) = result.fault() {
@@ -915,6 +976,41 @@ impl Shell {
     }
 }
 
+fn print_process_result(result: &userspace::ProcessResult) {
+    shell_println!(
+        "pid={} task={} `{}` completed: {}",
+        result.process_id,
+        result.task_id,
+        result.path,
+        result.termination
+    );
+    shell_println!(
+        "  scheduling: runs={}, runtime ticks={}; syscalls={}, writes={}, yields={}",
+        result.scheduled_count,
+        result.runtime_ticks,
+        result.syscall_count,
+        result.write_count,
+        result.yield_count
+    );
+    shell_println!(
+        "  files: opens={}, reads={}, closes={}, bytes read={}; frames reclaimed={}",
+        result.open_count,
+        result.read_count,
+        result.close_count,
+        result.bytes_read,
+        result.frames_reclaimed
+    );
+    if let Some(fault) = result.fault() {
+        shell_println!(
+            "  fault: vector={}, error={:#x}, address={:#018x}, rip={:#018x}",
+            fault.vector,
+            fault.error_code,
+            fault.address,
+            fault.instruction_pointer
+        );
+    }
+}
+
 fn parse_u64(value: &str) -> Option<u64> {
     value
         .strip_prefix("0x")
@@ -943,6 +1039,9 @@ fn print_help() {
     shell_println!("  cat <path>       preview a VFS file");
     shell_println!("  elf <path>       validate an ELF64 executable");
     shell_println!("  process          show process scheduling and fault results");
+    shell_println!("  spawn <path> [args...]  launch a userspace process");
+    shell_println!("  wait <pid>       wait for and reap a userspace process");
+    shell_println!("  run <path> [args...]    launch and wait for a process");
     shell_println!("  about            describe GalacticOS");
     shell_println!("  halt             halt the CPU");
 }

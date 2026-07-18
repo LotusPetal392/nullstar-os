@@ -15,3 +15,9 @@ name = "fault_probe"
 path = "src/bin/fault_probe.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+test = false
+bench = false

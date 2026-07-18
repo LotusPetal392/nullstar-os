@@ -516,6 +516,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         init_result.runtime_ticks
     );
 
+    let mut userspace_runtime =
+        userspace::Runtime::new(mapper, frame_allocator, physical_memory_offset);
+    let cat_result = match userspace_runtime.run("/cat", &["/hello.txt"]) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace file-I/O validation failed: {error}");
+            hlt_loop();
+        }
+    };
+    let file_io_verified = cat_result.exit_code() == Some(0)
+        && cat_result.open_count == 1
+        && cat_result.read_count >= 1
+        && cat_result.close_count == 1
+        && cat_result.bytes_read > 0;
+    if !file_io_verified {
+        serial_println!(
+            "userspace file-I/O verification failed: exit={:?}, opens={}, reads={}, closes={}, bytes_read={}",
+            cat_result.exit_code(),
+            cat_result.open_count,
+            cat_result.read_count,
+            cat_result.close_count,
+            cat_result.bytes_read
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace file I/O verified: pid={}, path={}, opens={}, reads={}, closes={}, bytes_read={}, exit_code=0",
+        cat_result.process_id,
+        cat_result.path,
+        cat_result.open_count,
+        cat_result.read_count,
+        cat_result.close_count,
+        cat_result.bytes_read
+    );
+
     println!("GalacticOS");
     println!("-------------");
     println!();
@@ -572,11 +607,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         println!("Userspace process verification unavailable");
     }
+    if file_io_verified {
+        println!("Userspace file descriptors verified");
+    } else {
+        println!("Userspace file descriptors unavailable");
+    }
     println!("Interactive shell initialized");
 
-    let usable_frames = frame_allocator.usable_frame_count();
-    let allocated_frames = frame_allocator.allocated_frame_count();
-    let remaining_frames = frame_allocator.remaining_frame_count();
+    let runtime_memory = userspace_runtime.memory_stats();
+    let usable_frames = runtime_memory.usable_frames;
+    let allocated_frames = runtime_memory.allocated_frames;
+    let remaining_frames = runtime_memory.remaining_frames;
     let usable_mebibytes = usable_frames.saturating_mul(memory::FRAME_SIZE) / (1024 * 1024);
 
     serial_println!(
@@ -595,9 +636,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     serial_println!(
         "physical frame recycling: reclaimed={}, recycled={}, reused={}",
-        frame_allocator.reclaimed_frame_count(),
-        frame_allocator.recycled_frame_count(),
-        frame_allocator.reused_frame_count()
+        runtime_memory.reclaimed_frames,
+        runtime_memory.recycled_frames,
+        runtime_memory.reused_frames
     );
     serial_println!("framebuffer console initialized");
     serial_println!("preemptive scheduler initialized");
@@ -615,12 +656,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         partition_inventory,
         filesystem_info,
     );
-    let mut interactive_shell = shell::Shell::new(system_info);
+    let mut interactive_shell = shell::Shell::new(system_info, userspace_runtime);
     interactive_shell.start();
 
     let mut reported_seconds = 0;
     loop {
         x86_64::instructions::hlt();
+        interactive_shell.poll();
 
         while let Some(key) = keyboard::poll_key() {
             match interactive_shell.handle_key(key) {
