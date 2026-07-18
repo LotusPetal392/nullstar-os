@@ -1,9 +1,9 @@
 name: Apply userspace process groups and signals
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/userspace-signals
+      - main
 
 permissions:
   contents: write
