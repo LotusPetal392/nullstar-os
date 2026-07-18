@@ -46,12 +46,8 @@ jobs:
 
           path = Path("kernel/src/process/userspace.rs")
           source = path.read_text()
-          old = '''            Some(descriptor)
-          } else if let Some(index) = process
-          '''
-          new = '''            descriptor
-          } else if let Some(index) = process
-          '''
+          old = "            Some(descriptor)\n        } else if let Some(index) = process\n"
+          new = "            descriptor\n        } else if let Some(index) = process\n"
           if old in source:
               path.write_text(source.replace(old, new, 1))
           elif new not in source:
