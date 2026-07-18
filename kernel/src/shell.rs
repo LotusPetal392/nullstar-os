@@ -681,10 +681,12 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, child spawns={}, waits={}, active={}, blocked={}, exited={}, faulted={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, pipe pairs={}, inherited fds={}, active={}, blocked={}, exited={}, faulted={}, reaped={}",
             snapshot.spawned,
             snapshot.child_spawns,
             snapshot.child_waits,
+            snapshot.pipe_pairs,
+            snapshot.pipe_descriptor_inherits,
             snapshot.active,
             snapshot.blocked,
             snapshot.exited,
@@ -746,13 +748,16 @@ impl Shell {
                 result.blocked_read_count
             );
             shell_println!(
-                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; children: spawns={}, waits={}; frames reclaimed={}",
+                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; children: spawns={}, waits={}; frames reclaimed={}",
                 result.pipe_read_count,
                 result.pipe_write_count,
                 result.pipe_bytes_read,
                 result.pipe_bytes_written,
                 result.blocked_pipe_read_count,
                 result.blocked_pipe_write_count,
+                result.pipe_pair_count,
+                result.pipe_descriptor_close_count,
+                result.pipe_descriptor_inherit_count,
                 result.child_spawn_count,
                 result.child_wait_count,
                 result.frames_reclaimed
@@ -802,7 +807,7 @@ impl Shell {
             crate::process::pipe::PIPE_CAPACITY_BYTES
         );
         shell_println!(
-            "I/O: reads={}, writes={}, bytes={}/{}, blocked={}/{}, wakeups={}/{}",
+            "I/O: reads={}, writes={}, bytes={}/{}, blocked={}/{}, wakeups={}/{}, endpoint retains={}/{}",
             pipes.total_read_calls,
             pipes.total_write_calls,
             pipes.total_bytes_read,
@@ -810,7 +815,9 @@ impl Shell {
             pipes.total_blocked_reads,
             pipes.total_blocked_writes,
             pipes.total_reader_wakeups,
-            pipes.total_writer_wakeups
+            pipes.total_writer_wakeups,
+            pipes.total_reader_retains,
+            pipes.total_writer_retains
         );
         for pipe in &pipes.pipes {
             shell_println!(
@@ -1129,13 +1136,16 @@ fn print_process_result(result: &userspace::ProcessResult) {
         result.blocked_read_count
     );
     shell_println!(
-        "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; frames reclaimed={}",
+        "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; frames reclaimed={}",
         result.pipe_read_count,
         result.pipe_write_count,
         result.pipe_bytes_read,
         result.pipe_bytes_written,
         result.blocked_pipe_read_count,
         result.blocked_pipe_write_count,
+        result.pipe_pair_count,
+        result.pipe_descriptor_close_count,
+        result.pipe_descriptor_inherit_count,
         result.frames_reclaimed
     );
     if let Some(fault) = result.fault() {
@@ -1180,7 +1190,7 @@ fn print_help() {
     shell_println!("  terminal         show canonical terminal and wakeup statistics");
     shell_println!("  pipes            show pipe buffers, blocking, and wakeups");
     shell_println!("  pipe <a> | <b>   run a userspace pipeline");
-    shell_println!("  ush              launch the userspace command shell");
+    shell_println!("  ush              launch the userspace shell with `|` pipelines");
     shell_println!("  spawn <path> [args...]  launch a userspace process");
     shell_println!("  wait <pid>       wait for and reap a userspace process");
     shell_println!("  run <path> [args...]    run in the foreground with stdin");

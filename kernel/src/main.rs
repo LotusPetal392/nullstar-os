@@ -680,6 +680,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!("userspace shell did not regain its prompt: {error}");
         hlt_loop();
     }
+
+    let userspace_pipeline_before = userspace_runtime.pipe_snapshot();
+    if let Err(error) = userspace_runtime.inject_terminal_line("pipe-producer | pipe-consumer") {
+        serial_println!("userspace pipeline command injection failed: {error}");
+        hlt_loop();
+    }
+    let shell_producer =
+        match userspace_runtime.wait_for_child_path(userspace_shell.process_id, "/pipe-producer") {
+            Ok(result) => result,
+            Err(error) => {
+                serial_println!("userspace pipeline producer wait failed: {error}");
+                hlt_loop();
+            }
+        };
+    let shell_consumer =
+        match userspace_runtime.wait_for_child_path(userspace_shell.process_id, "/pipe-consumer") {
+            Ok(result) => result,
+            Err(error) => {
+                serial_println!("userspace pipeline consumer wait failed: {error}");
+                hlt_loop();
+            }
+        };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not regain its prompt after pipeline: {error}");
+        hlt_loop();
+    }
+    let userspace_pipeline_after = userspace_runtime.pipe_snapshot();
+
     if let Err(error) = userspace_runtime.inject_terminal_line("exit") {
         serial_println!("userspace shell exit injection failed: {error}");
         hlt_loop();
@@ -691,13 +719,62 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             hlt_loop();
         }
     };
+    let userspace_pipeline_verified = shell_producer.parent_process_id
+        == Some(userspace_shell.process_id)
+        && shell_consumer.parent_process_id == Some(userspace_shell.process_id)
+        && shell_producer.exit_code() == Some(0)
+        && shell_consumer.exit_code() == Some(0)
+        && shell_producer.pipe_write_count >= 1
+        && shell_producer.pipe_bytes_written == PIPE_TEST_BYTES
+        && shell_consumer.pipe_read_count >= 2
+        && shell_consumer.pipe_bytes_read == PIPE_TEST_BYTES
+        && shell_consumer.blocked_pipe_read_count >= 1
+        && userspace_shell_result.pipe_pair_count == 1
+        && userspace_shell_result.pipe_descriptor_close_count == 2
+        && userspace_shell_result.pipe_descriptor_inherit_count == 2
+        && userspace_pipeline_after.total_reader_retains
+            > userspace_pipeline_before.total_reader_retains
+        && userspace_pipeline_after.total_writer_retains
+            > userspace_pipeline_before.total_writer_retains
+        && userspace_pipeline_after.active_pipes == 0;
+    if !userspace_pipeline_verified {
+        serial_println!(
+            "userspace pipeline verification failed: producer_exit={:?}, consumer_exit={:?}, producer_parent={:?}, consumer_parent={:?}, written={}, read={}, blocked_reads={}, pairs={}, closes={}, inherited={}, retains={}/{}, active={}",
+            shell_producer.exit_code(),
+            shell_consumer.exit_code(),
+            shell_producer.parent_process_id,
+            shell_consumer.parent_process_id,
+            shell_producer.pipe_bytes_written,
+            shell_consumer.pipe_bytes_read,
+            shell_consumer.blocked_pipe_read_count,
+            userspace_shell_result.pipe_pair_count,
+            userspace_shell_result.pipe_descriptor_close_count,
+            userspace_shell_result.pipe_descriptor_inherit_count,
+            userspace_pipeline_after.total_reader_retains,
+            userspace_pipeline_after.total_writer_retains,
+            userspace_pipeline_after.active_pipes
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace pipeline verified: shell_pid={}, producer_pid={}, consumer_pid={}, bytes={}, pairs={}, closes={}, inherited={}, active_pipes=0",
+        userspace_shell_result.process_id,
+        shell_producer.process_id,
+        shell_consumer.process_id,
+        shell_consumer.pipe_bytes_read,
+        userspace_shell_result.pipe_pair_count,
+        userspace_shell_result.pipe_descriptor_close_count,
+        userspace_shell_result.pipe_descriptor_inherit_count
+    );
+
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 1
-        && userspace_shell_result.child_wait_count == 1
+        && userspace_shell_result.child_spawn_count == 3
+        && userspace_shell_result.child_wait_count == 3
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
         && shell_child.bytes_read > 0
+        && userspace_pipeline_verified
         && userspace_runtime
             .terminal_snapshot()
             .foreground_process
@@ -800,6 +877,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace process-control shell verified");
     } else {
         println!("Userspace process-control shell unavailable");
+    }
+    if userspace_pipeline_verified {
+        println!("Userspace descriptor pipelines verified");
+    } else {
+        println!("Userspace descriptor pipelines unavailable");
     }
     println!("Interactive shell initialized");
 
