@@ -46,6 +46,7 @@ const SYSCALL_SPAWN_COMMAND: u64 = 7;
 const SYSCALL_WAIT_CHILD: u64 = 8;
 const SYSCALL_GETPID: u64 = 9;
 const SYSCALL_PIPE_PAIR: u64 = 10;
+const SYSCALL_TRY_WAIT_CHILD: u64 = 11;
 
 const USER_MIN_ADDRESS: u64 = 0x0001_0000;
 const USER_PML4_SLOT_END: u64 = 0x0000_0080_0000_0000;
@@ -72,6 +73,7 @@ const ERR_IO: i64 = -5;
 const ERR_ARGUMENT_TOO_LARGE: i64 = -7;
 const ERR_BAD_FILE_DESCRIPTOR: i64 = -9;
 const ERR_NO_CHILD: i64 = -10;
+const ERR_TRY_AGAIN: i64 = -11;
 const ERR_BAD_ADDRESS: i64 = -14;
 const ERR_IS_DIRECTORY: i64 = -21;
 const ERR_INVALID_ARGUMENT: i64 = -22;
@@ -307,6 +309,8 @@ pub struct ProcessResult {
     pub blocked_pipe_write_count: u64,
     pub child_spawn_count: u64,
     pub child_wait_count: u64,
+    pub child_poll_count: u64,
+    pub child_poll_pending_count: u64,
     pub pipe_pair_count: u64,
     pub pipe_descriptor_close_count: u64,
     pub pipe_descriptor_inherit_count: u64,
@@ -597,6 +601,8 @@ struct Process {
     blocked_pipe_write_count: u64,
     child_spawn_count: u64,
     child_wait_count: u64,
+    child_poll_count: u64,
+    child_poll_pending_count: u64,
     pipe_pair_count: u64,
     pipe_descriptor_close_count: u64,
     pipe_descriptor_inherit_count: u64,
@@ -645,6 +651,8 @@ impl Process {
             blocked_pipe_write_count: self.blocked_pipe_write_count,
             child_spawn_count: self.child_spawn_count,
             child_wait_count: self.child_wait_count,
+            child_poll_count: self.child_poll_count,
+            child_poll_pending_count: self.child_poll_pending_count,
             pipe_pair_count: self.pipe_pair_count,
             pipe_descriptor_close_count: self.pipe_descriptor_close_count,
             pipe_descriptor_inherit_count: self.pipe_descriptor_inherit_count,
@@ -1157,6 +1165,8 @@ fn spawn_with_mode(
         blocked_pipe_write_count: 0,
         child_spawn_count: 0,
         child_wait_count: 0,
+        child_poll_count: 0,
+        child_poll_pending_count: 0,
         pipe_pair_count: 0,
         pipe_descriptor_close_count: 0,
         pipe_descriptor_inherit_count: 0,
@@ -1653,6 +1663,15 @@ impl Runtime {
         }
     }
 
+    pub fn child_is_active(&mut self, parent_process_id: u64, path: &str) -> Result<bool, Error> {
+        self.poll()?;
+        Ok(cpu_interrupts::without_interrupts(|| {
+            PROCESS_MANAGER.lock().processes.iter().any(|process| {
+                process.parent_process_id == Some(parent_process_id) && process.path == path
+            })
+        }))
+    }
+
     pub fn inject_terminal_line(&mut self, line: &str) -> Result<usize, Error> {
         terminal::inject_line(line);
         service_terminal_reads(self.physical_memory_offset)
@@ -1887,6 +1906,10 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
         }
         SYSCALL_PIPE_PAIR => {
             registers.rax = syscall_pipe_pair(process_id);
+            current_stack_pointer
+        }
+        SYSCALL_TRY_WAIT_CHILD => {
+            registers.rax = syscall_try_wait_child(process_id, registers.rdi);
             current_stack_pointer
         }
         SYSCALL_EXIT => {
@@ -2190,6 +2213,37 @@ fn syscall_wait_child(
     });
     process.state = ProcessState::Blocked;
     ControlOutcome::Blocked
+}
+
+fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {
+    let mut manager = PROCESS_MANAGER.lock();
+    let completed = manager
+        .completed
+        .iter()
+        .find(|result| {
+            result.process_id == child_process_id && result.parent_process_id == Some(process_id)
+        })
+        .cloned();
+    let active = manager.processes.iter().any(|child| {
+        child.process_id == child_process_id && child.parent_process_id == Some(process_id)
+    });
+    if completed.is_none() && !active {
+        return error_return(ERR_NO_CHILD);
+    }
+
+    let pending = completed.is_none();
+    let Some(process) = manager.process_mut(process_id) else {
+        return error_return(ERR_NO_CHILD);
+    };
+    process.child_poll_count = process.child_poll_count.saturating_add(1);
+    if pending {
+        process.child_poll_pending_count = process.child_poll_pending_count.saturating_add(1);
+    }
+
+    completed
+        .as_ref()
+        .map(child_status)
+        .unwrap_or_else(|| error_return(ERR_TRY_AGAIN))
 }
 
 fn parse_command_line(command: &str) -> Result<(String, Vec<String>), i64> {

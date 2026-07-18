@@ -748,7 +748,7 @@ impl Shell {
                 result.blocked_read_count
             );
             shell_println!(
-                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; children: spawns={}, waits={}; frames reclaimed={}",
+                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; children: spawns={}, waits={}, polls={} (pending={}); frames reclaimed={}",
                 result.pipe_read_count,
                 result.pipe_write_count,
                 result.pipe_bytes_read,
@@ -760,6 +760,8 @@ impl Shell {
                 result.pipe_descriptor_inherit_count,
                 result.child_spawn_count,
                 result.child_wait_count,
+                result.child_poll_count,
+                result.child_poll_pending_count,
                 result.frames_reclaimed
             );
             if let Some(fault) = result.fault() {

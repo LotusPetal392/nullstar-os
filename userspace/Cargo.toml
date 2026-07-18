@@ -47,6 +47,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "delay"
+path = "src/bin/delay.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "ush"
 path = "src/bin/ush.rs"
 test = false
