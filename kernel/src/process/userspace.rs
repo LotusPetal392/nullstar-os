@@ -24,7 +24,12 @@ use x86_64::{
 
 use crate::{gdt, memory::BootInfoFrameAllocator, scheduler, vfs};
 
-use super::elf::{self, Image, ImageType, LoadSegment};
+use super::{
+    elf::{self, Image, ImageType, LoadSegment},
+    terminal,
+};
+
+pub use super::terminal::Snapshot as TerminalSnapshot;
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
@@ -215,6 +220,7 @@ unsafe extern "C" {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     Runnable,
+    Blocked,
     Exited,
     Faulted,
 }
@@ -223,6 +229,7 @@ impl fmt::Display for ProcessState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runnable => formatter.write_str("runnable"),
+            Self::Blocked => formatter.write_str("blocked"),
             Self::Exited => formatter.write_str("exited"),
             Self::Faulted => formatter.write_str("faulted"),
         }
@@ -277,6 +284,9 @@ pub struct ProcessResult {
     pub read_count: u64,
     pub close_count: u64,
     pub bytes_read: u64,
+    pub terminal_read_count: u64,
+    pub terminal_bytes_read: u64,
+    pub blocked_read_count: u64,
     pub scheduled_count: u64,
     pub runtime_ticks: u64,
     pub frames_reclaimed: usize,
@@ -302,6 +312,7 @@ impl ProcessResult {
 pub struct ManagerSnapshot {
     pub spawned: u64,
     pub active: usize,
+    pub blocked: usize,
     pub exited: u64,
     pub faulted: u64,
     pub reaped: u64,
@@ -335,6 +346,7 @@ pub enum Error {
     TooManyArguments,
     ArgumentBytesTooLarge,
     InvalidArgument,
+    TerminalBusy,
     ProcessNotFound(u64),
     Scheduler(scheduler::InitError),
     Elf(elf::Error),
@@ -365,6 +377,7 @@ impl Error {
                 "userspace argument strings exceed the configured stack bound"
             }
             Self::InvalidArgument => "userspace argument contains an invalid byte",
+            Self::TerminalBusy => "another userspace process owns the terminal",
             Self::ProcessNotFound(_) => "userspace process bookkeeping is missing",
             Self::Scheduler(_) => "scheduler rejected the userspace task",
             Self::Elf(_) => "userspace executable validation failed",
@@ -436,6 +449,13 @@ impl UserRange {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingTerminalRead {
+    address: u64,
+    length: usize,
+    stack_pointer: usize,
+}
+
 #[derive(Debug, Clone)]
 struct OpenFile {
     descriptor: u64,
@@ -455,9 +475,11 @@ struct Process {
     load_segments: usize,
     guard_page_address: u64,
     ranges: Vec<UserRange>,
+    pages: Vec<UserPage>,
     kernel_stack: Box<[u128]>,
     owned_frames: Vec<PhysFrame<Size4KiB>>,
     open_files: Vec<OpenFile>,
+    pending_terminal_read: Option<PendingTerminalRead>,
     syscall_count: u64,
     write_count: u64,
     yield_count: u64,
@@ -466,6 +488,9 @@ struct Process {
     read_count: u64,
     close_count: u64,
     bytes_read: u64,
+    terminal_read_count: u64,
+    terminal_bytes_read: u64,
+    blocked_read_count: u64,
 }
 
 impl Process {
@@ -499,6 +524,9 @@ impl Process {
             read_count: self.read_count,
             close_count: self.close_count,
             bytes_read: self.bytes_read,
+            terminal_read_count: self.terminal_read_count,
+            terminal_bytes_read: self.terminal_bytes_read,
+            blocked_read_count: self.blocked_read_count,
             scheduled_count,
             runtime_ticks,
             frames_reclaimed,
@@ -557,7 +585,17 @@ impl ProcessManager {
             active: self
                 .processes
                 .iter()
-                .filter(|process| process.state == ProcessState::Runnable)
+                .filter(|process| {
+                    matches!(
+                        process.state,
+                        ProcessState::Runnable | ProcessState::Blocked
+                    )
+                })
+                .count(),
+            blocked: self
+                .processes
+                .iter()
+                .filter(|process| process.state == ProcessState::Blocked)
                 .count(),
             exited: self.exited,
             faulted: self.faulted,
@@ -793,6 +831,28 @@ pub fn spawn_with_args(
     frame_allocator: &mut BootInfoFrameAllocator,
     physical_memory_offset: VirtAddr,
 ) -> Result<SpawnInfo, Error> {
+    spawn_with_mode(
+        path,
+        task_name,
+        image,
+        arguments,
+        false,
+        kernel_mapper,
+        frame_allocator,
+        physical_memory_offset,
+    )
+}
+
+fn spawn_with_mode(
+    path: &str,
+    task_name: &'static str,
+    image: &Image,
+    arguments: &[&str],
+    foreground: bool,
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    physical_memory_offset: VirtAddr,
+) -> Result<SpawnInfo, Error> {
     if scheduler::snapshot().current_task_kind != scheduler::TaskKind::Bootstrap {
         return Err(Error::SchedulerNotOnBootstrapTask);
     }
@@ -878,9 +938,11 @@ pub fn spawn_with_args(
         load_segments: image.load_segments().len(),
         guard_page_address: address_space.guard_page_address,
         ranges: core::mem::take(&mut address_space.ranges),
+        pages: core::mem::take(&mut address_space.pages),
         kernel_stack,
         owned_frames: core::mem::take(&mut address_space.owned_frames),
         open_files: Vec::new(),
+        pending_terminal_read: None,
         syscall_count: 0,
         write_count: 0,
         yield_count: 0,
@@ -889,9 +951,15 @@ pub fn spawn_with_args(
         read_count: 0,
         close_count: 0,
         bytes_read: 0,
+        terminal_read_count: 0,
+        terminal_bytes_read: 0,
+        blocked_read_count: 0,
     });
 
-    let task_result = cpu_interrupts::without_interrupts(|| {
+    let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
+        if foreground && !terminal::attach(process_id) {
+            return Err(Error::TerminalBusy);
+        }
         let task_id = scheduler::spawn_user_process(
             task_name,
             process_id,
@@ -907,18 +975,19 @@ pub fn spawn_with_args(
         let mut manager = PROCESS_MANAGER.lock();
         manager.spawned = manager.spawned.saturating_add(1);
         manager.processes.push(process);
-        Ok::<u64, scheduler::InitError>(task_id)
+        Ok(task_id)
     });
 
     let task_id = match task_result {
         Ok(task_id) => task_id,
         Err(error) => {
+            terminal::detach(process_id);
             if let Some(mut process) = pending_process.take() {
                 for frame in process.owned_frames.drain(..) {
                     frame_allocator.deallocate_frame(frame);
                 }
             }
-            return Err(Error::Scheduler(error));
+            return Err(error);
         }
     };
 
@@ -963,15 +1032,29 @@ impl Runtime {
     }
 
     pub fn spawn(&mut self, path: &str, arguments: &[&str]) -> Result<SpawnInfo, Error> {
+        self.spawn_mode(path, arguments, false)
+    }
+
+    pub fn spawn_foreground(&mut self, path: &str, arguments: &[&str]) -> Result<SpawnInfo, Error> {
+        self.spawn_mode(path, arguments, true)
+    }
+
+    fn spawn_mode(
+        &mut self,
+        path: &str,
+        arguments: &[&str],
+        foreground: bool,
+    ) -> Result<SpawnInfo, Error> {
         let image = elf::validate(path)?;
         let mut argv = Vec::with_capacity(arguments.len().saturating_add(1));
         argv.push(path);
         argv.extend_from_slice(arguments);
-        spawn_with_args(
+        spawn_with_mode(
             path,
             SHELL_PROCESS_TASK_NAME,
             &image,
             &argv,
+            foreground,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -979,16 +1062,69 @@ impl Runtime {
     }
 
     pub fn wait(&mut self, process_id: u64) -> Result<ProcessResult, Error> {
-        wait_for(&mut self.frame_allocator, process_id)
+        loop {
+            self.poll()?;
+            let manager = PROCESS_MANAGER.lock();
+            if let Some(result) = manager
+                .completed
+                .iter()
+                .find(|result| result.process_id == process_id)
+            {
+                return Ok(result.clone());
+            }
+            if !manager
+                .processes
+                .iter()
+                .any(|process| process.process_id == process_id)
+            {
+                return Err(Error::ProcessNotFound(process_id));
+            }
+            drop(manager);
+            hlt();
+        }
     }
 
     pub fn run(&mut self, path: &str, arguments: &[&str]) -> Result<ProcessResult, Error> {
-        let spawned = self.spawn(path, arguments)?;
+        let spawned = self.spawn_foreground(path, arguments)?;
         self.wait(spawned.process_id)
     }
 
-    pub fn reap(&mut self) -> Result<usize, Error> {
+    pub fn poll(&mut self) -> Result<usize, Error> {
+        terminal::poll_keyboard();
+        service_terminal_reads(self.physical_memory_offset)?;
         reap(&mut self.frame_allocator)
+    }
+
+    pub fn reap(&mut self) -> Result<usize, Error> {
+        self.poll()
+    }
+
+    pub fn wait_until_blocked(&mut self, process_id: u64) -> Result<(), Error> {
+        loop {
+            self.poll()?;
+            if scheduler::is_process_blocked(process_id) {
+                return Ok(());
+            }
+            let manager = PROCESS_MANAGER.lock();
+            if !manager
+                .processes
+                .iter()
+                .any(|process| process.process_id == process_id)
+            {
+                return Err(Error::ProcessNotFound(process_id));
+            }
+            drop(manager);
+            hlt();
+        }
+    }
+
+    pub fn inject_terminal_line(&mut self, line: &str) -> Result<usize, Error> {
+        terminal::inject_line(line);
+        service_terminal_reads(self.physical_memory_offset)
+    }
+
+    pub fn terminal_snapshot(&self) -> TerminalSnapshot {
+        terminal::snapshot()
     }
 
     pub fn memory_stats(&self) -> MemoryStats {
@@ -1053,6 +1189,7 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
             PROCESS_MANAGER.lock().remove_process(process_id)
         })
         .ok_or(Error::ProcessNotFound(process_id))?;
+        terminal::detach(process_id);
         let frames_reclaimed = process.owned_frames.len();
         for frame in process.owned_frames.drain(..) {
             frame_allocator.deallocate_frame(frame);
@@ -1129,10 +1266,19 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             registers.rax = syscall_open(process_id, registers.rdi, registers.rsi, registers.rdx);
             current_stack_pointer
         }
-        SYSCALL_READ => {
-            registers.rax = syscall_read(process_id, registers.rdi, registers.rsi, registers.rdx);
-            current_stack_pointer
-        }
+        SYSCALL_READ => match syscall_read(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            current_stack_pointer,
+        ) {
+            ReadOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ReadOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        },
         SYSCALL_CLOSE => {
             registers.rax = syscall_close(process_id, registers.rdi);
             current_stack_pointer
@@ -1413,16 +1559,33 @@ fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
     descriptor
 }
 
-fn syscall_read(process_id: u64, descriptor: u64, address: u64, length: u64) -> u64 {
+enum ReadOutcome {
+    Ready(u64),
+    Blocked,
+}
+
+fn syscall_read(
+    process_id: u64,
+    descriptor: u64,
+    address: u64,
+    length: u64,
+    current_stack_pointer: usize,
+) -> ReadOutcome {
     let length = match usize::try_from(length) {
         Ok(length) if length <= MAX_SYSCALL_READ_BYTES => length,
-        _ => return error_return(ERR_ARGUMENT_TOO_LARGE),
+        _ => return ReadOutcome::Ready(error_return(ERR_ARGUMENT_TOO_LARGE)),
     };
     if length == 0 {
-        return 0;
+        return ReadOutcome::Ready(0);
     }
     if !user_range_allows(process_id, address, length, true) {
-        return error_return(ERR_BAD_ADDRESS);
+        return ReadOutcome::Ready(error_return(ERR_BAD_ADDRESS));
+    }
+    if descriptor == 0 {
+        return syscall_terminal_read(process_id, address, length, current_stack_pointer);
+    }
+    if descriptor < 3 {
+        return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
     }
 
     let (path, offset) = {
@@ -1432,14 +1595,14 @@ fn syscall_read(process_id: u64, descriptor: u64, address: u64, length: u64) -> 
             .iter()
             .find(|process| process.process_id == process_id)
         else {
-            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+            return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
         };
         let Some(file) = process
             .open_files
             .iter()
             .find(|file| file.descriptor == descriptor)
         else {
-            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+            return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
         };
         (file.path.clone(), file.offset)
     };
@@ -1447,7 +1610,7 @@ fn syscall_read(process_id: u64, descriptor: u64, address: u64, length: u64) -> 
     let mut buffer = vec![0_u8; length];
     let count = match vfs::read_at(&path, offset, &mut buffer) {
         Ok(count) => count,
-        Err(error) => return error_return(vfs_errno(&error)),
+        Err(error) => return ReadOutcome::Ready(error_return(vfs_errno(&error))),
     };
     unsafe {
         ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, count);
@@ -1465,7 +1628,98 @@ fn syscall_read(process_id: u64, descriptor: u64, address: u64, length: u64) -> 
         process.read_count = process.read_count.saturating_add(1);
         process.bytes_read = process.bytes_read.saturating_add(count as u64);
     }
-    count as u64
+    ReadOutcome::Ready(count as u64)
+}
+
+fn syscall_terminal_read(
+    process_id: u64,
+    address: u64,
+    length: usize,
+    current_stack_pointer: usize,
+) -> ReadOutcome {
+    if !terminal::is_foreground(process_id) {
+        return ReadOutcome::Ready(error_return(ERR_IO));
+    }
+
+    if let Some(bytes) = terminal::take_committed(length) {
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
+        }
+        let mut manager = PROCESS_MANAGER.lock();
+        if let Some(process) = manager.process_mut(process_id) {
+            process.terminal_read_count = process.terminal_read_count.saturating_add(1);
+            process.terminal_bytes_read = process
+                .terminal_bytes_read
+                .saturating_add(bytes.len() as u64);
+        }
+        return ReadOutcome::Ready(bytes.len() as u64);
+    }
+
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+    };
+    if process.pending_terminal_read.is_some() {
+        return ReadOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_terminal_read = Some(PendingTerminalRead {
+        address,
+        length,
+        stack_pointer: current_stack_pointer,
+    });
+    process.state = ProcessState::Blocked;
+    process.blocked_read_count = process.blocked_read_count.saturating_add(1);
+    drop(manager);
+    terminal::note_blocked_read();
+    ReadOutcome::Blocked
+}
+
+fn service_terminal_reads(physical_memory_offset: VirtAddr) -> Result<usize, Error> {
+    let Some(process_id) = terminal::foreground_process() else {
+        return Ok(0);
+    };
+    let pending = cpu_interrupts::without_interrupts(|| {
+        PROCESS_MANAGER
+            .lock()
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+            .and_then(|process| process.pending_terminal_read)
+    });
+    let Some(pending) = pending else {
+        return Ok(0);
+    };
+    let Some(bytes) = terminal::take_committed(pending.length) else {
+        return Ok(0);
+    };
+
+    cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
+        let mut manager = PROCESS_MANAGER.lock();
+        let process = manager
+            .process_mut(process_id)
+            .ok_or(Error::ProcessNotFound(process_id))?;
+        write_user_bytes(
+            pending.address,
+            &bytes,
+            physical_memory_offset,
+            &process.pages,
+        )?;
+        let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+        registers.rax = bytes.len() as u64;
+        process.pending_terminal_read = None;
+        process.state = ProcessState::Runnable;
+        process.terminal_read_count = process.terminal_read_count.saturating_add(1);
+        process.terminal_bytes_read = process
+            .terminal_bytes_read
+            .saturating_add(bytes.len() as u64);
+        drop(manager);
+        if !scheduler::wake_process(process_id) {
+            return Err(Error::ProcessNotFound(process_id));
+        }
+        terminal::note_wakeup();
+        Ok(())
+    })?;
+    Ok(bytes.len())
 }
 
 fn syscall_close(process_id: u64, descriptor: u64) -> u64 {

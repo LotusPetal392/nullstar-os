@@ -132,6 +132,7 @@ impl fmt::Display for TaskKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Runnable,
+    Blocked,
     Zombie,
 }
 
@@ -139,6 +140,7 @@ impl fmt::Display for TaskState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runnable => formatter.write_str("runnable"),
+            Self::Blocked => formatter.write_str("blocked"),
             Self::Zombie => formatter.write_str("zombie"),
         }
     }
@@ -184,6 +186,7 @@ pub struct Snapshot {
     pub running: bool,
     pub task_count: usize,
     pub runnable_task_count: usize,
+    pub blocked_task_count: usize,
     pub zombie_task_count: usize,
     pub user_task_count: usize,
     pub current_task_id: u64,
@@ -496,6 +499,46 @@ impl Scheduler {
         self.switch_to_next(current_stack_pointer, SwitchReason::Voluntary)
     }
 
+    fn block_current(&mut self, current_stack_pointer: usize) -> usize {
+        if !self.running || self.tasks.is_empty() {
+            return current_stack_pointer;
+        }
+
+        let current = self.current_task;
+        if self.tasks[current].kind != TaskKind::UserProcess {
+            return current_stack_pointer;
+        }
+        self.tasks[current].stack_pointer = current_stack_pointer;
+        self.tasks[current].state = TaskState::Blocked;
+        self.ticks_in_quantum = 0;
+
+        let next = self
+            .next_runnable_after(current)
+            .expect("scheduler has no runnable task after userspace blocking");
+        self.switch_to(next, SwitchReason::Block)
+    }
+
+    fn wake_process(&mut self, process_id: u64) -> bool {
+        let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.process_id == Some(process_id))
+        else {
+            return false;
+        };
+        if task.state != TaskState::Blocked {
+            return false;
+        }
+        task.state = TaskState::Runnable;
+        true
+    }
+
+    fn is_process_blocked(&self, process_id: u64) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.process_id == Some(process_id) && task.state == TaskState::Blocked)
+    }
+
     fn terminate_current(&mut self, current_stack_pointer: usize) -> usize {
         if !self.running || self.tasks.is_empty() {
             return current_stack_pointer;
@@ -548,7 +591,7 @@ impl Scheduler {
             SwitchReason::Voluntary => {
                 self.voluntary_switches = self.voluntary_switches.saturating_add(1)
             }
-            SwitchReason::Termination => {}
+            SwitchReason::Block | SwitchReason::Termination => {}
         }
         self.tasks[next].scheduled_count = self.tasks[next].scheduled_count.saturating_add(1);
 
@@ -623,6 +666,11 @@ impl Scheduler {
                 .iter()
                 .filter(|task| task.state == TaskState::Runnable)
                 .count(),
+            blocked_task_count: self
+                .tasks
+                .iter()
+                .filter(|task| task.state == TaskState::Blocked)
+                .count(),
             zombie_task_count: self
                 .tasks
                 .iter()
@@ -657,6 +705,7 @@ impl Scheduler {
 enum SwitchReason {
     Preempt,
     Voluntary,
+    Block,
     Termination,
 }
 
@@ -748,6 +797,18 @@ pub fn on_timer_interrupt(current_stack_pointer: usize) -> usize {
 
 pub fn on_yield(current_stack_pointer: usize) -> usize {
     SCHEDULER.lock().yield_now(current_stack_pointer)
+}
+
+pub fn block_current(current_stack_pointer: usize) -> usize {
+    SCHEDULER.lock().block_current(current_stack_pointer)
+}
+
+pub fn wake_process(process_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().wake_process(process_id))
+}
+
+pub fn is_process_blocked(process_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().is_process_blocked(process_id))
 }
 
 pub fn terminate_current(current_stack_pointer: usize) -> usize {

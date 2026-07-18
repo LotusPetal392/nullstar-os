@@ -21,3 +21,9 @@ name = "cat"
 path = "src/bin/cat.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "readline"
+path = "src/bin/readline.rs"
+test = false
+bench = false

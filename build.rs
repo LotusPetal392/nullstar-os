@@ -22,6 +22,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_cat")
             .expect("userspace cat artifact path was not set"),
     );
+    let userspace_readline = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_readline")
+            .expect("userspace readline artifact path was not set"),
+    );
     let hello_text = output_directory.join("hello.txt");
     fs::write(&hello_text, HELLO_TEXT).expect("failed to create userspace file-I/O fixture");
 
@@ -30,6 +34,7 @@ fn main() {
     image.set_file(String::from("init"), userspace_init);
     image.set_file(String::from("fault-probe"), userspace_fault_probe);
     image.set_file(String::from("cat"), userspace_cat);
+    image.set_file(String::from("readline"), userspace_readline);
     image.set_file(String::from("hello.txt"), hello_text);
     image
         .create_bios_image(&bios_image)
