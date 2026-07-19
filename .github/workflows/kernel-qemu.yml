@@ -12,11 +12,14 @@ permissions:
 jobs:
   qemu-smoke-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Apply Rust userspace runtime integration
+        run: python tools/apply_runtime_milestone.py
 
       - name: Install pinned Rust toolchain
         run: |
@@ -27,8 +30,26 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Check formatting
-        run: cargo +nightly-2026-02-01 fmt --all -- --check
+      - name: Format and validate
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
+
+      - name: Package transformed sources
+        if: always()
+        shell: bash
+        run: |
+          tar --exclude-vcs -czf runtime-milestone-tree.tar.gz \
+            Cargo.toml Cargo.lock build.rs src kernel userspace shared
+
+      - name: Upload transformed sources
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: runtime-milestone-tree
+          path: runtime-milestone-tree.tar.gz
+          if-no-files-found: error
 
       - name: Install QEMU
         run: |
