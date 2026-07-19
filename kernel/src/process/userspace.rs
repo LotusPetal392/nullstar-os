@@ -47,6 +47,10 @@ const SYSCALL_WAIT_CHILD: u64 = 8;
 const SYSCALL_GETPID: u64 = 9;
 const SYSCALL_PIPE_PAIR: u64 = 10;
 const SYSCALL_TRY_WAIT_CHILD: u64 = 11;
+const SYSCALL_SIGNAL_PROCESS_GROUP: u64 = 12;
+
+pub const SIGNAL_INTERRUPT: u64 = 2;
+pub const SIGNAL_TERMINATE: u64 = 15;
 
 const USER_MIN_ADDRESS: u64 = 0x0001_0000;
 const USER_PML4_SLOT_END: u64 = 0x0000_0080_0000_0000;
@@ -63,12 +67,16 @@ const MAX_ARGUMENT_BYTES: usize = 4096;
 const MAX_COMMAND_BYTES: usize = 512;
 const SPAWN_FOREGROUND: u64 = 1;
 const SPAWN_USE_DESCRIPTORS: u64 = 1 << 1;
+const SPAWN_NEW_PROCESS_GROUP: u64 = 1 << 2;
+const SPAWN_JOIN_PROCESS_GROUP: u64 = 1 << 3;
 const DEFAULT_DESCRIPTOR: u64 = u64::MAX;
+const DEFAULT_PROCESS_GROUP: u64 = u64::MAX;
 const SHELL_PROCESS_TASK_NAME: &str = "user-shell-process";
 const USER_RFLAGS: u64 = 0x202;
 const PAGE_BYTES: u64 = Size4KiB::SIZE;
 
 const ERR_NO_ENTRY: i64 = -2;
+const ERR_NO_PROCESS: i64 = -3;
 const ERR_IO: i64 = -5;
 const ERR_ARGUMENT_TOO_LARGE: i64 = -7;
 const ERR_BAD_FILE_DESCRIPTOR: i64 = -9;
@@ -236,6 +244,7 @@ pub enum ProcessState {
     Blocked,
     Exited,
     Faulted,
+    Signaled,
 }
 
 impl fmt::Display for ProcessState {
@@ -245,6 +254,7 @@ impl fmt::Display for ProcessState {
             Self::Blocked => formatter.write_str("blocked"),
             Self::Exited => formatter.write_str("exited"),
             Self::Faulted => formatter.write_str("faulted"),
+            Self::Signaled => formatter.write_str("signaled"),
         }
     }
 }
@@ -261,6 +271,7 @@ pub struct FaultInfo {
 pub enum TerminationReason {
     Exit(u64),
     Fault(FaultInfo),
+    Signal(u64),
 }
 
 impl fmt::Display for TerminationReason {
@@ -272,6 +283,7 @@ impl fmt::Display for TerminationReason {
                 "fault(vector={}, address={:#018x}, rip={:#018x})",
                 fault.vector, fault.address, fault.instruction_pointer
             ),
+            Self::Signal(signal) => write!(formatter, "signal({signal})"),
         }
     }
 }
@@ -280,6 +292,7 @@ impl fmt::Display for TerminationReason {
 pub struct ProcessResult {
     pub process_id: u64,
     pub parent_process_id: Option<u64>,
+    pub process_group_id: u64,
     pub task_id: u64,
     pub path: String,
     pub termination: TerminationReason,
@@ -311,6 +324,8 @@ pub struct ProcessResult {
     pub child_wait_count: u64,
     pub child_poll_count: u64,
     pub child_poll_pending_count: u64,
+    pub signal_sent_count: u64,
+    pub signal_received_count: u64,
     pub pipe_pair_count: u64,
     pub pipe_descriptor_close_count: u64,
     pub pipe_descriptor_inherit_count: u64,
@@ -323,14 +338,21 @@ impl ProcessResult {
     pub fn exit_code(&self) -> Option<u64> {
         match &self.termination {
             TerminationReason::Exit(code) => Some(*code),
-            TerminationReason::Fault(_) => None,
+            TerminationReason::Fault(_) | TerminationReason::Signal(_) => None,
         }
     }
 
     pub fn fault(&self) -> Option<FaultInfo> {
         match &self.termination {
             TerminationReason::Fault(fault) => Some(*fault),
-            TerminationReason::Exit(_) => None,
+            TerminationReason::Exit(_) | TerminationReason::Signal(_) => None,
+        }
+    }
+
+    pub fn signal(&self) -> Option<u64> {
+        match &self.termination {
+            TerminationReason::Signal(signal) => Some(*signal),
+            TerminationReason::Exit(_) | TerminationReason::Fault(_) => None,
         }
     }
 }
@@ -340,12 +362,14 @@ pub struct ManagerSnapshot {
     pub spawned: u64,
     pub child_spawns: u64,
     pub child_waits: u64,
+    pub signals_sent: u64,
     pub pipe_pairs: u64,
     pub pipe_descriptor_inherits: u64,
     pub active: usize,
     pub blocked: usize,
     pub exited: u64,
     pub faulted: u64,
+    pub signaled: u64,
     pub reaped: u64,
     pub frames_reclaimed: u64,
     pub results: Vec<ProcessResult>,
@@ -354,12 +378,19 @@ pub struct ManagerSnapshot {
 #[derive(Debug, Clone)]
 pub struct SpawnInfo {
     pub process_id: u64,
+    pub process_group_id: u64,
     pub task_id: u64,
     pub path: String,
     pub entry_point: u64,
     pub page_table_address: u64,
     pub mapped_pages: usize,
     pub owned_frames: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessGroupInfo {
+    pub process_group_id: u64,
+    pub process_ids: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -378,6 +409,7 @@ pub enum Error {
     ArgumentBytesTooLarge,
     InvalidArgument,
     InvalidDescriptor(u64),
+    InvalidProcessGroup(u64),
     TerminalBusy,
     Pipe(pipe::Error),
     ProcessNotFound(u64),
@@ -411,6 +443,7 @@ impl Error {
             }
             Self::InvalidArgument => "userspace argument contains an invalid byte",
             Self::InvalidDescriptor(_) => "userspace file descriptor is invalid",
+            Self::InvalidProcessGroup(_) => "userspace process group is invalid",
             Self::TerminalBusy => "another userspace process owns the terminal",
             Self::Pipe(_) => "kernel pipe operation failed",
             Self::ProcessNotFound(_) => "userspace process bookkeeping is missing",
@@ -442,6 +475,9 @@ impl fmt::Display for Error {
                     formatter,
                     "userspace file descriptor {descriptor} is invalid"
                 )
+            }
+            Self::InvalidProcessGroup(group) => {
+                write!(formatter, "userspace process group {group} is invalid")
             }
             Self::Scheduler(error) => formatter.write_str(error.description()),
             Self::Elf(error) => write!(formatter, "ELF error: {error}"),
@@ -527,6 +563,8 @@ struct PendingChildSpawn {
     foreground: bool,
     stdin_descriptor: Option<u64>,
     stdout_descriptor: Option<u64>,
+    new_process_group: bool,
+    process_group_id: Option<u64>,
     stack_pointer: usize,
 }
 
@@ -559,6 +597,7 @@ struct PipeDescriptor {
 struct Process {
     process_id: u64,
     parent_process_id: Option<u64>,
+    process_group_id: u64,
     terminal_parent: Option<u64>,
     task_id: u64,
     path: String,
@@ -603,6 +642,8 @@ struct Process {
     child_wait_count: u64,
     child_poll_count: u64,
     child_poll_pending_count: u64,
+    signal_sent_count: u64,
+    signal_received_count: u64,
     pipe_pair_count: u64,
     pipe_descriptor_close_count: u64,
     pipe_descriptor_inherit_count: u64,
@@ -622,6 +663,7 @@ impl Process {
         Ok(ProcessResult {
             process_id: self.process_id,
             parent_process_id: self.parent_process_id,
+            process_group_id: self.process_group_id,
             task_id: self.task_id,
             path: self.path.clone(),
             termination,
@@ -653,6 +695,8 @@ impl Process {
             child_wait_count: self.child_wait_count,
             child_poll_count: self.child_poll_count,
             child_poll_pending_count: self.child_poll_pending_count,
+            signal_sent_count: self.signal_sent_count,
+            signal_received_count: self.signal_received_count,
             pipe_pair_count: self.pipe_pair_count,
             pipe_descriptor_close_count: self.pipe_descriptor_close_count,
             pipe_descriptor_inherit_count: self.pipe_descriptor_inherit_count,
@@ -670,10 +714,12 @@ struct ProcessManager {
     spawned: u64,
     child_spawns: u64,
     child_waits: u64,
+    signals_sent: u64,
     pipe_pairs: u64,
     pipe_descriptor_inherits: u64,
     exited: u64,
     faulted: u64,
+    signaled: u64,
     reaped: u64,
     frames_reclaimed: u64,
 }
@@ -687,10 +733,12 @@ impl ProcessManager {
             spawned: 0,
             child_spawns: 0,
             child_waits: 0,
+            signals_sent: 0,
             pipe_pairs: 0,
             pipe_descriptor_inherits: 0,
             exited: 0,
             faulted: 0,
+            signaled: 0,
             reaped: 0,
             frames_reclaimed: 0,
         }
@@ -721,6 +769,7 @@ impl ProcessManager {
             spawned: self.spawned,
             child_spawns: self.child_spawns,
             child_waits: self.child_waits,
+            signals_sent: self.signals_sent,
             pipe_pairs: self.pipe_pairs,
             pipe_descriptor_inherits: self.pipe_descriptor_inherits,
             active: self
@@ -740,6 +789,7 @@ impl ProcessManager {
                 .count(),
             exited: self.exited,
             faulted: self.faulted,
+            signaled: self.signaled,
             reaped: self.reaped,
             frames_reclaimed: self.frames_reclaimed,
             results: self.completed.clone(),
@@ -1027,6 +1077,7 @@ pub fn spawn_with_args(
         None,
         None,
         None,
+        None,
         kernel_mapper,
         frame_allocator,
         physical_memory_offset,
@@ -1043,6 +1094,7 @@ fn spawn_with_mode(
     stdout_pipe: Option<PipeId>,
     parent_process_id: Option<u64>,
     terminal_parent: Option<u64>,
+    process_group_id: Option<u64>,
     kernel_mapper: &mut OffsetPageTable<'_>,
     frame_allocator: &mut BootInfoFrameAllocator,
     physical_memory_offset: VirtAddr,
@@ -1120,9 +1172,11 @@ fn spawn_with_mode(
     unsafe { (initial_stack_pointer as *mut SavedContext).write(initial_context) };
 
     let process_id = PROCESS_MANAGER.lock().allocate_process_id();
+    let process_group_id = process_group_id.unwrap_or(process_id);
     let mut pending_process = Some(Process {
         process_id,
         parent_process_id,
+        process_group_id,
         terminal_parent,
         task_id: 0,
         path: path.to_string(),
@@ -1167,6 +1221,8 @@ fn spawn_with_mode(
         child_wait_count: 0,
         child_poll_count: 0,
         child_poll_pending_count: 0,
+        signal_sent_count: 0,
+        signal_received_count: 0,
         pipe_pair_count: 0,
         pipe_descriptor_close_count: 0,
         pipe_descriptor_inherit_count: 0,
@@ -1221,6 +1277,7 @@ fn spawn_with_mode(
 
     Ok(SpawnInfo {
         process_id,
+        process_group_id,
         task_id,
         path: path.to_string(),
         entry_point: image.entry_point,
@@ -1294,6 +1351,7 @@ impl Runtime {
             None,
             None,
             None,
+            None,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -1319,6 +1377,7 @@ impl Runtime {
             false,
             stdin_pipe,
             stdout_pipe,
+            None,
             None,
             None,
             &mut self.mapper,
@@ -1367,18 +1426,45 @@ impl Runtime {
         parent_process_id: u64,
         request: &PendingChildSpawn,
     ) -> Result<SpawnInfo, Error> {
-        let (stdin_pipe, stdout_pipe) = cpu_interrupts::without_interrupts(|| {
-            let manager = PROCESS_MANAGER.lock();
-            let parent = manager
-                .processes
-                .iter()
-                .find(|process| process.process_id == parent_process_id)
-                .ok_or(Error::ProcessNotFound(parent_process_id))?;
-            Ok::<_, Error>((
-                resolve_pipe_descriptor(parent, request.stdin_descriptor, PipeDirection::Reader)?,
-                resolve_pipe_descriptor(parent, request.stdout_descriptor, PipeDirection::Writer)?,
-            ))
-        })?;
+        let (stdin_pipe, stdout_pipe, process_group_id) =
+            cpu_interrupts::without_interrupts(|| {
+                let manager = PROCESS_MANAGER.lock();
+                let parent = manager
+                    .processes
+                    .iter()
+                    .find(|process| process.process_id == parent_process_id)
+                    .ok_or(Error::ProcessNotFound(parent_process_id))?;
+                let stdin_pipe = resolve_pipe_descriptor(
+                    parent,
+                    request.stdin_descriptor,
+                    PipeDirection::Reader,
+                )?;
+                let stdout_pipe = resolve_pipe_descriptor(
+                    parent,
+                    request.stdout_descriptor,
+                    PipeDirection::Writer,
+                )?;
+                let inherited_group = parent.process_group_id;
+                let process_group_id = if request.new_process_group {
+                    None
+                } else if let Some(group_id) = request.process_group_id {
+                    let group_owned = manager.processes.iter().any(|process| {
+                        process.parent_process_id == Some(parent_process_id)
+                            && process.process_group_id == group_id
+                            && matches!(
+                                process.state,
+                                ProcessState::Runnable | ProcessState::Blocked
+                            )
+                    });
+                    if !group_owned {
+                        return Err(Error::InvalidProcessGroup(group_id));
+                    }
+                    Some(group_id)
+                } else {
+                    Some(inherited_group)
+                };
+                Ok::<_, Error>((stdin_pipe, stdout_pipe, process_group_id))
+            })?;
 
         if let Some(pipe_id) = stdin_pipe {
             pipe::retain_reader(pipe_id)?;
@@ -1417,6 +1503,7 @@ impl Runtime {
             stdout_pipe,
             Some(parent_process_id),
             request.foreground.then_some(parent_process_id),
+            process_group_id,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -1483,6 +1570,7 @@ impl Runtime {
 
     pub fn poll(&mut self) -> Result<usize, Error> {
         terminal::poll_keyboard();
+        service_terminal_interrupt();
         let reaped = reap(&mut self.frame_allocator)?;
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;
@@ -1590,7 +1678,8 @@ impl Runtime {
 
     pub fn handle_terminal_key(&mut self, key: pc_keyboard::DecodedKey) -> Result<bool, Error> {
         let handled = terminal::handle_key(key);
-        if handled {
+        let signaled = service_terminal_interrupt();
+        if handled && signaled == 0 {
             service_terminal_reads(self.physical_memory_offset)?;
         }
         Ok(handled)
@@ -1670,6 +1759,73 @@ impl Runtime {
                 process.parent_process_id == Some(parent_process_id) && process.path == path
             })
         }))
+    }
+
+    pub fn wait_until_child_group(
+        &mut self,
+        parent_process_id: u64,
+        path: &str,
+        minimum_members: usize,
+    ) -> Result<ProcessGroupInfo, Error> {
+        loop {
+            self.poll()?;
+            if let Some(info) = active_child_group(parent_process_id, path, minimum_members, false)
+            {
+                return Ok(info);
+            }
+            hlt();
+        }
+    }
+
+    pub fn wait_until_foreground_child_group(
+        &mut self,
+        parent_process_id: u64,
+        path: &str,
+        minimum_members: usize,
+    ) -> Result<ProcessGroupInfo, Error> {
+        loop {
+            self.poll()?;
+            if let Some(info) = active_child_group(parent_process_id, path, minimum_members, true) {
+                return Ok(info);
+            }
+            hlt();
+        }
+    }
+
+    pub fn wait_for_child_group(
+        &mut self,
+        parent_process_id: u64,
+        process_group_id: u64,
+    ) -> Result<Vec<ProcessResult>, Error> {
+        loop {
+            self.poll()?;
+            let (active, results) = cpu_interrupts::without_interrupts(|| {
+                let manager = PROCESS_MANAGER.lock();
+                let active = manager.processes.iter().any(|process| {
+                    process.parent_process_id == Some(parent_process_id)
+                        && process.process_group_id == process_group_id
+                });
+                let results = manager
+                    .completed
+                    .iter()
+                    .filter(|result| {
+                        result.parent_process_id == Some(parent_process_id)
+                            && result.process_group_id == process_group_id
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (active, results)
+            });
+            if !active && !results.is_empty() {
+                return Ok(results);
+            }
+            hlt();
+        }
+    }
+
+    pub fn inject_terminal_interrupt(&mut self) -> Result<usize, Error> {
+        terminal::handle_key(pc_keyboard::DecodedKey::Unicode('\u{3}'));
+        Ok(service_terminal_interrupt())
     }
 
     pub fn inject_terminal_line(&mut self, line: &str) -> Result<usize, Error> {
@@ -1883,6 +2039,7 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             registers.rdx,
             registers.r10,
             registers.r8,
+            registers.rbx,
             current_stack_pointer,
         ) {
             ControlOutcome::Ready(result) => {
@@ -1910,6 +2067,10 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
         }
         SYSCALL_TRY_WAIT_CHILD => {
             registers.rax = syscall_try_wait_child(process_id, registers.rdi);
+            current_stack_pointer
+        }
+        SYSCALL_SIGNAL_PROCESS_GROUP => {
+            registers.rax = syscall_signal_process_group(process_id, registers.rdi, registers.rsi);
             current_stack_pointer
         }
         SYSCALL_EXIT => {
@@ -2074,11 +2235,29 @@ fn syscall_spawn_command(
     flags: u64,
     stdin_descriptor: u64,
     stdout_descriptor: u64,
+    process_group_argument: u64,
     current_stack_pointer: usize,
 ) -> ControlOutcome {
-    if flags & !(SPAWN_FOREGROUND | SPAWN_USE_DESCRIPTORS) != 0 {
+    let allowed_flags = SPAWN_FOREGROUND
+        | SPAWN_USE_DESCRIPTORS
+        | SPAWN_NEW_PROCESS_GROUP
+        | SPAWN_JOIN_PROCESS_GROUP;
+    if flags & !allowed_flags != 0 {
         return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
     }
+    let new_process_group = flags & SPAWN_NEW_PROCESS_GROUP != 0;
+    let join_process_group = flags & SPAWN_JOIN_PROCESS_GROUP != 0;
+    if new_process_group && join_process_group {
+        return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
+    }
+    let process_group_id = if join_process_group {
+        if process_group_argument == DEFAULT_PROCESS_GROUP {
+            return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
+        }
+        Some(process_group_argument)
+    } else {
+        None
+    };
     let command = match user_text(process_id, address, length, MAX_COMMAND_BYTES) {
         Ok(command) => command,
         Err(error) => return ControlOutcome::Ready(error_return(error)),
@@ -2111,6 +2290,8 @@ fn syscall_spawn_command(
         foreground: flags & SPAWN_FOREGROUND != 0,
         stdin_descriptor,
         stdout_descriptor,
+        new_process_group,
+        process_group_id,
         stack_pointer: current_stack_pointer,
     });
     process.state = ProcessState::Blocked;
@@ -2246,6 +2427,150 @@ fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {
         .unwrap_or_else(|| error_return(ERR_TRY_AGAIN))
 }
 
+fn syscall_signal_process_group(process_id: u64, process_group_id: u64, signal: u64) -> u64 {
+    match deliver_signal_group(Some(process_id), process_group_id, signal) {
+        Ok(count) => count as u64,
+        Err(error) => error_return(error),
+    }
+}
+
+fn deliver_signal_group(
+    owner_process_id: Option<u64>,
+    process_group_id: u64,
+    signal: u64,
+) -> Result<usize, i64> {
+    if signal != SIGNAL_INTERRUPT && signal != SIGNAL_TERMINATE {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    let target_process_ids = {
+        let manager = PROCESS_MANAGER.lock();
+        if let Some(owner_process_id) = owner_process_id {
+            let owned = manager.processes.iter().any(|process| {
+                process.parent_process_id == Some(owner_process_id)
+                    && process.process_group_id == process_group_id
+                    && matches!(
+                        process.state,
+                        ProcessState::Runnable | ProcessState::Blocked
+                    )
+            });
+            if !owned {
+                return Err(ERR_NO_CHILD);
+            }
+        }
+        manager
+            .processes
+            .iter()
+            .filter(|process| {
+                process.process_group_id == process_group_id
+                    && matches!(
+                        process.state,
+                        ProcessState::Runnable | ProcessState::Blocked
+                    )
+            })
+            .map(|process| process.process_id)
+            .collect::<Vec<_>>()
+    };
+    if target_process_ids.is_empty() {
+        return Err(ERR_NO_PROCESS);
+    }
+
+    let mut terminated = Vec::new();
+    for target_process_id in target_process_ids {
+        if scheduler::terminate_process(target_process_id) {
+            terminated.push(target_process_id);
+        }
+    }
+    if terminated.is_empty() {
+        return Err(ERR_NO_PROCESS);
+    }
+
+    let count = terminated.len();
+    let mut manager = PROCESS_MANAGER.lock();
+    for target_process_id in &terminated {
+        if let Some(process) = manager.process_mut(*target_process_id) {
+            process.state = ProcessState::Signaled;
+            process.termination = Some(TerminationReason::Signal(signal));
+            process.signal_received_count = process.signal_received_count.saturating_add(1);
+        }
+    }
+    if let Some(owner_process_id) = owner_process_id {
+        if let Some(owner) = manager.process_mut(owner_process_id) {
+            owner.signal_sent_count = owner.signal_sent_count.saturating_add(count as u64);
+        }
+    }
+    manager.signals_sent = manager.signals_sent.saturating_add(count as u64);
+    manager.signaled = manager.signaled.saturating_add(count as u64);
+    drop(manager);
+
+    crate::serial_println!(
+        "userspace process group signaled: group={}, signal={}, processes={}",
+        process_group_id,
+        signal,
+        count
+    );
+    Ok(count)
+}
+
+fn service_terminal_interrupt() -> usize {
+    let Some(foreground_process_id) = terminal::take_interrupt() else {
+        return 0;
+    };
+    let target = PROCESS_MANAGER
+        .lock()
+        .processes
+        .iter()
+        .find(|process| process.process_id == foreground_process_id)
+        .map(|process| (process.process_group_id, process.path == "/ush"));
+    let Some((process_group_id, is_shell)) = target else {
+        return 0;
+    };
+    if is_shell {
+        return 0;
+    }
+    deliver_signal_group(None, process_group_id, SIGNAL_INTERRUPT).unwrap_or(0)
+}
+
+fn active_child_group(
+    parent_process_id: u64,
+    path: &str,
+    minimum_members: usize,
+    require_foreground: bool,
+) -> Option<ProcessGroupInfo> {
+    let foreground_process = if require_foreground {
+        terminal::foreground_process()
+    } else {
+        None
+    };
+    let manager = PROCESS_MANAGER.lock();
+    let anchor = manager.processes.iter().find(|process| {
+        process.parent_process_id == Some(parent_process_id)
+            && process.path == path
+            && matches!(
+                process.state,
+                ProcessState::Runnable | ProcessState::Blocked
+            )
+            && foreground_process.map_or(true, |foreground| process.process_id == foreground)
+    })?;
+    let process_group_id = anchor.process_group_id;
+    let process_ids = manager
+        .processes
+        .iter()
+        .filter(|process| {
+            process.parent_process_id == Some(parent_process_id)
+                && process.process_group_id == process_group_id
+                && matches!(
+                    process.state,
+                    ProcessState::Runnable | ProcessState::Blocked
+                )
+        })
+        .map(|process| process.process_id)
+        .collect::<Vec<_>>();
+    (process_ids.len() >= minimum_members).then_some(ProcessGroupInfo {
+        process_group_id,
+        process_ids,
+    })
+}
+
 fn parse_command_line(command: &str) -> Result<(String, Vec<String>), i64> {
     let mut words = command.split_whitespace();
     let Some(program) = words.next() else {
@@ -2277,6 +2602,7 @@ fn child_status(result: &ProcessResult) -> u64 {
     match &result.termination {
         TerminationReason::Exit(code) => *code,
         TerminationReason::Fault(fault) => 128_u64.saturating_add(fault.vector),
+        TerminationReason::Signal(signal) => 128_u64.saturating_add(*signal),
     }
 }
 
@@ -2286,6 +2612,7 @@ fn process_error_number(error: &Error) -> i64 {
         Error::InvalidArgument | Error::TooManyArguments | Error::ArgumentBytesTooLarge => {
             ERR_INVALID_ARGUMENT
         }
+        Error::InvalidProcessGroup(_) => ERR_NO_PROCESS,
         Error::TerminalBusy => ERR_IO,
         _ => ERR_IO,
     }

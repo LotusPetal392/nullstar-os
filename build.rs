@@ -42,6 +42,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_delay")
             .expect("userspace delay artifact path was not set"),
     );
+    let userspace_signal_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_signal_probe")
+            .expect("userspace signal-probe artifact path was not set"),
+    );
     let userspace_shell = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_ush")
             .expect("userspace shell artifact path was not set"),
@@ -59,6 +63,7 @@ fn main() {
     image.set_file(String::from("pipe-consumer"), userspace_pipe_consumer);
     image.set_file(String::from("upper"), userspace_upper);
     image.set_file(String::from("delay"), userspace_delay);
+    image.set_file(String::from("signal-probe"), userspace_signal_probe);
     image.set_file(String::from("ush"), userspace_shell);
     image.set_file(String::from("hello.txt"), hello_text);
     image

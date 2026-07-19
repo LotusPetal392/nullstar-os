@@ -47,7 +47,7 @@ static SCANCODES: Mutex<ScancodeQueue> = Mutex::new(ScancodeQueue::new());
 static KEYBOARD: Mutex<PS2Keyboard<Us104Key, ScancodeSet1>> = Mutex::new(PS2Keyboard::new(
     ScancodeSet1::new(),
     Us104Key,
-    HandleControl::Ignore,
+    HandleControl::MapLettersToUnicode,
 ));
 
 pub(crate) fn push_scancode(scancode: u8) {

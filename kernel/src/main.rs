@@ -793,6 +793,101 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
 
+    if let Err(error) =
+        userspace_runtime.inject_terminal_line("signal-probe | upper | pipe-consumer")
+    {
+        serial_println!("userspace foreground signal pipeline injection failed: {error}");
+        hlt_loop();
+    }
+    let foreground_signal_group = match userspace_runtime.wait_until_foreground_child_group(
+        userspace_shell.process_id,
+        "/pipe-consumer",
+        3,
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            serial_println!("userspace foreground signal group did not start: {error}");
+            hlt_loop();
+        }
+    };
+    let terminal_before_interrupt = userspace_runtime.terminal_snapshot();
+    let foreground_signal_deliveries = match userspace_runtime.inject_terminal_interrupt() {
+        Ok(count) => count,
+        Err(error) => {
+            serial_println!("userspace terminal interrupt injection failed: {error}");
+            hlt_loop();
+        }
+    };
+    let foreground_signal_results = match userspace_runtime.wait_for_child_group(
+        userspace_shell.process_id,
+        foreground_signal_group.process_group_id,
+    ) {
+        Ok(results) => results,
+        Err(error) => {
+            serial_println!("userspace foreground signal group wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not regain its prompt after Ctrl-C: {error}");
+        hlt_loop();
+    }
+
+    if let Err(error) = userspace_runtime.inject_terminal_line("signal-probe &") {
+        serial_println!("userspace background signal probe injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not regain its prompt for kill test: {error}");
+        hlt_loop();
+    }
+    let background_signal_group = match userspace_runtime.wait_until_child_group(
+        userspace_shell.process_id,
+        "/signal-probe",
+        1,
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            serial_println!("userspace background signal group did not start: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) = userspace_runtime.inject_terminal_line("kill %1") {
+        serial_println!("userspace kill command injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace kill command did not return to the prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("jobs") {
+        serial_println!("userspace signaled-jobs command injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace signaled-jobs command did not return to the prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("wait") {
+        serial_println!("userspace killed-job wait injection failed: {error}");
+        hlt_loop();
+    }
+    let background_signal_results = match userspace_runtime.wait_for_child_group(
+        userspace_shell.process_id,
+        background_signal_group.process_group_id,
+    ) {
+        Ok(results) => results,
+        Err(error) => {
+            serial_println!("userspace killed-job wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not regain its prompt after kill wait: {error}");
+        hlt_loop();
+    }
+    let userspace_signal_pipe_after = userspace_runtime.pipe_snapshot();
+
     if let Err(error) = userspace_runtime.inject_terminal_line("exit") {
         serial_println!("userspace shell exit injection failed: {error}");
         hlt_loop();
@@ -839,9 +934,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && shell_consumer.pipe_read_count >= 2
         && shell_consumer.pipe_bytes_read == PIPE_TEST_BYTES
         && shell_consumer.blocked_pipe_read_count >= 1
-        && userspace_shell_result.pipe_pair_count == 2
-        && userspace_shell_result.pipe_descriptor_close_count == 4
-        && userspace_shell_result.pipe_descriptor_inherit_count == 4
+        && userspace_shell_result.pipe_pair_count == 4
+        && userspace_shell_result.pipe_descriptor_close_count == 8
+        && userspace_shell_result.pipe_descriptor_inherit_count == 8
         && created_pipe_delta == 2
         && destroyed_pipe_delta == 2
         && reader_retain_delta == 2
@@ -916,27 +1011,99 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         userspace_shell_result.child_poll_pending_count
     );
 
+    let terminal_after_interrupt = userspace_runtime.terminal_snapshot();
+    let signal_pipe_created = userspace_signal_pipe_after
+        .total_created
+        .saturating_sub(userspace_pipeline_after.total_created);
+    let signal_pipe_destroyed = userspace_signal_pipe_after
+        .total_destroyed
+        .saturating_sub(userspace_pipeline_after.total_destroyed);
+    let foreground_signal_verified = foreground_signal_deliveries == 3
+        && foreground_signal_group.process_ids.len() == 3
+        && foreground_signal_results.len() == 3
+        && foreground_signal_results.iter().all(|result| {
+            result.parent_process_id == Some(userspace_shell.process_id)
+                && result.process_group_id == foreground_signal_group.process_group_id
+                && result.signal() == Some(userspace::SIGNAL_INTERRUPT)
+                && result.signal_received_count == 1
+        })
+        && foreground_signal_results
+            .iter()
+            .any(|result| result.path == "/signal-probe")
+        && foreground_signal_results
+            .iter()
+            .any(|result| result.path == "/upper")
+        && foreground_signal_results
+            .iter()
+            .any(|result| result.path == "/pipe-consumer")
+        && terminal_after_interrupt.interrupts
+            == terminal_before_interrupt.interrupts.saturating_add(1)
+        && signal_pipe_created == 2
+        && signal_pipe_destroyed == 2
+        && userspace_signal_pipe_after.active_pipes == 0;
+    let background_signal_verified = background_signal_group.process_ids.len() == 1
+        && background_signal_results.len() == 1
+        && background_signal_results.iter().all(|result| {
+            result.parent_process_id == Some(userspace_shell.process_id)
+                && result.process_group_id == background_signal_group.process_group_id
+                && result.path == "/signal-probe"
+                && result.signal() == Some(userspace::SIGNAL_TERMINATE)
+                && result.signal_received_count == 1
+        })
+        && userspace_shell_result.signal_sent_count == 1;
+    let userspace_signals_verified = foreground_signal_verified && background_signal_verified;
+    if !userspace_signals_verified {
+        serial_println!(
+            "userspace signal verification failed: foreground_deliveries={}, foreground_members={}/{}, foreground_results={}, foreground_ok={}, terminal_interrupts={}/{}, signal_pipes={}/{}/active{}, background_members={}, background_results={}, background_ok={}, shell_signals={}",
+            foreground_signal_deliveries,
+            foreground_signal_group.process_ids.len(),
+            3,
+            foreground_signal_results.len(),
+            foreground_signal_verified,
+            terminal_before_interrupt.interrupts,
+            terminal_after_interrupt.interrupts,
+            signal_pipe_created,
+            signal_pipe_destroyed,
+            userspace_signal_pipe_after.active_pipes,
+            background_signal_group.process_ids.len(),
+            background_signal_results.len(),
+            background_signal_verified,
+            userspace_shell_result.signal_sent_count
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace process groups and signals verified: shell_pid={}, foreground_group={}, foreground_members=3, ctrl_c_deliveries={}, background_group={}, kill_deliveries=1, terminal_interrupts={}",
+        userspace_shell_result.process_id,
+        foreground_signal_group.process_group_id,
+        foreground_signal_deliveries,
+        background_signal_group.process_group_id,
+        terminal_after_interrupt.interrupts
+    );
+
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 5
-        && userspace_shell_result.child_wait_count == 5
+        && userspace_shell_result.child_spawn_count == 9
+        && userspace_shell_result.child_wait_count == 9
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
         && shell_child.bytes_read > 0
         && userspace_pipeline_verified
         && userspace_background_verified
+        && userspace_signals_verified
         && userspace_runtime
             .terminal_snapshot()
             .foreground_process
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
             userspace_shell_result.child_wait_count,
             userspace_shell_result.child_poll_count,
             userspace_shell_result.child_poll_pending_count,
+            userspace_shell_result.signal_sent_count,
             shell_child.parent_process_id,
             shell_child.exit_code(),
             shell_child.open_count,
@@ -946,13 +1113,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
     serial_println!(
-        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, child_exit=0, child_bytes={}",
+        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, child_exit=0, child_bytes={}",
         userspace_shell_result.process_id,
         shell_child.process_id,
         userspace_shell_result.child_spawn_count,
         userspace_shell_result.child_wait_count,
         userspace_shell_result.child_poll_count,
         userspace_shell_result.child_poll_pending_count,
+        userspace_shell_result.signal_sent_count,
         shell_child.bytes_read
     );
 
@@ -1041,6 +1209,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace background jobs verified");
     } else {
         println!("Userspace background jobs unavailable");
+    }
+    if userspace_signals_verified {
+        println!("Userspace process groups and signals verified");
+    } else {
+        println!("Userspace process groups and signals unavailable");
     }
     println!("Interactive shell initialized");
 

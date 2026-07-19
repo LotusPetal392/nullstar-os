@@ -539,6 +539,23 @@ impl Scheduler {
             .any(|task| task.process_id == Some(process_id) && task.state == TaskState::Blocked)
     }
 
+    fn terminate_process(&mut self, process_id: u64) -> bool {
+        let current = self.current_task;
+        let Some((index, task)) = self
+            .tasks
+            .iter_mut()
+            .enumerate()
+            .find(|(_, task)| task.process_id == Some(process_id))
+        else {
+            return false;
+        };
+        if index == current || task.state == TaskState::Zombie {
+            return false;
+        }
+        task.state = TaskState::Zombie;
+        true
+    }
+
     fn terminate_current(&mut self, current_stack_pointer: usize) -> usize {
         if !self.running || self.tasks.is_empty() {
             return current_stack_pointer;
@@ -809,6 +826,10 @@ pub fn wake_process(process_id: u64) -> bool {
 
 pub fn is_process_blocked(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().is_process_blocked(process_id))
+}
+
+pub fn terminate_process(process_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().terminate_process(process_id))
 }
 
 pub fn terminate_current(current_stack_pointer: usize) -> usize {
