@@ -5,7 +5,10 @@ pub mod heap;
 pub mod syscall;
 
 pub mod abi {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/userspace_abi.rs"));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/userspace_abi.rs"
+    ));
 }
 
 /// Defines the raw ELF entry point for a Rust userspace program.

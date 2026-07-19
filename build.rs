@@ -46,6 +46,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_signal_probe")
             .expect("userspace signal-probe artifact path was not set"),
     );
+    let userspace_runtime_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_runtime_probe")
+            .expect("userspace runtime-probe artifact path was not set"),
+    );
     let userspace_shell = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_ush")
             .expect("userspace shell artifact path was not set"),
@@ -64,6 +68,7 @@ fn main() {
     image.set_file(String::from("upper"), userspace_upper);
     image.set_file(String::from("delay"), userspace_delay);
     image.set_file(String::from("signal-probe"), userspace_signal_probe);
+    image.set_file(String::from("runtime-probe"), userspace_runtime_probe);
     image.set_file(String::from("ush"), userspace_shell);
     image.set_file(String::from("hello.txt"), hello_text);
     image

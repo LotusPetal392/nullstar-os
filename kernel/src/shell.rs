@@ -1202,7 +1202,7 @@ fn print_help() {
     shell_println!("  terminal         show canonical terminal and wakeup statistics");
     shell_println!("  pipes            show pipe buffers, blocking, and wakeups");
     shell_println!("  pipe <a> | <b>   run a userspace pipeline");
-    shell_println!("  ush              launch the userspace shell with `|` pipelines");
+    shell_println!("  ush              launch the Rust userspace shell and job controller");
     shell_println!("  spawn <path> [args...]  launch a userspace process");
     shell_println!("  wait <pid>       wait for and reap a userspace process");
     shell_println!("  run <path> [args...]    run in the foreground with stdin");

@@ -4,8 +4,7 @@
 use userspace::{
     abi::signal,
     syscall::{
-        self, ChildStatus, PipePair, ProcessGroupId, ProcessId, SpawnFlags, STDERR, STDIN,
-        STDOUT,
+        self, ChildStatus, PipePair, ProcessGroupId, ProcessId, STDERR, STDIN, STDOUT, SpawnFlags,
     },
 };
 
@@ -398,7 +397,8 @@ impl Shell {
             self.error(KILL_MISSING);
             return;
         }
-        if syscall::signal_process_group(self.jobs[slot].process_group, signal::TERMINATE).is_err() {
+        if syscall::signal_process_group(self.jobs[slot].process_group, signal::TERMINATE).is_err()
+        {
             self.error(KILL_FAILURE);
             return;
         }
@@ -504,10 +504,7 @@ fn parse_line(bytes: &[u8]) -> Result<ParsedLine, ParseError> {
             if parsed.count == MAX_STAGES {
                 return Err(ParseError::TooManyStages);
             }
-            parsed.stages[parsed.count] = Stage {
-                start,
-                end: finish,
-            };
+            parsed.stages[parsed.count] = Stage { start, end: finish };
             parsed.count += 1;
 
             if cursor == end {

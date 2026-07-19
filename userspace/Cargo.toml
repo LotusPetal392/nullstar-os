@@ -63,3 +63,9 @@ name = "ush"
 path = "src/bin/ush.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "runtime_probe"
+path = "src/bin/runtime_probe.rs"
+test = false
+bench = false

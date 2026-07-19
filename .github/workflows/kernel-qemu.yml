@@ -7,21 +7,16 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   qemu-smoke-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
-      - name: Check out implementation branch
+      - name: Check out repository
         uses: actions/checkout@v7
-        with:
-          ref: agent/userspace-runtime-rust-shell
-
-      - name: Apply Rust userspace runtime integration
-        run: python tools/apply_runtime_milestone.py
 
       - name: Install pinned Rust toolchain
         run: |
@@ -32,11 +27,8 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Format and validate
-        run: |
-          cargo +nightly-2026-02-01 fmt --all
-          cargo +nightly-2026-02-01 fmt --all -- --check
-          git diff --check
+      - name: Check formatting
+        run: cargo +nightly-2026-02-01 fmt --all -- --check
 
       - name: Install QEMU
         run: |
@@ -44,10 +36,7 @@ jobs:
           sudo apt-get install --yes --quiet qemu-system-x86
 
       - name: Build bootable image
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo +nightly-2026-02-01 build --locked --quiet 2>&1 | tee rust-userspace-build.log
+        run: cargo +nightly-2026-02-01 build --locked --quiet
 
       - name: Boot partition and FAT smoke test in QEMU
         shell: bash
@@ -55,25 +44,10 @@ jobs:
           set -o pipefail
           cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee partition-fat-qemu.log
 
-      - name: Upload build and runtime diagnostics
+      - name: Upload runtime diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: rust-userspace-runtime-diagnostics
-          path: |
-            rust-userspace-build.log
-            partition-fat-qemu.log
+          name: partition-fat-qemu-log
+          path: partition-fat-qemu.log
           if-no-files-found: ignore
-
-      - name: Publish validated product sources
-        run: |
-          git fetch origin main --depth=1
-          git checkout FETCH_HEAD -- .github/workflows/kernel-qemu.yml
-          rm tools/apply_runtime_milestone.py
-          rm -f rust-userspace-build.log partition-fat-qemu.log runtime-milestone-tree.tar.gz
-          git diff --check
-          git config user.name lotuspetalagent
-          git config user.email lotuspetalagent@users.noreply.github.com
-          git add -A
-          git commit -m "Add shared Rust userspace runtime and shell"
-          git push origin HEAD:agent/userspace-runtime-rust-shell
