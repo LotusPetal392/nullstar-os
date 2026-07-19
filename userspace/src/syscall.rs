@@ -119,7 +119,7 @@ impl ChildStatus {
         }
     }
 
-    pub const fn interrupted(self) -> bool {
+    pub fn interrupted(self) -> bool {
         self.signal() == Some(signal::INTERRUPT)
     }
 }
