@@ -19,19 +19,6 @@ jobs:
         with:
           ref: agent/userspace-stopped-jobs
 
-      - name: Decode and apply stopped-job integration
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat tools/stopped_jobs_payload.part0 \
-              tools/stopped_jobs_payload.part1 \
-              tools/stopped_jobs_payload.part2 \
-              tools/stopped_jobs_payload.part3 > /tmp/stopped-jobs.b64
-          base64 --decode /tmp/stopped-jobs.b64 | gzip --decompress > /tmp/stopped-jobs.patch
-          echo "b91ffd05fcc14c1a93b1e59a129b4a356a0275a5a9c32290885d3eb9293a53af  /tmp/stopped-jobs.patch" | sha256sum --check --strict
-          git apply --check /tmp/stopped-jobs.patch
-          git apply /tmp/stopped-jobs.patch
-
       - name: Install pinned Rust toolchain
         run: |
           rustup -q toolchain install nightly-2026-02-01 \
@@ -41,27 +28,38 @@ jobs:
             --component rustfmt
           rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
 
-      - name: Format and validate
-        run: |
-          cargo +nightly-2026-02-01 fmt --all
-          cargo +nightly-2026-02-01 fmt --all -- --check
-          git diff --check
-
       - name: Install QEMU
         run: |
           sudo apt-get update -qq
           sudo apt-get install --yes --quiet qemu-system-x86
 
-      - name: Build bootable image
-        run: cargo +nightly-2026-02-01 build --locked --quiet
-
-      - name: Boot stopped-job smoke test in QEMU
+      - name: Apply, format, build, and boot
+        id: validation
         shell: bash
         run: |
-          set -o pipefail
-          cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee stopped-jobs-qemu.log
+          set +e
+          (
+            set -euo pipefail
+            cat tools/stopped_jobs_payload.part0 \
+                tools/stopped_jobs_payload.part1 \
+                tools/stopped_jobs_payload.part2 \
+                tools/stopped_jobs_payload.part3 > /tmp/stopped-jobs.b64
+            base64 --decode /tmp/stopped-jobs.b64 | gzip --decompress > /tmp/stopped-jobs.patch
+            echo "b91ffd05fcc14c1a93b1e59a129b4a356a0275a5a9c32290885d3eb9293a53af  /tmp/stopped-jobs.patch" | sha256sum --check --strict
+            git apply --check /tmp/stopped-jobs.patch
+            git apply /tmp/stopped-jobs.patch
+            cargo +nightly-2026-02-01 fmt --all
+            cargo +nightly-2026-02-01 fmt --all -- --check
+            git diff --check
+            cargo +nightly-2026-02-01 build --locked --quiet
+            cargo +nightly-2026-02-01 run --locked --quiet -- --test
+          ) 2>&1 | tee stopped-jobs-validation.log
+          status=${PIPESTATUS[0]}
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Publish validated product sources
+        if: steps.validation.outputs.status == '0'
         shell: bash
         run: |
           set -euo pipefail
@@ -70,16 +68,30 @@ jobs:
           rm tools/stopped_jobs_payload.part2
           rm tools/stopped_jobs_payload.part3
           rm .github/workflows/apply-stopped-jobs.yml
+          rm stopped-jobs-validation.log
           git config user.name lotuspetalagent
           git config user.email lotuspetalagent@users.noreply.github.com
           git add -A
           git commit -m "Add stopped userspace job control"
           git push origin HEAD:agent/userspace-stopped-jobs
 
-      - name: Upload runtime diagnostics
+      - name: Publish failure diagnostics
+        if: steps.validation.outputs.status != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp stopped-jobs-validation.log tools/stopped_jobs_failure.txt
+          git config user.name lotuspetalagent
+          git config user.email lotuspetalagent@users.noreply.github.com
+          git add tools/stopped_jobs_failure.txt
+          git commit -m "Record stopped-job validation failure [skip ci]"
+          git push origin HEAD:agent/userspace-stopped-jobs
+          exit 1
+
+      - name: Upload validation diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: stopped-jobs-qemu-log
-          path: stopped-jobs-qemu.log
+          name: stopped-jobs-validation-log
+          path: stopped-jobs-validation.log
           if-no-files-found: ignore
