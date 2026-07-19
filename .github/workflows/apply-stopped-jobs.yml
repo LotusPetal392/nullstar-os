@@ -51,13 +51,21 @@ jobs:
             python - <<'PY'
           from pathlib import Path
 
-          path = Path("userspace/src/syscall.rs")
-          source = path.read_text()
-          old = "    pub const fn interrupted(self) -> bool {"
-          new = "    pub fn interrupted(self) -> bool {"
-          if source.count(old) != 1:
+          syscall_path = Path("userspace/src/syscall.rs")
+          syscall_source = syscall_path.read_text()
+          syscall_old = "    pub const fn interrupted(self) -> bool {"
+          syscall_new = "    pub fn interrupted(self) -> bool {"
+          if syscall_source.count(syscall_old) != 1:
               raise SystemExit("expected one interrupted const function")
-          path.write_text(source.replace(old, new, 1))
+          syscall_path.write_text(syscall_source.replace(syscall_old, syscall_new, 1))
+
+          main_path = Path("kernel/src/main.rs")
+          main_source = main_path.read_text()
+          main_old = "        && userspace_shell_result.child_poll_pending_count == 1\n"
+          main_new = "        && userspace_shell_result.child_poll_pending_count == 5\n"
+          if main_source.count(main_old) != 1:
+              raise SystemExit("expected one pending-poll assertion")
+          main_path.write_text(main_source.replace(main_old, main_new, 1))
           PY
             cargo +nightly-2026-02-01 fmt --all
             cargo +nightly-2026-02-01 fmt --all -- --check
