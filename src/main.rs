@@ -28,6 +28,7 @@ const USER_PIPELINE_OUTPUT_MARKER: &str = "HELLO THROUGH A BLOCKING GALACTICOS P
 const USER_PIPELINE_TEST_MARKER: &str = "userspace multi-stage pipeline verified:";
 const USER_BACKGROUND_TEST_MARKER: &str = "userspace background jobs verified:";
 const USER_STOPPED_JOB_TEST_MARKER: &str = "userspace stopped jobs verified:";
+const USER_TMPFS_TEST_MARKER: &str = "userspace tmpfs redirection verified:";
 const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals verified:";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -81,7 +82,7 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify hardware, storage, VFS, the Rust userspace runtime, process control, pipelines, jobs, and signals"
+        "  --test      Verify hardware, storage, VFS, the Rust userspace runtime, tmpfs, redirection, process control, pipelines, jobs, and signals"
     );
 }
 
@@ -157,6 +158,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut user_pipeline_ready = false;
         let mut user_background_ready = false;
         let mut user_stopped_job_ready = false;
+        let mut user_tmpfs_ready = false;
         let mut user_signal_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
@@ -185,6 +187,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             user_pipeline_ready |= line.contains(USER_PIPELINE_TEST_MARKER);
             user_background_ready |= line.contains(USER_BACKGROUND_TEST_MARKER);
             user_stopped_job_ready |= line.contains(USER_STOPPED_JOB_TEST_MARKER);
+            user_tmpfs_ready |= line.contains(USER_TMPFS_TEST_MARKER);
             user_signal_ready |= line.contains(USER_SIGNAL_TEST_MARKER);
 
             if heap_ready
@@ -208,6 +211,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && user_pipeline_ready
                 && user_background_ready
                 && user_stopped_job_ready
+                && user_tmpfs_ready
                 && user_signal_ready
             {
                 let _ = marker_sender.send(());

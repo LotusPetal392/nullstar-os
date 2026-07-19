@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::{alloc::Layout, panic::PanicInfo};
 use x86_64::VirtAddr;
@@ -333,6 +333,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     } else {
         serial_println!("VFS unavailable: no FAT filesystem is mounted");
+        None
+    };
+
+    let tmpfs_info = if vfs_info.is_some() {
+        match vfs::mount_tmpfs() {
+            Ok(info) => {
+                serial_println!(
+                    "tmpfs mounted: path={}, files={}/{}, bytes={}/{}, per_file_limit={}",
+                    info.mount_path,
+                    info.file_count,
+                    info.maximum_files,
+                    info.total_bytes,
+                    info.maximum_total_bytes,
+                    info.maximum_file_bytes
+                );
+                Some(info)
+            }
+            Err(error) => {
+                serial_println!("tmpfs mount failed: {error}");
+                None
+            }
+        }
+    } else {
+        serial_println!("tmpfs unavailable: VFS root is not initialized");
         None
     };
 
@@ -776,6 +800,130 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     let userspace_pipeline_after = userspace_runtime.pipe_snapshot();
 
+    for command in [
+        "pipe-producer > /tmp/message.txt",
+        "pipe-producer >> /tmp/message.txt",
+        "upper < /tmp/message.txt > /tmp/upper.txt",
+        "cat /hello.txt | upper > /tmp/pipeline.txt",
+        "stderr-probe 2> /tmp/errors.txt",
+        "stderr-probe > /tmp/all.txt 2>&1",
+    ] {
+        if let Err(error) = userspace_runtime.inject_terminal_line(command) {
+            serial_println!("userspace redirection command `{command}` injection failed: {error}");
+            hlt_loop();
+        }
+        if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+            serial_println!("userspace redirection command `{command}` did not finish: {error}");
+            hlt_loop();
+        }
+    }
+
+    let tmpfs_message = match vfs::read_file("/tmp/message.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("tmpfs message verification read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let tmpfs_upper = match vfs::read_file("/tmp/upper.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("tmpfs upper verification read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let tmpfs_pipeline = match vfs::read_file("/tmp/pipeline.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("tmpfs pipeline verification read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let tmpfs_errors = match vfs::read_file("/tmp/errors.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("tmpfs stderr verification read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let tmpfs_all = match vfs::read_file("/tmp/all.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("tmpfs combined-stream verification read failed: {error}");
+            hlt_loop();
+        }
+    };
+
+    let capacity_options = vfs::OpenOptions {
+        read: false,
+        write: true,
+        create: true,
+        truncate: true,
+        append: false,
+    };
+    if let Err(error) = vfs::open("/tmp/capacity.bin", capacity_options) {
+        serial_println!("tmpfs capacity fixture creation failed: {error}");
+        hlt_loop();
+    }
+    let oversized_write = vfs::write_at(
+        "/tmp/capacity.bin",
+        0,
+        &vec![0_u8; vfs::TMPFS_MAX_FILE_BYTES.saturating_add(1)],
+    );
+    let capacity_size = vfs::metadata("/tmp/capacity.bin")
+        .map(|metadata| metadata.size)
+        .unwrap_or(u64::MAX);
+    let fat_write_rejected = matches!(
+        vfs::open("/hello.txt", capacity_options),
+        Err(vfs::Error::ReadOnly)
+    );
+
+    let mut expected_message = Vec::new();
+    expected_message.extend_from_slice(b"Hello through a blocking GalacticOS pipe.\n");
+    expected_message.extend_from_slice(b"Hello through a blocking GalacticOS pipe.\n");
+    let mut expected_upper = Vec::new();
+    expected_upper.extend_from_slice(b"HELLO THROUGH A BLOCKING GALACTICOS PIPE.\n");
+    expected_upper.extend_from_slice(b"HELLO THROUGH A BLOCKING GALACTICOS PIPE.\n");
+    let tmpfs_snapshot = vfs::tmpfs_info().expect("mounted tmpfs disappeared");
+    let userspace_redirection_verified = tmpfs_message.bytes == expected_message
+        && tmpfs_upper.bytes == expected_upper
+        && tmpfs_pipeline.bytes == b"HELLO FROM A GALACTICOS USERSPACE FILE DESCRIPTOR.\n"
+        && tmpfs_errors.bytes == b"stderr probe line\n"
+        && tmpfs_all.bytes == b"stdout probe line\nstderr probe line\n"
+        && matches!(oversized_write, Err(vfs::Error::FileTooLarge))
+        && capacity_size == 0
+        && fat_write_rejected
+        && tmpfs_snapshot.file_count >= 6
+        && tmpfs_snapshot.rejected_writes >= 1;
+    if !userspace_redirection_verified {
+        serial_println!(
+            "userspace tmpfs/redirection verification failed: message={}, upper={}, pipeline={}, errors={}, all={}, capacity={:?}/{}, fat_read_only={}, files={}, bytes={}, rejected={}",
+            tmpfs_message.bytes.len(),
+            tmpfs_upper.bytes.len(),
+            tmpfs_pipeline.bytes.len(),
+            tmpfs_errors.bytes.len(),
+            tmpfs_all.bytes.len(),
+            oversized_write,
+            capacity_size,
+            fat_write_rejected,
+            tmpfs_snapshot.file_count,
+            tmpfs_snapshot.total_bytes,
+            tmpfs_snapshot.rejected_writes
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace tmpfs redirection verified: files={}, bytes={}, creates={}, truncates={}, writes={}, written={}, rejected={}, stdin_eof=true, shared_offset=true, fat_read_only=true",
+        tmpfs_snapshot.file_count,
+        tmpfs_snapshot.total_bytes,
+        tmpfs_snapshot.creates,
+        tmpfs_snapshot.truncates,
+        tmpfs_snapshot.writes,
+        tmpfs_snapshot.bytes_written,
+        tmpfs_snapshot.rejected_writes
+    );
+    let userspace_redirection_pipe_after = userspace_runtime.pipe_snapshot();
+
     const BACKGROUND_DELAY_YIELDS: u64 = 64;
     if let Err(error) = userspace_runtime.inject_terminal_line("delay &") {
         serial_println!("userspace background command injection failed: {error}");
@@ -1038,9 +1186,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && shell_consumer.pipe_read_count >= 2
         && shell_consumer.pipe_bytes_read == PIPE_TEST_BYTES
         && shell_consumer.blocked_pipe_read_count >= 1
-        && userspace_shell_result.pipe_pair_count == 4
-        && userspace_shell_result.pipe_descriptor_close_count == 8
-        && userspace_shell_result.pipe_descriptor_inherit_count == 8
+        && userspace_shell_result.pipe_pair_count == 5
+        && userspace_shell_result.pipe_descriptor_close_count == 10
+        && userspace_shell_result.pipe_descriptor_inherit_count == 10
         && created_pipe_delta == 2
         && destroyed_pipe_delta == 2
         && reader_retain_delta == 2
@@ -1118,10 +1266,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let terminal_after_interrupt = userspace_runtime.terminal_snapshot();
     let signal_pipe_created = userspace_signal_pipe_after
         .total_created
-        .saturating_sub(userspace_pipeline_after.total_created);
+        .saturating_sub(userspace_redirection_pipe_after.total_created);
     let signal_pipe_destroyed = userspace_signal_pipe_after
         .total_destroyed
-        .saturating_sub(userspace_pipeline_after.total_destroyed);
+        .saturating_sub(userspace_redirection_pipe_after.total_destroyed);
     let stop_delivery_delta = stopped_jobs_after
         .stop_deliveries
         .saturating_sub(stopped_jobs_before.stop_deliveries);
@@ -1247,16 +1395,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 9
-        && userspace_shell_result.child_wait_count == 13
+        && userspace_shell_result.child_spawn_count == 16
+        && userspace_shell_result.child_wait_count == 20
         && userspace_shell_result.child_poll_count == 5
         && userspace_shell_result.child_poll_pending_count == 5
         && userspace_shell_result.signal_sent_count == 4
+        && userspace_shell_result.open_count == 7
+        && userspace_shell_result.file_descriptor_inherit_count == 8
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
         && shell_child.bytes_read > 0
         && userspace_pipeline_verified
+        && userspace_redirection_verified
         && userspace_background_verified
         && userspace_stopped_jobs_verified
         && userspace_signals_verified
@@ -1340,6 +1491,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         println!("Virtual filesystem unavailable");
     }
+    if tmpfs_info.is_some() {
+        println!("Writable /tmp tmpfs mounted");
+    } else {
+        println!("Writable tmpfs unavailable");
+    }
     if elf_image.is_some() {
         println!("ELF64 image validated");
     } else {
@@ -1374,6 +1530,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace process-control shell verified");
     } else {
         println!("Userspace process-control shell unavailable");
+    }
+    if userspace_redirection_verified {
+        println!("Writable tmpfs and userspace redirection verified");
+    } else {
+        println!("Userspace redirection unavailable");
     }
     if userspace_pipeline_verified {
         println!("Userspace multi-stage descriptor pipelines verified");

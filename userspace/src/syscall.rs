@@ -3,7 +3,9 @@ use core::{
     ops::{BitOr, BitOrAssign},
 };
 
-use crate::abi::{child_status, errno as abi_errno, signal, spawn, syscall};
+use crate::abi::{
+    child_status, errno as abi_errno, open as abi_open, seek as abi_seek, signal, spawn, syscall,
+};
 
 global_asm!(
     r#"
@@ -14,7 +16,7 @@ global_asm!(
 galactic_userspace_spawn_command:
     push rbx
     mov r10, rcx
-    mov rbx, r9
+    mov rbx, qword ptr [rsp + 16]
     mov rax, {spawn_command}
     int 0x80
     pop rbx
@@ -31,6 +33,7 @@ unsafe extern "C" {
         flags: u64,
         stdin_descriptor: u64,
         stdout_descriptor: u64,
+        stderr_descriptor: u64,
         process_group: u64,
     ) -> u64;
 }
@@ -89,6 +92,38 @@ impl BitOrAssign for SpawnFlags {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFlags(u64);
+
+impl OpenFlags {
+    pub const READ: Self = Self(abi_open::READ);
+    pub const WRITE: Self = Self(abi_open::WRITE);
+    pub const CREATE: Self = Self(abi_open::CREATE);
+    pub const TRUNCATE: Self = Self(abi_open::TRUNCATE);
+    pub const APPEND: Self = Self(abi_open::APPEND);
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+impl BitOr for OpenFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+impl BitOrAssign for OpenFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekFrom {
+    Start(u64),
+    Current(i64),
+    End(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +232,7 @@ pub fn read(descriptor: FileDescriptor, buffer: &mut [u8]) -> Result<usize> {
     decode(result).map(|count| count as usize)
 }
 
-pub fn open(path: &[u8], flags: u64) -> Result<FileDescriptor> {
+pub fn open(path: &[u8], flags: OpenFlags) -> Result<FileDescriptor> {
     let mut result = syscall::OPEN;
     unsafe {
         asm!(
@@ -205,7 +240,7 @@ pub fn open(path: &[u8], flags: u64) -> Result<FileDescriptor> {
             inlateout("rax") result,
             in("rdi") path.as_ptr() as u64,
             in("rsi") path.len() as u64,
-            in("rdx") flags,
+            in("rdx") flags.bits(),
         );
     }
     decode(result)
@@ -244,6 +279,7 @@ pub fn spawn_command(
     flags: SpawnFlags,
     stdin_descriptor: Option<FileDescriptor>,
     stdout_descriptor: Option<FileDescriptor>,
+    stderr_descriptor: Option<FileDescriptor>,
     process_group: Option<ProcessGroupId>,
 ) -> Result<ProcessId> {
     let raw = unsafe {
@@ -253,6 +289,7 @@ pub fn spawn_command(
             flags.bits(),
             stdin_descriptor.unwrap_or(spawn::DEFAULT_DESCRIPTOR),
             stdout_descriptor.unwrap_or(spawn::DEFAULT_DESCRIPTOR),
+            stderr_descriptor.unwrap_or(spawn::DEFAULT_DESCRIPTOR),
             process_group.unwrap_or(spawn::DEFAULT_PROCESS_GROUP),
         )
     };
@@ -317,6 +354,19 @@ pub fn foreground_process_group(process_group: ProcessGroupId) -> Result<usize> 
         );
     }
     decode(result).map(|count| count as usize)
+}
+
+pub fn seek(descriptor: FileDescriptor, offset: SeekFrom) -> Result<u64> {
+    let (offset, whence) = match offset {
+        SeekFrom::Start(offset) => (offset as i64, abi_seek::SET),
+        SeekFrom::Current(offset) => (offset, abi_seek::CURRENT),
+        SeekFrom::End(offset) => (offset, abi_seek::END),
+    };
+    let mut result = syscall::SEEK;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result, in("rdi") descriptor, in("rsi") offset as u64, in("rdx") whence);
+    }
+    decode(result)
 }
 
 pub fn exit(code: u64) -> ! {

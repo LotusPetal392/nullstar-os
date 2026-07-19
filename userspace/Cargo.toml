@@ -69,3 +69,9 @@ name = "runtime_probe"
 path = "src/bin/runtime_probe.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "stderr_probe"
+path = "src/bin/stderr_probe.rs"
+test = false
+bench = false

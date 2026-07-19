@@ -1,6 +1,7 @@
 use alloc::{
     boxed::Box,
     string::{String, ToString},
+    sync::Arc,
     vec,
     vec::Vec,
 };
@@ -56,6 +57,7 @@ const SYSCALL_PIPE_PAIR: u64 = abi::syscall::PIPE_PAIR;
 const SYSCALL_TRY_WAIT_CHILD: u64 = abi::syscall::TRY_WAIT_CHILD;
 const SYSCALL_SIGNAL_PROCESS_GROUP: u64 = abi::syscall::SIGNAL_PROCESS_GROUP;
 const SYSCALL_FOREGROUND_PROCESS_GROUP: u64 = abi::syscall::FOREGROUND_PROCESS_GROUP;
+const SYSCALL_SEEK: u64 = abi::syscall::SEEK;
 
 pub const SIGNAL_INTERRUPT: u64 = abi::signal::INTERRUPT;
 pub const SIGNAL_TERMINATE: u64 = abi::signal::TERMINATE;
@@ -66,7 +68,7 @@ pub const SIGNAL_TERMINAL_STOP: u64 = abi::signal::TERMINAL_STOP;
 const USER_MIN_ADDRESS: u64 = 0x0001_0000;
 const USER_PML4_SLOT_END: u64 = 0x0000_0080_0000_0000;
 const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
-const USER_STACK_SIZE: usize = 64 * 1024;
+const USER_STACK_SIZE: usize = 128 * 1024;
 const USER_STACK_GUARD_SIZE: usize = Size4KiB::SIZE as usize;
 const KERNEL_TRANSITION_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_TRANSITION_STACK_WORDS: usize = KERNEL_TRANSITION_STACK_SIZE / size_of::<u128>();
@@ -82,6 +84,15 @@ const SPAWN_NEW_PROCESS_GROUP: u64 = abi::spawn::NEW_PROCESS_GROUP;
 const SPAWN_JOIN_PROCESS_GROUP: u64 = abi::spawn::JOIN_PROCESS_GROUP;
 const DEFAULT_DESCRIPTOR: u64 = abi::spawn::DEFAULT_DESCRIPTOR;
 const DEFAULT_PROCESS_GROUP: u64 = abi::spawn::DEFAULT_PROCESS_GROUP;
+const OPEN_READ: u64 = abi::open::READ;
+const OPEN_WRITE: u64 = abi::open::WRITE;
+const OPEN_CREATE: u64 = abi::open::CREATE;
+const OPEN_TRUNCATE: u64 = abi::open::TRUNCATE;
+const OPEN_APPEND: u64 = abi::open::APPEND;
+const OPEN_ALLOWED_FLAGS: u64 = abi::open::ALLOWED_FLAGS;
+const SEEK_SET: u64 = abi::seek::SET;
+const SEEK_CURRENT: u64 = abi::seek::CURRENT;
+const SEEK_END: u64 = abi::seek::END;
 const SHELL_PROCESS_TASK_NAME: &str = "user-shell-process";
 const USER_RFLAGS: u64 = 0x202;
 const PAGE_BYTES: u64 = Size4KiB::SIZE;
@@ -97,6 +108,8 @@ const ERR_BAD_ADDRESS: i64 = abi::errno::BAD_ADDRESS;
 const ERR_IS_DIRECTORY: i64 = abi::errno::IS_DIRECTORY;
 const ERR_INVALID_ARGUMENT: i64 = abi::errno::INVALID_ARGUMENT;
 const ERR_TOO_MANY_OPEN_FILES: i64 = abi::errno::TOO_MANY_OPEN_FILES;
+const ERR_NO_SPACE: i64 = abi::errno::NO_SPACE;
+const ERR_READ_ONLY: i64 = abi::errno::READ_ONLY;
 const ERR_BROKEN_PIPE: i64 = abi::errno::BROKEN_PIPE;
 const ERR_NOT_IMPLEMENTED: i64 = abi::errno::NOT_IMPLEMENTED;
 
@@ -324,6 +337,9 @@ pub struct ProcessResult {
     pub read_count: u64,
     pub close_count: u64,
     pub bytes_read: u64,
+    pub file_write_count: u64,
+    pub file_bytes_written: u64,
+    pub seek_count: u64,
     pub terminal_read_count: u64,
     pub terminal_bytes_read: u64,
     pub blocked_read_count: u64,
@@ -344,6 +360,7 @@ pub struct ProcessResult {
     pub pipe_pair_count: u64,
     pub pipe_descriptor_close_count: u64,
     pub pipe_descriptor_inherit_count: u64,
+    pub file_descriptor_inherit_count: u64,
     pub scheduled_count: u64,
     pub runtime_ticks: u64,
     pub frames_reclaimed: usize,
@@ -382,6 +399,7 @@ pub struct ManagerSnapshot {
     pub continue_deliveries: u64,
     pub pipe_pairs: u64,
     pub pipe_descriptor_inherits: u64,
+    pub file_descriptor_inherits: u64,
     pub active: usize,
     pub blocked: usize,
     pub stopped: usize,
@@ -584,6 +602,7 @@ struct PendingChildSpawn {
     foreground: bool,
     stdin_descriptor: Option<u64>,
     stdout_descriptor: Option<u64>,
+    stderr_descriptor: Option<u64>,
     new_process_group: bool,
     process_group_id: Option<u64>,
     stack_pointer: usize,
@@ -595,11 +614,26 @@ struct PendingChildWait {
     stack_pointer: usize,
 }
 
-#[derive(Debug, Clone)]
-struct OpenFile {
-    descriptor: u64,
+struct OpenFileState {
     path: String,
     offset: u64,
+    readable: bool,
+    writable: bool,
+    append: bool,
+}
+
+type OpenFileHandle = Arc<Mutex<OpenFileState>>;
+
+#[derive(Clone)]
+struct OpenFile {
+    descriptor: u64,
+    handle: OpenFileHandle,
+}
+
+#[derive(Clone)]
+enum StreamTarget {
+    Pipe(PipeId),
+    File(OpenFileHandle),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -638,8 +672,9 @@ struct Process {
     owned_frames: Vec<PhysFrame<Size4KiB>>,
     open_files: Vec<OpenFile>,
     pipe_descriptors: Vec<PipeDescriptor>,
-    stdin_pipe: Option<PipeId>,
-    stdout_pipe: Option<PipeId>,
+    stdin_target: Option<StreamTarget>,
+    stdout_target: Option<StreamTarget>,
+    stderr_target: Option<StreamTarget>,
     pending_terminal_read: Option<PendingTerminalRead>,
     pending_pipe_read: Option<PendingPipeRead>,
     pending_pipe_write: Option<PendingPipeWrite>,
@@ -653,6 +688,9 @@ struct Process {
     read_count: u64,
     close_count: u64,
     bytes_read: u64,
+    file_write_count: u64,
+    file_bytes_written: u64,
+    seek_count: u64,
     terminal_read_count: u64,
     terminal_bytes_read: u64,
     blocked_read_count: u64,
@@ -673,6 +711,7 @@ struct Process {
     pipe_pair_count: u64,
     pipe_descriptor_close_count: u64,
     pipe_descriptor_inherit_count: u64,
+    file_descriptor_inherit_count: u64,
 }
 
 impl Process {
@@ -756,6 +795,9 @@ impl Process {
             read_count: self.read_count,
             close_count: self.close_count,
             bytes_read: self.bytes_read,
+            file_write_count: self.file_write_count,
+            file_bytes_written: self.file_bytes_written,
+            seek_count: self.seek_count,
             terminal_read_count: self.terminal_read_count,
             terminal_bytes_read: self.terminal_bytes_read,
             blocked_read_count: self.blocked_read_count,
@@ -776,6 +818,7 @@ impl Process {
             pipe_pair_count: self.pipe_pair_count,
             pipe_descriptor_close_count: self.pipe_descriptor_close_count,
             pipe_descriptor_inherit_count: self.pipe_descriptor_inherit_count,
+            file_descriptor_inherit_count: self.file_descriptor_inherit_count,
             scheduled_count,
             runtime_ticks,
             frames_reclaimed,
@@ -795,6 +838,7 @@ struct ProcessManager {
     continue_deliveries: u64,
     pipe_pairs: u64,
     pipe_descriptor_inherits: u64,
+    file_descriptor_inherits: u64,
     exited: u64,
     faulted: u64,
     signaled: u64,
@@ -816,6 +860,7 @@ impl ProcessManager {
             continue_deliveries: 0,
             pipe_pairs: 0,
             pipe_descriptor_inherits: 0,
+            file_descriptor_inherits: 0,
             exited: 0,
             faulted: 0,
             signaled: 0,
@@ -854,6 +899,7 @@ impl ProcessManager {
             continue_deliveries: self.continue_deliveries,
             pipe_pairs: self.pipe_pairs,
             pipe_descriptor_inherits: self.pipe_descriptor_inherits,
+            file_descriptor_inherits: self.file_descriptor_inherits,
             active: self
                 .processes
                 .iter()
@@ -960,21 +1006,80 @@ fn allocate_descriptor_pair(process: &Process) -> Option<(u64, u64)> {
     Some((available.next()?, available.next()?))
 }
 
-fn resolve_pipe_descriptor(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamAccess {
+    Read,
+    Write,
+}
+
+fn resolve_stream_descriptor(
     process: &Process,
     descriptor: Option<u64>,
-    direction: PipeDirection,
-) -> Result<Option<PipeId>, Error> {
-    descriptor
-        .map(|descriptor| {
-            process
-                .pipe_descriptors
-                .iter()
-                .find(|pipe| pipe.descriptor == descriptor && pipe.direction == direction)
-                .map(|pipe| pipe.pipe_id)
-                .ok_or(Error::InvalidDescriptor(descriptor))
-        })
-        .transpose()
+    access: StreamAccess,
+) -> Result<Option<StreamTarget>, Error> {
+    let Some(descriptor) = descriptor else {
+        return Ok(None);
+    };
+    let direction = match access {
+        StreamAccess::Read => PipeDirection::Reader,
+        StreamAccess::Write => PipeDirection::Writer,
+    };
+    if let Some(pipe) = process
+        .pipe_descriptors
+        .iter()
+        .find(|pipe| pipe.descriptor == descriptor && pipe.direction == direction)
+    {
+        return Ok(Some(StreamTarget::Pipe(pipe.pipe_id)));
+    }
+    if let Some(file) = process
+        .open_files
+        .iter()
+        .find(|file| file.descriptor == descriptor)
+    {
+        let allowed = {
+            let state = file.handle.lock();
+            match access {
+                StreamAccess::Read => state.readable,
+                StreamAccess::Write => state.writable,
+            }
+        };
+        if allowed {
+            return Ok(Some(StreamTarget::File(file.handle.clone())));
+        }
+    }
+    Err(Error::InvalidDescriptor(descriptor))
+}
+
+fn retain_stream_target(target: &Option<StreamTarget>, access: StreamAccess) -> Result<(), Error> {
+    let Some(StreamTarget::Pipe(pipe_id)) = target else {
+        return Ok(());
+    };
+    match access {
+        StreamAccess::Read => pipe::retain_reader(*pipe_id)?,
+        StreamAccess::Write => pipe::retain_writer(*pipe_id)?,
+    }
+    Ok(())
+}
+
+fn release_stream_target(target: Option<StreamTarget>, access: StreamAccess) {
+    let Some(StreamTarget::Pipe(pipe_id)) = target else {
+        return;
+    };
+    match access {
+        StreamAccess::Read => {
+            let _ = pipe::close_reader(pipe_id);
+        }
+        StreamAccess::Write => {
+            let _ = pipe::close_writer(pipe_id);
+        }
+    }
+}
+
+fn stream_target_is_pipe(target: &Option<StreamTarget>) -> bool {
+    matches!(target, Some(StreamTarget::Pipe(_)))
+}
+fn stream_target_is_file(target: &Option<StreamTarget>) -> bool {
+    matches!(target, Some(StreamTarget::File(_)))
 }
 
 impl BuiltAddressSpace {
@@ -1165,6 +1270,7 @@ pub fn spawn_with_args(
         None,
         None,
         None,
+        None,
         kernel_mapper,
         frame_allocator,
         physical_memory_offset,
@@ -1177,8 +1283,9 @@ fn spawn_with_mode(
     image: &Image,
     arguments: &[&str],
     foreground: bool,
-    stdin_pipe: Option<PipeId>,
-    stdout_pipe: Option<PipeId>,
+    stdin_target: Option<StreamTarget>,
+    stdout_target: Option<StreamTarget>,
+    stderr_target: Option<StreamTarget>,
     parent_process_id: Option<u64>,
     terminal_parent: Option<u64>,
     process_group_id: Option<u64>,
@@ -1283,8 +1390,9 @@ fn spawn_with_mode(
         owned_frames: core::mem::take(&mut address_space.owned_frames),
         open_files: Vec::new(),
         pipe_descriptors: Vec::new(),
-        stdin_pipe,
-        stdout_pipe,
+        stdin_target,
+        stdout_target,
+        stderr_target,
         pending_terminal_read: None,
         pending_pipe_read: None,
         pending_pipe_write: None,
@@ -1298,6 +1406,9 @@ fn spawn_with_mode(
         read_count: 0,
         close_count: 0,
         bytes_read: 0,
+        file_write_count: 0,
+        file_bytes_written: 0,
+        seek_count: 0,
         terminal_read_count: 0,
         terminal_bytes_read: 0,
         blocked_read_count: 0,
@@ -1318,6 +1429,7 @@ fn spawn_with_mode(
         pipe_pair_count: 0,
         pipe_descriptor_close_count: 0,
         pipe_descriptor_inherit_count: 0,
+        file_descriptor_inherit_count: 0,
     });
 
     let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
@@ -1444,6 +1556,7 @@ impl Runtime {
             None,
             None,
             None,
+            None,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -1467,8 +1580,9 @@ impl Runtime {
             &image,
             &argv,
             false,
-            stdin_pipe,
-            stdout_pipe,
+            stdin_pipe.map(StreamTarget::Pipe),
+            stdout_pipe.map(StreamTarget::Pipe),
+            None,
             None,
             None,
             None,
@@ -1518,7 +1632,7 @@ impl Runtime {
         parent_process_id: u64,
         request: &PendingChildSpawn,
     ) -> Result<SpawnInfo, Error> {
-        let (stdin_pipe, stdout_pipe, process_group_id) =
+        let (stdin_target, stdout_target, stderr_target, process_group_id) =
             cpu_interrupts::without_interrupts(|| {
                 let manager = PROCESS_MANAGER.lock();
                 let parent = manager
@@ -1526,56 +1640,55 @@ impl Runtime {
                     .iter()
                     .find(|process| process.process_id == parent_process_id)
                     .ok_or(Error::ProcessNotFound(parent_process_id))?;
-                let stdin_pipe = resolve_pipe_descriptor(
+                let stdin_target = resolve_stream_descriptor(
                     parent,
                     request.stdin_descriptor,
-                    PipeDirection::Reader,
+                    StreamAccess::Read,
                 )?;
-                let stdout_pipe = resolve_pipe_descriptor(
+                let stdout_target = resolve_stream_descriptor(
                     parent,
                     request.stdout_descriptor,
-                    PipeDirection::Writer,
+                    StreamAccess::Write,
+                )?;
+                let stderr_target = resolve_stream_descriptor(
+                    parent,
+                    request.stderr_descriptor,
+                    StreamAccess::Write,
                 )?;
                 let inherited_group = parent.process_group_id;
                 let process_group_id = if request.new_process_group {
                     None
                 } else if let Some(group_id) = request.process_group_id {
-                    let group_owned = manager.processes.iter().any(|process| {
+                    let owned = manager.processes.iter().any(|process| {
                         process.parent_process_id == Some(parent_process_id)
                             && process.process_group_id == group_id
                             && process.is_live()
                     });
-                    if !group_owned {
+                    if !owned {
                         return Err(Error::InvalidProcessGroup(group_id));
                     }
                     Some(group_id)
                 } else {
                     Some(inherited_group)
                 };
-                Ok::<_, Error>((stdin_pipe, stdout_pipe, process_group_id))
+                Ok::<_, Error>((stdin_target, stdout_target, stderr_target, process_group_id))
             })?;
-
-        if let Some(pipe_id) = stdin_pipe {
-            pipe::retain_reader(pipe_id)?;
+        retain_stream_target(&stdin_target, StreamAccess::Read)?;
+        if let Err(error) = retain_stream_target(&stdout_target, StreamAccess::Write) {
+            release_stream_target(stdin_target, StreamAccess::Read);
+            return Err(error);
         }
-        if let Some(pipe_id) = stdout_pipe {
-            if let Err(error) = pipe::retain_writer(pipe_id) {
-                if let Some(stdin_pipe) = stdin_pipe {
-                    let _ = pipe::close_reader(stdin_pipe);
-                }
-                return Err(error.into());
-            }
+        if let Err(error) = retain_stream_target(&stderr_target, StreamAccess::Write) {
+            release_stream_target(stdout_target, StreamAccess::Write);
+            release_stream_target(stdin_target, StreamAccess::Read);
+            return Err(error);
         }
-
         let image = match elf::validate(&request.path) {
             Ok(image) => image,
             Err(error) => {
-                if let Some(pipe_id) = stdin_pipe {
-                    let _ = pipe::close_reader(pipe_id);
-                }
-                if let Some(pipe_id) = stdout_pipe {
-                    let _ = pipe::close_writer(pipe_id);
-                }
+                release_stream_target(stderr_target, StreamAccess::Write);
+                release_stream_target(stdout_target, StreamAccess::Write);
+                release_stream_target(stdin_target, StreamAccess::Read);
                 return Err(error.into());
             }
         };
@@ -1588,8 +1701,9 @@ impl Runtime {
             &image,
             &argv,
             request.foreground,
-            stdin_pipe,
-            stdout_pipe,
+            stdin_target.clone(),
+            stdout_target.clone(),
+            stderr_target.clone(),
             Some(parent_process_id),
             request.foreground.then_some(parent_process_id),
             process_group_id,
@@ -1597,32 +1711,39 @@ impl Runtime {
             &mut self.frame_allocator,
             self.physical_memory_offset,
         );
-
         if result.is_err() {
-            if let Some(pipe_id) = stdin_pipe {
-                let _ = pipe::close_reader(pipe_id);
-            }
-            if let Some(pipe_id) = stdout_pipe {
-                let _ = pipe::close_writer(pipe_id);
-            }
+            release_stream_target(stderr_target, StreamAccess::Write);
+            release_stream_target(stdout_target, StreamAccess::Write);
+            release_stream_target(stdin_target, StreamAccess::Read);
             return result;
         }
-
-        let inherited = u64::from(stdin_pipe.is_some()) + u64::from(stdout_pipe.is_some());
-        if inherited > 0 {
+        let pipe_inherited = u64::from(stream_target_is_pipe(&stdin_target))
+            + u64::from(stream_target_is_pipe(&stdout_target))
+            + u64::from(stream_target_is_pipe(&stderr_target));
+        let file_inherited = u64::from(stream_target_is_file(&stdin_target))
+            + u64::from(stream_target_is_file(&stdout_target))
+            + u64::from(stream_target_is_file(&stderr_target));
+        if pipe_inherited > 0 || file_inherited > 0 {
             cpu_interrupts::without_interrupts(|| {
                 let mut manager = PROCESS_MANAGER.lock();
                 let updated = if let Some(parent) = manager.process_mut(parent_process_id) {
                     parent.pipe_descriptor_inherit_count = parent
                         .pipe_descriptor_inherit_count
-                        .saturating_add(inherited);
+                        .saturating_add(pipe_inherited);
+                    parent.file_descriptor_inherit_count = parent
+                        .file_descriptor_inherit_count
+                        .saturating_add(file_inherited);
                     true
                 } else {
                     false
                 };
                 if updated {
-                    manager.pipe_descriptor_inherits =
-                        manager.pipe_descriptor_inherits.saturating_add(inherited);
+                    manager.pipe_descriptor_inherits = manager
+                        .pipe_descriptor_inherits
+                        .saturating_add(pipe_inherited);
+                    manager.file_descriptor_inherits = manager
+                        .file_descriptor_inherits
+                        .saturating_add(file_inherited);
                 }
             });
         }
@@ -2068,12 +2189,9 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
                 let _ = terminal::attach(parent_process_id);
             }
         }
-        if let Some(pipe_id) = process.stdin_pipe.take() {
-            let _ = pipe::close_reader(pipe_id);
-        }
-        if let Some(pipe_id) = process.stdout_pipe.take() {
-            let _ = pipe::close_writer(pipe_id);
-        }
+        release_stream_target(process.stdin_target.take(), StreamAccess::Read);
+        release_stream_target(process.stdout_target.take(), StreamAccess::Write);
+        release_stream_target(process.stderr_target.take(), StreamAccess::Write);
         for descriptor in process.pipe_descriptors.drain(..) {
             match descriptor.direction {
                 PipeDirection::Reader => {
@@ -2192,6 +2310,7 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             registers.rdx,
             registers.r10,
             registers.r8,
+            registers.r9,
             registers.rbx,
             current_stack_pointer,
         ) {
@@ -2228,6 +2347,10 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
         }
         SYSCALL_FOREGROUND_PROCESS_GROUP => {
             registers.rax = syscall_foreground_process_group(process_id, registers.rdi);
+            current_stack_pointer
+        }
+        SYSCALL_SEEK => {
+            registers.rax = syscall_seek(process_id, registers.rdi, registers.rsi, registers.rdx);
             current_stack_pointer
         }
         SYSCALL_EXIT => {
@@ -2392,6 +2515,7 @@ fn syscall_spawn_command(
     flags: u64,
     stdin_descriptor: u64,
     stdout_descriptor: u64,
+    stderr_descriptor: u64,
     process_group_argument: u64,
     current_stack_pointer: usize,
 ) -> ControlOutcome {
@@ -2425,13 +2549,16 @@ fn syscall_spawn_command(
         (use_descriptors && stdin_descriptor != DEFAULT_DESCRIPTOR).then_some(stdin_descriptor);
     let stdout_descriptor =
         (use_descriptors && stdout_descriptor != DEFAULT_DESCRIPTOR).then_some(stdout_descriptor);
+    let stderr_descriptor =
+        (use_descriptors && stderr_descriptor != DEFAULT_DESCRIPTOR).then_some(stderr_descriptor);
 
     let mut manager = PROCESS_MANAGER.lock();
     let Some(process) = manager.process_mut(process_id) else {
         return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
     };
-    if resolve_pipe_descriptor(process, stdin_descriptor, PipeDirection::Reader).is_err()
-        || resolve_pipe_descriptor(process, stdout_descriptor, PipeDirection::Writer).is_err()
+    if resolve_stream_descriptor(process, stdin_descriptor, StreamAccess::Read).is_err()
+        || resolve_stream_descriptor(process, stdout_descriptor, StreamAccess::Write).is_err()
+        || resolve_stream_descriptor(process, stderr_descriptor, StreamAccess::Write).is_err()
     {
         return ControlOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
     }
@@ -2444,6 +2571,7 @@ fn syscall_spawn_command(
         foreground: flags & SPAWN_FOREGROUND != 0,
         stdin_descriptor,
         stdout_descriptor,
+        stderr_descriptor,
         new_process_group,
         process_group_id,
         stack_pointer: current_stack_pointer,
@@ -2952,13 +3080,20 @@ enum WriteOutcome {
     Blocked,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum WriteTarget {
     Console,
     Pipe(PipeId),
+    File(OpenFileHandle),
     Invalid,
 }
-
+fn stream_write_target(target: &Option<StreamTarget>) -> WriteTarget {
+    match target {
+        Some(StreamTarget::Pipe(id)) => WriteTarget::Pipe(*id),
+        Some(StreamTarget::File(h)) => WriteTarget::File(h.clone()),
+        None => WriteTarget::Console,
+    }
+}
 fn syscall_write(
     process_id: u64,
     file_descriptor: u64,
@@ -2975,32 +3110,33 @@ fn syscall_write(
     if length == 0 {
         return WriteOutcome::Ready(0);
     }
-
     let (readable, target) = PROCESS_MANAGER
         .lock()
         .processes
         .iter()
-        .find(|process| process.process_id == process_id)
-        .map(|process| {
-            let readable = process
+        .find(|p| p.process_id == process_id)
+        .map(|p| {
+            let readable = p
                 .ranges
                 .iter()
-                .any(|range| range.readable && range.contains(address, length));
+                .any(|r| r.readable && r.contains(address, length));
             let target = match file_descriptor {
-                1 => process
-                    .stdout_pipe
-                    .map(WriteTarget::Pipe)
-                    .unwrap_or(WriteTarget::Console),
-                2 => WriteTarget::Console,
-                descriptor if descriptor >= 3 => process
-                    .pipe_descriptors
-                    .iter()
-                    .find(|pipe| pipe.descriptor == descriptor)
-                    .map(|pipe| match pipe.direction {
-                        PipeDirection::Writer => WriteTarget::Pipe(pipe.pipe_id),
-                        PipeDirection::Reader => WriteTarget::Invalid,
-                    })
-                    .unwrap_or(WriteTarget::Invalid),
+                1 => stream_write_target(&p.stdout_target),
+                2 => stream_write_target(&p.stderr_target),
+                d if d >= 3 => {
+                    if let Some(pd) = p.pipe_descriptors.iter().find(|x| x.descriptor == d) {
+                        match pd.direction {
+                            PipeDirection::Writer => WriteTarget::Pipe(pd.pipe_id),
+                            PipeDirection::Reader => WriteTarget::Invalid,
+                        }
+                    } else {
+                        p.open_files
+                            .iter()
+                            .find(|f| f.descriptor == d)
+                            .map(|f| WriteTarget::File(f.handle.clone()))
+                            .unwrap_or(WriteTarget::Invalid)
+                    }
+                }
                 _ => WriteTarget::Invalid,
             };
             (readable, target)
@@ -3012,36 +3148,34 @@ fn syscall_write(
     if matches!(target, WriteTarget::Invalid) {
         return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
     }
-
     let bytes = unsafe { slice::from_raw_parts(address as *const u8, length) };
-    if let WriteTarget::Pipe(pipe_id) = target {
+    if let WriteTarget::Pipe(pipe_id) = &target {
+        let pipe_id = *pipe_id;
         return match pipe::write(pipe_id, bytes) {
             Ok(pipe::WriteOutcome::Written(count)) => {
-                let mut manager = PROCESS_MANAGER.lock();
-                if let Some(process) = manager.process_mut(process_id) {
-                    process.write_count = process.write_count.saturating_add(1);
-                    process.bytes_written = process.bytes_written.saturating_add(count as u64);
-                    process.pipe_write_count = process.pipe_write_count.saturating_add(1);
-                    process.pipe_bytes_written =
-                        process.pipe_bytes_written.saturating_add(count as u64);
+                let mut m = PROCESS_MANAGER.lock();
+                if let Some(p) = m.process_mut(process_id) {
+                    p.write_count = p.write_count.saturating_add(1);
+                    p.bytes_written = p.bytes_written.saturating_add(count as u64);
+                    p.pipe_write_count = p.pipe_write_count.saturating_add(1);
+                    p.pipe_bytes_written = p.pipe_bytes_written.saturating_add(count as u64);
                 }
                 WriteOutcome::Ready(count as u64)
             }
             Ok(pipe::WriteOutcome::Full) => {
-                let mut manager = PROCESS_MANAGER.lock();
-                let Some(process) = manager.process_mut(process_id) else {
+                let mut m = PROCESS_MANAGER.lock();
+                let Some(p) = m.process_mut(process_id) else {
                     return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
                 };
-                process.pending_pipe_write = Some(PendingPipeWrite {
+                p.pending_pipe_write = Some(PendingPipeWrite {
                     pipe_id,
                     address,
                     length,
                     stack_pointer: current_stack_pointer,
                 });
-                process.state = ProcessState::Blocked;
-                process.blocked_pipe_write_count =
-                    process.blocked_pipe_write_count.saturating_add(1);
-                drop(manager);
+                p.state = ProcessState::Blocked;
+                p.blocked_pipe_write_count = p.blocked_pipe_write_count.saturating_add(1);
+                drop(m);
                 let _ = pipe::note_blocked_write(pipe_id);
                 WriteOutcome::Blocked
             }
@@ -3049,26 +3183,62 @@ fn syscall_write(
             Err(_) => WriteOutcome::Ready(error_return(ERR_IO)),
         };
     }
-
+    if let WriteTarget::File(handle) = &target {
+        let handle = handle.clone();
+        let result = {
+            let mut f = handle.lock();
+            if !f.writable {
+                Err(ERR_BAD_FILE_DESCRIPTOR)
+            } else if f.append {
+                match vfs::append(&f.path, bytes) {
+                    Ok((offset, count)) => {
+                        f.offset = offset.saturating_add(count as u64);
+                        Ok(count)
+                    }
+                    Err(e) => Err(vfs_errno(&e)),
+                }
+            } else {
+                match vfs::write_at(&f.path, f.offset, bytes) {
+                    Ok(count) => {
+                        f.offset = f.offset.saturating_add(count as u64);
+                        Ok(count)
+                    }
+                    Err(e) => Err(vfs_errno(&e)),
+                }
+            }
+        };
+        return match result {
+            Ok(count) => {
+                let mut m = PROCESS_MANAGER.lock();
+                if let Some(p) = m.process_mut(process_id) {
+                    p.write_count = p.write_count.saturating_add(1);
+                    p.bytes_written = p.bytes_written.saturating_add(count as u64);
+                    p.file_write_count = p.file_write_count.saturating_add(1);
+                    p.file_bytes_written = p.file_bytes_written.saturating_add(count as u64);
+                }
+                WriteOutcome::Ready(count as u64)
+            }
+            Err(e) => WriteOutcome::Ready(error_return(e)),
+        };
+    }
     if let Ok(text) = str::from_utf8(bytes) {
         crate::print!("{text}");
         crate::serial_print!("{text}");
     } else {
         for byte in bytes.iter().copied() {
-            let character = match byte {
+            let c = match byte {
                 b'\n' | b'\r' | b'\t' => char::from(byte),
                 0x20..=0x7e => char::from(byte),
                 _ => '.',
             };
-            crate::print!("{character}");
-            crate::serial_print!("{character}");
+            crate::print!("{c}");
+            crate::serial_print!("{c}");
         }
     }
-
-    let mut manager = PROCESS_MANAGER.lock();
-    if let Some(process) = manager.process_mut(process_id) {
-        process.write_count = process.write_count.saturating_add(1);
-        process.bytes_written = process.bytes_written.saturating_add(length as u64);
+    let mut m = PROCESS_MANAGER.lock();
+    if let Some(p) = m.process_mut(process_id) {
+        p.write_count = p.write_count.saturating_add(1);
+        p.bytes_written = p.bytes_written.saturating_add(length as u64);
     }
     WriteOutcome::Ready(length as u64)
 }
@@ -3109,46 +3279,84 @@ fn user_text(process_id: u64, address: u64, length: u64, maximum: usize) -> Resu
     Ok(String::from(text))
 }
 
+fn decode_open_options(mut flags: u64) -> Result<vfs::OpenOptions, i64> {
+    if flags == 0 {
+        flags = OPEN_READ;
+    }
+    if flags & !OPEN_ALLOWED_FLAGS != 0 {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    let o = vfs::OpenOptions {
+        read: flags & OPEN_READ != 0,
+        write: flags & OPEN_WRITE != 0,
+        create: flags & OPEN_CREATE != 0,
+        truncate: flags & OPEN_TRUNCATE != 0,
+        append: flags & OPEN_APPEND != 0,
+    };
+    if !o.read && !o.write
+        || (o.create || o.truncate || o.append) && !o.write
+        || o.truncate && o.append
+    {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    Ok(o)
+}
 fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
-    if flags != 0 {
-        return error_return(ERR_INVALID_ARGUMENT);
-    }
+    let options = match decode_open_options(flags) {
+        Ok(o) => o,
+        Err(e) => return error_return(e),
+    };
     let path = match user_string(process_id, address, length) {
-        Ok(path) => path,
-        Err(error) => return error_return(error),
+        Ok(p) => p,
+        Err(e) => return error_return(e),
     };
-    let metadata = match vfs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) => return error_return(vfs_errno(&error)),
+    let descriptor = {
+        let m = PROCESS_MANAGER.lock();
+        let Some(p) = m.processes.iter().find(|p| p.process_id == process_id) else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        };
+        if descriptor_count(p) >= MAX_OPEN_FILES {
+            return error_return(ERR_TOO_MANY_OPEN_FILES);
+        }
+        let Some(d) = allocate_descriptor(p) else {
+            return error_return(ERR_TOO_MANY_OPEN_FILES);
+        };
+        d
     };
-    if metadata.is_directory() {
-        return error_return(ERR_IS_DIRECTORY);
-    }
-
-    let mut manager = PROCESS_MANAGER.lock();
-    let Some(process) = manager.process_mut(process_id) else {
+    let metadata = match vfs::open(&path, options) {
+        Ok(m) => m,
+        Err(e) => return error_return(vfs_errno(&e)),
+    };
+    let offset = if options.append { metadata.size } else { 0 };
+    let handle = Arc::new(Mutex::new(OpenFileState {
+        path: metadata.path,
+        offset,
+        readable: options.read,
+        writable: options.write,
+        append: options.append,
+    }));
+    let mut m = PROCESS_MANAGER.lock();
+    let Some(p) = m.process_mut(process_id) else {
         return error_return(ERR_BAD_FILE_DESCRIPTOR);
     };
-    if descriptor_count(process) >= MAX_OPEN_FILES {
+    if descriptor_in_use(p, descriptor) {
         return error_return(ERR_TOO_MANY_OPEN_FILES);
     }
-    let Some(descriptor) = allocate_descriptor(process) else {
-        return error_return(ERR_TOO_MANY_OPEN_FILES);
-    };
-    process.open_files.push(OpenFile {
-        descriptor,
-        path: metadata.path,
-        offset: 0,
-    });
-    process.open_count = process.open_count.saturating_add(1);
+    p.open_files.push(OpenFile { descriptor, handle });
+    p.open_count = p.open_count.saturating_add(1);
     descriptor
 }
-
 enum ReadOutcome {
     Ready(u64),
     Blocked,
 }
-
+#[derive(Clone)]
+enum ReadTarget {
+    Terminal,
+    Pipe(PipeId),
+    File(OpenFileHandle),
+    Invalid,
+}
 fn syscall_read(
     process_id: u64,
     descriptor: u64,
@@ -3157,7 +3365,7 @@ fn syscall_read(
     current_stack_pointer: usize,
 ) -> ReadOutcome {
     let length = match usize::try_from(length) {
-        Ok(length) if length <= MAX_SYSCALL_READ_BYTES => length,
+        Ok(n) if n <= MAX_SYSCALL_READ_BYTES => n,
         _ => return ReadOutcome::Ready(error_return(ERR_ARGUMENT_TOO_LARGE)),
     };
     if length == 0 {
@@ -3166,90 +3374,74 @@ fn syscall_read(
     if !user_range_allows(process_id, address, length, true) {
         return ReadOutcome::Ready(error_return(ERR_BAD_ADDRESS));
     }
-    if descriptor == 0 {
-        let stdin_pipe = PROCESS_MANAGER
-            .lock()
-            .processes
-            .iter()
-            .find(|process| process.process_id == process_id)
-            .and_then(|process| process.stdin_pipe);
-        if let Some(pipe_id) = stdin_pipe {
-            return syscall_pipe_read(process_id, pipe_id, address, length, current_stack_pointer);
-        }
-        return syscall_terminal_read(process_id, address, length, current_stack_pointer);
-    }
-    if descriptor < 3 {
-        return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
-    }
-
-    let pipe_descriptor = {
-        let manager = PROCESS_MANAGER.lock();
-        manager
-            .processes
-            .iter()
-            .find(|process| process.process_id == process_id)
-            .and_then(|process| {
-                process
-                    .pipe_descriptors
-                    .iter()
-                    .find(|pipe| pipe.descriptor == descriptor)
-                    .copied()
-            })
-    };
-    if let Some(pipe_descriptor) = pipe_descriptor {
-        if pipe_descriptor.direction != PipeDirection::Reader {
-            return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
-        }
-        return syscall_pipe_read(
-            process_id,
-            pipe_descriptor.pipe_id,
-            address,
-            length,
-            current_stack_pointer,
-        );
-    }
-
-    let (path, offset) = {
-        let manager = PROCESS_MANAGER.lock();
-        let Some(process) = manager
-            .processes
-            .iter()
-            .find(|process| process.process_id == process_id)
-        else {
+    let target = {
+        let m = PROCESS_MANAGER.lock();
+        let Some(p) = m.processes.iter().find(|p| p.process_id == process_id) else {
             return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
         };
-        let Some(file) = process
-            .open_files
-            .iter()
-            .find(|file| file.descriptor == descriptor)
-        else {
-            return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
-        };
-        (file.path.clone(), file.offset)
-    };
-
-    let mut buffer = vec![0_u8; length];
-    let count = match vfs::read_at(&path, offset, &mut buffer) {
-        Ok(count) => count,
-        Err(error) => return ReadOutcome::Ready(error_return(vfs_errno(&error))),
-    };
-    unsafe {
-        ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, count);
-    }
-
-    let mut manager = PROCESS_MANAGER.lock();
-    if let Some(process) = manager.process_mut(process_id) {
-        if let Some(file) = process
-            .open_files
-            .iter_mut()
-            .find(|file| file.descriptor == descriptor)
-        {
-            file.offset = file.offset.saturating_add(count as u64);
+        match descriptor {
+            0 => match &p.stdin_target {
+                Some(StreamTarget::Pipe(id)) => ReadTarget::Pipe(*id),
+                Some(StreamTarget::File(h)) => ReadTarget::File(h.clone()),
+                None => ReadTarget::Terminal,
+            },
+            1 | 2 => ReadTarget::Invalid,
+            d => {
+                if let Some(pd) = p.pipe_descriptors.iter().find(|x| x.descriptor == d) {
+                    match pd.direction {
+                        PipeDirection::Reader => ReadTarget::Pipe(pd.pipe_id),
+                        PipeDirection::Writer => ReadTarget::Invalid,
+                    }
+                } else {
+                    p.open_files
+                        .iter()
+                        .find(|f| f.descriptor == d)
+                        .map(|f| ReadTarget::File(f.handle.clone()))
+                        .unwrap_or(ReadTarget::Invalid)
+                }
+            }
         }
-        process.read_count = process.read_count.saturating_add(1);
-        process.bytes_read = process.bytes_read.saturating_add(count as u64);
+    };
+    match target {
+        ReadTarget::Terminal => {
+            syscall_terminal_read(process_id, address, length, current_stack_pointer)
+        }
+        ReadTarget::Pipe(id) => {
+            syscall_pipe_read(process_id, id, address, length, current_stack_pointer)
+        }
+        ReadTarget::File(handle) => {
+            let mut buffer = vec![0_u8; length];
+            let result = {
+                let mut f = handle.lock();
+                if !f.readable {
+                    Err(ERR_BAD_FILE_DESCRIPTOR)
+                } else {
+                    match vfs::read_at(&f.path, f.offset, &mut buffer) {
+                        Ok(count) => {
+                            f.offset = f.offset.saturating_add(count as u64);
+                            Ok(count)
+                        }
+                        Err(e) => Err(vfs_errno(&e)),
+                    }
+                }
+            };
+            match result {
+                Ok(count) => {
+                    unsafe {
+                        ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, count);
+                    }
+                    let mut m = PROCESS_MANAGER.lock();
+                    if let Some(p) = m.process_mut(process_id) {
+                        p.read_count = p.read_count.saturating_add(1);
+                        p.bytes_read = p.bytes_read.saturating_add(count as u64);
+                    }
+                    ReadOutcome::Ready(count as u64)
+                }
+                Err(e) => ReadOutcome::Ready(error_return(e)),
+            }
+        }
+        ReadTarget::Invalid => ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR)),
     }
-    ReadOutcome::Ready(count as u64)
 }
 
 fn syscall_pipe_read(
@@ -3536,6 +3728,66 @@ fn complete_pipe_read_error(
     })
 }
 
+fn syscall_seek(process_id: u64, descriptor: u64, offset: u64, whence: u64) -> u64 {
+    let handle = {
+        let m = PROCESS_MANAGER.lock();
+        let Some(p) = m.processes.iter().find(|p| p.process_id == process_id) else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        };
+        match descriptor {
+            0 => match &p.stdin_target {
+                Some(StreamTarget::File(h)) => Some(h.clone()),
+                _ => None,
+            },
+            1 => match &p.stdout_target {
+                Some(StreamTarget::File(h)) => Some(h.clone()),
+                _ => None,
+            },
+            2 => match &p.stderr_target {
+                Some(StreamTarget::File(h)) => Some(h.clone()),
+                _ => None,
+            },
+            d => p
+                .open_files
+                .iter()
+                .find(|f| f.descriptor == d)
+                .map(|f| f.handle.clone()),
+        }
+    };
+    let Some(handle) = handle else {
+        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+    };
+    let signed = offset as i64;
+    let new_offset = {
+        let mut f = handle.lock();
+        let base = match whence {
+            SEEK_SET => 0_i128,
+            SEEK_CURRENT => i128::from(f.offset),
+            SEEK_END => match vfs::metadata(&f.path) {
+                Ok(md) => i128::from(md.size),
+                Err(e) => return error_return(vfs_errno(&e)),
+            },
+            _ => return error_return(ERR_INVALID_ARGUMENT),
+        };
+        if whence == SEEK_SET && signed < 0 {
+            return error_return(ERR_INVALID_ARGUMENT);
+        }
+        let Some(value) = base.checked_add(i128::from(signed)) else {
+            return error_return(ERR_INVALID_ARGUMENT);
+        };
+        let Ok(value) = u64::try_from(value) else {
+            return error_return(ERR_INVALID_ARGUMENT);
+        };
+        f.offset = value;
+        value
+    };
+    let mut m = PROCESS_MANAGER.lock();
+    if let Some(p) = m.process_mut(process_id) {
+        p.seek_count = p.seek_count.saturating_add(1);
+    }
+    new_offset
+}
+
 fn syscall_close(process_id: u64, descriptor: u64) -> u64 {
     if descriptor < 3 {
         return error_return(ERR_BAD_FILE_DESCRIPTOR);
@@ -3583,9 +3835,13 @@ fn vfs_errno(error: &vfs::Error) -> i64 {
     match error {
         vfs::Error::NotFound => ERR_NO_ENTRY,
         vfs::Error::IsDirectory => ERR_IS_DIRECTORY,
-        vfs::Error::InvalidPath | vfs::Error::PathTooLong | vfs::Error::TooManyPathComponents => {
-            ERR_INVALID_ARGUMENT
-        }
+        vfs::Error::ReadOnly => ERR_READ_ONLY,
+        vfs::Error::NoSpace | vfs::Error::FileTooLarge | vfs::Error::TooManyFiles => ERR_NO_SPACE,
+        vfs::Error::InvalidPath
+        | vfs::Error::PathTooLong
+        | vfs::Error::TooManyPathComponents
+        | vfs::Error::NameTooLong
+        | vfs::Error::InvalidOpenOptions => ERR_INVALID_ARGUMENT,
         _ => ERR_IO,
     }
 }

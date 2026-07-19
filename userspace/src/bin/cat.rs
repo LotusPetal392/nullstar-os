@@ -18,7 +18,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         syscall::exit(64);
     };
 
-    let descriptor = match syscall::open(path, 0) {
+    let descriptor = match syscall::open(path, syscall::OpenFlags::READ) {
         Ok(descriptor) => descriptor,
         Err(_) => syscall::exit(1),
     };
