@@ -575,6 +575,19 @@ impl Shell {
             vfs::MAX_PATH_COMPONENTS,
             vfs::MAX_READ_WINDOW_BYTES / 1024
         );
+        if let Some(tmpfs) = vfs::tmpfs_info() {
+            shell_println!(
+                "tmpfs: {} files={}/{}, bytes={}/{}, per-file={}, writes={}, rejected={}",
+                tmpfs.mount_path,
+                tmpfs.file_count,
+                tmpfs.maximum_files,
+                tmpfs.total_bytes,
+                tmpfs.maximum_total_bytes,
+                tmpfs.maximum_file_bytes,
+                tmpfs.writes,
+                tmpfs.rejected_writes
+            );
+        }
     }
 
     fn inspect_elf(&self, path: &str) {
@@ -682,7 +695,7 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, child spawns={}, waits={}, signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
             snapshot.spawned,
             snapshot.child_spawns,
             snapshot.child_waits,
@@ -691,6 +704,7 @@ impl Shell {
             snapshot.continue_deliveries,
             snapshot.pipe_pairs,
             snapshot.pipe_descriptor_inherits,
+            snapshot.file_descriptor_inherits,
             snapshot.active,
             snapshot.blocked,
             snapshot.stopped,
@@ -748,6 +762,13 @@ impl Shell {
                 result.read_count,
                 result.close_count,
                 result.bytes_read
+            );
+            shell_println!(
+                "  regular files: writes={}, bytes={}, seeks={}, inherited={}",
+                result.file_write_count,
+                result.file_bytes_written,
+                result.seek_count,
+                result.file_descriptor_inherit_count
             );
             shell_println!(
                 "  terminal: reads={}, bytes={}, blocked reads={}",

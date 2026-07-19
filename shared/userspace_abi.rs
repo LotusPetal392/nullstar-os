@@ -19,6 +19,7 @@ pub mod syscall {
     pub const TRY_WAIT_CHILD: u64 = 11;
     pub const SIGNAL_PROCESS_GROUP: u64 = 12;
     pub const FOREGROUND_PROCESS_GROUP: u64 = 13;
+    pub const SEEK: u64 = 14;
 }
 
 pub mod signal {
@@ -47,6 +48,21 @@ pub mod spawn {
     pub const DEFAULT_PROCESS_GROUP: u64 = u64::MAX;
 }
 
+pub mod open {
+    pub const READ: u64 = 1 << 0;
+    pub const WRITE: u64 = 1 << 1;
+    pub const CREATE: u64 = 1 << 2;
+    pub const TRUNCATE: u64 = 1 << 3;
+    pub const APPEND: u64 = 1 << 4;
+    pub const ALLOWED_FLAGS: u64 = READ | WRITE | CREATE | TRUNCATE | APPEND;
+}
+
+pub mod seek {
+    pub const SET: u64 = 0;
+    pub const CURRENT: u64 = 1;
+    pub const END: u64 = 2;
+}
+
 pub mod limits {
     pub const MAX_SYSCALL_WRITE_BYTES: usize = 4096;
     pub const MAX_SYSCALL_READ_BYTES: usize = 4096;
@@ -68,6 +84,8 @@ pub mod errno {
     pub const IS_DIRECTORY: i64 = -21;
     pub const INVALID_ARGUMENT: i64 = -22;
     pub const TOO_MANY_OPEN_FILES: i64 = -24;
+    pub const NO_SPACE: i64 = -28;
+    pub const READ_ONLY: i64 = -30;
     pub const BROKEN_PIPE: i64 = -32;
     pub const NOT_IMPLEMENTED: i64 = -38;
 }

@@ -4,7 +4,8 @@
 use userspace::{
     abi::signal,
     syscall::{
-        self, ChildStatus, PipePair, ProcessGroupId, ProcessId, STDERR, STDIN, STDOUT, SpawnFlags,
+        self, ChildStatus, FileDescriptor, OpenFlags, PipePair, ProcessGroupId, ProcessId, STDERR,
+        STDIN, STDOUT, SpawnFlags,
     },
 };
 
@@ -12,14 +13,19 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const COMMAND_BYTES: usize = 512;
+const PATH_BYTES: usize = 256;
 const MAX_STAGES: usize = 8;
 const MAX_PIPES: usize = MAX_STAGES - 1;
 const MAX_JOBS: usize = 4;
 
 const PROMPT: &[u8] = b"ush> ";
-const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N exit\nbackground: command & (up to 4 jobs)\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
+const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N exit\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
+const REDIRECTION_SYNTAX_FAILURE: &[u8] = b"ush: invalid redirection syntax\n";
+const REDIRECTION_PATH_FAILURE: &[u8] = b"ush: redirection path is too long\n";
+const REDIRECTION_OPEN_FAILURE: &[u8] = b"ush: redirection open failed\n";
+const BUILTIN_REDIRECTION_FAILURE: &[u8] = b"ush: builtins do not support redirection\n";
 const JOB_LIMIT_FAILURE: &[u8] = b"ush: background job table is full\n";
 const BUILTIN_BACKGROUND_FAILURE: &[u8] = b"ush: builtins cannot run in the background\n";
 const JOB_TARGET_USAGE: &[u8] = b"ush: expected a job selector from %1 to %4\n";
@@ -35,22 +41,90 @@ const WAIT_COMPLETE: &[u8] = b"ush: background jobs complete\n";
 const NO_JOBS: &[u8] = b"ush: no background jobs\n";
 
 #[derive(Clone, Copy)]
+struct ByteBuffer<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+impl<const N: usize> ByteBuffer<N> {
+    const EMPTY: Self = Self {
+        bytes: [0; N],
+        len: 0,
+    };
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+    fn copy_from(&mut self, source: &[u8]) -> bool {
+        if source.len() > N {
+            return false;
+        }
+        self.bytes[..source.len()].copy_from_slice(source);
+        self.len = source.len();
+        true
+    }
+    fn push_token(&mut self, token: &[u8]) -> bool {
+        let separator = usize::from(self.len != 0);
+        let Some(end) = self
+            .len
+            .checked_add(separator)
+            .and_then(|v| v.checked_add(token.len()))
+        else {
+            return false;
+        };
+        if end > N {
+            return false;
+        }
+        if separator != 0 {
+            self.bytes[self.len] = b' ';
+            self.len += 1;
+        }
+        self.bytes[self.len..self.len + token.len()].copy_from_slice(token);
+        self.len += token.len();
+        true
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedirectMode {
+    Read,
+    Truncate,
+    Append,
+}
+#[derive(Clone, Copy)]
+struct FileRedirect {
+    path: ByteBuffer<PATH_BYTES>,
+    mode: RedirectMode,
+}
+#[derive(Clone, Copy)]
+enum StderrRedirect {
+    Default,
+    File(FileRedirect),
+    Stdout,
+}
+#[derive(Clone, Copy)]
 struct Stage {
-    start: usize,
-    end: usize,
+    command: ByteBuffer<COMMAND_BYTES>,
+    stdin: Option<FileRedirect>,
+    stdout: Option<FileRedirect>,
+    stderr: StderrRedirect,
 }
-
 impl Stage {
-    const EMPTY: Self = Self { start: 0, end: 0 };
+    const EMPTY: Self = Self {
+        command: ByteBuffer::EMPTY,
+        stdin: None,
+        stdout: None,
+        stderr: StderrRedirect::Default,
+    };
+    fn has_redirection(self) -> bool {
+        self.stdin.is_some()
+            || self.stdout.is_some()
+            || !matches!(self.stderr, StderrRedirect::Default)
+    }
 }
-
 #[derive(Clone, Copy)]
 struct ParsedLine {
     stages: [Stage; MAX_STAGES],
     count: usize,
     background: bool,
 }
-
 impl ParsedLine {
     const EMPTY: Self = Self {
         stages: [Stage::EMPTY; MAX_STAGES],
@@ -58,13 +132,13 @@ impl ParsedLine {
         background: false,
     };
 }
-
 #[derive(Clone, Copy)]
 enum ParseError {
     EmptyStage,
     TooManyStages,
+    RedirectionSyntax,
+    PathTooLong,
 }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobState {
     Running,
@@ -74,7 +148,6 @@ enum JobState {
     Started,
     Signaled,
 }
-
 #[derive(Clone, Copy)]
 struct Job {
     process_ids: [ProcessId; MAX_STAGES],
@@ -82,7 +155,6 @@ struct Job {
     process_group: ProcessGroupId,
     state: JobState,
 }
-
 impl Job {
     const EMPTY: Self = Self {
         process_ids: [0; MAX_STAGES],
@@ -90,12 +162,10 @@ impl Job {
         process_group: 0,
         state: JobState::Running,
     };
-
     const fn is_active(self) -> bool {
         self.process_count != 0
     }
 }
-
 #[derive(Clone, Copy)]
 enum Builtin {
     Help,
@@ -106,46 +176,65 @@ enum Builtin {
     Exit,
     Kill(JobTarget),
 }
-
 #[derive(Clone, Copy)]
 enum JobTarget {
     Job(usize),
     Usage,
 }
-
 #[derive(Clone, Copy)]
 enum WaitTarget {
     All,
     Job(usize),
     Usage,
 }
-
 #[derive(Clone, Copy, Default)]
 struct WaitSummary {
     failed: bool,
     interrupted: bool,
     stopped: bool,
 }
-
 enum WaitAllResult {
     Complete,
     Stopped,
     Failed,
 }
-
 enum CollectResult {
     Complete,
     Stopped,
     Failed,
 }
-
+#[derive(Clone, Copy)]
+struct StageDescriptors {
+    stdin: Option<FileDescriptor>,
+    stdout: Option<FileDescriptor>,
+    stderr: Option<FileDescriptor>,
+    opened: [FileDescriptor; 3],
+    opened_count: usize,
+}
+impl StageDescriptors {
+    const fn new(stdin: Option<FileDescriptor>, stdout: Option<FileDescriptor>) -> Self {
+        Self {
+            stdin,
+            stdout,
+            stderr: None,
+            opened: [0; 3],
+            opened_count: 0,
+        }
+    }
+    fn remember(&mut self, d: FileDescriptor) {
+        self.opened[self.opened_count] = d;
+        self.opened_count += 1;
+    }
+    const fn uses_descriptors(self) -> bool {
+        self.stdin.is_some() || self.stdout.is_some() || self.stderr.is_some()
+    }
+}
 struct Shell {
     command: [u8; COMMAND_BYTES],
     pipes: [PipePair; MAX_PIPES],
     children: [ProcessId; MAX_STAGES],
     jobs: [Job; MAX_JOBS],
 }
-
 impl Shell {
     const fn new() -> Self {
         Self {
@@ -158,24 +247,21 @@ impl Shell {
             jobs: [Job::EMPTY; MAX_JOBS],
         }
     }
-
     fn run(&mut self) -> ! {
         loop {
             if syscall::write_all(STDOUT, PROMPT).is_err() {
                 syscall::exit(1);
             }
-
             let count = match syscall::read(STDIN, &mut self.command) {
-                Ok(count) => count,
+                Ok(c) => c,
                 Err(_) => syscall::exit(1),
             };
             if count == 0 {
                 self.terminate_all_jobs();
                 syscall::exit(0);
             }
-
             let parsed = match parse_line(&self.command[..count]) {
-                Ok(parsed) => parsed,
+                Ok(v) => v,
                 Err(ParseError::EmptyStage) => {
                     self.error(SYNTAX_FAILURE);
                     continue;
@@ -184,14 +270,20 @@ impl Shell {
                     self.error(STAGE_FAILURE);
                     continue;
                 }
+                Err(ParseError::RedirectionSyntax) => {
+                    self.error(REDIRECTION_SYNTAX_FAILURE);
+                    continue;
+                }
+                Err(ParseError::PathTooLong) => {
+                    self.error(REDIRECTION_PATH_FAILURE);
+                    continue;
+                }
             };
             if parsed.count == 0 {
                 continue;
             }
-
             let builtin = if parsed.count == 1 {
-                let stage = parsed.stages[0];
-                detect_builtin(&self.command[stage.start..stage.end])
+                detect_builtin(parsed.stages[0].command.as_slice())
             } else {
                 None
             };
@@ -200,13 +292,16 @@ impl Shell {
                     self.error(BUILTIN_BACKGROUND_FAILURE);
                     continue;
                 }
+                if parsed.stages[0].has_redirection() {
+                    self.error(BUILTIN_REDIRECTION_FAILURE);
+                    continue;
+                }
                 self.run_builtin(builtin);
                 continue;
             }
-
-            let job_slot = if parsed.background {
+            let slot = if parsed.background {
                 match self.reserve_job() {
-                    Some(slot) => Some(slot),
+                    Some(s) => Some(s),
                     None => {
                         self.error(JOB_LIMIT_FAILURE);
                         continue;
@@ -215,17 +310,15 @@ impl Shell {
             } else {
                 None
             };
-
             if parsed.count == 1 {
-                self.run_single(parsed, job_slot);
+                self.run_single(parsed, slot)
             } else {
-                self.run_pipeline(parsed, job_slot);
+                self.run_pipeline(parsed, slot)
             }
         }
     }
-
-    fn run_builtin(&mut self, builtin: Builtin) {
-        match builtin {
+    fn run_builtin(&mut self, b: Builtin) {
+        match b {
             Builtin::Help => self.output(HELP),
             Builtin::Jobs => self.print_jobs(),
             Builtin::Wait(WaitTarget::All) => match self.wait_all_jobs() {
@@ -233,60 +326,73 @@ impl Shell {
                 WaitAllResult::Stopped => self.error(JOB_STOPPED),
                 WaitAllResult::Failed => self.error(WAIT_FAILURE),
             },
-            Builtin::Wait(WaitTarget::Job(slot)) => {
-                if self.wait_job(slot) {
+            Builtin::Wait(WaitTarget::Job(s)) => {
+                if self.wait_job(s) {
                     self.output(WAIT_COMPLETE);
                 }
             }
             Builtin::Wait(WaitTarget::Usage) => self.error(JOB_TARGET_USAGE),
-            Builtin::Foreground(JobTarget::Job(slot)) => self.foreground_job(slot),
+            Builtin::Foreground(JobTarget::Job(s)) => self.foreground_job(s),
             Builtin::Foreground(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
-            Builtin::Background(JobTarget::Job(slot)) => self.background_job(slot),
+            Builtin::Background(JobTarget::Job(s)) => self.background_job(s),
             Builtin::Background(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
             Builtin::Exit => {
                 self.terminate_all_jobs();
-                syscall::exit(0);
+                syscall::exit(0)
             }
             Builtin::Kill(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
-            Builtin::Kill(JobTarget::Job(slot)) => self.kill_job(slot),
+            Builtin::Kill(JobTarget::Job(s)) => self.kill_job(s),
         }
     }
-
     fn run_single(&mut self, parsed: ParsedLine, job_slot: Option<usize>) {
         let stage = parsed.stages[0];
-        let command = &self.command[stage.start..stage.end];
+        let d = match self.open_stage(&stage, None, None) {
+            Ok(v) => v,
+            Err(()) => {
+                self.error(REDIRECTION_OPEN_FAILURE);
+                return;
+            }
+        };
         let mut flags = SpawnFlags::NEW_PROCESS_GROUP;
         if !parsed.background {
             flags |= SpawnFlags::FOREGROUND;
         }
-
-        let process_id = match syscall::spawn_command(command, flags, None, None, None) {
-            Ok(process_id) => process_id,
+        if d.uses_descriptors() {
+            flags |= SpawnFlags::USE_DESCRIPTORS;
+        }
+        let spawned = syscall::spawn_command(
+            stage.command.as_slice(),
+            flags,
+            d.stdin,
+            d.stdout,
+            d.stderr,
+            None,
+        );
+        self.close_stage_descriptors(&d);
+        let pid = match spawned {
+            Ok(p) => p,
             Err(_) => {
                 self.error(SPAWN_FAILURE);
                 return;
             }
         };
-        self.children[0] = process_id;
-
+        self.children[0] = pid;
         if let Some(slot) = job_slot {
-            self.store_job(slot, 1, process_id, JobState::Started);
+            self.store_job(slot, 1, pid, JobState::Started);
             self.print_job(slot);
             self.jobs[slot].state = JobState::Running;
             return;
         }
-
-        self.finish_foreground(1, process_id);
+        self.finish_foreground(1, pid)
     }
-
     fn run_pipeline(&mut self, parsed: ParsedLine, job_slot: Option<usize>) {
         let pipe_count = parsed.count - 1;
-        let mut created = 0usize;
+        let mut created = 0;
         while created < pipe_count {
             match syscall::pipe_pair() {
                 Ok(pair) => {
                     self.pipes[created] = pair;
-                    created += 1;
+                    created += 1
                 }
                 Err(_) => {
                     self.close_pipes(created);
@@ -295,16 +401,37 @@ impl Shell {
                 }
             }
         }
-
         let mut leader = None;
         let mut stage_index = parsed.count;
         while stage_index > 0 {
             stage_index -= 1;
             let stage = parsed.stages[stage_index];
-            let command = &self.command[stage.start..stage.end];
-
-            let mut flags = SpawnFlags::USE_DESCRIPTORS;
-            let process_group = if stage_index == parsed.count - 1 {
+            let default_stdin = if stage_index == 0 {
+                None
+            } else {
+                Some(self.pipes[stage_index - 1].reader)
+            };
+            let default_stdout = if stage_index == parsed.count - 1 {
+                None
+            } else {
+                Some(self.pipes[stage_index].writer)
+            };
+            let d = match self.open_stage(&stage, default_stdin, default_stdout) {
+                Ok(v) => v,
+                Err(()) => {
+                    self.close_pipes(pipe_count);
+                    for i in stage_index + 1..parsed.count {
+                        let _ = self.wait_final(self.children[i]);
+                    }
+                    self.error(REDIRECTION_OPEN_FAILURE);
+                    return;
+                }
+            };
+            let mut flags = SpawnFlags::EMPTY;
+            if d.uses_descriptors() {
+                flags |= SpawnFlags::USE_DESCRIPTORS;
+            }
+            let group = if stage_index == parsed.count - 1 {
                 flags |= SpawnFlags::NEW_PROCESS_GROUP;
                 if !parsed.background {
                     flags |= SpawnFlags::FOREGROUND;
@@ -314,53 +441,91 @@ impl Shell {
                 flags |= SpawnFlags::JOIN_PROCESS_GROUP;
                 leader
             };
-            let stdin_descriptor = if stage_index == 0 {
-                None
-            } else {
-                Some(self.pipes[stage_index - 1].reader)
-            };
-            let stdout_descriptor = if stage_index == parsed.count - 1 {
-                None
-            } else {
-                Some(self.pipes[stage_index].writer)
-            };
-
-            match syscall::spawn_command(
-                command,
+            let spawned = syscall::spawn_command(
+                stage.command.as_slice(),
                 flags,
-                stdin_descriptor,
-                stdout_descriptor,
-                process_group,
-            ) {
-                Ok(process_id) => {
-                    self.children[stage_index] = process_id;
+                d.stdin,
+                d.stdout,
+                d.stderr,
+                group,
+            );
+            self.close_stage_descriptors(&d);
+            match spawned {
+                Ok(pid) => {
+                    self.children[stage_index] = pid;
                     if leader.is_none() {
-                        leader = Some(process_id);
+                        leader = Some(pid);
                     }
                 }
                 Err(_) => {
                     self.close_pipes(pipe_count);
-                    for child_index in stage_index + 1..parsed.count {
-                        let _ = self.wait_final(self.children[child_index]);
+                    for i in stage_index + 1..parsed.count {
+                        let _ = self.wait_final(self.children[i]);
                     }
                     self.error(SPAWN_FAILURE);
                     return;
                 }
             }
         }
-
         self.close_pipes(pipe_count);
-        let process_group = leader.unwrap_or(0);
+        let group = leader.unwrap_or(0);
         if let Some(slot) = job_slot {
-            self.store_job(slot, parsed.count, process_group, JobState::Started);
+            self.store_job(slot, parsed.count, group, JobState::Started);
             self.print_job(slot);
             self.jobs[slot].state = JobState::Running;
             return;
         }
-
-        self.finish_foreground(parsed.count, process_group);
+        self.finish_foreground(parsed.count, group)
     }
-
+    fn open_stage(
+        &self,
+        stage: &Stage,
+        default_stdin: Option<FileDescriptor>,
+        default_stdout: Option<FileDescriptor>,
+    ) -> Result<StageDescriptors, ()> {
+        let mut d = StageDescriptors::new(default_stdin, default_stdout);
+        if let Some(r) = stage.stdin {
+            match open_redirect(r) {
+                Ok(fd) => {
+                    d.stdin = Some(fd);
+                    d.remember(fd)
+                }
+                Err(()) => return Err(()),
+            }
+        }
+        if let Some(r) = stage.stdout {
+            match open_redirect(r) {
+                Ok(fd) => {
+                    d.stdout = Some(fd);
+                    d.remember(fd)
+                }
+                Err(()) => {
+                    self.close_stage_descriptors(&d);
+                    return Err(());
+                }
+            }
+        }
+        match stage.stderr {
+            StderrRedirect::Default => {}
+            StderrRedirect::Stdout => d.stderr = d.stdout,
+            StderrRedirect::File(r) => match open_redirect(r) {
+                Ok(fd) => {
+                    d.stderr = Some(fd);
+                    d.remember(fd)
+                }
+                Err(()) => {
+                    self.close_stage_descriptors(&d);
+                    return Err(());
+                }
+            },
+        }
+        Ok(d)
+    }
+    fn close_stage_descriptors(&self, d: &StageDescriptors) {
+        for fd in &d.opened[..d.opened_count] {
+            let _ = syscall::close(*fd);
+        }
+    }
     fn finish_foreground(&mut self, process_count: usize, process_group: ProcessGroupId) {
         let children = self.children;
         let summary = self.wait_children(&children, process_count);
@@ -719,7 +884,6 @@ fn parse_line(bytes: &[u8]) -> Result<ParsedLine, ParseError> {
     if end == 0 {
         return Ok(ParsedLine::EMPTY);
     }
-
     let mut background = false;
     if bytes[end - 1] == b'&' {
         background = true;
@@ -731,40 +895,105 @@ fn parse_line(bytes: &[u8]) -> Result<ParsedLine, ParseError> {
             return Err(ParseError::EmptyStage);
         }
     }
-
     let mut parsed = ParsedLine {
         background,
         ..ParsedLine::EMPTY
     };
-    let mut stage_start = 0usize;
-    let mut cursor = 0usize;
+    let mut start = 0;
+    let mut cursor = 0;
     loop {
         if cursor == end || bytes[cursor] == b'|' {
-            let mut start = stage_start;
-            let mut finish = cursor;
-            while start < finish && is_horizontal_space(bytes[start]) {
-                start += 1;
+            let mut a = start;
+            let mut b = cursor;
+            while a < b && is_horizontal_space(bytes[a]) {
+                a += 1;
             }
-            while finish > start && is_horizontal_space(bytes[finish - 1]) {
-                finish -= 1;
+            while b > a && is_horizontal_space(bytes[b - 1]) {
+                b -= 1;
             }
-            if start == finish {
+            if a == b {
                 return Err(ParseError::EmptyStage);
             }
             if parsed.count == MAX_STAGES {
                 return Err(ParseError::TooManyStages);
             }
-            parsed.stages[parsed.count] = Stage { start, end: finish };
+            parsed.stages[parsed.count] = parse_stage(&bytes[a..b])?;
             parsed.count += 1;
-
             if cursor == end {
                 break;
             }
-            stage_start = cursor + 1;
+            start = cursor + 1;
         }
         cursor += 1;
     }
     Ok(parsed)
+}
+fn parse_stage(bytes: &[u8]) -> Result<Stage, ParseError> {
+    let mut stage = Stage::EMPTY;
+    let mut cursor = 0;
+    while let Some(token) = next_token(bytes, &mut cursor) {
+        match token {
+            b"<" | b">" | b">>" | b"2>" | b"2>>" => {
+                let path = next_token(bytes, &mut cursor).ok_or(ParseError::RedirectionSyntax)?;
+                if is_redirection_operator(path) {
+                    return Err(ParseError::RedirectionSyntax);
+                }
+                let mut stored = ByteBuffer::<PATH_BYTES>::EMPTY;
+                if !stored.copy_from(path) {
+                    return Err(ParseError::PathTooLong);
+                }
+                let r = FileRedirect {
+                    path: stored,
+                    mode: match token {
+                        b"<" => RedirectMode::Read,
+                        b">" | b"2>" => RedirectMode::Truncate,
+                        b">>" | b"2>>" => RedirectMode::Append,
+                        _ => return Err(ParseError::RedirectionSyntax),
+                    },
+                };
+                match token {
+                    b"<" => stage.stdin = Some(r),
+                    b">" | b">>" => stage.stdout = Some(r),
+                    b"2>" | b"2>>" => stage.stderr = StderrRedirect::File(r),
+                    _ => return Err(ParseError::RedirectionSyntax),
+                }
+            }
+            b"2>&1" => stage.stderr = StderrRedirect::Stdout,
+            _ => {
+                if !stage.command.push_token(token) {
+                    return Err(ParseError::RedirectionSyntax);
+                }
+            }
+        }
+    }
+    if stage.command.len == 0 {
+        return Err(ParseError::EmptyStage);
+    }
+    Ok(stage)
+}
+fn next_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    while *cursor < bytes.len() && is_horizontal_space(bytes[*cursor]) {
+        *cursor += 1;
+    }
+    if *cursor == bytes.len() {
+        return None;
+    }
+    let start = *cursor;
+    while *cursor < bytes.len() && !is_horizontal_space(bytes[*cursor]) {
+        *cursor += 1;
+    }
+    Some(&bytes[start..*cursor])
+}
+fn is_redirection_operator(token: &[u8]) -> bool {
+    matches!(token, b"<" | b">" | b">>" | b"2>" | b"2>>" | b"2>&1")
+}
+fn open_redirect(r: FileRedirect) -> Result<FileDescriptor, ()> {
+    let flags = match r.mode {
+        RedirectMode::Read => OpenFlags::READ,
+        RedirectMode::Truncate => OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        RedirectMode::Append => OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND,
+    };
+    syscall::open(r.path.as_slice(), flags).map_err(|_| ())
 }
 
 fn detect_builtin(command: &[u8]) -> Option<Builtin> {
