@@ -1,0 +1,85 @@
+name: Apply Rust userspace runtime milestone
+
+on:
+  push:
+    branches:
+      - agent/userspace-runtime-rust-shell
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out implementation branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-runtime-rust-shell
+
+      - name: Apply kernel and boot integration
+        run: python tools/apply_runtime_milestone.py
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Format and validate source changes
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
+
+      - name: Package transformed sources
+        if: always()
+        shell: bash
+        run: |
+          tar --exclude-vcs -czf runtime-milestone-tree.tar.gz \
+            Cargo.toml Cargo.lock build.rs src kernel userspace shared
+
+      - name: Upload transformed sources
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: runtime-milestone-tree
+          path: runtime-milestone-tree.tar.gz
+          if-no-files-found: error
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --quiet qemu-system-x86
+
+      - name: Build bootable image
+        run: cargo +nightly-2026-02-01 build --locked --quiet
+
+      - name: Boot full QEMU smoke test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee rust-userspace-runtime-qemu.log
+
+      - name: Remove integration helpers and publish validated product changes
+        run: |
+          rm tools/apply_runtime_milestone.py
+          rm .github/workflows/apply-runtime-milestone.yml
+          git config user.name lotuspetalagent
+          git config user.email lotuspetalagent@users.noreply.github.com
+          git add -A
+          git commit -m "Add shared Rust userspace runtime and shell"
+          git push origin HEAD:agent/userspace-runtime-rust-shell
+
+      - name: Upload runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-userspace-runtime-qemu-log
+          path: rust-userspace-runtime-qemu.log
+          if-no-files-found: ignore
