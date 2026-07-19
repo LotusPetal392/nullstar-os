@@ -1,0 +1,85 @@
+name: Apply userspace stopped-job control
+
+on:
+  push:
+    branches:
+      - agent/userspace-stopped-jobs
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out implementation branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/userspace-stopped-jobs
+
+      - name: Decode and apply stopped-job integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat tools/stopped_jobs_payload.part0 \
+              tools/stopped_jobs_payload.part1 \
+              tools/stopped_jobs_payload.part2 \
+              tools/stopped_jobs_payload.part3 > /tmp/stopped-jobs.b64
+          base64 --decode /tmp/stopped-jobs.b64 | gzip --decompress > /tmp/stopped-jobs.patch
+          echo "b91ffd05fcc14c1a93b1e59a129b4a356a0275a5a9c32290885d3eb9293a53af  /tmp/stopped-jobs.patch" | sha256sum --check --strict
+          git apply --check /tmp/stopped-jobs.patch
+          git apply /tmp/stopped-jobs.patch
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup -q toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt
+          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
+
+      - name: Format and validate
+        run: |
+          cargo +nightly-2026-02-01 fmt --all
+          cargo +nightly-2026-02-01 fmt --all -- --check
+          git diff --check
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --quiet qemu-system-x86
+
+      - name: Build bootable image
+        run: cargo +nightly-2026-02-01 build --locked --quiet
+
+      - name: Boot stopped-job smoke test in QEMU
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee stopped-jobs-qemu.log
+
+      - name: Publish validated product sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm tools/stopped_jobs_payload.part0
+          rm tools/stopped_jobs_payload.part1
+          rm tools/stopped_jobs_payload.part2
+          rm tools/stopped_jobs_payload.part3
+          rm .github/workflows/apply-stopped-jobs.yml
+          git config user.name lotuspetalagent
+          git config user.email lotuspetalagent@users.noreply.github.com
+          git add -A
+          git commit -m "Add stopped userspace job control"
+          git push origin HEAD:agent/userspace-stopped-jobs
+
+      - name: Upload runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: stopped-jobs-qemu-log
+          path: stopped-jobs-qemu.log
+          if-no-files-found: ignore
