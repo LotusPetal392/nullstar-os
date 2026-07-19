@@ -534,6 +534,7 @@ impl Scheduler {
             return false;
         };
         match task.state {
+            TaskState::Runnable => true,
             TaskState::Blocked => {
                 task.state = TaskState::Runnable;
                 true
@@ -544,6 +545,36 @@ impl Scheduler {
             }
             _ => false,
         }
+    }
+
+    fn replace_process_image(
+        &mut self,
+        process_id: u64,
+        stack_pointer: usize,
+        page_table_frame: PhysFrame<Size4KiB>,
+    ) -> bool {
+        if stack_pointer == 0 || stack_pointer % 16 != 0 {
+            return false;
+        }
+        let current = self.current_task;
+        let Some((index, task)) = self
+            .tasks
+            .iter_mut()
+            .enumerate()
+            .find(|(_, task)| task.process_id == Some(process_id))
+        else {
+            return false;
+        };
+        if index == current
+            || task.kind != TaskKind::UserProcess
+            || task.state != TaskState::Blocked
+        {
+            return false;
+        }
+        task.stack_pointer = stack_pointer;
+        task.address_space = AddressSpace::user(page_table_frame);
+        task.stopped_resume_state = None;
+        true
     }
 
     fn is_process_blocked(&self, process_id: u64) -> bool {
@@ -892,6 +923,22 @@ pub fn block_current(current_stack_pointer: usize) -> usize {
 
 pub fn wake_process(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().wake_process(process_id))
+}
+
+pub fn replace_process_image(
+    process_id: u64,
+    stack_pointer: usize,
+    page_table_address: u64,
+) -> bool {
+    let Ok(page_table_frame) = PhysFrame::from_start_address(PhysAddr::new(page_table_address))
+    else {
+        return false;
+    };
+    cpu_interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .replace_process_image(process_id, stack_pointer, page_table_frame)
+    })
 }
 
 pub fn is_process_blocked(process_id: u64) -> bool {

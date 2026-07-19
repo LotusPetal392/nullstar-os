@@ -4,7 +4,8 @@ use core::{
 };
 
 use crate::abi::{
-    child_status, errno as abi_errno, open as abi_open, seek as abi_seek, signal, spawn, syscall,
+    child_status, descriptor as abi_descriptor, errno as abi_errno, open as abi_open,
+    seek as abi_seek, signal, spawn, syscall,
 };
 
 global_asm!(
@@ -50,9 +51,12 @@ pub const STDERR: FileDescriptor = 2;
 pub struct Errno(i32);
 
 impl Errno {
+    pub const NO_ENTRY: Self = Self((-abi_errno::NO_ENTRY) as i32);
     pub const IO: Self = Self((-abi_errno::IO) as i32);
+    pub const BAD_FILE_DESCRIPTOR: Self = Self((-abi_errno::BAD_FILE_DESCRIPTOR) as i32);
     pub const NO_CHILD: Self = Self((-abi_errno::NO_CHILD) as i32);
     pub const TRY_AGAIN: Self = Self((-abi_errno::TRY_AGAIN) as i32);
+    pub const INVALID_ARGUMENT: Self = Self((-abi_errno::INVALID_ARGUMENT) as i32);
 
     pub const fn code(self) -> i32 {
         self.0
@@ -103,6 +107,7 @@ impl OpenFlags {
     pub const CREATE: Self = Self(abi_open::CREATE);
     pub const TRUNCATE: Self = Self(abi_open::TRUNCATE);
     pub const APPEND: Self = Self(abi_open::APPEND);
+    pub const CLOSE_ON_EXEC: Self = Self(abi_open::CLOSE_ON_EXEC);
     pub const fn bits(self) -> u64 {
         self.0
     }
@@ -114,6 +119,32 @@ impl BitOr for OpenFlags {
     }
 }
 impl BitOrAssign for OpenFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorFlags(u64);
+
+impl DescriptorFlags {
+    pub const EMPTY: Self = Self(0);
+    pub const CLOSE_ON_EXEC: Self = Self(abi_descriptor::CLOSE_ON_EXEC);
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+
+impl BitOr for DescriptorFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for DescriptorFlags {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
@@ -367,6 +398,32 @@ pub fn seek(descriptor: FileDescriptor, offset: SeekFrom) -> Result<u64> {
         asm!("int 0x80", inlateout("rax") result, in("rdi") descriptor, in("rsi") offset as u64, in("rdx") whence);
     }
     decode(result)
+}
+
+pub fn execve(command: &[u8]) -> Result<()> {
+    let mut result = syscall::EXECVE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") command.as_ptr() as u64,
+            in("rsi") command.len() as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn set_descriptor_flags(descriptor: FileDescriptor, flags: DescriptorFlags) -> Result<()> {
+    let mut result = syscall::SET_DESCRIPTOR_FLAGS;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") descriptor,
+            in("rsi") flags.bits(),
+        );
+    }
+    decode(result).map(|_| ())
 }
 
 pub fn exit(code: u64) -> ! {

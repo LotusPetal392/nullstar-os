@@ -19,7 +19,7 @@ const MAX_PIPES: usize = MAX_STAGES - 1;
 const MAX_JOBS: usize = 4;
 
 const PROMPT: &[u8] = b"ush> ";
-const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N exit\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
+const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N exit\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
 const REDIRECTION_SYNTAX_FAILURE: &[u8] = b"ush: invalid redirection syntax\n";

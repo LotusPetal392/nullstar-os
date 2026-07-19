@@ -633,6 +633,159 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         runtime_probe_result.bytes_written
     );
 
+    let exec_before = userspace::snapshot();
+    let exec_memory_before = userspace_runtime.memory_stats();
+    let exec_source_spawn = match userspace_runtime.spawn_foreground("/exec-source", &[]) {
+        Ok(info) => info,
+        Err(error) => {
+            serial_println!("transactional exec source spawn failed: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) =
+        userspace_runtime.wait_until_process_path(exec_source_spawn.process_id, "/exec-target")
+    {
+        serial_println!("transactional exec target did not replace the source: {error}");
+        hlt_loop();
+    }
+    let exec_source_terminal = userspace_runtime.terminal_snapshot();
+    let exec_source_result = match userspace_runtime.wait(exec_source_spawn.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("transactional exec source wait failed: {error}");
+            hlt_loop();
+        }
+    };
+
+    let exec_launcher_spawn =
+        match userspace_runtime.spawn_foreground("/exec", &["/cat", "/hello.txt"]) {
+            Ok(info) => info,
+            Err(error) => {
+                serial_println!("userspace exec launcher spawn failed: {error}");
+                hlt_loop();
+            }
+        };
+    if let Err(error) =
+        userspace_runtime.wait_until_process_path(exec_launcher_spawn.process_id, "/cat")
+    {
+        serial_println!("userspace exec launcher did not replace itself with /cat: {error}");
+        hlt_loop();
+    }
+    let exec_launcher_terminal = userspace_runtime.terminal_snapshot();
+    let exec_launcher_result = match userspace_runtime.wait(exec_launcher_spawn.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace exec launcher wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    let exec_memory_after = userspace_runtime.memory_stats();
+    let exec_after = userspace::snapshot();
+
+    let exec_preserved = match vfs::read_file("/tmp/exec-preserved.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("transactional exec preserved-descriptor read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let exec_closed = match vfs::read_file("/tmp/exec-closed.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("transactional exec close-on-exec read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let expected_exec_preserved =
+        b"source-before-failed-exec\nsource-after-failed-exec\ntarget-after-exec\n";
+    let expected_exec_closed = b"cloexec-before-failed-exec\ncloexec-after-failed-exec\n";
+    let exec_delta = exec_after.execs.saturating_sub(exec_before.execs);
+    let exec_failure_delta = exec_after
+        .exec_failures
+        .saturating_sub(exec_before.exec_failures);
+    let userspace_exec_verified = exec_source_result.process_id == exec_source_spawn.process_id
+        && exec_source_result.process_group_id == exec_source_spawn.process_group_id
+        && exec_source_result.path == "/exec-target"
+        && exec_source_result.exit_code() == Some(23)
+        && exec_source_result.page_table_address != exec_source_spawn.page_table_address
+        && exec_source_result.exec_count == 1
+        && exec_source_result.exec_failure_count == 1
+        && exec_source_result.close_on_exec_count == 1
+        && exec_source_result.exec_frames_reclaimed == exec_source_spawn.owned_frames as u64
+        && exec_source_result.open_count == 2
+        && exec_source_result.file_write_count == 5
+        && exec_source_terminal.foreground_process == Some(exec_source_spawn.process_id)
+        && exec_launcher_result.process_id == exec_launcher_spawn.process_id
+        && exec_launcher_result.process_group_id == exec_launcher_spawn.process_group_id
+        && exec_launcher_result.path == "/cat"
+        && exec_launcher_result.exit_code() == Some(0)
+        && exec_launcher_result.page_table_address != exec_launcher_spawn.page_table_address
+        && exec_launcher_result.exec_count == 1
+        && exec_launcher_result.exec_failure_count == 0
+        && exec_launcher_result.close_on_exec_count == 0
+        && exec_launcher_result.exec_frames_reclaimed == exec_launcher_spawn.owned_frames as u64
+        && exec_launcher_result.open_count == 1
+        && exec_launcher_result.bytes_read > 0
+        && exec_launcher_terminal.foreground_process == Some(exec_launcher_spawn.process_id)
+        && exec_preserved.bytes.as_slice() == expected_exec_preserved
+        && exec_closed.bytes.as_slice() == expected_exec_closed
+        && exec_delta == 2
+        && exec_failure_delta == 1
+        && exec_memory_after.allocated_frames == exec_memory_before.allocated_frames
+        && userspace_runtime
+            .terminal_snapshot()
+            .foreground_process
+            .is_none();
+    if !userspace_exec_verified {
+        serial_println!(
+            "userspace transactional exec verification failed: source={}/{}/{:?}, source_group={}/{}, source_tables={:#x}/{:#x}, source_exec={}/{}/{}/{}, source_io={}/{}, source_terminal={:?}, launcher={}/{}/{:?}, launcher_group={}/{}, launcher_tables={:#x}/{:#x}, launcher_exec={}/{}/{}, launcher_io={}/{}, launcher_terminal={:?}, files={}/{}, deltas={}/{}, frames={}/{}",
+            exec_source_spawn.process_id,
+            exec_source_result.process_id,
+            exec_source_result.exit_code(),
+            exec_source_spawn.process_group_id,
+            exec_source_result.process_group_id,
+            exec_source_spawn.page_table_address,
+            exec_source_result.page_table_address,
+            exec_source_result.exec_count,
+            exec_source_result.exec_failure_count,
+            exec_source_result.close_on_exec_count,
+            exec_source_result.exec_frames_reclaimed,
+            exec_source_result.open_count,
+            exec_source_result.file_write_count,
+            exec_source_terminal.foreground_process,
+            exec_launcher_spawn.process_id,
+            exec_launcher_result.process_id,
+            exec_launcher_result.exit_code(),
+            exec_launcher_spawn.process_group_id,
+            exec_launcher_result.process_group_id,
+            exec_launcher_spawn.page_table_address,
+            exec_launcher_result.page_table_address,
+            exec_launcher_result.exec_count,
+            exec_launcher_result.exec_failure_count,
+            exec_launcher_result.close_on_exec_count,
+            exec_launcher_result.open_count,
+            exec_launcher_result.bytes_read,
+            exec_launcher_terminal.foreground_process,
+            exec_preserved.bytes.len(),
+            exec_closed.bytes.len(),
+            exec_delta,
+            exec_failure_delta,
+            exec_memory_before.allocated_frames,
+            exec_memory_after.allocated_frames
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace transactional exec verified: source_pid={}, launcher_pid={}, execs={}, failures={}, close_on_exec={}, source_frames={}, launcher_frames={}, argv=3, pid_preserved=true, group_preserved=true, terminal_preserved=true, descriptors_preserved=true",
+        exec_source_result.process_id,
+        exec_launcher_result.process_id,
+        exec_delta,
+        exec_failure_delta,
+        exec_source_result.close_on_exec_count,
+        exec_source_result.exec_frames_reclaimed,
+        exec_launcher_result.exec_frames_reclaimed
+    );
+
     const TERMINAL_TEST_LINE: &str = "hello from canonical stdin";
     let terminal_spawn = match userspace_runtime.spawn_foreground("/readline", &[]) {
         Ok(info) => info,
@@ -760,6 +913,56 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         };
     if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
         serial_println!("userspace shell did not regain its prompt: {error}");
+        hlt_loop();
+    }
+
+    if let Err(error) =
+        userspace_runtime.inject_terminal_line("exec runtime-probe manual-argv > /tmp/exec.txt")
+    {
+        serial_println!("userspace shell exec/redirection injection failed: {error}");
+        hlt_loop();
+    }
+    let shell_exec_child =
+        match userspace_runtime.wait_for_child_path(userspace_shell.process_id, "/runtime-probe") {
+            Ok(result) => result,
+            Err(error) => {
+                serial_println!("userspace shell exec child wait failed: {error}");
+                hlt_loop();
+            }
+        };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not regain its prompt after exec: {error}");
+        hlt_loop();
+    }
+    let shell_exec_output = match vfs::read_file("/tmp/exec.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("userspace shell exec output read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let userspace_shell_exec_verified = shell_exec_child.parent_process_id
+        == Some(userspace_shell.process_id)
+        && shell_exec_child.path == "/runtime-probe"
+        && shell_exec_child.exit_code() == Some(0)
+        && shell_exec_child.exec_count == 1
+        && shell_exec_child.exec_failure_count == 0
+        && shell_exec_child.close_on_exec_count == 0
+        && shell_exec_child.file_write_count == 1
+        && shell_exec_output.bytes.as_slice() == b"userspace Rust runtime probe passed\n";
+    if !userspace_shell_exec_verified {
+        serial_println!(
+            "userspace shell exec verification failed: parent={:?}/{}, path={}, exit={:?}, exec={}/{}, cloexec={}, file_writes={}, output={}",
+            shell_exec_child.parent_process_id,
+            userspace_shell.process_id,
+            shell_exec_child.path,
+            shell_exec_child.exit_code(),
+            shell_exec_child.exec_count,
+            shell_exec_child.exec_failure_count,
+            shell_exec_child.close_on_exec_count,
+            shell_exec_child.file_write_count,
+            shell_exec_output.bytes.len()
+        );
         hlt_loop();
     }
 
@@ -1395,19 +1598,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 16
-        && userspace_shell_result.child_wait_count == 20
+        && userspace_shell_result.child_spawn_count == 17
+        && userspace_shell_result.child_wait_count == 21
         && userspace_shell_result.child_poll_count == 5
         && userspace_shell_result.child_poll_pending_count == 5
         && userspace_shell_result.signal_sent_count == 4
-        && userspace_shell_result.open_count == 7
-        && userspace_shell_result.file_descriptor_inherit_count == 8
+        && userspace_shell_result.open_count == 8
+        && userspace_shell_result.file_descriptor_inherit_count == 9
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
         && shell_child.bytes_read > 0
         && userspace_pipeline_verified
         && userspace_redirection_verified
+        && userspace_exec_verified
+        && userspace_shell_exec_verified
         && userspace_background_verified
         && userspace_stopped_jobs_verified
         && userspace_signals_verified
@@ -1417,7 +1622,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs={}, exec_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
             userspace_shell_result.child_wait_count,
@@ -1425,6 +1630,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             userspace_shell_result.child_poll_pending_count,
             userspace_shell_result.signal_sent_count,
             userspace_stopped_jobs_verified,
+            userspace_shell_exec_verified,
             shell_child.parent_process_id,
             shell_child.exit_code(),
             shell_child.open_count,
@@ -1434,7 +1640,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
     serial_println!(
-        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs=1, child_exit=0, child_bytes={}",
+        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs=1, exec_jobs=1, child_exit=0, child_bytes={}",
         userspace_shell_result.process_id,
         shell_child.process_id,
         userspace_shell_result.child_spawn_count,
@@ -1515,6 +1721,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Shared Rust userspace runtime verified");
     } else {
         println!("Rust userspace runtime unavailable");
+    }
+    if userspace_exec_verified {
+        println!("Transactional userspace exec verified");
+    } else {
+        println!("Userspace exec unavailable");
     }
     if terminal_verified {
         println!("Blocking userspace terminal verified");

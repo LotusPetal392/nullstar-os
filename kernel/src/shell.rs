@@ -695,10 +695,12 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, child spawns={}, waits={}, signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, execs={} (failed={}), signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
             snapshot.spawned,
             snapshot.child_spawns,
             snapshot.child_waits,
+            snapshot.execs,
+            snapshot.exec_failures,
             snapshot.signals_sent,
             snapshot.stop_deliveries,
             snapshot.continue_deliveries,
@@ -769,6 +771,13 @@ impl Shell {
                 result.file_bytes_written,
                 result.seek_count,
                 result.file_descriptor_inherit_count
+            );
+            shell_println!(
+                "  exec: successful={}, failed={}, close-on-exec={}, image frames reclaimed={}",
+                result.exec_count,
+                result.exec_failure_count,
+                result.close_on_exec_count,
+                result.exec_frames_reclaimed
             );
             shell_println!(
                 "  terminal: reads={}, bytes={}, blocked reads={}",

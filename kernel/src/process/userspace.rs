@@ -58,6 +58,8 @@ const SYSCALL_TRY_WAIT_CHILD: u64 = abi::syscall::TRY_WAIT_CHILD;
 const SYSCALL_SIGNAL_PROCESS_GROUP: u64 = abi::syscall::SIGNAL_PROCESS_GROUP;
 const SYSCALL_FOREGROUND_PROCESS_GROUP: u64 = abi::syscall::FOREGROUND_PROCESS_GROUP;
 const SYSCALL_SEEK: u64 = abi::syscall::SEEK;
+const SYSCALL_EXECVE: u64 = abi::syscall::EXECVE;
+const SYSCALL_SET_DESCRIPTOR_FLAGS: u64 = abi::syscall::SET_DESCRIPTOR_FLAGS;
 
 pub const SIGNAL_INTERRUPT: u64 = abi::signal::INTERRUPT;
 pub const SIGNAL_TERMINATE: u64 = abi::signal::TERMINATE;
@@ -89,7 +91,10 @@ const OPEN_WRITE: u64 = abi::open::WRITE;
 const OPEN_CREATE: u64 = abi::open::CREATE;
 const OPEN_TRUNCATE: u64 = abi::open::TRUNCATE;
 const OPEN_APPEND: u64 = abi::open::APPEND;
+const OPEN_CLOSE_ON_EXEC: u64 = abi::open::CLOSE_ON_EXEC;
 const OPEN_ALLOWED_FLAGS: u64 = abi::open::ALLOWED_FLAGS;
+const DESCRIPTOR_CLOSE_ON_EXEC: u64 = abi::descriptor::CLOSE_ON_EXEC;
+const DESCRIPTOR_ALLOWED_FLAGS: u64 = abi::descriptor::ALLOWED_FLAGS;
 const SEEK_SET: u64 = abi::seek::SET;
 const SEEK_CURRENT: u64 = abi::seek::CURRENT;
 const SEEK_END: u64 = abi::seek::END;
@@ -353,6 +358,10 @@ pub struct ProcessResult {
     pub child_wait_count: u64,
     pub child_poll_count: u64,
     pub child_poll_pending_count: u64,
+    pub exec_count: u64,
+    pub exec_failure_count: u64,
+    pub close_on_exec_count: u64,
+    pub exec_frames_reclaimed: u64,
     pub signal_sent_count: u64,
     pub signal_received_count: u64,
     pub stop_count: u64,
@@ -394,6 +403,8 @@ pub struct ManagerSnapshot {
     pub spawned: u64,
     pub child_spawns: u64,
     pub child_waits: u64,
+    pub execs: u64,
+    pub exec_failures: u64,
     pub signals_sent: u64,
     pub stop_deliveries: u64,
     pub continue_deliveries: u64,
@@ -614,6 +625,13 @@ struct PendingChildWait {
     stack_pointer: usize,
 }
 
+#[derive(Debug, Clone)]
+struct PendingExec {
+    path: String,
+    arguments: Vec<String>,
+    stack_pointer: usize,
+}
+
 struct OpenFileState {
     path: String,
     offset: u64,
@@ -628,6 +646,7 @@ type OpenFileHandle = Arc<Mutex<OpenFileState>>;
 struct OpenFile {
     descriptor: u64,
     handle: OpenFileHandle,
+    close_on_exec: bool,
 }
 
 #[derive(Clone)]
@@ -647,6 +666,7 @@ struct PipeDescriptor {
     descriptor: u64,
     pipe_id: PipeId,
     direction: PipeDirection,
+    close_on_exec: bool,
 }
 
 struct Process {
@@ -680,6 +700,7 @@ struct Process {
     pending_pipe_write: Option<PendingPipeWrite>,
     pending_child_spawn: Option<PendingChildSpawn>,
     pending_child_wait: Option<PendingChildWait>,
+    pending_exec: Option<PendingExec>,
     syscall_count: u64,
     write_count: u64,
     yield_count: u64,
@@ -704,6 +725,10 @@ struct Process {
     child_wait_count: u64,
     child_poll_count: u64,
     child_poll_pending_count: u64,
+    exec_count: u64,
+    exec_failure_count: u64,
+    close_on_exec_count: u64,
+    exec_frames_reclaimed: u64,
     signal_sent_count: u64,
     signal_received_count: u64,
     stop_count: u64,
@@ -811,6 +836,10 @@ impl Process {
             child_wait_count: self.child_wait_count,
             child_poll_count: self.child_poll_count,
             child_poll_pending_count: self.child_poll_pending_count,
+            exec_count: self.exec_count,
+            exec_failure_count: self.exec_failure_count,
+            close_on_exec_count: self.close_on_exec_count,
+            exec_frames_reclaimed: self.exec_frames_reclaimed,
             signal_sent_count: self.signal_sent_count,
             signal_received_count: self.signal_received_count,
             stop_count: self.stop_count,
@@ -821,7 +850,7 @@ impl Process {
             file_descriptor_inherit_count: self.file_descriptor_inherit_count,
             scheduled_count,
             runtime_ticks,
-            frames_reclaimed,
+            frames_reclaimed: frames_reclaimed.saturating_add(self.exec_frames_reclaimed as usize),
         })
     }
 }
@@ -833,6 +862,8 @@ struct ProcessManager {
     spawned: u64,
     child_spawns: u64,
     child_waits: u64,
+    execs: u64,
+    exec_failures: u64,
     signals_sent: u64,
     stop_deliveries: u64,
     continue_deliveries: u64,
@@ -855,6 +886,8 @@ impl ProcessManager {
             spawned: 0,
             child_spawns: 0,
             child_waits: 0,
+            execs: 0,
+            exec_failures: 0,
             signals_sent: 0,
             stop_deliveries: 0,
             continue_deliveries: 0,
@@ -894,6 +927,8 @@ impl ProcessManager {
             spawned: self.spawned,
             child_spawns: self.child_spawns,
             child_waits: self.child_waits,
+            execs: self.execs,
+            exec_failures: self.exec_failures,
             signals_sent: self.signals_sent,
             stop_deliveries: self.stop_deliveries,
             continue_deliveries: self.continue_deliveries,
@@ -1080,6 +1115,34 @@ fn stream_target_is_pipe(target: &Option<StreamTarget>) -> bool {
 }
 fn stream_target_is_file(target: &Option<StreamTarget>) -> bool {
     matches!(target, Some(StreamTarget::File(_)))
+}
+
+fn validate_kernel_context_pointer(process: &Process, context_pointer: usize) -> Result<(), Error> {
+    let stack_start = process.kernel_stack.as_ptr() as usize;
+    let stack_bytes = process
+        .kernel_stack
+        .len()
+        .checked_mul(size_of::<u128>())
+        .ok_or(Error::StackLayoutInvalid)?;
+    let stack_top = stack_start
+        .checked_add(stack_bytes)
+        .ok_or(Error::StackLayoutInvalid)?;
+    let expected_pointer = stack_top
+        .checked_sub(size_of::<SavedContext>())
+        .ok_or(Error::StackLayoutInvalid)?;
+    let context_end = context_pointer
+        .checked_add(size_of::<SavedContext>())
+        .ok_or(Error::StackLayoutInvalid)?;
+    if stack_start % align_of::<u128>() != 0
+        || stack_top % 16 != 0
+        || context_pointer % 16 != 0
+        || context_pointer != expected_pointer
+        || context_pointer < stack_start
+        || context_end > stack_top
+    {
+        return Err(Error::StackLayoutInvalid);
+    }
+    Ok(())
 }
 
 impl BuiltAddressSpace {
@@ -1398,6 +1461,7 @@ fn spawn_with_mode(
         pending_pipe_write: None,
         pending_child_spawn: None,
         pending_child_wait: None,
+        pending_exec: None,
         syscall_count: 0,
         write_count: 0,
         yield_count: 0,
@@ -1422,6 +1486,10 @@ fn spawn_with_mode(
         child_wait_count: 0,
         child_poll_count: 0,
         child_poll_pending_count: 0,
+        exec_count: 0,
+        exec_failure_count: 0,
+        close_on_exec_count: 0,
+        exec_frames_reclaimed: 0,
         signal_sent_count: 0,
         signal_received_count: 0,
         stop_count: 0,
@@ -1750,6 +1818,231 @@ impl Runtime {
         result
     }
 
+    fn replace_process_image(
+        &mut self,
+        process_id: u64,
+        mut request: PendingExec,
+    ) -> Result<(), Error> {
+        let context_pointer = request.stack_pointer;
+        {
+            let manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            if process.state != ProcessState::Blocked || process.pending_exec.is_none() {
+                return Err(Error::InvalidArgument);
+            }
+            validate_kernel_context_pointer(process, context_pointer)?;
+        }
+
+        let image = elf::validate(&request.path)?;
+        let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
+        argv.push(request.path.as_str());
+        argv.extend(request.arguments.iter().map(String::as_str));
+        let mut address_space = BuiltAddressSpace::build(
+            &request.path,
+            &image,
+            &argv,
+            &mut self.mapper,
+            &mut self.frame_allocator,
+            self.physical_memory_offset,
+        )?;
+        let page_table_address = address_space.page_table_frame.start_address().as_u64();
+        let new_entry_point = address_space.entry_point;
+        let new_path = core::mem::take(&mut request.path);
+        let mut closed_pipes = [None; MAX_OPEN_FILES];
+
+        let commit = cpu_interrupts::without_interrupts(|| {
+            if !scheduler::replace_process_image(process_id, context_pointer, page_table_address) {
+                return Err(Error::Scheduler(scheduler::InitError::InvalidUserContext));
+            }
+
+            let context = SavedContext {
+                r15: 0,
+                r14: 0,
+                r13: 0,
+                r12: 0,
+                r11: 0,
+                r10: 0,
+                r9: 0,
+                r8: 0,
+                rbp: 0,
+                rdi: 0,
+                rsi: 0,
+                rdx: 0,
+                rcx: 0,
+                rbx: 0,
+                rax: 0,
+                rip: new_entry_point,
+                cs: u64::from(gdt::user_code_selector()),
+                rflags: USER_RFLAGS,
+                stack_pointer: address_space.stack_pointer,
+                stack_segment: u64::from(gdt::user_data_selector()),
+            };
+            unsafe { (context_pointer as *mut SavedContext).write(context) };
+
+            let mut manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .process_mut(process_id)
+                .expect("exec process disappeared after scheduler replacement");
+            let old_path = core::mem::replace(&mut process.path, new_path);
+            let old_frames = core::mem::replace(
+                &mut process.owned_frames,
+                core::mem::take(&mut address_space.owned_frames),
+            );
+            process.page_table_address = page_table_address;
+            process.entry_point = new_entry_point;
+            process.mapped_pages = address_space.pages.len();
+            process.load_segments = image.load_segments().len();
+            process.guard_page_address = address_space.guard_page_address;
+            process.ranges = core::mem::take(&mut address_space.ranges);
+            process.pages = core::mem::take(&mut address_space.pages);
+            process.pending_exec = None;
+            process.exec_count = process.exec_count.saturating_add(1);
+
+            let open_before = process.open_files.len();
+            process.open_files.retain(|file| !file.close_on_exec);
+            let closed_files = open_before.saturating_sub(process.open_files.len());
+            let mut closed_pipe_count = 0usize;
+            let mut index = 0usize;
+            while index < process.pipe_descriptors.len() {
+                if process.pipe_descriptors[index].close_on_exec {
+                    closed_pipes[closed_pipe_count] = Some(process.pipe_descriptors.remove(index));
+                    closed_pipe_count = closed_pipe_count.saturating_add(1);
+                } else {
+                    index = index.saturating_add(1);
+                }
+            }
+            let closed_descriptors = closed_files.saturating_add(closed_pipe_count);
+            process.close_count = process
+                .close_count
+                .saturating_add(closed_descriptors as u64);
+            process.pipe_descriptor_close_count = process
+                .pipe_descriptor_close_count
+                .saturating_add(closed_pipe_count as u64);
+            process.close_on_exec_count = process
+                .close_on_exec_count
+                .saturating_add(closed_descriptors as u64);
+            process.exec_frames_reclaimed = process
+                .exec_frames_reclaimed
+                .saturating_add(old_frames.len() as u64);
+            manager.execs = manager.execs.saturating_add(1);
+            manager.frames_reclaimed = manager
+                .frames_reclaimed
+                .saturating_add(old_frames.len() as u64);
+            Ok((old_path, old_frames, closed_pipe_count, closed_descriptors))
+        });
+        let (old_path, mut old_frames, closed_pipe_count, closed_descriptors) = match commit {
+            Ok(committed) => committed,
+            Err(error) => {
+                for frame in address_space.owned_frames.drain(..) {
+                    self.frame_allocator.deallocate_frame(frame);
+                }
+                return Err(error);
+            }
+        };
+
+        for descriptor in closed_pipes.into_iter().take(closed_pipe_count).flatten() {
+            match descriptor.direction {
+                PipeDirection::Reader => {
+                    let _ = pipe::close_reader(descriptor.pipe_id);
+                }
+                PipeDirection::Writer => {
+                    let _ = pipe::close_writer(descriptor.pipe_id);
+                }
+            }
+        }
+        let reclaimed_frames = old_frames.len();
+        for frame in old_frames.drain(..) {
+            self.frame_allocator.deallocate_frame(frame);
+        }
+        crate::serial_println!(
+            "userspace process image replaced: pid={}, old={}, new={}, entry={:#018x}, closed={}, frames_reclaimed={}",
+            process_id,
+            old_path,
+            process_path(process_id),
+            new_entry_point,
+            closed_descriptors,
+            reclaimed_frames
+        );
+        let should_wake = {
+            let mut manager = PROCESS_MANAGER.lock();
+            manager.process_mut(process_id).is_some_and(|process| {
+                if process.state == ProcessState::Blocked {
+                    process.make_runnable();
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        if should_wake {
+            assert!(
+                scheduler::wake_process(process_id),
+                "exec process task disappeared before wakeup"
+            );
+        }
+        Ok(())
+    }
+
+    fn service_exec_requests(&mut self) -> Result<usize, Error> {
+        let requests: Vec<(u64, PendingExec)> = cpu_interrupts::without_interrupts(|| {
+            PROCESS_MANAGER
+                .lock()
+                .processes
+                .iter()
+                .filter_map(|process| {
+                    process
+                        .pending_exec
+                        .clone()
+                        .map(|request| (process.process_id, request))
+                })
+                .collect()
+        });
+        let mut completed = 0usize;
+        for (process_id, request) in requests {
+            match self.replace_process_image(process_id, request.clone()) {
+                Ok(()) => {
+                    completed = completed.saturating_add(1);
+                }
+                Err(error) => {
+                    let return_value = error_return(process_error_number(&error));
+                    let should_wake = cpu_interrupts::without_interrupts(|| {
+                        let mut manager = PROCESS_MANAGER.lock();
+                        let Some(process) = manager.process_mut(process_id) else {
+                            return false;
+                        };
+                        if process.state != ProcessState::Blocked || process.pending_exec.is_none()
+                        {
+                            return false;
+                        }
+                        let registers =
+                            unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
+                        registers.rax = return_value;
+                        process.pending_exec = None;
+                        process.make_runnable();
+                        process.exec_failure_count = process.exec_failure_count.saturating_add(1);
+                        manager.exec_failures = manager.exec_failures.saturating_add(1);
+                        true
+                    });
+                    if should_wake && !scheduler::wake_process(process_id) {
+                        return Err(Error::ProcessNotFound(process_id));
+                    }
+                    crate::serial_println!(
+                        "userspace process exec failed: pid={}, path={}, error={}",
+                        process_id,
+                        request.path,
+                        error
+                    );
+                    completed = completed.saturating_add(1);
+                }
+            }
+        }
+        Ok(completed)
+    }
+
     pub fn wait(&mut self, process_id: u64) -> Result<ProcessResult, Error> {
         loop {
             self.poll()?;
@@ -1785,6 +2078,7 @@ impl Runtime {
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;
         self.service_child_requests()?;
+        self.service_exec_requests()?;
         Ok(reaped)
     }
 
@@ -1913,6 +2207,33 @@ impl Runtime {
 
     pub fn reap(&mut self) -> Result<usize, Error> {
         self.poll()
+    }
+
+    pub fn wait_until_process_path(&mut self, process_id: u64, path: &str) -> Result<(), Error> {
+        loop {
+            self.poll()?;
+            let (active_match, exists, completed_match) =
+                cpu_interrupts::without_interrupts(|| {
+                    let manager = PROCESS_MANAGER.lock();
+                    let active = manager
+                        .processes
+                        .iter()
+                        .find(|process| process.process_id == process_id);
+                    let active_match = active.is_some_and(|process| process.path == path);
+                    let completed_match = manager
+                        .completed
+                        .iter()
+                        .any(|result| result.process_id == process_id && result.path == path);
+                    (active_match, active.is_some(), completed_match)
+                });
+            if active_match || completed_match {
+                return Ok(());
+            }
+            if !exists {
+                return Err(Error::ProcessNotFound(process_id));
+            }
+            hlt();
+        }
     }
 
     pub fn wait_until_blocked(&mut self, process_id: u64) -> Result<(), Error> {
@@ -2353,6 +2674,24 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             registers.rax = syscall_seek(process_id, registers.rdi, registers.rsi, registers.rdx);
             current_stack_pointer
         }
+        SYSCALL_EXECVE => {
+            match syscall_execve(
+                process_id,
+                registers.rdi,
+                registers.rsi,
+                current_stack_pointer,
+            ) {
+                ControlOutcome::Ready(result) => {
+                    registers.rax = result;
+                    current_stack_pointer
+                }
+                ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+            }
+        }
+        SYSCALL_SET_DESCRIPTOR_FLAGS => {
+            registers.rax = syscall_set_descriptor_flags(process_id, registers.rdi, registers.rsi);
+            current_stack_pointer
+        }
         SYSCALL_EXIT => {
             let exit_code = registers.rdi;
             {
@@ -2562,7 +2901,10 @@ fn syscall_spawn_command(
     {
         return ControlOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
     }
-    if process.pending_child_spawn.is_some() || process.pending_child_wait.is_some() {
+    if process.pending_child_spawn.is_some()
+        || process.pending_child_wait.is_some()
+        || process.pending_exec.is_some()
+    {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
     process.pending_child_spawn = Some(PendingChildSpawn {
@@ -2578,6 +2920,71 @@ fn syscall_spawn_command(
     });
     process.state = ProcessState::Blocked;
     ControlOutcome::Blocked
+}
+
+fn syscall_execve(
+    process_id: u64,
+    address: u64,
+    length: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
+    let command = match user_text(process_id, address, length, MAX_COMMAND_BYTES) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let (path, arguments) = match parse_command_line(&command) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return ControlOutcome::Ready(error_return(ERR_NO_PROCESS));
+    };
+    if process.pending_terminal_read.is_some()
+        || process.pending_pipe_read.is_some()
+        || process.pending_pipe_write.is_some()
+        || process.pending_child_spawn.is_some()
+        || process.pending_child_wait.is_some()
+        || process.pending_exec.is_some()
+    {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_exec = Some(PendingExec {
+        path,
+        arguments,
+        stack_pointer: current_stack_pointer,
+    });
+    process.state = ProcessState::Blocked;
+    ControlOutcome::Blocked
+}
+
+fn syscall_set_descriptor_flags(process_id: u64, descriptor: u64, flags: u64) -> u64 {
+    if descriptor < 3 || flags & !DESCRIPTOR_ALLOWED_FLAGS != 0 {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    let close_on_exec = flags & DESCRIPTOR_CLOSE_ON_EXEC != 0;
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+    };
+    if let Some(file) = process
+        .open_files
+        .iter_mut()
+        .find(|file| file.descriptor == descriptor)
+    {
+        file.close_on_exec = close_on_exec;
+        return 0;
+    }
+    if let Some(pipe) = process
+        .pipe_descriptors
+        .iter_mut()
+        .find(|pipe| pipe.descriptor == descriptor)
+    {
+        pipe.close_on_exec = close_on_exec;
+        return 0;
+    }
+    error_return(ERR_BAD_FILE_DESCRIPTOR)
 }
 
 fn syscall_pipe_pair(process_id: u64) -> u64 {
@@ -2618,11 +3025,13 @@ fn syscall_pipe_pair(process_id: u64) -> u64 {
                 descriptor: reader_descriptor,
                 pipe_id,
                 direction: PipeDirection::Reader,
+                close_on_exec: false,
             });
             process.pipe_descriptors.push(PipeDescriptor {
                 descriptor: writer_descriptor,
                 pipe_id,
                 direction: PipeDirection::Writer,
+                close_on_exec: false,
             });
             process.pipe_pair_count = process.pipe_pair_count.saturating_add(1);
             true
@@ -2670,7 +3079,10 @@ fn syscall_wait_child(
     let Some(process) = manager.process_mut(process_id) else {
         return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
     };
-    if process.pending_child_spawn.is_some() || process.pending_child_wait.is_some() {
+    if process.pending_child_spawn.is_some()
+        || process.pending_child_wait.is_some()
+        || process.pending_exec.is_some()
+    {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
     process.pending_child_wait = Some(PendingChildWait {
@@ -3065,7 +3477,9 @@ fn note_child_wait(manager: &mut ProcessManager, parent_process_id: u64) {
 
 fn process_error_number(error: &Error) -> i64 {
     match error {
-        Error::Vfs(vfs::Error::NotFound) => ERR_NO_ENTRY,
+        Error::Vfs(vfs::Error::NotFound) | Error::Elf(elf::Error::Vfs(vfs::Error::NotFound)) => {
+            ERR_NO_ENTRY
+        }
         Error::InvalidArgument | Error::TooManyArguments | Error::ArgumentBytesTooLarge => {
             ERR_INVALID_ARGUMENT
         }
@@ -3279,7 +3693,7 @@ fn user_text(process_id: u64, address: u64, length: u64, maximum: usize) -> Resu
     Ok(String::from(text))
 }
 
-fn decode_open_options(mut flags: u64) -> Result<vfs::OpenOptions, i64> {
+fn decode_open_options(mut flags: u64) -> Result<(vfs::OpenOptions, bool), i64> {
     if flags == 0 {
         flags = OPEN_READ;
     }
@@ -3299,11 +3713,11 @@ fn decode_open_options(mut flags: u64) -> Result<vfs::OpenOptions, i64> {
     {
         return Err(ERR_INVALID_ARGUMENT);
     }
-    Ok(o)
+    Ok((o, flags & OPEN_CLOSE_ON_EXEC != 0))
 }
 fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
-    let options = match decode_open_options(flags) {
-        Ok(o) => o,
+    let (options, close_on_exec) = match decode_open_options(flags) {
+        Ok(decoded) => decoded,
         Err(e) => return error_return(e),
     };
     let path = match user_string(process_id, address, length) {
@@ -3342,7 +3756,11 @@ fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
     if descriptor_in_use(p, descriptor) {
         return error_return(ERR_TOO_MANY_OPEN_FILES);
     }
-    p.open_files.push(OpenFile { descriptor, handle });
+    p.open_files.push(OpenFile {
+        descriptor,
+        handle,
+        close_on_exec,
+    });
     p.open_count = p.open_count.saturating_add(1);
     descriptor
 }

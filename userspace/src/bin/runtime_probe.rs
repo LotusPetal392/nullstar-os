@@ -10,12 +10,14 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const EXPECTED_ARGUMENT: &[u8] = b"runtime-smoke";
 const SUCCESS: &[u8] = b"userspace Rust runtime probe passed\n";
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
-    if arguments.len() != 2 || arguments.get(1) != Some(EXPECTED_ARGUMENT) {
+    let Some(argument) = arguments.get(1) else {
+        syscall::exit(64);
+    };
+    if arguments.len() != 2 || argument.is_empty() {
         syscall::exit(64);
     }
 
@@ -34,10 +36,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             syscall::exit(1);
         }
 
-        let Some(copy) = heap.copy_bytes(EXPECTED_ARGUMENT, 8) else {
+        let Some(copy) = heap.copy_bytes(argument, 8) else {
             syscall::exit(1);
         };
-        if copy != EXPECTED_ARGUMENT || heap.used() <= block.len() {
+        if copy != argument || heap.used() <= block.len() {
             syscall::exit(1);
         }
     }

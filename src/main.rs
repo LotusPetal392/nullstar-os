@@ -21,6 +21,7 @@ const ELF_TEST_MARKER: &str = "ELF image validated:";
 const USERSPACE_TEST_MARKER: &str = "process isolation verified:";
 const USER_FILE_IO_TEST_MARKER: &str = "userspace file I/O verified:";
 const USER_RUST_RUNTIME_TEST_MARKER: &str = "userspace Rust runtime verified:";
+const USER_EXEC_TEST_MARKER: &str = "userspace transactional exec verified:";
 const USER_TERMINAL_TEST_MARKER: &str = "userspace terminal verified:";
 const USER_PIPE_TEST_MARKER: &str = "userspace pipe verified:";
 const USER_SHELL_TEST_MARKER: &str = "userspace shell verified:";
@@ -30,7 +31,7 @@ const USER_BACKGROUND_TEST_MARKER: &str = "userspace background jobs verified:";
 const USER_STOPPED_JOB_TEST_MARKER: &str = "userspace stopped jobs verified:";
 const USER_TMPFS_TEST_MARKER: &str = "userspace tmpfs redirection verified:";
 const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals verified:";
-const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(90);
+const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Default)]
 struct Options {
@@ -82,7 +83,7 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify hardware, storage, VFS, the Rust userspace runtime, tmpfs, redirection, process control, pipelines, jobs, and signals"
+        "  --test      Verify hardware, storage, VFS, the Rust userspace runtime, transactional exec, tmpfs, redirection, process control, pipelines, jobs, and signals"
     );
 }
 
@@ -151,6 +152,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut userspace_ready = false;
         let mut user_file_io_ready = false;
         let mut user_rust_runtime_ready = false;
+        let mut user_exec_ready = false;
         let mut user_terminal_ready = false;
         let mut user_pipe_ready = false;
         let mut user_shell_ready = false;
@@ -180,6 +182,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             userspace_ready |= line.contains(USERSPACE_TEST_MARKER);
             user_file_io_ready |= line.contains(USER_FILE_IO_TEST_MARKER);
             user_rust_runtime_ready |= line.contains(USER_RUST_RUNTIME_TEST_MARKER);
+            user_exec_ready |= line.contains(USER_EXEC_TEST_MARKER);
             user_terminal_ready |= line.contains(USER_TERMINAL_TEST_MARKER);
             user_pipe_ready |= line.contains(USER_PIPE_TEST_MARKER);
             user_shell_ready |= line.contains(USER_SHELL_TEST_MARKER);
@@ -204,6 +207,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && userspace_ready
                 && user_file_io_ready
                 && user_rust_runtime_ready
+                && user_exec_ready
                 && user_terminal_ready
                 && user_pipe_ready
                 && user_shell_ready

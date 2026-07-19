@@ -75,3 +75,21 @@ name = "stderr_probe"
 path = "src/bin/stderr_probe.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "exec"
+path = "src/bin/exec.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "exec_source"
+path = "src/bin/exec_source.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "exec_target"
+path = "src/bin/exec_target.rs"
+test = false
+bench = false

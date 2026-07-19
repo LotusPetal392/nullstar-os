@@ -54,6 +54,18 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_stderr_probe")
             .expect("userspace stderr-probe artifact path was not set"),
     );
+    let userspace_exec = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_exec")
+            .expect("userspace exec launcher artifact path was not set"),
+    );
+    let userspace_exec_source = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_exec_source")
+            .expect("userspace exec-source artifact path was not set"),
+    );
+    let userspace_exec_target = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_exec_target")
+            .expect("userspace exec-target artifact path was not set"),
+    );
     let userspace_shell = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_ush")
             .expect("userspace shell artifact path was not set"),
@@ -74,6 +86,9 @@ fn main() {
     image.set_file(String::from("signal-probe"), userspace_signal_probe);
     image.set_file(String::from("runtime-probe"), userspace_runtime_probe);
     image.set_file(String::from("stderr-probe"), userspace_stderr_probe);
+    image.set_file(String::from("exec"), userspace_exec);
+    image.set_file(String::from("exec-source"), userspace_exec_source);
+    image.set_file(String::from("exec-target"), userspace_exec_target);
     image.set_file(String::from("ush"), userspace_shell);
     image.set_file(String::from("hello.txt"), hello_text);
     image
