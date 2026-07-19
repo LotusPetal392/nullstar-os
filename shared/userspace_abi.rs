@@ -18,11 +18,21 @@ pub mod syscall {
     pub const PIPE_PAIR: u64 = 10;
     pub const TRY_WAIT_CHILD: u64 = 11;
     pub const SIGNAL_PROCESS_GROUP: u64 = 12;
+    pub const FOREGROUND_PROCESS_GROUP: u64 = 13;
 }
 
 pub mod signal {
     pub const INTERRUPT: u64 = 2;
     pub const TERMINATE: u64 = 15;
+    pub const CONTINUE: u64 = 18;
+    pub const STOP: u64 = 19;
+    pub const TERMINAL_STOP: u64 = 20;
+}
+
+pub mod child_status {
+    pub const SIGNAL_BASE: u64 = 128;
+    pub const STOPPED_BASE: u64 = 0x100;
+    pub const CONTINUED: u64 = 0x200;
 }
 
 pub mod spawn {

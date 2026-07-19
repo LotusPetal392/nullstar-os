@@ -55,9 +55,13 @@ const SYSCALL_GETPID: u64 = abi::syscall::GETPID;
 const SYSCALL_PIPE_PAIR: u64 = abi::syscall::PIPE_PAIR;
 const SYSCALL_TRY_WAIT_CHILD: u64 = abi::syscall::TRY_WAIT_CHILD;
 const SYSCALL_SIGNAL_PROCESS_GROUP: u64 = abi::syscall::SIGNAL_PROCESS_GROUP;
+const SYSCALL_FOREGROUND_PROCESS_GROUP: u64 = abi::syscall::FOREGROUND_PROCESS_GROUP;
 
 pub const SIGNAL_INTERRUPT: u64 = abi::signal::INTERRUPT;
 pub const SIGNAL_TERMINATE: u64 = abi::signal::TERMINATE;
+pub const SIGNAL_CONTINUE: u64 = abi::signal::CONTINUE;
+pub const SIGNAL_STOP: u64 = abi::signal::STOP;
+pub const SIGNAL_TERMINAL_STOP: u64 = abi::signal::TERMINAL_STOP;
 
 const USER_MIN_ADDRESS: u64 = 0x0001_0000;
 const USER_PML4_SLOT_END: u64 = 0x0000_0080_0000_0000;
@@ -249,6 +253,7 @@ unsafe extern "C" {
 pub enum ProcessState {
     Runnable,
     Blocked,
+    Stopped,
     Exited,
     Faulted,
     Signaled,
@@ -259,6 +264,7 @@ impl fmt::Display for ProcessState {
         match self {
             Self::Runnable => formatter.write_str("runnable"),
             Self::Blocked => formatter.write_str("blocked"),
+            Self::Stopped => formatter.write_str("stopped"),
             Self::Exited => formatter.write_str("exited"),
             Self::Faulted => formatter.write_str("faulted"),
             Self::Signaled => formatter.write_str("signaled"),
@@ -333,6 +339,8 @@ pub struct ProcessResult {
     pub child_poll_pending_count: u64,
     pub signal_sent_count: u64,
     pub signal_received_count: u64,
+    pub stop_count: u64,
+    pub continue_count: u64,
     pub pipe_pair_count: u64,
     pub pipe_descriptor_close_count: u64,
     pub pipe_descriptor_inherit_count: u64,
@@ -370,10 +378,13 @@ pub struct ManagerSnapshot {
     pub child_spawns: u64,
     pub child_waits: u64,
     pub signals_sent: u64,
+    pub stop_deliveries: u64,
+    pub continue_deliveries: u64,
     pub pipe_pairs: u64,
     pub pipe_descriptor_inherits: u64,
     pub active: usize,
     pub blocked: usize,
+    pub stopped: usize,
     pub exited: u64,
     pub faulted: u64,
     pub signaled: u64,
@@ -398,6 +409,9 @@ pub struct SpawnInfo {
 pub struct ProcessGroupInfo {
     pub process_group_id: u64,
     pub process_ids: Vec<u64>,
+    pub runnable: usize,
+    pub blocked: usize,
+    pub stopped: usize,
 }
 
 #[derive(Debug)]
@@ -609,6 +623,9 @@ struct Process {
     task_id: u64,
     path: String,
     state: ProcessState,
+    stopped_resume_state: Option<ProcessState>,
+    last_stop_signal: Option<u64>,
+    pending_parent_status: Option<u64>,
     termination: Option<TerminationReason>,
     page_table_address: u64,
     entry_point: u64,
@@ -651,12 +668,62 @@ struct Process {
     child_poll_pending_count: u64,
     signal_sent_count: u64,
     signal_received_count: u64,
+    stop_count: u64,
+    continue_count: u64,
     pipe_pair_count: u64,
     pipe_descriptor_close_count: u64,
     pipe_descriptor_inherit_count: u64,
 }
 
 impl Process {
+    fn is_live(&self) -> bool {
+        matches!(
+            self.state,
+            ProcessState::Runnable | ProcessState::Blocked | ProcessState::Stopped
+        )
+    }
+
+    fn make_runnable(&mut self) {
+        match self.state {
+            ProcessState::Blocked => self.state = ProcessState::Runnable,
+            ProcessState::Stopped if self.stopped_resume_state == Some(ProcessState::Blocked) => {
+                self.stopped_resume_state = Some(ProcessState::Runnable);
+            }
+            _ => {}
+        }
+    }
+
+    fn stop(&mut self, signal: u64) -> bool {
+        if !matches!(self.state, ProcessState::Runnable | ProcessState::Blocked) {
+            return false;
+        }
+        self.stopped_resume_state = Some(self.state);
+        self.state = ProcessState::Stopped;
+        self.last_stop_signal = Some(signal);
+        self.pending_parent_status = Some(stopped_child_status(signal));
+        self.signal_received_count = self.signal_received_count.saturating_add(1);
+        self.stop_count = self.stop_count.saturating_add(1);
+        true
+    }
+
+    fn continue_running(&mut self) -> bool {
+        if self.state != ProcessState::Stopped {
+            return false;
+        }
+        self.state = self
+            .stopped_resume_state
+            .take()
+            .unwrap_or(ProcessState::Runnable);
+        self.pending_parent_status = Some(abi::child_status::CONTINUED);
+        self.signal_received_count = self.signal_received_count.saturating_add(1);
+        self.continue_count = self.continue_count.saturating_add(1);
+        true
+    }
+
+    fn take_parent_status(&mut self) -> Option<u64> {
+        self.pending_parent_status.take()
+    }
+
     fn result(
         &self,
         frames_reclaimed: usize,
@@ -704,6 +771,8 @@ impl Process {
             child_poll_pending_count: self.child_poll_pending_count,
             signal_sent_count: self.signal_sent_count,
             signal_received_count: self.signal_received_count,
+            stop_count: self.stop_count,
+            continue_count: self.continue_count,
             pipe_pair_count: self.pipe_pair_count,
             pipe_descriptor_close_count: self.pipe_descriptor_close_count,
             pipe_descriptor_inherit_count: self.pipe_descriptor_inherit_count,
@@ -722,6 +791,8 @@ struct ProcessManager {
     child_spawns: u64,
     child_waits: u64,
     signals_sent: u64,
+    stop_deliveries: u64,
+    continue_deliveries: u64,
     pipe_pairs: u64,
     pipe_descriptor_inherits: u64,
     exited: u64,
@@ -741,6 +812,8 @@ impl ProcessManager {
             child_spawns: 0,
             child_waits: 0,
             signals_sent: 0,
+            stop_deliveries: 0,
+            continue_deliveries: 0,
             pipe_pairs: 0,
             pipe_descriptor_inherits: 0,
             exited: 0,
@@ -777,6 +850,8 @@ impl ProcessManager {
             child_spawns: self.child_spawns,
             child_waits: self.child_waits,
             signals_sent: self.signals_sent,
+            stop_deliveries: self.stop_deliveries,
+            continue_deliveries: self.continue_deliveries,
             pipe_pairs: self.pipe_pairs,
             pipe_descriptor_inherits: self.pipe_descriptor_inherits,
             active: self
@@ -785,7 +860,7 @@ impl ProcessManager {
                 .filter(|process| {
                     matches!(
                         process.state,
-                        ProcessState::Runnable | ProcessState::Blocked
+                        ProcessState::Runnable | ProcessState::Blocked | ProcessState::Stopped
                     )
                 })
                 .count(),
@@ -793,6 +868,11 @@ impl ProcessManager {
                 .processes
                 .iter()
                 .filter(|process| process.state == ProcessState::Blocked)
+                .count(),
+            stopped: self
+                .processes
+                .iter()
+                .filter(|process| process.state == ProcessState::Stopped)
                 .count(),
             exited: self.exited,
             faulted: self.faulted,
@@ -1188,6 +1268,9 @@ fn spawn_with_mode(
         task_id: 0,
         path: path.to_string(),
         state: ProcessState::Runnable,
+        stopped_resume_state: None,
+        last_stop_signal: None,
+        pending_parent_status: None,
         termination: None,
         page_table_address,
         entry_point: address_space.entry_point,
@@ -1230,6 +1313,8 @@ fn spawn_with_mode(
         child_poll_pending_count: 0,
         signal_sent_count: 0,
         signal_received_count: 0,
+        stop_count: 0,
+        continue_count: 0,
         pipe_pair_count: 0,
         pipe_descriptor_close_count: 0,
         pipe_descriptor_inherit_count: 0,
@@ -1458,10 +1543,7 @@ impl Runtime {
                     let group_owned = manager.processes.iter().any(|process| {
                         process.parent_process_id == Some(parent_process_id)
                             && process.process_group_id == group_id
-                            && matches!(
-                                process.state,
-                                ProcessState::Runnable | ProcessState::Blocked
-                            )
+                            && process.is_live()
                     });
                     if !group_owned {
                         return Err(Error::InvalidProcessGroup(group_id));
@@ -1577,7 +1659,7 @@ impl Runtime {
 
     pub fn poll(&mut self) -> Result<usize, Error> {
         terminal::poll_keyboard();
-        service_terminal_interrupt();
+        service_terminal_control();
         let reaped = reap(&mut self.frame_allocator)?;
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;
@@ -1615,7 +1697,7 @@ impl Runtime {
                 let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
                 registers.rax = return_value;
                 process.pending_child_spawn = None;
-                process.state = ProcessState::Runnable;
+                process.make_runnable();
                 if (return_value as i64) >= 0 {
                     process.child_spawn_count = process.child_spawn_count.saturating_add(1);
                     manager.child_spawns = manager.child_spawns.saturating_add(1);
@@ -1643,38 +1725,54 @@ impl Runtime {
                     .collect()
             });
         for (parent_process_id, request) in wait_requests {
-            let result = cpu_interrupts::without_interrupts(|| {
-                PROCESS_MANAGER
-                    .lock()
+            let serviced = cpu_interrupts::without_interrupts(|| -> Result<bool, Error> {
+                let mut manager = PROCESS_MANAGER.lock();
+                let final_status = manager
                     .completed
                     .iter()
                     .find(|result| {
                         result.process_id == request.child_process_id
                             && result.parent_process_id == Some(parent_process_id)
                     })
-                    .cloned()
-            });
-            let Some(result) = result else {
-                continue;
-            };
-            cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
-                let mut manager = PROCESS_MANAGER.lock();
-                let process = manager
-                    .process_mut(parent_process_id)
+                    .map(child_status);
+                let status = if final_status.is_some() {
+                    final_status
+                } else {
+                    manager
+                        .processes
+                        .iter_mut()
+                        .find(|process| {
+                            process.process_id == request.child_process_id
+                                && process.parent_process_id == Some(parent_process_id)
+                        })
+                        .and_then(Process::take_parent_status)
+                };
+                let Some(status) = status else {
+                    return Ok(false);
+                };
+                let parent_index = manager
+                    .processes
+                    .iter()
+                    .position(|process| process.process_id == parent_process_id)
                     .ok_or(Error::ProcessNotFound(parent_process_id))?;
                 let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
-                registers.rax = child_status(&result);
-                process.pending_child_wait = None;
-                process.state = ProcessState::Runnable;
-                process.child_wait_count = process.child_wait_count.saturating_add(1);
+                registers.rax = status;
+                {
+                    let parent = &mut manager.processes[parent_index];
+                    parent.pending_child_wait = None;
+                    parent.make_runnable();
+                    parent.child_wait_count = parent.child_wait_count.saturating_add(1);
+                }
                 manager.child_waits = manager.child_waits.saturating_add(1);
                 drop(manager);
                 if !scheduler::wake_process(parent_process_id) {
                     return Err(Error::ProcessNotFound(parent_process_id));
                 }
-                Ok(())
+                Ok(true)
             })?;
-            completed = completed.saturating_add(1);
+            if serviced {
+                completed = completed.saturating_add(1);
+            }
         }
         Ok(completed)
     }
@@ -1685,7 +1783,7 @@ impl Runtime {
 
     pub fn handle_terminal_key(&mut self, key: pc_keyboard::DecodedKey) -> Result<bool, Error> {
         let handled = terminal::handle_key(key);
-        let signaled = service_terminal_interrupt();
+        let signaled = service_terminal_control();
         if handled && signaled == 0 {
             service_terminal_reads(self.physical_memory_offset)?;
         }
@@ -1799,6 +1897,42 @@ impl Runtime {
         }
     }
 
+    pub fn wait_until_child_group_stopped(
+        &mut self,
+        parent_process_id: u64,
+        process_group_id: u64,
+        minimum_members: usize,
+    ) -> Result<ProcessGroupInfo, Error> {
+        loop {
+            self.poll()?;
+            if let Some(info) = child_group_info(parent_process_id, process_group_id) {
+                if info.process_ids.len() >= minimum_members
+                    && info.stopped == info.process_ids.len()
+                {
+                    return Ok(info);
+                }
+            }
+            hlt();
+        }
+    }
+
+    pub fn wait_until_child_group_resumed(
+        &mut self,
+        parent_process_id: u64,
+        process_group_id: u64,
+        minimum_members: usize,
+    ) -> Result<ProcessGroupInfo, Error> {
+        loop {
+            self.poll()?;
+            if let Some(info) = child_group_info(parent_process_id, process_group_id) {
+                if info.process_ids.len() >= minimum_members && info.stopped == 0 {
+                    return Ok(info);
+                }
+            }
+            hlt();
+        }
+    }
+
     pub fn wait_for_child_group(
         &mut self,
         parent_process_id: u64,
@@ -1831,8 +1965,20 @@ impl Runtime {
     }
 
     pub fn inject_terminal_interrupt(&mut self) -> Result<usize, Error> {
-        terminal::handle_key(pc_keyboard::DecodedKey::Unicode('\u{3}'));
-        Ok(service_terminal_interrupt())
+        self.inject_terminal_control(pc_keyboard::DecodedKey::Unicode('\u{3}'))
+    }
+
+    pub fn inject_terminal_suspend(&mut self) -> Result<usize, Error> {
+        self.inject_terminal_control(pc_keyboard::DecodedKey::Unicode('\u{1a}'))
+    }
+
+    fn inject_terminal_control(&mut self, key: pc_keyboard::DecodedKey) -> Result<usize, Error> {
+        terminal::handle_key(key);
+        let delivered = service_terminal_control();
+        if delivered == 0 {
+            service_terminal_reads(self.physical_memory_offset)?;
+        }
+        Ok(delivered)
     }
 
     pub fn inject_terminal_line(&mut self, line: &str) -> Result<usize, Error> {
@@ -1918,7 +2064,7 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
                 .processes
                 .iter()
                 .any(|candidate| candidate.process_id == parent_process_id);
-            if parent_exists {
+            if parent_exists && terminal::foreground_process() != Some(parent_process_id) {
                 let _ = terminal::attach(parent_process_id);
             }
         }
@@ -2078,6 +2224,10 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
         }
         SYSCALL_SIGNAL_PROCESS_GROUP => {
             registers.rax = syscall_signal_process_group(process_id, registers.rdi, registers.rsi);
+            current_stack_pointer
+        }
+        SYSCALL_FOREGROUND_PROCESS_GROUP => {
+            registers.rax = syscall_foreground_process_group(process_id, registers.rdi);
             current_stack_pointer
         }
         SYSCALL_EXIT => {
@@ -2366,26 +2516,29 @@ fn syscall_wait_child(
     current_stack_pointer: usize,
 ) -> ControlOutcome {
     let mut manager = PROCESS_MANAGER.lock();
-    if let Some(result) = manager
+    let final_status = manager
         .completed
         .iter()
         .find(|result| {
             result.process_id == child_process_id && result.parent_process_id == Some(process_id)
         })
-        .cloned()
-    {
-        if let Some(process) = manager.process_mut(process_id) {
-            process.child_wait_count = process.child_wait_count.saturating_add(1);
-        }
-        manager.child_waits = manager.child_waits.saturating_add(1);
-        return ControlOutcome::Ready(child_status(&result));
+        .map(child_status);
+    if let Some(status) = final_status {
+        note_child_wait(&mut manager, process_id);
+        return ControlOutcome::Ready(status);
     }
-    let child_exists = manager.processes.iter().any(|child| {
+
+    let child_index = manager.processes.iter().position(|child| {
         child.process_id == child_process_id && child.parent_process_id == Some(process_id)
     });
-    if !child_exists {
+    let Some(child_index) = child_index else {
         return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
+    };
+    if let Some(status) = manager.processes[child_index].take_parent_status() {
+        note_child_wait(&mut manager, process_id);
+        return ControlOutcome::Ready(status);
     }
+
     let Some(process) = manager.process_mut(process_id) else {
         return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
     };
@@ -2409,14 +2562,20 @@ fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {
             result.process_id == child_process_id && result.parent_process_id == Some(process_id)
         })
         .cloned();
-    let active = manager.processes.iter().any(|child| {
-        child.process_id == child_process_id && child.parent_process_id == Some(process_id)
+    let active_child = manager.processes.iter().find(|child| {
+        child.process_id == child_process_id
+            && child.parent_process_id == Some(process_id)
+            && child.is_live()
     });
-    if completed.is_none() && !active {
+    if completed.is_none() && active_child.is_none() {
         return error_return(ERR_NO_CHILD);
     }
+    let stopped_status = active_child.and_then(|child| {
+        (child.state == ProcessState::Stopped)
+            .then(|| stopped_child_status(child.last_stop_signal.unwrap_or(SIGNAL_STOP)))
+    });
 
-    let pending = completed.is_none();
+    let pending = completed.is_none() && stopped_status.is_none();
     let Some(process) = manager.process_mut(process_id) else {
         return error_return(ERR_NO_CHILD);
     };
@@ -2428,6 +2587,7 @@ fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {
     completed
         .as_ref()
         .map(child_status)
+        .or(stopped_status)
         .unwrap_or_else(|| error_return(ERR_TRY_AGAIN))
 }
 
@@ -2438,24 +2598,44 @@ fn syscall_signal_process_group(process_id: u64, process_group_id: u64, signal: 
     }
 }
 
+fn syscall_foreground_process_group(process_id: u64, process_group_id: u64) -> u64 {
+    match foreground_process_group(process_id, process_group_id) {
+        Ok(count) => count as u64,
+        Err(error) => error_return(error),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignalAction {
+    Terminate,
+    Stop,
+    Continue,
+}
+
+fn signal_action(signal: u64) -> Option<SignalAction> {
+    match signal {
+        SIGNAL_INTERRUPT | SIGNAL_TERMINATE => Some(SignalAction::Terminate),
+        SIGNAL_STOP | SIGNAL_TERMINAL_STOP => Some(SignalAction::Stop),
+        SIGNAL_CONTINUE => Some(SignalAction::Continue),
+        _ => None,
+    }
+}
+
 fn deliver_signal_group(
     owner_process_id: Option<u64>,
     process_group_id: u64,
     signal: u64,
 ) -> Result<usize, i64> {
-    if signal != SIGNAL_INTERRUPT && signal != SIGNAL_TERMINATE {
+    let Some(action) = signal_action(signal) else {
         return Err(ERR_INVALID_ARGUMENT);
-    }
+    };
     let target_process_ids = {
         let manager = PROCESS_MANAGER.lock();
         if let Some(owner_process_id) = owner_process_id {
             let owned = manager.processes.iter().any(|process| {
                 process.parent_process_id == Some(owner_process_id)
                     && process.process_group_id == process_group_id
-                    && matches!(
-                        process.state,
-                        ProcessState::Runnable | ProcessState::Blocked
-                    )
+                    && process.is_live()
             });
             if !owned {
                 return Err(ERR_NO_CHILD);
@@ -2466,10 +2646,16 @@ fn deliver_signal_group(
             .iter()
             .filter(|process| {
                 process.process_group_id == process_group_id
-                    && matches!(
-                        process.state,
-                        ProcessState::Runnable | ProcessState::Blocked
-                    )
+                    && match action {
+                        SignalAction::Terminate => process.is_live(),
+                        SignalAction::Stop => {
+                            matches!(
+                                process.state,
+                                ProcessState::Runnable | ProcessState::Blocked
+                            )
+                        }
+                        SignalAction::Continue => process.state == ProcessState::Stopped,
+                    }
             })
             .map(|process| process.process_id)
             .collect::<Vec<_>>()
@@ -2478,23 +2664,41 @@ fn deliver_signal_group(
         return Err(ERR_NO_PROCESS);
     }
 
-    let mut terminated = Vec::new();
+    let mut delivered = Vec::new();
     for target_process_id in target_process_ids {
-        if scheduler::terminate_process(target_process_id) {
-            terminated.push(target_process_id);
+        let changed = match action {
+            SignalAction::Terminate => scheduler::terminate_process(target_process_id),
+            SignalAction::Stop => scheduler::stop_process(target_process_id),
+            SignalAction::Continue => scheduler::continue_process(target_process_id),
+        };
+        if changed {
+            delivered.push(target_process_id);
         }
     }
-    if terminated.is_empty() {
+    if delivered.is_empty() {
         return Err(ERR_NO_PROCESS);
     }
 
-    let count = terminated.len();
+    let count = delivered.len();
     let mut manager = PROCESS_MANAGER.lock();
-    for target_process_id in &terminated {
-        if let Some(process) = manager.process_mut(*target_process_id) {
-            process.state = ProcessState::Signaled;
-            process.termination = Some(TerminationReason::Signal(signal));
-            process.signal_received_count = process.signal_received_count.saturating_add(1);
+    for target_process_id in &delivered {
+        let Some(process) = manager.process_mut(*target_process_id) else {
+            continue;
+        };
+        match action {
+            SignalAction::Terminate => {
+                process.state = ProcessState::Signaled;
+                process.stopped_resume_state = None;
+                process.pending_parent_status = None;
+                process.termination = Some(TerminationReason::Signal(signal));
+                process.signal_received_count = process.signal_received_count.saturating_add(1);
+            }
+            SignalAction::Stop => {
+                let _ = process.stop(signal);
+            }
+            SignalAction::Continue => {
+                let _ = process.continue_running();
+            }
         }
     }
     if let Some(owner_process_id) = owner_process_id {
@@ -2503,8 +2707,20 @@ fn deliver_signal_group(
         }
     }
     manager.signals_sent = manager.signals_sent.saturating_add(count as u64);
-    manager.signaled = manager.signaled.saturating_add(count as u64);
+    match action {
+        SignalAction::Terminate => manager.signaled = manager.signaled.saturating_add(count as u64),
+        SignalAction::Stop => {
+            manager.stop_deliveries = manager.stop_deliveries.saturating_add(count as u64)
+        }
+        SignalAction::Continue => {
+            manager.continue_deliveries = manager.continue_deliveries.saturating_add(count as u64)
+        }
+    }
     drop(manager);
+
+    if action == SignalAction::Stop {
+        restore_group_terminal(process_group_id);
+    }
 
     crate::serial_println!(
         "userspace process group signaled: group={}, signal={}, processes={}",
@@ -2515,15 +2731,85 @@ fn deliver_signal_group(
     Ok(count)
 }
 
-fn service_terminal_interrupt() -> usize {
-    let Some(foreground_process_id) = terminal::take_interrupt() else {
+fn restore_group_terminal(process_group_id: u64) {
+    let Some(foreground_process_id) = terminal::foreground_process() else {
+        return;
+    };
+    let terminal_parent = PROCESS_MANAGER
+        .lock()
+        .processes
+        .iter()
+        .find(|process| {
+            process.process_id == foreground_process_id
+                && process.process_group_id == process_group_id
+        })
+        .and_then(|process| process.terminal_parent);
+    let Some(terminal_parent) = terminal_parent else {
+        return;
+    };
+    let _ = terminal::transfer(foreground_process_id, terminal_parent);
+}
+
+fn foreground_process_group(owner_process_id: u64, process_group_id: u64) -> Result<usize, i64> {
+    if !terminal::is_foreground(owner_process_id) {
+        return Err(ERR_IO);
+    }
+    let (foreground_process_id, active_count, stopped) = {
+        let manager = PROCESS_MANAGER.lock();
+        let members = manager
+            .processes
+            .iter()
+            .filter(|process| {
+                process.parent_process_id == Some(owner_process_id)
+                    && process.process_group_id == process_group_id
+                    && process.is_live()
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return Err(ERR_NO_CHILD);
+        }
+        let foreground_process_id = members
+            .iter()
+            .find(|process| process.process_id == process_group_id)
+            .or_else(|| members.first())
+            .map(|process| process.process_id)
+            .ok_or(ERR_NO_PROCESS)?;
+        let stopped = members
+            .iter()
+            .any(|process| process.state == ProcessState::Stopped);
+        (foreground_process_id, members.len(), stopped)
+    };
+
+    if !terminal::transfer(owner_process_id, foreground_process_id) {
+        return Err(ERR_IO);
+    }
+    {
+        let mut manager = PROCESS_MANAGER.lock();
+        if let Some(process) = manager.process_mut(foreground_process_id) {
+            process.terminal_parent = Some(owner_process_id);
+        }
+    }
+
+    if stopped {
+        if let Err(error) =
+            deliver_signal_group(Some(owner_process_id), process_group_id, SIGNAL_CONTINUE)
+        {
+            let _ = terminal::transfer(foreground_process_id, owner_process_id);
+            return Err(error);
+        }
+    }
+    Ok(active_count)
+}
+
+fn service_terminal_control() -> usize {
+    let Some(event) = terminal::take_control() else {
         return 0;
     };
     let target = PROCESS_MANAGER
         .lock()
         .processes
         .iter()
-        .find(|process| process.process_id == foreground_process_id)
+        .find(|process| process.process_id == event.foreground_process)
         .map(|process| (process.process_group_id, process.path == "/ush"));
     let Some((process_group_id, is_shell)) = target else {
         return 0;
@@ -2531,7 +2817,11 @@ fn service_terminal_interrupt() -> usize {
     if is_shell {
         return 0;
     }
-    deliver_signal_group(None, process_group_id, SIGNAL_INTERRUPT).unwrap_or(0)
+    let signal = match event.signal {
+        terminal::ControlSignal::Interrupt => SIGNAL_INTERRUPT,
+        terminal::ControlSignal::Suspend => SIGNAL_TERMINAL_STOP,
+    };
+    deliver_signal_group(None, process_group_id, signal).unwrap_or(0)
 }
 
 fn active_child_group(
@@ -2549,29 +2839,51 @@ fn active_child_group(
     let anchor = manager.processes.iter().find(|process| {
         process.parent_process_id == Some(parent_process_id)
             && process.path == path
-            && matches!(
-                process.state,
-                ProcessState::Runnable | ProcessState::Blocked
-            )
+            && process.is_live()
             && foreground_process.map_or(true, |foreground| process.process_id == foreground)
     })?;
     let process_group_id = anchor.process_group_id;
-    let process_ids = manager
+    let info = child_group_info_locked(&manager, parent_process_id, process_group_id)?;
+    (info.process_ids.len() >= minimum_members).then_some(info)
+}
+
+fn child_group_info(parent_process_id: u64, process_group_id: u64) -> Option<ProcessGroupInfo> {
+    let manager = PROCESS_MANAGER.lock();
+    child_group_info_locked(&manager, parent_process_id, process_group_id)
+}
+
+fn child_group_info_locked(
+    manager: &ProcessManager,
+    parent_process_id: u64,
+    process_group_id: u64,
+) -> Option<ProcessGroupInfo> {
+    let members = manager
         .processes
         .iter()
         .filter(|process| {
             process.parent_process_id == Some(parent_process_id)
                 && process.process_group_id == process_group_id
-                && matches!(
-                    process.state,
-                    ProcessState::Runnable | ProcessState::Blocked
-                )
+                && process.is_live()
         })
-        .map(|process| process.process_id)
         .collect::<Vec<_>>();
-    (process_ids.len() >= minimum_members).then_some(ProcessGroupInfo {
+    if members.is_empty() {
+        return None;
+    }
+    Some(ProcessGroupInfo {
         process_group_id,
-        process_ids,
+        process_ids: members.iter().map(|process| process.process_id).collect(),
+        runnable: members
+            .iter()
+            .filter(|process| process.state == ProcessState::Runnable)
+            .count(),
+        blocked: members
+            .iter()
+            .filter(|process| process.state == ProcessState::Blocked)
+            .count(),
+        stopped: members
+            .iter()
+            .filter(|process| process.state == ProcessState::Stopped)
+            .count(),
     })
 }
 
@@ -2605,9 +2917,22 @@ fn parse_command_line(command: &str) -> Result<(String, Vec<String>), i64> {
 fn child_status(result: &ProcessResult) -> u64 {
     match &result.termination {
         TerminationReason::Exit(code) => *code,
-        TerminationReason::Fault(fault) => 128_u64.saturating_add(fault.vector),
-        TerminationReason::Signal(signal) => 128_u64.saturating_add(*signal),
+        TerminationReason::Fault(fault) => {
+            abi::child_status::SIGNAL_BASE.saturating_add(fault.vector)
+        }
+        TerminationReason::Signal(signal) => abi::child_status::SIGNAL_BASE.saturating_add(*signal),
     }
+}
+
+fn stopped_child_status(signal: u64) -> u64 {
+    abi::child_status::STOPPED_BASE.saturating_add(signal)
+}
+
+fn note_child_wait(manager: &mut ProcessManager, parent_process_id: u64) {
+    if let Some(parent) = manager.process_mut(parent_process_id) {
+        parent.child_wait_count = parent.child_wait_count.saturating_add(1);
+    }
+    manager.child_waits = manager.child_waits.saturating_add(1);
 }
 
 fn process_error_number(error: &Error) -> i64 {
@@ -3051,7 +3376,7 @@ fn service_terminal_reads(physical_memory_offset: VirtAddr) -> Result<usize, Err
         let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
         registers.rax = bytes.len() as u64;
         process.pending_terminal_read = None;
-        process.state = ProcessState::Runnable;
+        process.make_runnable();
         process.terminal_read_count = process.terminal_read_count.saturating_add(1);
         process.terminal_bytes_read = process
             .terminal_bytes_read
@@ -3123,7 +3448,7 @@ fn service_pipe_waiters(physical_memory_offset: VirtAddr) -> Result<usize, Error
             let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
             registers.rax = bytes.len() as u64;
             process.pending_pipe_read = None;
-            process.state = ProcessState::Runnable;
+            process.make_runnable();
             process.pipe_read_count = process.pipe_read_count.saturating_add(1);
             process.pipe_bytes_read = process.pipe_bytes_read.saturating_add(bytes.len() as u64);
             drop(manager);
@@ -3174,7 +3499,7 @@ fn service_pipe_waiters(physical_memory_offset: VirtAddr) -> Result<usize, Error
                 Err(error) => registers.rax = error_return(error),
             }
             process.pending_pipe_write = None;
-            process.state = ProcessState::Runnable;
+            process.make_runnable();
             drop(manager);
             if !scheduler::wake_process(process_id) {
                 return Err(Error::ProcessNotFound(process_id));
@@ -3201,7 +3526,7 @@ fn complete_pipe_read_error(
         let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
         registers.rax = error_return(error);
         process.pending_pipe_read = None;
-        process.state = ProcessState::Runnable;
+        process.make_runnable();
         drop(manager);
         if !scheduler::wake_process(process_id) {
             return Err(Error::ProcessNotFound(process_id));

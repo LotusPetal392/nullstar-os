@@ -826,10 +826,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
 
+    let stopped_jobs_before = userspace::snapshot();
     if let Err(error) =
         userspace_runtime.inject_terminal_line("signal-probe | upper | pipe-consumer")
     {
-        serial_println!("userspace foreground signal pipeline injection failed: {error}");
+        serial_println!("userspace stopped-job pipeline injection failed: {error}");
         hlt_loop();
     }
     let foreground_signal_group = match userspace_runtime.wait_until_foreground_child_group(
@@ -839,7 +840,76 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     ) {
         Ok(group) => group,
         Err(error) => {
-            serial_println!("userspace foreground signal group did not start: {error}");
+            serial_println!("userspace stopped-job foreground group did not start: {error}");
+            hlt_loop();
+        }
+    };
+    let terminal_before_suspend = userspace_runtime.terminal_snapshot();
+    let foreground_stop_deliveries = match userspace_runtime.inject_terminal_suspend() {
+        Ok(count) => count,
+        Err(error) => {
+            serial_println!("userspace terminal suspend injection failed: {error}");
+            hlt_loop();
+        }
+    };
+    let stopped_group = match userspace_runtime.wait_until_child_group_stopped(
+        userspace_shell.process_id,
+        foreground_signal_group.process_group_id,
+        3,
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            serial_println!("userspace foreground group did not stop: {error}");
+            hlt_loop();
+        }
+    };
+    let stopped_scheduler = scheduler::snapshot();
+    let terminal_after_suspend = userspace_runtime.terminal_snapshot();
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell did not regain its prompt after Ctrl-Z: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("jobs") {
+        serial_println!("userspace stopped-jobs command injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace stopped-jobs command did not return to the prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("bg %1") {
+        serial_println!("userspace background-resume command injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!(
+            "userspace background-resume command did not return to the prompt: {error}"
+        );
+        hlt_loop();
+    }
+    let resumed_group = match userspace_runtime.wait_until_child_group_resumed(
+        userspace_shell.process_id,
+        foreground_signal_group.process_group_id,
+        3,
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            serial_println!("userspace stopped group did not resume in the background: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) = userspace_runtime.inject_terminal_line("fg %1") {
+        serial_println!("userspace foreground-resume command injection failed: {error}");
+        hlt_loop();
+    }
+    let foreground_resumed_group = match userspace_runtime.wait_until_foreground_child_group(
+        userspace_shell.process_id,
+        "/pipe-consumer",
+        3,
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            serial_println!("userspace resumed group did not regain the foreground: {error}");
             hlt_loop();
         }
     };
@@ -857,12 +927,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     ) {
         Ok(results) => results,
         Err(error) => {
-            serial_println!("userspace foreground signal group wait failed: {error}");
+            serial_println!("userspace resumed foreground group wait failed: {error}");
             hlt_loop();
         }
     };
     if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
-        serial_println!("userspace shell did not regain its prompt after Ctrl-C: {error}");
+        serial_println!("userspace shell did not regain its prompt after resumed Ctrl-C: {error}");
         hlt_loop();
     }
 
@@ -932,6 +1002,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             hlt_loop();
         }
     };
+    let stopped_jobs_after = userspace::snapshot();
     let created_pipe_delta = userspace_pipeline_after
         .total_created
         .saturating_sub(userspace_pipeline_before.total_created);
@@ -1051,6 +1122,63 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let signal_pipe_destroyed = userspace_signal_pipe_after
         .total_destroyed
         .saturating_sub(userspace_pipeline_after.total_destroyed);
+    let stop_delivery_delta = stopped_jobs_after
+        .stop_deliveries
+        .saturating_sub(stopped_jobs_before.stop_deliveries);
+    let continue_delivery_delta = stopped_jobs_after
+        .continue_deliveries
+        .saturating_sub(stopped_jobs_before.continue_deliveries);
+    let userspace_stopped_jobs_verified = foreground_stop_deliveries == 3
+        && stopped_group.process_group_id == foreground_signal_group.process_group_id
+        && stopped_group.process_ids.len() == 3
+        && stopped_group.stopped == 3
+        && stopped_group.runnable == 0
+        && stopped_group.blocked == 0
+        && stopped_scheduler.stopped_task_count >= 3
+        && terminal_after_suspend.suspends == terminal_before_suspend.suspends.saturating_add(1)
+        && terminal_after_suspend.foreground_process == Some(userspace_shell.process_id)
+        && resumed_group.process_group_id == foreground_signal_group.process_group_id
+        && resumed_group.process_ids.len() == 3
+        && resumed_group.stopped == 0
+        && resumed_group.runnable.saturating_add(resumed_group.blocked) == 3
+        && foreground_resumed_group.process_group_id == foreground_signal_group.process_group_id
+        && foreground_resumed_group.process_ids.len() == 3
+        && stop_delivery_delta == 3
+        && continue_delivery_delta == 3;
+    if !userspace_stopped_jobs_verified {
+        serial_println!(
+            "userspace stopped-job verification failed: stop_deliveries={}, group={}/{}, members={}, stopped={}/{}, scheduler_stopped={}, foreground_after_stop={:?}, terminal_suspends={}/{}, resumed={}/{}/{}, foreground_resumed={}/{}, delivery_deltas={}/{}",
+            foreground_stop_deliveries,
+            stopped_group.process_group_id,
+            foreground_signal_group.process_group_id,
+            stopped_group.process_ids.len(),
+            stopped_group.stopped,
+            3,
+            stopped_scheduler.stopped_task_count,
+            terminal_after_suspend.foreground_process,
+            terminal_before_suspend.suspends,
+            terminal_after_suspend.suspends,
+            resumed_group.runnable,
+            resumed_group.blocked,
+            resumed_group.stopped,
+            foreground_resumed_group.process_group_id,
+            foreground_resumed_group.process_ids.len(),
+            stop_delivery_delta,
+            continue_delivery_delta
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace stopped jobs verified: shell_pid={}, group={}, members=3, stopped=3, resumed_runnable={}, resumed_blocked={}, stop_deliveries={}, continue_deliveries={}, terminal_suspends={}",
+        userspace_shell_result.process_id,
+        stopped_group.process_group_id,
+        resumed_group.runnable,
+        resumed_group.blocked,
+        stop_delivery_delta,
+        continue_delivery_delta,
+        terminal_after_suspend.suspends
+    );
+
     let foreground_signal_verified = foreground_signal_deliveries == 3
         && foreground_signal_group.process_ids.len() == 3
         && foreground_signal_results.len() == 3
@@ -1058,7 +1186,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             result.parent_process_id == Some(userspace_shell.process_id)
                 && result.process_group_id == foreground_signal_group.process_group_id
                 && result.signal() == Some(userspace::SIGNAL_INTERRUPT)
-                && result.signal_received_count == 1
+                && result.signal_received_count == 3
+                && result.stop_count == 1
+                && result.continue_count == 1
         })
         && foreground_signal_results
             .iter()
@@ -1082,8 +1212,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 && result.path == "/signal-probe"
                 && result.signal() == Some(userspace::SIGNAL_TERMINATE)
                 && result.signal_received_count == 1
+                && result.stop_count == 0
+                && result.continue_count == 0
         })
-        && userspace_shell_result.signal_sent_count == 1;
+        && userspace_shell_result.signal_sent_count == 4;
     let userspace_signals_verified = foreground_signal_verified && background_signal_verified;
     if !userspace_signals_verified {
         serial_println!(
@@ -1116,13 +1248,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
         && userspace_shell_result.child_spawn_count == 9
-        && userspace_shell_result.child_wait_count == 9
+        && userspace_shell_result.child_wait_count == 13
+        && userspace_shell_result.child_poll_count == 5
+        && userspace_shell_result.child_poll_pending_count == 5
+        && userspace_shell_result.signal_sent_count == 4
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
         && shell_child.bytes_read > 0
         && userspace_pipeline_verified
         && userspace_background_verified
+        && userspace_stopped_jobs_verified
         && userspace_signals_verified
         && userspace_runtime
             .terminal_snapshot()
@@ -1130,13 +1266,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
             userspace_shell_result.child_wait_count,
             userspace_shell_result.child_poll_count,
             userspace_shell_result.child_poll_pending_count,
             userspace_shell_result.signal_sent_count,
+            userspace_stopped_jobs_verified,
             shell_child.parent_process_id,
             shell_child.exit_code(),
             shell_child.open_count,
@@ -1146,7 +1283,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
     serial_println!(
-        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, child_exit=0, child_bytes={}",
+        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs=1, child_exit=0, child_bytes={}",
         userspace_shell_result.process_id,
         shell_child.process_id,
         userspace_shell_result.child_spawn_count,
@@ -1247,6 +1384,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace background jobs verified");
     } else {
         println!("Userspace background jobs unavailable");
+    }
+    if userspace_stopped_jobs_verified {
+        println!("Userspace stopped-job control verified");
+    } else {
+        println!("Userspace stopped-job control unavailable");
     }
     if userspace_signals_verified {
         println!("Userspace process groups and signals verified");

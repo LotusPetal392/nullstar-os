@@ -17,14 +17,16 @@ const MAX_PIPES: usize = MAX_STAGES - 1;
 const MAX_JOBS: usize = 4;
 
 const PROMPT: &[u8] = b"ush> ";
-const HELP: &[u8] = b"builtins: help jobs wait kill %N exit\nbackground: command & (up to 4 jobs)\nCtrl-C: interrupt foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
+const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N exit\nbackground: command & (up to 4 jobs)\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
 const JOB_LIMIT_FAILURE: &[u8] = b"ush: background job table is full\n";
 const BUILTIN_BACKGROUND_FAILURE: &[u8] = b"ush: builtins cannot run in the background\n";
-const KILL_USAGE: &[u8] = b"usage: kill %1..%4\n";
-const KILL_MISSING: &[u8] = b"ush: background job not found\n";
-const KILL_FAILURE: &[u8] = b"ush: kill failed\n";
+const JOB_TARGET_USAGE: &[u8] = b"ush: expected a job selector from %1 to %4\n";
+const JOB_MISSING: &[u8] = b"ush: background job not found\n";
+const JOB_NOT_STOPPED: &[u8] = b"ush: background job is not stopped\n";
+const JOB_STOPPED: &[u8] = b"ush: background job is stopped\n";
+const JOB_CONTROL_FAILURE: &[u8] = b"ush: job control failed\n";
 const INTERRUPTED: &[u8] = b"ush: interrupted\n";
 const PIPE_FAILURE: &[u8] = b"ush: pipe failed\n";
 const SPAWN_FAILURE: &[u8] = b"ush: spawn failed\n";
@@ -66,6 +68,7 @@ enum ParseError {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobState {
     Running,
+    Stopped,
     Done,
     Failed,
     Started,
@@ -97,15 +100,43 @@ impl Job {
 enum Builtin {
     Help,
     Jobs,
-    Wait,
+    Wait(WaitTarget),
+    Foreground(JobTarget),
+    Background(JobTarget),
     Exit,
-    Kill(KillTarget),
+    Kill(JobTarget),
 }
 
 #[derive(Clone, Copy)]
-enum KillTarget {
+enum JobTarget {
     Job(usize),
     Usage,
+}
+
+#[derive(Clone, Copy)]
+enum WaitTarget {
+    All,
+    Job(usize),
+    Usage,
+}
+
+#[derive(Clone, Copy, Default)]
+struct WaitSummary {
+    failed: bool,
+    interrupted: bool,
+    stopped: bool,
+}
+
+enum WaitAllResult {
+    Complete,
+    Stopped,
+    Failed,
+}
+
+enum CollectResult {
+    Complete,
+    Stopped,
+    Failed,
 }
 
 struct Shell {
@@ -139,7 +170,7 @@ impl Shell {
                 Err(_) => syscall::exit(1),
             };
             if count == 0 {
-                let _ = self.wait_all_jobs();
+                self.terminate_all_jobs();
                 syscall::exit(0);
             }
 
@@ -197,19 +228,27 @@ impl Shell {
         match builtin {
             Builtin::Help => self.output(HELP),
             Builtin::Jobs => self.print_jobs(),
-            Builtin::Wait => {
-                if self.wait_all_jobs() {
+            Builtin::Wait(WaitTarget::All) => match self.wait_all_jobs() {
+                WaitAllResult::Complete => self.output(WAIT_COMPLETE),
+                WaitAllResult::Stopped => self.error(JOB_STOPPED),
+                WaitAllResult::Failed => self.error(WAIT_FAILURE),
+            },
+            Builtin::Wait(WaitTarget::Job(slot)) => {
+                if self.wait_job(slot) {
                     self.output(WAIT_COMPLETE);
-                } else {
-                    self.error(WAIT_FAILURE);
                 }
             }
+            Builtin::Wait(WaitTarget::Usage) => self.error(JOB_TARGET_USAGE),
+            Builtin::Foreground(JobTarget::Job(slot)) => self.foreground_job(slot),
+            Builtin::Foreground(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
+            Builtin::Background(JobTarget::Job(slot)) => self.background_job(slot),
+            Builtin::Background(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
             Builtin::Exit => {
-                let _ = self.wait_all_jobs();
+                self.terminate_all_jobs();
                 syscall::exit(0);
             }
-            Builtin::Kill(KillTarget::Usage) => self.error(KILL_USAGE),
-            Builtin::Kill(KillTarget::Job(slot)) => self.kill_job(slot),
+            Builtin::Kill(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
+            Builtin::Kill(JobTarget::Job(slot)) => self.kill_job(slot),
         }
     }
 
@@ -228,24 +267,16 @@ impl Shell {
                 return;
             }
         };
+        self.children[0] = process_id;
 
         if let Some(slot) = job_slot {
-            let mut job = Job::EMPTY;
-            job.process_ids[0] = process_id;
-            job.process_count = 1;
-            job.process_group = process_id;
-            job.state = JobState::Started;
-            self.jobs[slot] = job;
+            self.store_job(slot, 1, process_id, JobState::Started);
             self.print_job(slot);
             self.jobs[slot].state = JobState::Running;
             return;
         }
 
-        match syscall::wait_child(process_id) {
-            Ok(status) if status.interrupted() => self.error(INTERRUPTED),
-            Ok(_) => {}
-            Err(_) => self.error(WAIT_FAILURE),
-        }
+        self.finish_foreground(1, process_id);
     }
 
     fn run_pipeline(&mut self, parsed: ParsedLine, job_slot: Option<usize>) {
@@ -310,7 +341,7 @@ impl Shell {
                 Err(_) => {
                     self.close_pipes(pipe_count);
                     for child_index in stage_index + 1..parsed.count {
-                        let _ = syscall::wait_child(self.children[child_index]);
+                        let _ = self.wait_final(self.children[child_index]);
                     }
                     self.error(SPAWN_FAILURE);
                     return;
@@ -321,29 +352,255 @@ impl Shell {
         self.close_pipes(pipe_count);
         let process_group = leader.unwrap_or(0);
         if let Some(slot) = job_slot {
-            let mut job = Job::EMPTY;
-            job.process_count = parsed.count;
-            job.process_group = process_group;
-            job.process_ids[..parsed.count].copy_from_slice(&self.children[..parsed.count]);
-            job.state = JobState::Started;
-            self.jobs[slot] = job;
+            self.store_job(slot, parsed.count, process_group, JobState::Started);
             self.print_job(slot);
             self.jobs[slot].state = JobState::Running;
             return;
         }
 
-        let mut wait_failed = false;
-        let mut interrupted = false;
-        for process_id in &self.children[..parsed.count] {
-            match syscall::wait_child(*process_id) {
-                Ok(status) => interrupted |= status.interrupted(),
-                Err(_) => wait_failed = true,
+        self.finish_foreground(parsed.count, process_group);
+    }
+
+    fn finish_foreground(&mut self, process_count: usize, process_group: ProcessGroupId) {
+        let children = self.children;
+        let summary = self.wait_children(&children, process_count);
+        if summary.stopped {
+            if let Some(slot) = self.reserve_job() {
+                self.store_job(slot, process_count, process_group, JobState::Stopped);
+                self.print_job(slot);
+            } else {
+                let _ = syscall::signal_process_group(process_group, signal::TERMINATE);
+                self.collect_children(&children, process_count);
+                self.error(JOB_LIMIT_FAILURE);
+            }
+        } else if summary.failed {
+            self.error(WAIT_FAILURE);
+        } else if summary.interrupted {
+            self.error(INTERRUPTED);
+        }
+    }
+
+    fn foreground_job(&mut self, slot: usize) {
+        if !self.valid_job(slot) {
+            self.error(JOB_MISSING);
+            return;
+        }
+        if self.jobs[slot].state == JobState::Running {
+            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+        }
+        let job = self.jobs[slot];
+        if matches!(
+            job.state,
+            JobState::Done | JobState::Failed | JobState::Signaled
+        ) {
+            let _ = self.wait_job(slot);
+            return;
+        }
+        if syscall::foreground_process_group(job.process_group).is_err() {
+            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+            if matches!(
+                self.jobs[slot].state,
+                JobState::Done | JobState::Failed | JobState::Signaled
+            ) {
+                let _ = self.wait_job(slot);
+            } else {
+                self.error(JOB_CONTROL_FAILURE);
+            }
+            return;
+        }
+
+        self.jobs[slot].state = JobState::Running;
+        let summary = self.wait_children(&job.process_ids, job.process_count);
+        if summary.stopped {
+            self.jobs[slot].state = JobState::Stopped;
+            self.print_job(slot);
+            return;
+        }
+        self.jobs[slot] = Job::EMPTY;
+        if summary.failed {
+            self.error(WAIT_FAILURE);
+        } else if summary.interrupted {
+            self.error(INTERRUPTED);
+        }
+    }
+
+    fn background_job(&mut self, slot: usize) {
+        if !self.valid_job(slot) {
+            self.error(JOB_MISSING);
+            return;
+        }
+        if self.jobs[slot].state == JobState::Running {
+            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+        }
+        if self.jobs[slot].state != JobState::Stopped {
+            self.error(JOB_NOT_STOPPED);
+            return;
+        }
+        if syscall::signal_process_group(self.jobs[slot].process_group, signal::CONTINUE).is_err() {
+            self.error(JOB_CONTROL_FAILURE);
+            return;
+        }
+        self.jobs[slot].state = JobState::Running;
+        self.print_job(slot);
+    }
+
+    fn wait_job(&mut self, slot: usize) -> bool {
+        if !self.valid_job(slot) {
+            self.error(JOB_MISSING);
+            return false;
+        }
+        if self.jobs[slot].state == JobState::Running {
+            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+        }
+        if self.jobs[slot].state == JobState::Stopped {
+            self.error(JOB_STOPPED);
+            return false;
+        }
+        let job = self.jobs[slot];
+        match self.collect_job(&job) {
+            CollectResult::Complete => {
+                self.jobs[slot] = Job::EMPTY;
+                true
+            }
+            CollectResult::Stopped => {
+                self.jobs[slot].state = JobState::Stopped;
+                self.error(JOB_STOPPED);
+                false
+            }
+            CollectResult::Failed => {
+                self.jobs[slot] = Job::EMPTY;
+                self.error(WAIT_FAILURE);
+                false
             }
         }
-        if wait_failed {
-            self.error(WAIT_FAILURE);
-        } else if interrupted {
-            self.error(INTERRUPTED);
+    }
+
+    fn wait_all_jobs(&mut self) -> WaitAllResult {
+        let mut failed = false;
+        let mut stopped = false;
+        for slot in 0..MAX_JOBS {
+            if !self.jobs[slot].is_active() {
+                continue;
+            }
+            if self.jobs[slot].state == JobState::Running {
+                self.jobs[slot].state = poll_job(&self.jobs[slot]);
+            }
+            if self.jobs[slot].state == JobState::Stopped {
+                stopped = true;
+                continue;
+            }
+            let job = self.jobs[slot];
+            match self.collect_job(&job) {
+                CollectResult::Complete => self.jobs[slot] = Job::EMPTY,
+                CollectResult::Stopped => {
+                    self.jobs[slot].state = JobState::Stopped;
+                    stopped = true;
+                }
+                CollectResult::Failed => {
+                    self.jobs[slot] = Job::EMPTY;
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            WaitAllResult::Failed
+        } else if stopped {
+            WaitAllResult::Stopped
+        } else {
+            WaitAllResult::Complete
+        }
+    }
+
+    fn collect_job(&self, job: &Job) -> CollectResult {
+        for process_id in &job.process_ids[..job.process_count] {
+            loop {
+                let status = match syscall::wait_child(*process_id) {
+                    Ok(status) => status,
+                    Err(_) => return CollectResult::Failed,
+                };
+                if status.continued() {
+                    continue;
+                }
+                if status.stopped_signal().is_some() {
+                    return CollectResult::Stopped;
+                }
+                break;
+            }
+        }
+        CollectResult::Complete
+    }
+
+    fn terminate_all_jobs(&mut self) {
+        for job in &self.jobs {
+            if job.is_active() {
+                let _ = syscall::signal_process_group(job.process_group, signal::TERMINATE);
+            }
+        }
+        for slot in 0..MAX_JOBS {
+            if !self.jobs[slot].is_active() {
+                continue;
+            }
+            let job = self.jobs[slot];
+            self.collect_children(&job.process_ids, job.process_count);
+            self.jobs[slot] = Job::EMPTY;
+        }
+    }
+
+    fn kill_job(&mut self, slot: usize) {
+        if !self.valid_job(slot) {
+            self.error(JOB_MISSING);
+            return;
+        }
+        if syscall::signal_process_group(self.jobs[slot].process_group, signal::TERMINATE).is_err()
+        {
+            self.error(JOB_CONTROL_FAILURE);
+            return;
+        }
+        self.jobs[slot].state = JobState::Signaled;
+        self.print_job(slot);
+    }
+
+    fn wait_children(&self, process_ids: &[ProcessId; MAX_STAGES], count: usize) -> WaitSummary {
+        let mut summary = WaitSummary::default();
+        for process_id in &process_ids[..count] {
+            match self.wait_noncontinued(*process_id) {
+                Ok(status) => {
+                    if status.stopped_signal().is_some() {
+                        summary.stopped = true;
+                    } else if status.interrupted() {
+                        summary.interrupted = true;
+                    } else if status.signal().is_some() || !status.success() {
+                        summary.failed = true;
+                    }
+                }
+                Err(_) => summary.failed = true,
+            }
+        }
+        summary
+    }
+
+    fn wait_noncontinued(&self, process_id: ProcessId) -> syscall::Result<ChildStatus> {
+        loop {
+            let status = syscall::wait_child(process_id)?;
+            if !status.continued() {
+                return Ok(status);
+            }
+        }
+    }
+
+    fn wait_final(&self, process_id: ProcessId) -> syscall::Result<ChildStatus> {
+        loop {
+            let status = syscall::wait_child(process_id)?;
+            if status.continued() || status.stopped_signal().is_some() {
+                continue;
+            }
+            return Ok(status);
+        }
+    }
+
+    fn collect_children(&self, process_ids: &[ProcessId; MAX_STAGES], count: usize) {
+        for process_id in &process_ids[..count] {
+            let _ = self.wait_final(*process_id);
         }
     }
 
@@ -358,6 +615,25 @@ impl Shell {
         self.jobs.iter().position(|job| !job.is_active())
     }
 
+    fn valid_job(&self, slot: usize) -> bool {
+        slot < MAX_JOBS && self.jobs[slot].is_active()
+    }
+
+    fn store_job(
+        &mut self,
+        slot: usize,
+        process_count: usize,
+        process_group: ProcessGroupId,
+        state: JobState,
+    ) {
+        let mut job = Job::EMPTY;
+        job.process_count = process_count;
+        job.process_group = process_group;
+        job.process_ids[..process_count].copy_from_slice(&self.children[..process_count]);
+        job.state = state;
+        self.jobs[slot] = job;
+    }
+
     fn print_jobs(&mut self) {
         let mut found = false;
         for slot in 0..MAX_JOBS {
@@ -366,44 +642,13 @@ impl Shell {
             }
             found = true;
             if self.jobs[slot].state == JobState::Running {
-                let state = poll_job(&self.jobs[slot]);
-                self.jobs[slot].state = state;
+                self.jobs[slot].state = poll_job(&self.jobs[slot]);
             }
             self.print_job(slot);
         }
         if !found {
             self.output(NO_JOBS);
         }
-    }
-
-    fn wait_all_jobs(&mut self) -> bool {
-        let mut succeeded = true;
-        for job in &mut self.jobs {
-            if !job.is_active() {
-                continue;
-            }
-            for process_id in &job.process_ids[..job.process_count] {
-                if syscall::wait_child(*process_id).is_err() {
-                    succeeded = false;
-                }
-            }
-            *job = Job::EMPTY;
-        }
-        succeeded
-    }
-
-    fn kill_job(&mut self, slot: usize) {
-        if slot >= MAX_JOBS || !self.jobs[slot].is_active() {
-            self.error(KILL_MISSING);
-            return;
-        }
-        if syscall::signal_process_group(self.jobs[slot].process_group, signal::TERMINATE).is_err()
-        {
-            self.error(KILL_FAILURE);
-            return;
-        }
-        self.jobs[slot].state = JobState::Signaled;
-        self.print_job(slot);
     }
 
     fn print_job(&self, slot: usize) {
@@ -413,6 +658,7 @@ impl Shell {
         self.output(b"] ");
         let status = match self.jobs[slot].state {
             JobState::Running => b"running\n" as &[u8],
+            JobState::Stopped => b"stopped\n",
             JobState::Done => b"done\n",
             JobState::Failed => b"failed\n",
             JobState::Started => b"started\n",
@@ -432,10 +678,12 @@ impl Shell {
 
 fn poll_job(job: &Job) -> JobState {
     let mut running = false;
+    let mut stopped = false;
     let mut failed = false;
     let mut signaled = false;
     for process_id in &job.process_ids[..job.process_count] {
         match syscall::try_wait_child(*process_id) {
+            Ok(status) if status.stopped_signal().is_some() => stopped = true,
             Ok(status) => classify_status(status, &mut failed, &mut signaled),
             Err(error) if error == syscall::Errno::TRY_AGAIN => running = true,
             Err(_) => failed = true,
@@ -444,6 +692,8 @@ fn poll_job(job: &Job) -> JobState {
 
     if running {
         JobState::Running
+    } else if stopped {
+        JobState::Stopped
     } else if signaled {
         JobState::Signaled
     } else if failed {
@@ -518,38 +768,60 @@ fn parse_line(bytes: &[u8]) -> Result<ParsedLine, ParseError> {
 }
 
 fn detect_builtin(command: &[u8]) -> Option<Builtin> {
-    match command {
-        b"help" => Some(Builtin::Help),
-        b"jobs" => Some(Builtin::Jobs),
-        b"wait" => Some(Builtin::Wait),
-        b"exit" => Some(Builtin::Exit),
-        _ => {
-            let token_end = command
-                .iter()
-                .position(|byte| is_horizontal_space(*byte))
-                .unwrap_or(command.len());
-            if &command[..token_end] != b"kill" {
-                return None;
-            }
-            Some(Builtin::Kill(parse_kill_target(&command[token_end..])))
+    let token_end = command
+        .iter()
+        .position(|byte| is_horizontal_space(*byte))
+        .unwrap_or(command.len());
+    let arguments = &command[token_end..];
+    match &command[..token_end] {
+        b"help" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => Some(Builtin::Help),
+        b"jobs" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => Some(Builtin::Jobs),
+        b"exit" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => Some(Builtin::Exit),
+        b"wait" => Some(Builtin::Wait(parse_wait_target(arguments))),
+        b"fg" => Some(Builtin::Foreground(parse_job_target(arguments))),
+        b"bg" => Some(Builtin::Background(parse_job_target(arguments))),
+        b"kill" => Some(Builtin::Kill(parse_job_target(arguments))),
+        _ => None,
+    }
+}
+
+fn parse_wait_target(bytes: &[u8]) -> WaitTarget {
+    let bytes = trim_horizontal(bytes);
+    if bytes.is_empty() {
+        WaitTarget::All
+    } else {
+        match parse_job_target(bytes) {
+            JobTarget::Job(slot) => WaitTarget::Job(slot),
+            JobTarget::Usage => WaitTarget::Usage,
         }
     }
 }
 
-fn parse_kill_target(mut bytes: &[u8]) -> KillTarget {
+fn parse_job_target(bytes: &[u8]) -> JobTarget {
+    let mut bytes = trim_horizontal(bytes);
+    if bytes.first() == Some(&b'%') {
+        bytes = &bytes[1..];
+    }
+    if bytes.len() != 1 || !(b'1'..=b'4').contains(&bytes[0]) {
+        return JobTarget::Usage;
+    }
+    JobTarget::Job(usize::from(bytes[0] - b'1'))
+}
+
+fn trim_horizontal(mut bytes: &[u8]) -> &[u8] {
     while let Some((first, rest)) = bytes.split_first() {
         if !is_horizontal_space(*first) {
             break;
         }
         bytes = rest;
     }
-    if bytes.first() == Some(&b'%') {
-        bytes = &bytes[1..];
+    while let Some((last, rest)) = bytes.split_last() {
+        if !is_horizontal_space(*last) {
+            break;
+        }
+        bytes = rest;
     }
-    if bytes.len() != 1 || !(b'1'..=b'4').contains(&bytes[0]) {
-        return KillTarget::Usage;
-    }
-    KillTarget::Job(usize::from(bytes[0] - b'1'))
+    bytes
 }
 
 const fn is_horizontal_space(byte: u8) -> bool {

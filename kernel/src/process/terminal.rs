@@ -21,6 +21,19 @@ pub struct Snapshot {
     pub wakeups: u64,
     pub injected_lines: u64,
     pub interrupts: u64,
+    pub suspends: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlSignal {
+    Interrupt,
+    Suspend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlEvent {
+    pub foreground_process: u64,
+    pub signal: ControlSignal,
 }
 
 struct Terminal {
@@ -34,8 +47,9 @@ struct Terminal {
     blocked_reads: u64,
     wakeups: u64,
     injected_lines: u64,
-    interrupt_pending: bool,
+    pending_control: Option<ControlSignal>,
     interrupts: u64,
+    suspends: u64,
 }
 
 impl Terminal {
@@ -51,8 +65,9 @@ impl Terminal {
             blocked_reads: 0,
             wakeups: 0,
             injected_lines: 0,
-            interrupt_pending: false,
+            pending_control: None,
             interrupts: 0,
+            suspends: 0,
         }
     }
 
@@ -66,7 +81,7 @@ impl Terminal {
         self.foreground_process = Some(process_id);
         self.editing.clear();
         self.committed.clear();
-        self.interrupt_pending = false;
+        self.pending_control = None;
         true
     }
 
@@ -75,7 +90,7 @@ impl Terminal {
             self.foreground_process = None;
             self.editing.clear();
             self.committed.clear();
-            self.interrupt_pending = false;
+            self.pending_control = None;
         }
     }
 
@@ -86,14 +101,15 @@ impl Terminal {
         self.foreground_process = Some(next_process);
         self.editing.clear();
         self.committed.clear();
-        self.interrupt_pending = false;
+        self.pending_control = None;
         true
     }
 
     fn handle_key(&mut self, key: DecodedKey) {
         self.keys_received = self.keys_received.saturating_add(1);
         match key {
-            DecodedKey::Unicode('\u{3}') => self.interrupt(true),
+            DecodedKey::Unicode('\u{3}') => self.control(ControlSignal::Interrupt, true),
+            DecodedKey::Unicode('\u{1a}') => self.control(ControlSignal::Suspend, true),
             DecodedKey::Unicode('\n' | '\r') => self.commit_editing(true),
             DecodedKey::Unicode('\u{8}' | '\u{7f}') => self.backspace(),
             DecodedKey::Unicode('\t') => self.push_character('\t'),
@@ -105,7 +121,7 @@ impl Terminal {
         }
     }
 
-    fn interrupt(&mut self, echo: bool) {
+    fn control(&mut self, signal: ControlSignal, echo: bool) {
         if self.foreground_process.is_none() {
             return;
         }
@@ -114,22 +130,33 @@ impl Terminal {
         self.committed.push_back(b'\n');
         self.lines_committed = self.lines_committed.saturating_add(1);
         self.bytes_committed = self.bytes_committed.saturating_add(1);
-        self.interrupt_pending = true;
-        self.interrupts = self.interrupts.saturating_add(1);
+        self.pending_control = Some(signal);
+        match signal {
+            ControlSignal::Interrupt => self.interrupts = self.interrupts.saturating_add(1),
+            ControlSignal::Suspend => self.suspends = self.suspends.saturating_add(1),
+        }
         if echo {
-            crate::print!("^C");
-            crate::serial_print!("^C");
+            match signal {
+                ControlSignal::Interrupt => {
+                    crate::print!("^C");
+                    crate::serial_print!("^C");
+                }
+                ControlSignal::Suspend => {
+                    crate::print!("^Z");
+                    crate::serial_print!("^Z");
+                }
+            }
             crate::println!();
             crate::serial_println!();
         }
     }
 
-    fn take_interrupt(&mut self) -> Option<u64> {
-        if !self.interrupt_pending {
-            return None;
-        }
-        self.interrupt_pending = false;
-        self.foreground_process
+    fn take_control(&mut self) -> Option<ControlEvent> {
+        let signal = self.pending_control.take()?;
+        Some(ControlEvent {
+            foreground_process: self.foreground_process?,
+            signal,
+        })
     }
 
     fn push_character(&mut self, character: char) {
@@ -211,6 +238,7 @@ impl Terminal {
             wakeups: self.wakeups,
             injected_lines: self.injected_lines,
             interrupts: self.interrupts,
+            suspends: self.suspends,
         }
     }
 }
@@ -270,8 +298,8 @@ pub fn inject_line(line: &str) {
     x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().inject_line(line));
 }
 
-pub fn take_interrupt() -> Option<u64> {
-    x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().take_interrupt())
+pub fn take_control() -> Option<ControlEvent> {
+    x86_64::instructions::interrupts::without_interrupts(|| TERMINAL.lock().take_control())
 }
 
 pub fn take_committed(maximum: usize) -> Option<Vec<u8>> {

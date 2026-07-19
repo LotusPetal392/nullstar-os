@@ -682,25 +682,29 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, child spawns={}, waits={}, signals={}, pipe pairs={}, inherited fds={}, active={}, blocked={}, exited={}, faulted={}, signaled={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
             snapshot.spawned,
             snapshot.child_spawns,
             snapshot.child_waits,
             snapshot.signals_sent,
+            snapshot.stop_deliveries,
+            snapshot.continue_deliveries,
             snapshot.pipe_pairs,
             snapshot.pipe_descriptor_inherits,
             snapshot.active,
             snapshot.blocked,
+            snapshot.stopped,
             snapshot.exited,
             snapshot.faulted,
             snapshot.signaled,
             snapshot.reaped
         );
         shell_println!(
-            "resources: frames reclaimed={}, scheduler users={}, blocked={}, zombies={}, address-space switches={}",
+            "resources: frames reclaimed={}, scheduler users={}, blocked={}, stopped={}, zombies={}, address-space switches={}",
             snapshot.frames_reclaimed,
             scheduler.user_task_count,
             scheduler.blocked_task_count,
+            scheduler.stopped_task_count,
             scheduler.zombie_task_count,
             scheduler.address_space_switches
         );
@@ -752,7 +756,7 @@ impl Shell {
                 result.blocked_read_count
             );
             shell_println!(
-                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; children: spawns={}, waits={}, polls={} (pending={}), signals sent={}; signals received={}; frames reclaimed={}",
+                "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; children: spawns={}, waits={}, polls={} (pending={}), signals sent={}; signals received={} (stops={}, continues={}); frames reclaimed={}",
                 result.pipe_read_count,
                 result.pipe_write_count,
                 result.pipe_bytes_read,
@@ -768,6 +772,8 @@ impl Shell {
                 result.child_poll_pending_count,
                 result.signal_sent_count,
                 result.signal_received_count,
+                result.stop_count,
+                result.continue_count,
                 result.frames_reclaimed
             );
             if let Some(fault) = result.fault() {
@@ -791,13 +797,14 @@ impl Shell {
             terminal.committed_bytes
         );
         shell_println!(
-            "input: keys={}, lines={}, bytes={}, dropped={}, injected={}, interrupts={}",
+            "input: keys={}, lines={}, bytes={}, dropped={}, injected={}, interrupts={}, suspends={}",
             terminal.keys_received,
             terminal.lines_committed,
             terminal.bytes_committed,
             terminal.dropped_bytes,
             terminal.injected_lines,
-            terminal.interrupts
+            terminal.interrupts,
+            terminal.suspends
         );
         shell_println!(
             "blocking: reads={}, wakeups={}",
@@ -1146,7 +1153,7 @@ fn print_process_result(result: &userspace::ProcessResult) {
         result.blocked_read_count
     );
     shell_println!(
-        "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; signals sent/received={}/{}; frames reclaimed={}",
+        "  pipes: reads={}, writes={}, bytes={}/{}, blocked={}/{}; pairs={}, fd closes={}, inherited={}; signals sent/received={}/{} (stops={}, continues={}); frames reclaimed={}",
         result.pipe_read_count,
         result.pipe_write_count,
         result.pipe_bytes_read,
@@ -1158,6 +1165,8 @@ fn print_process_result(result: &userspace::ProcessResult) {
         result.pipe_descriptor_inherit_count,
         result.signal_sent_count,
         result.signal_received_count,
+        result.stop_count,
+        result.continue_count,
         result.frames_reclaimed
     );
     if let Some(fault) = result.fault() {
@@ -1202,7 +1211,7 @@ fn print_help() {
     shell_println!("  terminal         show canonical terminal and wakeup statistics");
     shell_println!("  pipes            show pipe buffers, blocking, and wakeups");
     shell_println!("  pipe <a> | <b>   run a userspace pipeline");
-    shell_println!("  ush              launch the Rust userspace shell and job controller");
+    shell_println!("  ush              launch the Rust shell with pipelines, Ctrl-C, and Ctrl-Z");
     shell_println!("  spawn <path> [args...]  launch a userspace process");
     shell_println!("  wait <pid>       wait for and reap a userspace process");
     shell_println!("  run <path> [args...]    run in the foreground with stdin");

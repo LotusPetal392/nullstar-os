@@ -133,6 +133,7 @@ impl fmt::Display for TaskKind {
 pub enum TaskState {
     Runnable,
     Blocked,
+    Stopped,
     Zombie,
 }
 
@@ -141,6 +142,7 @@ impl fmt::Display for TaskState {
         match self {
             Self::Runnable => formatter.write_str("runnable"),
             Self::Blocked => formatter.write_str("blocked"),
+            Self::Stopped => formatter.write_str("stopped"),
             Self::Zombie => formatter.write_str("zombie"),
         }
     }
@@ -187,6 +189,7 @@ pub struct Snapshot {
     pub task_count: usize,
     pub runnable_task_count: usize,
     pub blocked_task_count: usize,
+    pub stopped_task_count: usize,
     pub zombie_task_count: usize,
     pub user_task_count: usize,
     pub current_task_id: u64,
@@ -240,6 +243,7 @@ struct Task {
     name: &'static str,
     kind: TaskKind,
     state: TaskState,
+    stopped_resume_state: Option<TaskState>,
     process_id: Option<u64>,
     stack_pointer: usize,
     stack: Option<Box<[u128]>>,
@@ -257,6 +261,7 @@ impl Task {
             name: "bootstrap-shell",
             kind: TaskKind::Bootstrap,
             state: TaskState::Runnable,
+            stopped_resume_state: None,
             process_id: None,
             stack_pointer: 0,
             stack: None,
@@ -321,6 +326,7 @@ impl Task {
             name,
             kind: TaskKind::KernelThread,
             state: TaskState::Runnable,
+            stopped_resume_state: None,
             process_id: None,
             stack_pointer,
             stack: Some(stack),
@@ -354,6 +360,7 @@ impl Task {
             name,
             kind: TaskKind::UserProcess,
             state: TaskState::Runnable,
+            stopped_resume_state: None,
             process_id: Some(process_id),
             stack_pointer,
             stack: None,
@@ -526,17 +533,73 @@ impl Scheduler {
         else {
             return false;
         };
-        if task.state != TaskState::Blocked {
-            return false;
+        match task.state {
+            TaskState::Blocked => {
+                task.state = TaskState::Runnable;
+                true
+            }
+            TaskState::Stopped if task.stopped_resume_state == Some(TaskState::Blocked) => {
+                task.stopped_resume_state = Some(TaskState::Runnable);
+                true
+            }
+            _ => false,
         }
-        task.state = TaskState::Runnable;
-        true
     }
 
     fn is_process_blocked(&self, process_id: u64) -> bool {
+        self.tasks.iter().any(|task| {
+            task.process_id == Some(process_id)
+                && (task.state == TaskState::Blocked
+                    || (task.state == TaskState::Stopped
+                        && task.stopped_resume_state == Some(TaskState::Blocked)))
+        })
+    }
+
+    fn is_process_stopped(&self, process_id: u64) -> bool {
         self.tasks
             .iter()
-            .any(|task| task.process_id == Some(process_id) && task.state == TaskState::Blocked)
+            .any(|task| task.process_id == Some(process_id) && task.state == TaskState::Stopped)
+    }
+
+    fn stop_process(&mut self, process_id: u64) -> bool {
+        let current = self.current_task;
+        let Some((index, task)) = self
+            .tasks
+            .iter_mut()
+            .enumerate()
+            .find(|(_, task)| task.process_id == Some(process_id))
+        else {
+            return false;
+        };
+        if index == current || task.kind != TaskKind::UserProcess {
+            return false;
+        }
+        match task.state {
+            TaskState::Runnable | TaskState::Blocked => {
+                task.stopped_resume_state = Some(task.state);
+                task.state = TaskState::Stopped;
+                true
+            }
+            TaskState::Stopped | TaskState::Zombie => false,
+        }
+    }
+
+    fn continue_process(&mut self, process_id: u64) -> bool {
+        let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.process_id == Some(process_id))
+        else {
+            return false;
+        };
+        if task.state != TaskState::Stopped {
+            return false;
+        }
+        task.state = task
+            .stopped_resume_state
+            .take()
+            .unwrap_or(TaskState::Runnable);
+        true
     }
 
     fn terminate_process(&mut self, process_id: u64) -> bool {
@@ -553,6 +616,7 @@ impl Scheduler {
             return false;
         }
         task.state = TaskState::Zombie;
+        task.stopped_resume_state = None;
         true
     }
 
@@ -564,6 +628,7 @@ impl Scheduler {
         let current = self.current_task;
         self.tasks[current].stack_pointer = current_stack_pointer;
         self.tasks[current].state = TaskState::Zombie;
+        self.tasks[current].stopped_resume_state = None;
         self.ticks_in_quantum = 0;
 
         let next = self
@@ -687,6 +752,11 @@ impl Scheduler {
                 .tasks
                 .iter()
                 .filter(|task| task.state == TaskState::Blocked)
+                .count(),
+            stopped_task_count: self
+                .tasks
+                .iter()
+                .filter(|task| task.state == TaskState::Stopped)
                 .count(),
             zombie_task_count: self
                 .tasks
@@ -826,6 +896,18 @@ pub fn wake_process(process_id: u64) -> bool {
 
 pub fn is_process_blocked(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().is_process_blocked(process_id))
+}
+
+pub fn is_process_stopped(process_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().is_process_stopped(process_id))
+}
+
+pub fn stop_process(process_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().stop_process(process_id))
+}
+
+pub fn continue_process(process_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().continue_process(process_id))
 }
 
 pub fn terminate_process(process_id: u64) -> bool {
