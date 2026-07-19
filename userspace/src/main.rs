@@ -1,54 +1,34 @@
 #![no_std]
 #![no_main]
 
-use core::{arch::global_asm, panic::PanicInfo};
+use core::arch::asm;
 
-global_asm!(
-    r#"
-    .section .text._start,"ax"
-    .p2align 4
-    .global _start
-    .type _start,@function
-_start:
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [rip + first_message]
-    mov rdx, 29
-    int 0x80
+use userspace::syscall::{self, STDOUT};
 
-    mov rcx, 50000000
-.Linit_busy:
-    pause
-    dec rcx
-    jnz .Linit_busy
+userspace::entry!(rust_main);
+userspace::panic_handler!();
 
-    mov rax, 2
-    int 0x80
-
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [rip + second_message]
-    mov rdx, 31
-    int 0x80
-
-    mov rax, 3
-    mov rdi, 42
-    int 0x80
-
-    ud2
-.size _start, .-_start
-
-    .section .rodata,"a"
-first_message:
-    .ascii "userspace: hello from ring 3\n"
-second_message:
-    .ascii "userspace: resumed after yield\n"
-"#,
-);
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {
-        core::hint::spin_loop();
+extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
+    if syscall::write_all(STDOUT, b"userspace: hello from ring 3\n").is_err() {
+        syscall::exit(1);
     }
+
+    unsafe {
+        asm!(
+            "mov rcx, 50000000",
+            "2:",
+            "pause",
+            "dec rcx",
+            "jnz 2b",
+            out("rcx") _,
+            options(nomem, nostack),
+        );
+    }
+
+    if syscall::yield_now().is_err()
+        || syscall::write_all(STDOUT, b"userspace: resumed after yield\n").is_err()
+    {
+        syscall::exit(1);
+    }
+    syscall::exit(42)
 }
