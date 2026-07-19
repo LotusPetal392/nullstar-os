@@ -3,7 +3,7 @@ use core::{
     ops::{BitOr, BitOrAssign},
 };
 
-use crate::abi::{errno as abi_errno, signal, spawn, syscall};
+use crate::abi::{child_status, errno as abi_errno, signal, spawn, syscall};
 
 global_asm!(
     r#"
@@ -110,13 +110,38 @@ impl ChildStatus {
     }
 
     pub const fn signal(self) -> Option<u64> {
-        if self.0 == 128 + signal::INTERRUPT {
-            Some(signal::INTERRUPT)
-        } else if self.0 == 128 + signal::TERMINATE {
-            Some(signal::TERMINATE)
+        let number = self.0.saturating_sub(child_status::SIGNAL_BASE);
+        if self.0 >= child_status::SIGNAL_BASE
+            && self.0 < child_status::STOPPED_BASE
+            && matches!(
+                number,
+                signal::INTERRUPT
+                    | signal::TERMINATE
+                    | signal::CONTINUE
+                    | signal::STOP
+                    | signal::TERMINAL_STOP
+            )
+        {
+            Some(number)
         } else {
             None
         }
+    }
+
+    pub const fn stopped_signal(self) -> Option<u64> {
+        let number = self.0.saturating_sub(child_status::STOPPED_BASE);
+        if self.0 >= child_status::STOPPED_BASE
+            && self.0 < child_status::CONTINUED
+            && matches!(number, signal::STOP | signal::TERMINAL_STOP)
+        {
+            Some(number)
+        } else {
+            None
+        }
+    }
+
+    pub const fn continued(self) -> bool {
+        self.0 == child_status::CONTINUED
     }
 
     pub fn interrupted(self) -> bool {
@@ -277,6 +302,18 @@ pub fn signal_process_group(process_group: ProcessGroupId, signal: u64) -> Resul
             inlateout("rax") result,
             in("rdi") process_group,
             in("rsi") signal,
+        );
+    }
+    decode(result).map(|count| count as usize)
+}
+
+pub fn foreground_process_group(process_group: ProcessGroupId) -> Result<usize> {
+    let mut result = syscall::FOREGROUND_PROCESS_GROUP;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") process_group,
         );
     }
     decode(result).map(|count| count as usize)
