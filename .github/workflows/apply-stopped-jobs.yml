@@ -48,6 +48,17 @@ jobs:
             echo "b91ffd05fcc14c1a93b1e59a129b4a356a0275a5a9c32290885d3eb9293a53af  /tmp/stopped-jobs.patch" | sha256sum --check --strict
             git apply --check /tmp/stopped-jobs.patch
             git apply /tmp/stopped-jobs.patch
+            python - <<'PY'
+          from pathlib import Path
+
+          path = Path("userspace/src/syscall.rs")
+          source = path.read_text()
+          old = "    pub const fn interrupted(self) -> bool {"
+          new = "    pub fn interrupted(self) -> bool {"
+          if source.count(old) != 1:
+              raise SystemExit("expected one interrupted const function")
+          path.write_text(source.replace(old, new, 1))
+          PY
             cargo +nightly-2026-02-01 fmt --all
             cargo +nightly-2026-02-01 fmt --all -- --check
             git diff --check
@@ -67,6 +78,7 @@ jobs:
           rm tools/stopped_jobs_payload.part1
           rm tools/stopped_jobs_payload.part2
           rm tools/stopped_jobs_payload.part3
+          rm -f tools/stopped_jobs_failure.txt
           rm .github/workflows/apply-stopped-jobs.yml
           rm stopped-jobs-validation.log
           git config user.name lotuspetalagent
