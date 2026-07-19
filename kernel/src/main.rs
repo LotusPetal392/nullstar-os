@@ -576,6 +576,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cat_result.bytes_read
     );
 
+    const USERSPACE_RUNTIME_PROBE_BYTES: u64 =
+        b"userspace Rust runtime probe passed\n".len() as u64;
+    let runtime_probe_result = match userspace_runtime.run("/runtime-probe", &["runtime-smoke"]) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace Rust runtime validation failed to launch: {error}");
+            hlt_loop();
+        }
+    };
+    let userspace_rust_runtime_verified = runtime_probe_result.exit_code() == Some(0)
+        && runtime_probe_result.path == "/runtime-probe"
+        && runtime_probe_result.syscall_count == 3
+        && runtime_probe_result.write_count == 1
+        && runtime_probe_result.bytes_written == USERSPACE_RUNTIME_PROBE_BYTES;
+    if !userspace_rust_runtime_verified {
+        serial_println!(
+            "userspace Rust runtime verification failed: exit={:?}, path={}, syscalls={}, writes={}, bytes={}",
+            runtime_probe_result.exit_code(),
+            runtime_probe_result.path,
+            runtime_probe_result.syscall_count,
+            runtime_probe_result.write_count,
+            runtime_probe_result.bytes_written
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace Rust runtime verified: pid={}, syscalls={}, writes={}, bytes={}, heap=4096, argv=2",
+        runtime_probe_result.process_id,
+        runtime_probe_result.syscall_count,
+        runtime_probe_result.write_count,
+        runtime_probe_result.bytes_written
+    );
+
     const TERMINAL_TEST_LINE: &str = "hello from canonical stdin";
     let terminal_spawn = match userspace_runtime.spawn_foreground("/readline", &[]) {
         Ok(info) => info,
@@ -1184,6 +1217,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Userspace file descriptors verified");
     } else {
         println!("Userspace file descriptors unavailable");
+    }
+    if userspace_rust_runtime_verified {
+        println!("Shared Rust userspace runtime verified");
+    } else {
+        println!("Rust userspace runtime unavailable");
     }
     if terminal_verified {
         println!("Blocking userspace terminal verified");
