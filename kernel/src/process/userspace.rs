@@ -14,7 +14,7 @@ use core::{
 
 use spin::Mutex;
 use x86_64::{
-    VirtAddr,
+    PhysAddr, VirtAddr,
     instructions::{hlt, interrupts as cpu_interrupts},
     registers::control::Cr2,
     structures::paging::{
@@ -60,6 +60,7 @@ const SYSCALL_FOREGROUND_PROCESS_GROUP: u64 = abi::syscall::FOREGROUND_PROCESS_G
 const SYSCALL_SEEK: u64 = abi::syscall::SEEK;
 const SYSCALL_EXECVE: u64 = abi::syscall::EXECVE;
 const SYSCALL_SET_DESCRIPTOR_FLAGS: u64 = abi::syscall::SET_DESCRIPTOR_FLAGS;
+const SYSCALL_FORK: u64 = abi::syscall::FORK;
 
 pub const SIGNAL_INTERRUPT: u64 = abi::signal::INTERRUPT;
 pub const SIGNAL_TERMINATE: u64 = abi::signal::TERMINATE;
@@ -119,6 +120,101 @@ const ERR_BROKEN_PIPE: i64 = abi::errno::BROKEN_PIPE;
 const ERR_NOT_IMPLEMENTED: i64 = abi::errno::NOT_IMPLEMENTED;
 
 static PROCESS_MANAGER: Mutex<ProcessManager> = Mutex::new(ProcessManager::new());
+
+#[derive(Debug, Clone, Copy)]
+struct SharedFrameReference {
+    frame: PhysFrame<Size4KiB>,
+    references: usize,
+}
+
+#[derive(Debug)]
+struct SharedFrameTable {
+    frames: Vec<SharedFrameReference>,
+    peak_frames: usize,
+    peak_references: usize,
+}
+
+impl SharedFrameTable {
+    const fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            peak_frames: 0,
+            peak_references: 0,
+        }
+    }
+
+    fn retain(&mut self, frame: PhysFrame<Size4KiB>) {
+        if let Some(reference) = self.frames.iter_mut().find(|entry| entry.frame == frame) {
+            reference.references = reference.references.saturating_add(1);
+        } else {
+            self.frames.push(SharedFrameReference {
+                frame,
+                references: 2,
+            });
+        }
+        self.peak_frames = self.peak_frames.max(self.frames.len());
+        self.peak_references = self.peak_references.max(self.total_references());
+    }
+
+    fn references(&self, frame: PhysFrame<Size4KiB>) -> usize {
+        self.frames
+            .iter()
+            .find(|entry| entry.frame == frame)
+            .map(|entry| entry.references)
+            .unwrap_or(1)
+    }
+
+    fn release(&mut self, frame: PhysFrame<Size4KiB>) -> bool {
+        let Some(index) = self.frames.iter().position(|entry| entry.frame == frame) else {
+            return true;
+        };
+        let references = self.frames[index].references.saturating_sub(1);
+        if references <= 1 {
+            self.frames.remove(index);
+        } else {
+            self.frames[index].references = references;
+        }
+        false
+    }
+
+    fn total_references(&self) -> usize {
+        self.frames.iter().map(|entry| entry.references).sum()
+    }
+}
+
+static SHARED_USER_FRAMES: Mutex<SharedFrameTable> = Mutex::new(SharedFrameTable::new());
+
+fn retain_shared_frame(frame: PhysFrame<Size4KiB>) {
+    SHARED_USER_FRAMES.lock().retain(frame);
+}
+
+fn shared_frame_references(frame: PhysFrame<Size4KiB>) -> usize {
+    SHARED_USER_FRAMES.lock().references(frame)
+}
+
+fn release_owned_frame(
+    frame: PhysFrame<Size4KiB>,
+    frame_allocator: &mut BootInfoFrameAllocator,
+) -> bool {
+    if SHARED_USER_FRAMES.lock().release(frame) {
+        frame_allocator.deallocate_frame(frame);
+        true
+    } else {
+        false
+    }
+}
+
+fn release_owned_frames(
+    frames: &mut Vec<PhysFrame<Size4KiB>>,
+    frame_allocator: &mut BootInfoFrameAllocator,
+) -> usize {
+    let mut reclaimed = 0usize;
+    for frame in frames.drain(..) {
+        reclaimed =
+            reclaimed.saturating_add(usize::from(release_owned_frame(frame, frame_allocator)));
+    }
+    reclaimed
+}
 
 global_asm!(
     r#"
@@ -362,6 +458,9 @@ pub struct ProcessResult {
     pub exec_failure_count: u64,
     pub close_on_exec_count: u64,
     pub exec_frames_reclaimed: u64,
+    pub fork_count: u64,
+    pub cow_fault_count: u64,
+    pub cow_copy_count: u64,
     pub signal_sent_count: u64,
     pub signal_received_count: u64,
     pub stop_count: u64,
@@ -405,6 +504,14 @@ pub struct ManagerSnapshot {
     pub child_waits: u64,
     pub execs: u64,
     pub exec_failures: u64,
+    pub forks: u64,
+    pub fork_failures: u64,
+    pub cow_faults: u64,
+    pub cow_copies: u64,
+    pub shared_frames: usize,
+    pub shared_references: usize,
+    pub peak_shared_frames: usize,
+    pub peak_shared_references: usize,
     pub signals_sent: u64,
     pub stop_deliveries: u64,
     pub continue_deliveries: u64,
@@ -632,6 +739,16 @@ struct PendingExec {
     stack_pointer: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingFork {
+    stack_pointer: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCowFault {
+    page_address: u64,
+}
+
 struct OpenFileState {
     path: String,
     offset: u64,
@@ -701,6 +818,8 @@ struct Process {
     pending_child_spawn: Option<PendingChildSpawn>,
     pending_child_wait: Option<PendingChildWait>,
     pending_exec: Option<PendingExec>,
+    pending_fork: Option<PendingFork>,
+    pending_cow_fault: Option<PendingCowFault>,
     syscall_count: u64,
     write_count: u64,
     yield_count: u64,
@@ -729,6 +848,9 @@ struct Process {
     exec_failure_count: u64,
     close_on_exec_count: u64,
     exec_frames_reclaimed: u64,
+    fork_count: u64,
+    cow_fault_count: u64,
+    cow_copy_count: u64,
     signal_sent_count: u64,
     signal_received_count: u64,
     stop_count: u64,
@@ -840,6 +962,9 @@ impl Process {
             exec_failure_count: self.exec_failure_count,
             close_on_exec_count: self.close_on_exec_count,
             exec_frames_reclaimed: self.exec_frames_reclaimed,
+            fork_count: self.fork_count,
+            cow_fault_count: self.cow_fault_count,
+            cow_copy_count: self.cow_copy_count,
             signal_sent_count: self.signal_sent_count,
             signal_received_count: self.signal_received_count,
             stop_count: self.stop_count,
@@ -864,6 +989,10 @@ struct ProcessManager {
     child_waits: u64,
     execs: u64,
     exec_failures: u64,
+    forks: u64,
+    fork_failures: u64,
+    cow_faults: u64,
+    cow_copies: u64,
     signals_sent: u64,
     stop_deliveries: u64,
     continue_deliveries: u64,
@@ -888,6 +1017,10 @@ impl ProcessManager {
             child_waits: 0,
             execs: 0,
             exec_failures: 0,
+            forks: 0,
+            fork_failures: 0,
+            cow_faults: 0,
+            cow_copies: 0,
             signals_sent: 0,
             stop_deliveries: 0,
             continue_deliveries: 0,
@@ -923,12 +1056,21 @@ impl ProcessManager {
     }
 
     fn snapshot(&self) -> ManagerSnapshot {
+        let shared = SHARED_USER_FRAMES.lock();
         ManagerSnapshot {
             spawned: self.spawned,
             child_spawns: self.child_spawns,
             child_waits: self.child_waits,
             execs: self.execs,
             exec_failures: self.exec_failures,
+            forks: self.forks,
+            fork_failures: self.fork_failures,
+            cow_faults: self.cow_faults,
+            cow_copies: self.cow_copies,
+            shared_frames: shared.frames.len(),
+            shared_references: shared.total_references(),
+            peak_shared_frames: shared.peak_frames,
+            peak_shared_references: shared.peak_references,
             signals_sent: self.signals_sent,
             stop_deliveries: self.stop_deliveries,
             continue_deliveries: self.continue_deliveries,
@@ -969,6 +1111,8 @@ impl ProcessManager {
 struct UserPage {
     virtual_address: u64,
     frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+    copy_on_write: bool,
 }
 
 struct BuiltAddressSpace {
@@ -1462,6 +1606,8 @@ fn spawn_with_mode(
         pending_child_spawn: None,
         pending_child_wait: None,
         pending_exec: None,
+        pending_fork: None,
+        pending_cow_fault: None,
         syscall_count: 0,
         write_count: 0,
         yield_count: 0,
@@ -1490,6 +1636,9 @@ fn spawn_with_mode(
         exec_failure_count: 0,
         close_on_exec_count: 0,
         exec_frames_reclaimed: 0,
+        fork_count: 0,
+        cow_fault_count: 0,
+        cow_copy_count: 0,
         signal_sent_count: 0,
         signal_received_count: 0,
         stop_count: 0,
@@ -1574,6 +1723,236 @@ pub struct PipelineResult {
     pub pipe_id: PipeId,
     pub producer: ProcessResult,
     pub consumer: ProcessResult,
+}
+
+#[derive(Clone)]
+struct ForkSnapshot {
+    path: String,
+    process_group_id: u64,
+    entry_point: u64,
+    mapped_pages: usize,
+    load_segments: usize,
+    guard_page_address: u64,
+    page_table_address: u64,
+    ranges: Vec<UserRange>,
+    pages: Vec<UserPage>,
+    open_files: Vec<OpenFile>,
+    pipe_descriptors: Vec<PipeDescriptor>,
+    stdin_target: Option<StreamTarget>,
+    stdout_target: Option<StreamTarget>,
+    stderr_target: Option<StreamTarget>,
+    context: SavedContext,
+}
+
+struct ForkAddressSpace {
+    page_table_frame: PhysFrame<Size4KiB>,
+    pages: Vec<UserPage>,
+    page_table_frames: Vec<PhysFrame<Size4KiB>>,
+}
+
+fn page_table_mapper(
+    page_table_address: u64,
+    physical_memory_offset: VirtAddr,
+) -> Result<OffsetPageTable<'static>, Error> {
+    let frame: PhysFrame<Size4KiB> =
+        PhysFrame::from_start_address(PhysAddr::new(page_table_address))
+            .map_err(|_| Error::InvalidUserRange)?;
+    let address = physical_memory_offset
+        .as_u64()
+        .checked_add(frame.start_address().as_u64())
+        .ok_or(Error::AddressOverflow)?;
+    let table = unsafe { &mut *(address as *mut PageTable) };
+    Ok(unsafe { OffsetPageTable::new(table, physical_memory_offset) })
+}
+
+fn copy_frame(
+    source: PhysFrame<Size4KiB>,
+    destination: PhysFrame<Size4KiB>,
+    physical_memory_offset: VirtAddr,
+) -> Result<(), Error> {
+    let source_address = physical_memory_offset
+        .as_u64()
+        .checked_add(source.start_address().as_u64())
+        .ok_or(Error::AddressOverflow)?;
+    let destination_address = physical_memory_offset
+        .as_u64()
+        .checked_add(destination.start_address().as_u64())
+        .ok_or(Error::AddressOverflow)?;
+    unsafe {
+        ptr::copy_nonoverlapping(
+            source_address as *const u8,
+            destination_address as *mut u8,
+            Size4KiB::SIZE as usize,
+        );
+    }
+    Ok(())
+}
+
+fn clone_fork_address_space(
+    parent: &ForkSnapshot,
+    kernel_mapper: &mut OffsetPageTable<'_>,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    physical_memory_offset: VirtAddr,
+) -> Result<ForkAddressSpace, Error> {
+    let mut tracking = TrackingFrameAllocator::new(frame_allocator);
+    let result = (|| {
+        let page_table_frame = tracking
+            .allocate_frame()
+            .ok_or(Error::FrameAllocationFailed)?;
+        let table_address = physical_memory_offset
+            .as_u64()
+            .checked_add(page_table_frame.start_address().as_u64())
+            .ok_or(Error::AddressOverflow)?;
+        let table_pointer = table_address as *mut PageTable;
+        unsafe { table_pointer.write(PageTable::new()) };
+        let level_4_table = unsafe { &mut *table_pointer };
+        for index in 1..512 {
+            let source = &kernel_mapper.level_4_table()[index];
+            if !source.is_unused() {
+                level_4_table[index].set_addr(source.addr(), source.flags());
+            }
+        }
+        let mut mapper = unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) };
+        let mut pages = Vec::with_capacity(parent.pages.len());
+        for source in &parent.pages {
+            let mut mapping_flags = source.flags;
+            let copy_on_write =
+                source.copy_on_write || source.flags.contains(PageTableFlags::WRITABLE);
+            if copy_on_write {
+                mapping_flags.remove(PageTableFlags::WRITABLE);
+            }
+            let page = Page::containing_address(VirtAddr::new(source.virtual_address));
+            let flush = unsafe { mapper.map_to(page, source.frame, mapping_flags, &mut tracking) }
+                .map_err(|error| map_error(error, source.virtual_address))?;
+            flush.ignore();
+            pages.push(UserPage {
+                virtual_address: source.virtual_address,
+                frame: source.frame,
+                flags: source.flags,
+                copy_on_write,
+            });
+        }
+        Ok(ForkAddressSpace {
+            page_table_frame,
+            pages,
+            page_table_frames: Vec::new(),
+        })
+    })();
+    match result {
+        Ok(mut address_space) => {
+            address_space.page_table_frames = tracking.take_frames();
+            Ok(address_space)
+        }
+        Err(error) => {
+            tracking.reclaim_all();
+            Err(error)
+        }
+    }
+}
+
+fn retain_pipe_descriptor(descriptor: PipeDescriptor) -> Result<(), Error> {
+    match descriptor.direction {
+        PipeDirection::Reader => pipe::retain_reader(descriptor.pipe_id)?,
+        PipeDirection::Writer => pipe::retain_writer(descriptor.pipe_id)?,
+    }
+    Ok(())
+}
+
+fn release_pipe_descriptor(descriptor: PipeDescriptor) {
+    match descriptor.direction {
+        PipeDirection::Reader => {
+            let _ = pipe::close_reader(descriptor.pipe_id);
+        }
+        PipeDirection::Writer => {
+            let _ = pipe::close_writer(descriptor.pipe_id);
+        }
+    }
+}
+
+fn retain_fork_resources(snapshot: &ForkSnapshot) -> Result<(), Error> {
+    let mut retained_descriptors = 0usize;
+    for descriptor in &snapshot.pipe_descriptors {
+        if let Err(error) = retain_pipe_descriptor(*descriptor) {
+            for retained in &snapshot.pipe_descriptors[..retained_descriptors] {
+                release_pipe_descriptor(*retained);
+            }
+            return Err(error);
+        }
+        retained_descriptors = retained_descriptors.saturating_add(1);
+    }
+    if let Err(error) = retain_stream_target(&snapshot.stdin_target, StreamAccess::Read) {
+        for descriptor in &snapshot.pipe_descriptors {
+            release_pipe_descriptor(*descriptor);
+        }
+        return Err(error);
+    }
+    if let Err(error) = retain_stream_target(&snapshot.stdout_target, StreamAccess::Write) {
+        release_stream_target(snapshot.stdin_target.clone(), StreamAccess::Read);
+        for descriptor in &snapshot.pipe_descriptors {
+            release_pipe_descriptor(*descriptor);
+        }
+        return Err(error);
+    }
+    if let Err(error) = retain_stream_target(&snapshot.stderr_target, StreamAccess::Write) {
+        release_stream_target(snapshot.stdout_target.clone(), StreamAccess::Write);
+        release_stream_target(snapshot.stdin_target.clone(), StreamAccess::Read);
+        for descriptor in &snapshot.pipe_descriptors {
+            release_pipe_descriptor(*descriptor);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn release_fork_resources(snapshot: &ForkSnapshot) {
+    release_stream_target(snapshot.stderr_target.clone(), StreamAccess::Write);
+    release_stream_target(snapshot.stdout_target.clone(), StreamAccess::Write);
+    release_stream_target(snapshot.stdin_target.clone(), StreamAccess::Read);
+    for descriptor in &snapshot.pipe_descriptors {
+        release_pipe_descriptor(*descriptor);
+    }
+}
+
+fn protect_parent_pages_for_fork(
+    process_id: u64,
+    physical_memory_offset: VirtAddr,
+) -> Result<usize, Error> {
+    let (page_table_address, pages) = {
+        let manager = PROCESS_MANAGER.lock();
+        let process = manager
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+            .ok_or(Error::ProcessNotFound(process_id))?;
+        (process.page_table_address, process.pages.clone())
+    };
+    let mut mapper = page_table_mapper(page_table_address, physical_memory_offset)?;
+    let mut protected = 0usize;
+    for page_info in &pages {
+        if page_info.copy_on_write || !page_info.flags.contains(PageTableFlags::WRITABLE) {
+            continue;
+        }
+        let mut flags = page_info.flags;
+        flags.remove(PageTableFlags::WRITABLE);
+        let page: Page<Size4KiB> =
+            Page::containing_address(VirtAddr::new(page_info.virtual_address));
+        let flush =
+            unsafe { mapper.update_flags(page, flags) }.map_err(|_| Error::InvalidUserRange)?;
+        flush.ignore();
+        protected = protected.saturating_add(1);
+    }
+    if protected != 0 {
+        let mut manager = PROCESS_MANAGER.lock();
+        let process = manager
+            .process_mut(process_id)
+            .ok_or(Error::ProcessNotFound(process_id))?;
+        for page in &mut process.pages {
+            if page.flags.contains(PageTableFlags::WRITABLE) {
+                page.copy_on_write = true;
+            }
+        }
+    }
+    Ok(protected)
 }
 
 pub struct Runtime {
@@ -1818,6 +2197,365 @@ impl Runtime {
         result
     }
 
+    fn fork_process(&mut self, parent_process_id: u64, request: PendingFork) -> Result<u64, Error> {
+        let snapshot = {
+            let manager = PROCESS_MANAGER.lock();
+            let parent = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == parent_process_id)
+                .ok_or(Error::ProcessNotFound(parent_process_id))?;
+            if parent.state != ProcessState::Blocked || parent.pending_fork.is_none() {
+                return Err(Error::InvalidArgument);
+            }
+            validate_kernel_context_pointer(parent, request.stack_pointer)?;
+            ForkSnapshot {
+                path: parent.path.clone(),
+                process_group_id: parent.process_group_id,
+                entry_point: parent.entry_point,
+                mapped_pages: parent.mapped_pages,
+                load_segments: parent.load_segments,
+                guard_page_address: parent.guard_page_address,
+                page_table_address: parent.page_table_address,
+                ranges: parent.ranges.clone(),
+                pages: parent.pages.clone(),
+                open_files: parent.open_files.clone(),
+                pipe_descriptors: parent.pipe_descriptors.clone(),
+                stdin_target: parent.stdin_target.clone(),
+                stdout_target: parent.stdout_target.clone(),
+                stderr_target: parent.stderr_target.clone(),
+                context: unsafe { *(request.stack_pointer as *const SavedContext) },
+            }
+        };
+
+        let mut address_space = clone_fork_address_space(
+            &snapshot,
+            &mut self.mapper,
+            &mut self.frame_allocator,
+            self.physical_memory_offset,
+        )?;
+        if let Err(error) = retain_fork_resources(&snapshot) {
+            for frame in address_space.page_table_frames.drain(..) {
+                self.frame_allocator.deallocate_frame(frame);
+            }
+            return Err(error);
+        }
+
+        let mut kernel_stack = vec![0_u128; KERNEL_TRANSITION_STACK_WORDS].into_boxed_slice();
+        let kernel_stack_start = kernel_stack.as_mut_ptr() as usize;
+        let kernel_stack_bytes = kernel_stack
+            .len()
+            .checked_mul(size_of::<u128>())
+            .ok_or(Error::StackLayoutInvalid)?;
+        let kernel_stack_top = kernel_stack_start
+            .checked_add(kernel_stack_bytes)
+            .ok_or(Error::StackLayoutInvalid)?;
+        let child_stack_pointer = kernel_stack_top
+            .checked_sub(size_of::<SavedContext>())
+            .ok_or(Error::StackLayoutInvalid)?;
+        if kernel_stack_start % align_of::<u128>() != 0
+            || kernel_stack_top % 16 != 0
+            || child_stack_pointer % 16 != 0
+        {
+            release_fork_resources(&snapshot);
+            for frame in address_space.page_table_frames.drain(..) {
+                self.frame_allocator.deallocate_frame(frame);
+            }
+            return Err(Error::StackLayoutInvalid);
+        }
+        let mut child_context = snapshot.context;
+        child_context.rax = 0;
+        unsafe { (child_stack_pointer as *mut SavedContext).write(child_context) };
+
+        let child_process_id = PROCESS_MANAGER.lock().allocate_process_id();
+        let page_table_address = address_space.page_table_frame.start_address().as_u64();
+        let mut owned_frames = core::mem::take(&mut address_space.page_table_frames);
+        owned_frames.extend(snapshot.pages.iter().map(|page| page.frame));
+
+        let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
+            let _ = protect_parent_pages_for_fork(parent_process_id, self.physical_memory_offset)?;
+            let task_id = scheduler::spawn_user_process(
+                SHELL_PROCESS_TASK_NAME,
+                child_process_id,
+                child_stack_pointer,
+                VirtAddr::new(kernel_stack_top as u64),
+                kernel_stack_bytes,
+                page_table_address,
+            )?;
+            for page in &snapshot.pages {
+                retain_shared_frame(page.frame);
+            }
+
+            let child = Process {
+                process_id: child_process_id,
+                parent_process_id: Some(parent_process_id),
+                process_group_id: snapshot.process_group_id,
+                terminal_parent: None,
+                task_id,
+                path: snapshot.path.clone(),
+                state: ProcessState::Runnable,
+                stopped_resume_state: None,
+                last_stop_signal: None,
+                pending_parent_status: None,
+                termination: None,
+                page_table_address,
+                entry_point: snapshot.entry_point,
+                mapped_pages: snapshot.mapped_pages,
+                load_segments: snapshot.load_segments,
+                guard_page_address: snapshot.guard_page_address,
+                ranges: snapshot.ranges.clone(),
+                pages: core::mem::take(&mut address_space.pages),
+                kernel_stack,
+                owned_frames,
+                open_files: snapshot.open_files.clone(),
+                pipe_descriptors: snapshot.pipe_descriptors.clone(),
+                stdin_target: snapshot.stdin_target.clone(),
+                stdout_target: snapshot.stdout_target.clone(),
+                stderr_target: snapshot.stderr_target.clone(),
+                pending_terminal_read: None,
+                pending_pipe_read: None,
+                pending_pipe_write: None,
+                pending_child_spawn: None,
+                pending_child_wait: None,
+                pending_exec: None,
+                pending_fork: None,
+                pending_cow_fault: None,
+                syscall_count: 0,
+                write_count: 0,
+                yield_count: 0,
+                bytes_written: 0,
+                open_count: 0,
+                read_count: 0,
+                close_count: 0,
+                bytes_read: 0,
+                file_write_count: 0,
+                file_bytes_written: 0,
+                seek_count: 0,
+                terminal_read_count: 0,
+                terminal_bytes_read: 0,
+                blocked_read_count: 0,
+                pipe_read_count: 0,
+                pipe_write_count: 0,
+                pipe_bytes_read: 0,
+                pipe_bytes_written: 0,
+                blocked_pipe_read_count: 0,
+                blocked_pipe_write_count: 0,
+                child_spawn_count: 0,
+                child_wait_count: 0,
+                child_poll_count: 0,
+                child_poll_pending_count: 0,
+                exec_count: 0,
+                exec_failure_count: 0,
+                close_on_exec_count: 0,
+                exec_frames_reclaimed: 0,
+                fork_count: 0,
+                cow_fault_count: 0,
+                cow_copy_count: 0,
+                signal_sent_count: 0,
+                signal_received_count: 0,
+                stop_count: 0,
+                continue_count: 0,
+                pipe_pair_count: 0,
+                pipe_descriptor_close_count: 0,
+                pipe_descriptor_inherit_count: snapshot.pipe_descriptors.len() as u64,
+                file_descriptor_inherit_count: snapshot.open_files.len() as u64,
+            };
+
+            let mut manager = PROCESS_MANAGER.lock();
+            let parent = manager
+                .process_mut(parent_process_id)
+                .ok_or(Error::ProcessNotFound(parent_process_id))?;
+            let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
+            registers.rax = child_process_id;
+            parent.pending_fork = None;
+            parent.make_runnable();
+            parent.fork_count = parent.fork_count.saturating_add(1);
+            manager.forks = manager.forks.saturating_add(1);
+            manager.spawned = manager.spawned.saturating_add(1);
+            manager.processes.push(child);
+            Ok(task_id)
+        });
+
+        if let Err(error) = task_result {
+            release_fork_resources(&snapshot);
+            for frame in address_space.page_table_frames.drain(..) {
+                self.frame_allocator.deallocate_frame(frame);
+            }
+            return Err(error);
+        }
+        if !scheduler::wake_process(parent_process_id) {
+            return Err(Error::ProcessNotFound(parent_process_id));
+        }
+        crate::serial_println!(
+            "userspace process forked: parent={}, child={}, group={}, shared_pages={}",
+            parent_process_id,
+            child_process_id,
+            snapshot.process_group_id,
+            snapshot.pages.len()
+        );
+        Ok(child_process_id)
+    }
+
+    fn service_fork_requests(&mut self) -> Result<usize, Error> {
+        let requests: Vec<(u64, PendingFork)> = cpu_interrupts::without_interrupts(|| {
+            PROCESS_MANAGER
+                .lock()
+                .processes
+                .iter()
+                .filter_map(|process| {
+                    process
+                        .pending_fork
+                        .map(|request| (process.process_id, request))
+                })
+                .collect()
+        });
+        let mut completed = 0usize;
+        for (parent_process_id, request) in requests {
+            if let Err(error) = self.fork_process(parent_process_id, request) {
+                let return_value = error_return(process_error_number(&error));
+                let should_wake = cpu_interrupts::without_interrupts(|| {
+                    let mut manager = PROCESS_MANAGER.lock();
+                    let Some(parent) = manager.process_mut(parent_process_id) else {
+                        return false;
+                    };
+                    if parent.state != ProcessState::Blocked || parent.pending_fork.is_none() {
+                        return false;
+                    }
+                    let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
+                    registers.rax = return_value;
+                    parent.pending_fork = None;
+                    parent.make_runnable();
+                    manager.fork_failures = manager.fork_failures.saturating_add(1);
+                    true
+                });
+                if should_wake && !scheduler::wake_process(parent_process_id) {
+                    return Err(Error::ProcessNotFound(parent_process_id));
+                }
+                crate::serial_println!(
+                    "userspace process fork failed: parent={}, error={}",
+                    parent_process_id,
+                    error
+                );
+            }
+            completed = completed.saturating_add(1);
+        }
+        Ok(completed)
+    }
+
+    fn resolve_cow_page(&mut self, process_id: u64, page_address: u64) -> Result<bool, Error> {
+        let (page_table_address, page_info) = {
+            let manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            let page = process
+                .pages
+                .iter()
+                .find(|page| page.virtual_address == page_address && page.copy_on_write)
+                .copied()
+                .ok_or(Error::InvalidUserRange)?;
+            (process.page_table_address, page)
+        };
+        let references = shared_frame_references(page_info.frame);
+        let page = Page::containing_address(VirtAddr::new(page_address));
+        let mut mapper = page_table_mapper(page_table_address, self.physical_memory_offset)?;
+        let mut copied = false;
+        let replacement = if references > 1 {
+            let new_frame = self
+                .frame_allocator
+                .allocate_frame()
+                .ok_or(Error::FrameAllocationFailed)?;
+            copy_frame(page_info.frame, new_frame, self.physical_memory_offset)?;
+            let (old_frame, flush) = mapper.unmap(page).map_err(|_| Error::InvalidUserRange)?;
+            flush.ignore();
+            if old_frame != page_info.frame {
+                self.frame_allocator.deallocate_frame(new_frame);
+                return Err(Error::InvalidUserRange);
+            }
+            let flush = unsafe {
+                mapper.map_to(page, new_frame, page_info.flags, &mut self.frame_allocator)
+            }
+            .map_err(|error| map_error(error, page_address))?;
+            flush.ignore();
+            copied = true;
+            new_frame
+        } else {
+            let (old_frame, flush) = mapper.unmap(page).map_err(|_| Error::InvalidUserRange)?;
+            flush.ignore();
+            if old_frame != page_info.frame {
+                return Err(Error::InvalidUserRange);
+            }
+            let flush = unsafe {
+                mapper.map_to(page, old_frame, page_info.flags, &mut self.frame_allocator)
+            }
+            .map_err(|error| map_error(error, page_address))?;
+            flush.ignore();
+            old_frame
+        };
+
+        let mut manager = PROCESS_MANAGER.lock();
+        {
+            let process = manager
+                .process_mut(process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            let page_index = process
+                .pages
+                .iter()
+                .position(|page| page.virtual_address == page_address)
+                .ok_or(Error::InvalidUserRange)?;
+            if copied {
+                let owned = process
+                    .owned_frames
+                    .iter_mut()
+                    .find(|frame| **frame == page_info.frame)
+                    .ok_or(Error::InvalidUserRange)?;
+                *owned = replacement;
+                let _ = release_owned_frame(page_info.frame, &mut self.frame_allocator);
+                process.cow_copy_count = process.cow_copy_count.saturating_add(1);
+            }
+            process.pages[page_index].frame = replacement;
+            process.pages[page_index].copy_on_write = false;
+            process.pending_cow_fault = None;
+            process.make_runnable();
+        }
+        if copied {
+            manager.cow_copies = manager.cow_copies.saturating_add(1);
+        }
+        drop(manager);
+        if !scheduler::wake_process(process_id) {
+            return Err(Error::ProcessNotFound(process_id));
+        }
+        Ok(copied)
+    }
+
+    fn service_cow_faults(&mut self) -> Result<usize, Error> {
+        let faults: Vec<(u64, PendingCowFault)> = cpu_interrupts::without_interrupts(|| {
+            PROCESS_MANAGER
+                .lock()
+                .processes
+                .iter()
+                .filter_map(|process| {
+                    process
+                        .pending_cow_fault
+                        .map(|fault| (process.process_id, fault))
+                })
+                .collect()
+        });
+        let mut completed = 0usize;
+        for (process_id, fault) in faults {
+            let copied = self.resolve_cow_page(process_id, fault.page_address)?;
+            crate::serial_println!(
+                "userspace copy-on-write resolved: pid={}, page={:#018x}, copied={}",
+                process_id,
+                fault.page_address,
+                copied
+            );
+            completed = completed.saturating_add(1);
+        }
+        Ok(completed)
+    }
     fn replace_process_image(
         &mut self,
         process_id: u64,
@@ -1925,13 +2663,7 @@ impl Runtime {
             process.close_on_exec_count = process
                 .close_on_exec_count
                 .saturating_add(closed_descriptors as u64);
-            process.exec_frames_reclaimed = process
-                .exec_frames_reclaimed
-                .saturating_add(old_frames.len() as u64);
             manager.execs = manager.execs.saturating_add(1);
-            manager.frames_reclaimed = manager
-                .frames_reclaimed
-                .saturating_add(old_frames.len() as u64);
             Ok((old_path, old_frames, closed_pipe_count, closed_descriptors))
         });
         let (old_path, mut old_frames, closed_pipe_count, closed_descriptors) = match commit {
@@ -1954,9 +2686,17 @@ impl Runtime {
                 }
             }
         }
-        let reclaimed_frames = old_frames.len();
-        for frame in old_frames.drain(..) {
-            self.frame_allocator.deallocate_frame(frame);
+        let reclaimed_frames = release_owned_frames(&mut old_frames, &mut self.frame_allocator);
+        {
+            let mut manager = PROCESS_MANAGER.lock();
+            if let Some(process) = manager.process_mut(process_id) {
+                process.exec_frames_reclaimed = process
+                    .exec_frames_reclaimed
+                    .saturating_add(reclaimed_frames as u64);
+            }
+            manager.frames_reclaimed = manager
+                .frames_reclaimed
+                .saturating_add(reclaimed_frames as u64);
         }
         crate::serial_println!(
             "userspace process image replaced: pid={}, old={}, new={}, entry={:#018x}, closed={}, frames_reclaimed={}",
@@ -2075,8 +2815,10 @@ impl Runtime {
         terminal::poll_keyboard();
         service_terminal_control();
         let reaped = reap(&mut self.frame_allocator)?;
+        self.service_cow_faults()?;
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;
+        self.service_fork_requests()?;
         self.service_child_requests()?;
         self.service_exec_requests()?;
         Ok(reaped)
@@ -2523,10 +3265,7 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
                 }
             }
         }
-        let frames_reclaimed = process.owned_frames.len();
-        for frame in process.owned_frames.drain(..) {
-            frame_allocator.deallocate_frame(frame);
-        }
+        let frames_reclaimed = release_owned_frames(&mut process.owned_frames, frame_allocator);
         let result = process.result(frames_reclaimed, task.scheduled_count, task.runtime_ticks)?;
         cpu_interrupts::without_interrupts(|| {
             let mut manager = PROCESS_MANAGER.lock();
@@ -2692,6 +3431,13 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             registers.rax = syscall_set_descriptor_flags(process_id, registers.rdi, registers.rsi);
             current_stack_pointer
         }
+        SYSCALL_FORK => match syscall_fork(process_id, current_stack_pointer) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        },
         SYSCALL_EXIT => {
             let exit_code = registers.rdi;
             {
@@ -2724,7 +3470,7 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
 
 #[unsafe(no_mangle)]
 pub extern "C" fn galactic_user_fault_dispatch(current_stack_pointer: usize, vector: u64) -> usize {
-    let frame = unsafe { &*(current_stack_pointer as *const FaultStack) };
+    let frame = unsafe { &mut *(current_stack_pointer as *mut FaultStack) };
     if frame.cs & 3 != 3 {
         let address = if vector == PAGE_FAULT_VECTOR {
             Cr2::read().map(|address| address.as_u64()).unwrap_or(0)
@@ -2742,6 +3488,52 @@ pub extern "C" fn galactic_user_fault_dispatch(current_stack_pointer: usize, vec
         crate::serial_println!("user exception arrived without an active process task");
         crate::hlt_loop();
     };
+
+    let fault_address = if vector == PAGE_FAULT_VECTOR {
+        Cr2::read().map(|address| address.as_u64()).unwrap_or(0)
+    } else {
+        0
+    };
+    let cow_page_address = align_down(fault_address);
+    let is_cow_fault = vector == PAGE_FAULT_VECTOR
+        && frame.error_code & 0b111 == 0b111
+        && PROCESS_MANAGER
+            .lock()
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+            .is_some_and(|process| {
+                process.pending_cow_fault.is_none()
+                    && process
+                        .pages
+                        .iter()
+                        .any(|page| page.virtual_address == cow_page_address && page.copy_on_write)
+            });
+    if is_cow_fault {
+        let original_rip = frame.rip;
+        let original_cs = frame.cs;
+        let original_rflags = frame.rflags;
+        let original_stack_pointer = frame.stack_pointer;
+        let original_stack_segment = frame.stack_segment;
+        frame.error_code = original_rip;
+        frame.rip = original_cs;
+        frame.cs = original_rflags;
+        frame.rflags = original_stack_pointer;
+        frame.stack_pointer = original_stack_segment;
+        {
+            let mut manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .process_mut(process_id)
+                .expect("copy-on-write process disappeared");
+            process.pending_cow_fault = Some(PendingCowFault {
+                page_address: cow_page_address,
+            });
+            process.state = ProcessState::Blocked;
+            process.cow_fault_count = process.cow_fault_count.saturating_add(1);
+            manager.cow_faults = manager.cow_faults.saturating_add(1);
+        }
+        return scheduler::block_current(current_stack_pointer);
+    }
     let fault = FaultInfo {
         vector,
         error_code: frame.error_code,
@@ -2798,6 +3590,7 @@ struct SavedRegisters {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SavedContext {
     r15: u64,
     r14: u64,
@@ -2904,6 +3697,7 @@ fn syscall_spawn_command(
     if process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
+        || process.pending_fork.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -2947,12 +3741,36 @@ fn syscall_execve(
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
+        || process.pending_fork.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
     process.pending_exec = Some(PendingExec {
         path,
         arguments,
+        stack_pointer: current_stack_pointer,
+    });
+    process.state = ProcessState::Blocked;
+    ControlOutcome::Blocked
+}
+
+fn syscall_fork(process_id: u64, current_stack_pointer: usize) -> ControlOutcome {
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return ControlOutcome::Ready(error_return(ERR_NO_PROCESS));
+    };
+    if process.pending_terminal_read.is_some()
+        || process.pending_pipe_read.is_some()
+        || process.pending_pipe_write.is_some()
+        || process.pending_child_spawn.is_some()
+        || process.pending_child_wait.is_some()
+        || process.pending_exec.is_some()
+        || process.pending_fork.is_some()
+        || process.pending_cow_fault.is_some()
+    {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_fork = Some(PendingFork {
         stack_pointer: current_stack_pointer,
     });
     process.state = ProcessState::Blocked;
@@ -3082,6 +3900,7 @@ fn syscall_wait_child(
     if process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
+        || process.pending_fork.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -4420,6 +5239,8 @@ fn map_range(
         pages.push(UserPage {
             virtual_address: address,
             frame,
+            flags,
+            copy_on_write: false,
         });
         address = address
             .checked_add(PAGE_BYTES)

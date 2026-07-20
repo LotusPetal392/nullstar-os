@@ -66,6 +66,15 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_exec_target")
             .expect("userspace exec-target artifact path was not set"),
     );
+
+    let userspace_fork_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_fork_probe")
+            .expect("userspace fork-probe artifact path was not set"),
+    );
+    let userspace_fork_target = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_fork_target")
+            .expect("userspace fork-target artifact path was not set"),
+    );
     let userspace_shell = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_ush")
             .expect("userspace shell artifact path was not set"),
@@ -89,6 +98,8 @@ fn main() {
     image.set_file(String::from("exec"), userspace_exec);
     image.set_file(String::from("exec-source"), userspace_exec_source);
     image.set_file(String::from("exec-target"), userspace_exec_target);
+    image.set_file(String::from("fork-probe"), userspace_fork_probe);
+    image.set_file(String::from("fork-target"), userspace_fork_target);
     image.set_file(String::from("ush"), userspace_shell);
     image.set_file(String::from("hello.txt"), hello_text);
     image

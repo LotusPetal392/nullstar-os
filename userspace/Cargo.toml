@@ -93,3 +93,16 @@ name = "exec_target"
 path = "src/bin/exec_target.rs"
 test = false
 bench = false
+
+
+[[bin]]
+name = "fork_probe"
+path = "src/bin/fork_probe.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fork_target"
+path = "src/bin/fork_target.rs"
+test = false
+bench = false

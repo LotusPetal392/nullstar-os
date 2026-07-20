@@ -426,6 +426,14 @@ pub fn set_descriptor_flags(descriptor: FileDescriptor, flags: DescriptorFlags) 
     decode(result).map(|_| ())
 }
 
+pub fn fork() -> Result<ProcessId> {
+    let mut result = syscall::FORK;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result)
+}
+
 pub fn exit(code: u64) -> ! {
     unsafe {
         asm!(

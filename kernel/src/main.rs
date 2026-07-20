@@ -786,6 +786,91 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         exec_launcher_result.exec_frames_reclaimed
     );
 
+    let fork_before = userspace::snapshot();
+    let fork_memory_before = userspace_runtime.memory_stats();
+    let fork_spawn = match userspace_runtime.spawn_foreground("/fork-probe", &[]) {
+        Ok(info) => info,
+        Err(error) => {
+            serial_println!("copy-on-write fork probe spawn failed: {error}");
+            hlt_loop();
+        }
+    };
+    let fork_parent_result = match userspace_runtime.wait(fork_spawn.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("copy-on-write fork parent wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    let fork_after = userspace::snapshot();
+    let fork_memory_after = userspace_runtime.memory_stats();
+    let fork_child_result = fork_after.results.iter().find(|result| {
+        result.parent_process_id == Some(fork_spawn.process_id) && result.path == "/fork-target"
+    });
+    let fork_output = match vfs::read_file("/tmp/fork-shared.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("copy-on-write fork output read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let fork_delta = fork_after.forks.saturating_sub(fork_before.forks);
+    let cow_fault_delta = fork_after.cow_faults.saturating_sub(fork_before.cow_faults);
+    let cow_copy_delta = fork_after.cow_copies.saturating_sub(fork_before.cow_copies);
+    let expected_fork_output = b"child-before-exec\ntarget-after-exec\nparent-after-wait\n";
+    let userspace_fork_verified = fork_parent_result.exit_code() == Some(0)
+        && fork_parent_result.process_id == fork_spawn.process_id
+        && fork_parent_result.fork_count == 1
+        && fork_child_result.is_some_and(|child| {
+            child.exit_code() == Some(17)
+                && child.process_group_id == fork_spawn.process_group_id
+                && child.exec_count == 1
+                && child.file_write_count == 2
+        })
+        && fork_delta == 1
+        && cow_fault_delta >= 2
+        && cow_copy_delta >= 2
+        && fork_after.shared_frames == 0
+        && fork_after.shared_references == 0
+        && fork_output.bytes.as_slice() == expected_fork_output
+        && fork_memory_after.allocated_frames == fork_memory_before.allocated_frames;
+    if !userspace_fork_verified {
+        serial_println!(
+            "userspace copy-on-write fork verification failed: parent={}/{:?}, parent_forks={}, child={:?}, forks={}, cow_faults={}, cow_copies={}, shared={}/{}, output={}, frames={}/{}",
+            fork_parent_result.process_id,
+            fork_parent_result.exit_code(),
+            fork_parent_result.fork_count,
+            fork_child_result.map(|child| (
+                child.process_id,
+                child.exit_code(),
+                child.process_group_id,
+                child.exec_count,
+                child.file_write_count
+            )),
+            fork_delta,
+            cow_fault_delta,
+            cow_copy_delta,
+            fork_after.shared_frames,
+            fork_after.shared_references,
+            fork_output.bytes.len(),
+            fork_memory_before.allocated_frames,
+            fork_memory_after.allocated_frames
+        );
+        hlt_loop();
+    }
+    let fork_child_result = fork_child_result.expect("validated fork child result disappeared");
+    serial_println!(
+        "userspace copy-on-write fork verified: parent_pid={}, child_pid={}, group={}, forks={}, cow_faults={}, cow_copies={}, peak_shared_frames={}, peak_shared_references={}, child_exec=1, descriptors_preserved=true, frame_balance=true",
+        fork_parent_result.process_id,
+        fork_child_result.process_id,
+        fork_parent_result.process_group_id,
+        fork_delta,
+        cow_fault_delta,
+        cow_copy_delta,
+        fork_after.peak_shared_frames,
+        fork_after.peak_shared_references
+    );
+
     const TERMINAL_TEST_LINE: &str = "hello from canonical stdin";
     let terminal_spawn = match userspace_runtime.spawn_foreground("/readline", &[]) {
         Ok(info) => info,
