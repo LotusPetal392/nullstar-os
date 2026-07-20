@@ -910,6 +910,197 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         fork_after.peak_shared_references
     );
 
+    let handled_signal_before = userspace::snapshot();
+    let handled_signal_memory_before = userspace_runtime.memory_stats();
+    let handled_signal_terminal_before = userspace_runtime.terminal_snapshot();
+    let handled_signal_spawn =
+        match userspace_runtime.spawn_foreground("/signal-handler-probe", &[]) {
+            Ok(info) => info,
+            Err(error) => {
+                serial_println!("userspace handled-signal probe spawn failed: {error}");
+                hlt_loop();
+            }
+        };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(handled_signal_spawn.process_id)
+    {
+        serial_println!("userspace handled-signal probe did not block in terminal read: {error}");
+        hlt_loop();
+    }
+    let masked_terminate_deliveries = match userspace_runtime.signal_process_group(
+        handled_signal_spawn.process_group_id,
+        userspace::SIGNAL_TERMINATE,
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            serial_println!("userspace masked SIGTERM delivery failed: {error}");
+            hlt_loop();
+        }
+    };
+    let pending_after_terminate = userspace::snapshot().pending_signals;
+    let handled_interrupt_deliveries = match userspace_runtime.inject_terminal_interrupt() {
+        Ok(count) => count,
+        Err(error) => {
+            serial_println!("userspace handled SIGINT injection failed: {error}");
+            hlt_loop();
+        }
+    };
+    let handled_signal_result = match userspace_runtime.wait(handled_signal_spawn.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace handled-signal probe wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    let handled_signal_after = userspace::snapshot();
+    let handled_signal_memory_after = userspace_runtime.memory_stats();
+    let handled_signal_terminal_after = userspace_runtime.terminal_snapshot();
+    let handled_signal_verified = handled_signal_result.exit_code() == Some(0)
+        && handled_signal_result.signal_received_count == 2
+        && handled_signal_result.signal_handler_count == 2
+        && handled_signal_result.signal_return_count == 2
+        && handled_signal_result.signal_interrupted_syscall_count == 1
+        && handled_signal_result.signal_frame_failure_count == 0
+        && handled_signal_result.pending_signal_peak >= 2
+        && masked_terminate_deliveries == 1
+        && handled_interrupt_deliveries == 1
+        && pending_after_terminate >= 1
+        && handled_signal_after
+            .signal_handlers
+            .saturating_sub(handled_signal_before.signal_handlers)
+            == 2
+        && handled_signal_after
+            .signal_returns
+            .saturating_sub(handled_signal_before.signal_returns)
+            == 2
+        && handled_signal_after
+            .signal_interruptions
+            .saturating_sub(handled_signal_before.signal_interruptions)
+            == 1
+        && handled_signal_after
+            .signals_sent
+            .saturating_sub(handled_signal_before.signals_sent)
+            == 2
+        && handled_signal_after.signal_frame_failures
+            == handled_signal_before.signal_frame_failures
+        && handled_signal_after.pending_signals == 0
+        && handled_signal_terminal_after.interrupts
+            == handled_signal_terminal_before.interrupts.saturating_add(1)
+        && handled_signal_terminal_after.foreground_process.is_none()
+        && handled_signal_memory_after.allocated_frames
+            == handled_signal_memory_before.allocated_frames;
+    if !handled_signal_verified {
+        serial_println!(
+            "userspace handled-signal verification failed: exit={:?}, received={}, handlers={}, returns={}, interrupted={}, frame_failures={}, pending_peak={}, deliveries={}/{}, pending_after_term={}, manager_handlers={}/{}, manager_returns={}/{}, manager_interruptions={}/{}, manager_pending={}, terminal_interrupts={}/{}, foreground={:?}, frames={}/{}",
+            handled_signal_result.exit_code(),
+            handled_signal_result.signal_received_count,
+            handled_signal_result.signal_handler_count,
+            handled_signal_result.signal_return_count,
+            handled_signal_result.signal_interrupted_syscall_count,
+            handled_signal_result.signal_frame_failure_count,
+            handled_signal_result.pending_signal_peak,
+            masked_terminate_deliveries,
+            handled_interrupt_deliveries,
+            pending_after_terminate,
+            handled_signal_before.signal_handlers,
+            handled_signal_after.signal_handlers,
+            handled_signal_before.signal_returns,
+            handled_signal_after.signal_returns,
+            handled_signal_before.signal_interruptions,
+            handled_signal_after.signal_interruptions,
+            handled_signal_after.pending_signals,
+            handled_signal_terminal_before.interrupts,
+            handled_signal_terminal_after.interrupts,
+            handled_signal_terminal_after.foreground_process,
+            handled_signal_memory_before.allocated_frames,
+            handled_signal_memory_after.allocated_frames
+        );
+        hlt_loop();
+    }
+
+    let signal_lifecycle_before = userspace::snapshot();
+    let signal_lifecycle_memory_before = userspace_runtime.memory_stats();
+    let signal_lifecycle_spawn =
+        match userspace_runtime.spawn_foreground("/signal-lifecycle-probe", &[]) {
+            Ok(info) => info,
+            Err(error) => {
+                serial_println!("userspace signal-lifecycle probe spawn failed: {error}");
+                hlt_loop();
+            }
+        };
+    let signal_lifecycle_result = match userspace_runtime.wait(signal_lifecycle_spawn.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace signal-lifecycle probe wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    let signal_lifecycle_after = userspace::snapshot();
+    let signal_lifecycle_memory_after = userspace_runtime.memory_stats();
+    let signal_lifecycle_child = signal_lifecycle_after.results.iter().find(|result| {
+        result.parent_process_id == Some(signal_lifecycle_spawn.process_id)
+            && result.path == "/signal-lifecycle-target"
+    });
+    let signal_lifecycle_verified = signal_lifecycle_result.exit_code() == Some(0)
+        && signal_lifecycle_result.fork_count == 1
+        && signal_lifecycle_child.is_some_and(|child| {
+            child.exit_code() == Some(19)
+                && child.process_group_id == signal_lifecycle_spawn.process_group_id
+                && child.exec_count == 1
+                && child.signal_handler_count == 0
+                && child.signal_return_count == 0
+        })
+        && signal_lifecycle_after
+            .forks
+            .saturating_sub(signal_lifecycle_before.forks)
+            == 1
+        && signal_lifecycle_after
+            .execs
+            .saturating_sub(signal_lifecycle_before.execs)
+            == 1
+        && signal_lifecycle_after.pending_signals == 0
+        && signal_lifecycle_memory_after.allocated_frames
+            == signal_lifecycle_memory_before.allocated_frames
+        && userspace_runtime
+            .terminal_snapshot()
+            .foreground_process
+            .is_none();
+    if !signal_lifecycle_verified {
+        serial_println!(
+            "userspace signal-lifecycle verification failed: parent={}/{:?}, forks={}, child={:?}, fork_delta={}, exec_delta={}, pending={}, frames={}/{}",
+            signal_lifecycle_result.process_id,
+            signal_lifecycle_result.exit_code(),
+            signal_lifecycle_result.fork_count,
+            signal_lifecycle_child.map(|child| (
+                child.process_id,
+                child.exit_code(),
+                child.process_group_id,
+                child.exec_count,
+                child.signal_handler_count,
+                child.signal_return_count
+            )),
+            signal_lifecycle_after
+                .forks
+                .saturating_sub(signal_lifecycle_before.forks),
+            signal_lifecycle_after
+                .execs
+                .saturating_sub(signal_lifecycle_before.execs),
+            signal_lifecycle_after.pending_signals,
+            signal_lifecycle_memory_before.allocated_frames,
+            signal_lifecycle_memory_after.allocated_frames
+        );
+        hlt_loop();
+    }
+    let signal_lifecycle_child =
+        signal_lifecycle_child.expect("validated signal lifecycle child disappeared");
+    let userspace_handled_signals_verified = handled_signal_verified && signal_lifecycle_verified;
+    serial_println!(
+        "userspace handled signals verified: handler_pid={}, lifecycle_parent={}, lifecycle_child={}, handlers=2, returns=2, interrupted_syscalls=1, pending_peak={}, fork_inherited=true, exec_reset=true, mask_preserved=true, frame_balance=true",
+        handled_signal_result.process_id,
+        signal_lifecycle_result.process_id,
+        signal_lifecycle_child.process_id,
+        handled_signal_result.pending_signal_peak
+    );
+
     const TERMINAL_TEST_LINE: &str = "hello from canonical stdin";
     let terminal_spawn = match userspace_runtime.spawn_foreground("/readline", &[]) {
         Ok(info) => info,
@@ -1881,6 +2072,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Transactional userspace exec verified");
     } else {
         println!("Userspace exec unavailable");
+    }
+    if userspace_handled_signals_verified {
+        println!("Userspace signal handlers verified");
+    } else {
+        println!("Userspace signal handlers unavailable");
     }
     if terminal_verified {
         println!("Blocking userspace terminal verified");

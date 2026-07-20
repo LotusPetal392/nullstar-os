@@ -35,6 +35,7 @@ const USER_BACKGROUND_TEST_MARKER: &str = "userspace background jobs verified:";
 const USER_STOPPED_JOB_TEST_MARKER: &str = "userspace stopped jobs verified:";
 const USER_TMPFS_TEST_MARKER: &str = "userspace tmpfs redirection verified:";
 const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals verified:";
+const USER_SIGNAL_HANDLER_TEST_MARKER: &str = "userspace handled signals verified:";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Default)]
@@ -85,7 +86,7 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, tmpfs, redirection, process control, pipelines, jobs, and signals"
+        "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
     );
 }
 
@@ -221,6 +222,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
         let mut user_stopped_job_ready = false;
         let mut user_tmpfs_ready = false;
         let mut user_signal_ready = false;
+        let mut user_signal_handler_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
@@ -261,6 +263,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
             user_stopped_job_ready |= line.contains(USER_STOPPED_JOB_TEST_MARKER);
             user_tmpfs_ready |= line.contains(USER_TMPFS_TEST_MARKER);
             user_signal_ready |= line.contains(USER_SIGNAL_TEST_MARKER);
+            user_signal_handler_ready |= line.contains(USER_SIGNAL_HANDLER_TEST_MARKER);
 
             if phase == SmokePhase::VerifyCompleteSystem
                 && heap_ready
@@ -289,6 +292,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
                 && user_stopped_job_ready
                 && user_tmpfs_ready
                 && user_signal_ready
+                && user_signal_handler_ready
             {
                 let _ = marker_sender.send(());
                 break;

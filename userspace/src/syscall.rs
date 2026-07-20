@@ -5,7 +5,8 @@ use core::{
 
 use crate::abi::{
     child_status, descriptor as abi_descriptor, errno as abi_errno, open as abi_open,
-    seek as abi_seek, signal, spawn, syscall,
+    seek as abi_seek, signal, signal_action as abi_signal_action, signal_mask as abi_signal_mask,
+    spawn, syscall,
 };
 
 global_asm!(
@@ -23,8 +24,18 @@ galactic_userspace_spawn_command:
     pop rbx
     ret
 .size galactic_userspace_spawn_command, .-galactic_userspace_spawn_command
+
+    .p2align 4
+    .global galactic_userspace_signal_restorer
+    .type galactic_userspace_signal_restorer,@function
+galactic_userspace_signal_restorer:
+    mov rax, {signal_return}
+    int 0x80
+    ud2
+.size galactic_userspace_signal_restorer, .-galactic_userspace_signal_restorer
 "#,
     spawn_command = const syscall::SPAWN_COMMAND,
+    signal_return = const syscall::SIGNAL_RETURN,
 );
 
 unsafe extern "C" {
@@ -37,11 +48,14 @@ unsafe extern "C" {
         stderr_descriptor: u64,
         process_group: u64,
     ) -> u64;
+    fn galactic_userspace_signal_restorer();
 }
 
 pub type FileDescriptor = u64;
 pub type ProcessId = u64;
 pub type ProcessGroupId = u64;
+pub type SignalHandler = extern "C" fn(u64, *const SignalFrame);
+pub use crate::abi::signal_action::Frame as SignalFrame;
 
 pub const STDIN: FileDescriptor = 0;
 pub const STDOUT: FileDescriptor = 1;
@@ -52,6 +66,7 @@ pub struct Errno(i32);
 
 impl Errno {
     pub const NO_ENTRY: Self = Self((-abi_errno::NO_ENTRY) as i32);
+    pub const INTERRUPTED: Self = Self((-abi_errno::INTERRUPTED) as i32);
     pub const IO: Self = Self((-abi_errno::IO) as i32);
     pub const BAD_FILE_DESCRIPTOR: Self = Self((-abi_errno::BAD_FILE_DESCRIPTOR) as i32);
     pub const NO_CHILD: Self = Self((-abi_errno::NO_CHILD) as i32);
@@ -64,6 +79,128 @@ impl Errno {
 }
 
 pub type Result<T> = core::result::Result<T, Errno>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalMask(u64);
+
+impl SignalMask {
+    pub const EMPTY: Self = Self(0);
+
+    pub const fn from_signal(signal_number: u64) -> Self {
+        Self(signal::bit(signal_number))
+    }
+
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        if bits & !signal::SUPPORTED_MASK == 0 {
+            Some(Self(bits & !signal::UNBLOCKABLE_MASK))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn contains(self, signal_number: u64) -> bool {
+        self.0 & signal::bit(signal_number) != 0
+    }
+}
+
+impl BitOr for SignalMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for SignalMask {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalActionFlags(u64);
+
+impl SignalActionFlags {
+    pub const EMPTY: Self = Self(0);
+    pub const RESET_HANDLER: Self = Self(abi_signal_action::RESET_HANDLER);
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+
+impl BitOr for SignalActionFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for SignalActionFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalAction(abi_signal_action::Action);
+
+impl SignalAction {
+    pub const DEFAULT: Self = Self(abi_signal_action::Action::DEFAULT);
+    pub const IGNORE: Self = Self(abi_signal_action::Action::IGNORE);
+
+    pub fn handler(handler: SignalHandler, mask: SignalMask, flags: SignalActionFlags) -> Self {
+        Self(abi_signal_action::Action {
+            handler: handler as usize as u64,
+            mask: mask.bits(),
+            flags: flags.bits(),
+            restorer: galactic_userspace_signal_restorer as usize as u64,
+        })
+    }
+
+    pub const fn handler_address(self) -> u64 {
+        self.0.handler
+    }
+
+    pub const fn mask(self) -> SignalMask {
+        SignalMask(self.0.mask)
+    }
+
+    pub const fn flags(self) -> SignalActionFlags {
+        SignalActionFlags(self.0.flags)
+    }
+
+    pub const fn is_default(self) -> bool {
+        self.0.handler == abi_signal_action::DEFAULT
+    }
+
+    pub const fn is_ignored(self) -> bool {
+        self.0.handler == abi_signal_action::IGNORE
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalMaskHow {
+    Block,
+    Unblock,
+    Set,
+}
+
+impl SignalMaskHow {
+    const fn raw(self) -> u64 {
+        match self {
+            Self::Block => abi_signal_mask::BLOCK,
+            Self::Unblock => abi_signal_mask::UNBLOCK,
+            Self::Set => abi_signal_mask::SET,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnFlags(u64);
@@ -432,6 +569,47 @@ pub fn fork() -> Result<ProcessId> {
         asm!("int 0x80", inlateout("rax") result);
     }
     decode(result)
+}
+
+pub fn signal_action(
+    signal_number: u64,
+    action: Option<&SignalAction>,
+    previous: Option<&mut SignalAction>,
+) -> Result<()> {
+    let mut result = syscall::SIGNAL_ACTION;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") signal_number,
+            in("rsi") action.map_or(0, |action| core::ptr::from_ref(action) as u64),
+            in("rdx") previous.map_or(0, |action| core::ptr::from_mut(action) as u64),
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn query_signal_action(signal_number: u64) -> Result<SignalAction> {
+    let mut action = SignalAction::DEFAULT;
+    signal_action(signal_number, None, Some(&mut action))?;
+    Ok(action)
+}
+
+pub fn signal_mask(how: SignalMaskHow, mask: SignalMask) -> Result<SignalMask> {
+    let mut result = syscall::SIGNAL_MASK;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") how.raw(),
+            in("rsi") mask.bits(),
+        );
+    }
+    decode(result).map(SignalMask)
+}
+
+pub fn current_signal_mask() -> Result<SignalMask> {
+    signal_mask(SignalMaskHow::Block, SignalMask::EMPTY)
 }
 
 pub fn exit(code: u64) -> ! {

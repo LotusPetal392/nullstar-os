@@ -732,7 +732,7 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, child spawns={}, waits={}, execs={} (failed={}), forks={} (failed={}), COW={}/{}, shared={}/{}, signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, execs={} (failed={}), forks={} (failed={}), COW={}/{}, shared={}/{}, signals={} (handlers={}, returns={}, ignored={}, interrupted={}, frame_failures={}, pending={}, stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
             snapshot.spawned,
             snapshot.child_spawns,
             snapshot.child_waits,
@@ -745,6 +745,12 @@ impl Shell {
             snapshot.shared_frames,
             snapshot.shared_references,
             snapshot.signals_sent,
+            snapshot.signal_handlers,
+            snapshot.signal_returns,
+            snapshot.signal_ignores,
+            snapshot.signal_interruptions,
+            snapshot.signal_frame_failures,
+            snapshot.pending_signals,
             snapshot.stop_deliveries,
             snapshot.continue_deliveries,
             snapshot.pipe_pairs,
@@ -827,6 +833,15 @@ impl Shell {
                 result.fork_count,
                 result.cow_fault_count,
                 result.cow_copy_count
+            );
+            shell_println!(
+                "  signal handlers: entered={}, returned={}, ignored={}, interrupted syscalls={}, frame failures={}, pending peak={}",
+                result.signal_handler_count,
+                result.signal_return_count,
+                result.signal_ignored_count,
+                result.signal_interrupted_syscall_count,
+                result.signal_frame_failure_count,
+                result.pending_signal_peak
             );
             shell_println!(
                 "  terminal: reads={}, bytes={}, blocked reads={}",
@@ -1224,6 +1239,15 @@ fn print_process_result(result: &userspace::ProcessResult) {
         result.read_count,
         result.close_count,
         result.bytes_read
+    );
+    shell_println!(
+        "  signal handlers: entered={}, returned={}, ignored={}, interrupted syscalls={}, frame failures={}, pending peak={}",
+        result.signal_handler_count,
+        result.signal_return_count,
+        result.signal_ignored_count,
+        result.signal_interrupted_syscall_count,
+        result.signal_frame_failure_count,
+        result.pending_signal_peak
     );
     shell_println!(
         "  terminal: reads={}, bytes={}, blocked reads={}",
