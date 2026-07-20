@@ -1,6 +1,7 @@
 use std::{
-    env,
+    env, fs,
     io::{self, BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     sync::mpsc,
     thread,
@@ -16,6 +17,8 @@ const PCIE_TEST_MARKER: &str = "PCIe initialized:";
 const AHCI_TEST_MARKER: &str = "AHCI storage verified:";
 const PARTITION_TEST_MARKER: &str = "partition table initialized:";
 const FAT_TEST_MARKER: &str = "FAT filesystem mounted:";
+const FAT_PERSIST_PREPARED_MARKER: &str = "persistent FAT write prepared:";
+const FAT_PERSIST_VERIFIED_MARKER: &str = "persistent FAT write verified:";
 const VFS_TEST_MARKER: &str = "VFS initialized:";
 const ELF_TEST_MARKER: &str = "ELF image validated:";
 const USERSPACE_TEST_MARKER: &str = "process isolation verified:";
@@ -46,12 +49,10 @@ fn main() -> ExitCode {
         Err(exit_code) => return exit_code,
     };
 
-    let command = qemu_command(&options);
-
     if options.test {
-        run_kernel_smoke_test(command)
+        run_kernel_smoke_test(&options)
     } else {
-        run_interactive(command)
+        run_interactive(qemu_command(&options))
     }
 }
 
@@ -84,18 +85,24 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify hardware, storage, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, tmpfs, redirection, process control, pipelines, jobs, and signals"
+        "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, tmpfs, redirection, process control, pipelines, jobs, and signals"
     );
 }
 
 fn qemu_command(options: &Options) -> Command {
-    let bios_image = env!("BIOS_IMAGE");
+    qemu_command_for_image(options, Path::new(env!("BIOS_IMAGE")))
+}
+
+fn qemu_command_for_image(options: &Options, image: &Path) -> Command {
     let mut command = Command::new("qemu-system-x86_64");
 
     command
         .args(["-machine", "q35"])
         .arg("-drive")
-        .arg(format!("if=none,id=bootdisk,format=raw,file={bios_image}"))
+        .arg(format!(
+            "if=none,id=bootdisk,format=raw,file={}",
+            image.display()
+        ))
         .args(["-device", "ide-hd,drive=bootdisk,bus=ide.0,bootindex=1"])
         .args(["-serial", "stdio", "-monitor", "none", "-m", "128M"]);
 
@@ -121,19 +128,68 @@ fn run_interactive(mut command: Command) -> ExitCode {
     }
 }
 
-fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmokePhase {
+    PreparePersistentFat,
+    VerifyCompleteSystem,
+}
+
+fn run_kernel_smoke_test(options: &Options) -> ExitCode {
+    let source_image = Path::new(env!("BIOS_IMAGE"));
+    let test_image = persistent_test_image_path();
+    let _ = fs::remove_file(&test_image);
+    if let Err(error) = fs::copy(source_image, &test_image) {
+        eprintln!(
+            "Could not create persistent FAT test image {} from {}: {error}",
+            test_image.display(),
+            source_image.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let prepare = run_qemu_phase(
+        qemu_command_for_image(options, &test_image),
+        SmokePhase::PreparePersistentFat,
+    );
+    let result = if prepare {
+        run_qemu_phase(
+            qemu_command_for_image(options, &test_image),
+            SmokePhase::VerifyCompleteSystem,
+        )
+    } else {
+        false
+    };
+    let _ = fs::remove_file(&test_image);
+    if result {
+        println!("QEMU kernel smoke test passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn persistent_test_image_path() -> PathBuf {
+    env::temp_dir().join(format!(
+        "galactic-os-persistent-fat-{}.img",
+        std::process::id()
+    ))
+}
+
+fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return qemu_start_error(error),
+        Err(error) => {
+            let _ = qemu_start_error(error);
+            return false;
+        }
     };
-
     let Some(serial_output) = child.stdout.take() else {
         eprintln!("QEMU serial output was not captured");
         let _ = child.kill();
         let _ = child.wait();
-        return ExitCode::FAILURE;
+        return false;
     };
 
     let (marker_sender, marker_receiver) = mpsc::channel();
@@ -148,6 +204,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         let mut ahci_ready = false;
         let mut partitions_ready = false;
         let mut fat_ready = false;
+        let mut fat_persistent_ready = false;
         let mut vfs_ready = false;
         let mut elf_ready = false;
         let mut userspace_ready = false;
@@ -170,6 +227,14 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             writeln!(terminal, "{line}")?;
             terminal.flush()?;
 
+            if phase == SmokePhase::PreparePersistentFat
+                && (line.contains(FAT_PERSIST_PREPARED_MARKER)
+                    || line.contains(FAT_PERSIST_VERIFIED_MARKER))
+            {
+                let _ = marker_sender.send(());
+                break;
+            }
+
             heap_ready |= line.contains(HEAP_TEST_MARKER);
             framebuffer_ready |= line.contains(FRAMEBUFFER_TEST_MARKER);
             acpi_ready |= line.contains(ACPI_TEST_MARKER);
@@ -179,6 +244,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             ahci_ready |= line.contains(AHCI_TEST_MARKER);
             partitions_ready |= line.contains(PARTITION_TEST_MARKER);
             fat_ready |= line.contains(FAT_TEST_MARKER);
+            fat_persistent_ready |= line.contains(FAT_PERSIST_VERIFIED_MARKER);
             vfs_ready |= line.contains(VFS_TEST_MARKER);
             elf_ready |= line.contains(ELF_TEST_MARKER);
             userspace_ready |= line.contains(USERSPACE_TEST_MARKER);
@@ -196,7 +262,8 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             user_tmpfs_ready |= line.contains(USER_TMPFS_TEST_MARKER);
             user_signal_ready |= line.contains(USER_SIGNAL_TEST_MARKER);
 
-            if heap_ready
+            if phase == SmokePhase::VerifyCompleteSystem
+                && heap_ready
                 && framebuffer_ready
                 && acpi_ready
                 && lapic_timer_ready
@@ -205,6 +272,7 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
                 && ahci_ready
                 && partitions_ready
                 && fat_ready
+                && fat_persistent_ready
                 && vfs_ready
                 && elf_ready
                 && userspace_ready
@@ -231,22 +299,20 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
     });
 
     let deadline = Instant::now() + QEMU_TEST_TIMEOUT;
-
     loop {
         match marker_receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(()) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader.join();
-                println!("QEMU kernel smoke test passed");
-                return ExitCode::SUCCESS;
+                return true;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 report_reader_result(reader.join());
-                eprintln!("QEMU stopped producing serial output before the kernel test passed");
-                return ExitCode::FAILURE;
+                eprintln!("QEMU stopped producing serial output during phase {phase:?}");
+                return false;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -254,16 +320,16 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
         match child.try_wait() {
             Ok(Some(status)) => {
                 report_reader_result(reader.join());
-                eprintln!("QEMU exited with status {status} before the kernel test passed");
-                return ExitCode::FAILURE;
+                eprintln!("QEMU exited with status {status} during phase {phase:?}");
+                return false;
             }
             Ok(None) => {}
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 report_reader_result(reader.join());
-                eprintln!("Could not query QEMU status: {error}");
-                return ExitCode::FAILURE;
+                eprintln!("Could not query QEMU status during phase {phase:?}: {error}");
+                return false;
             }
         }
 
@@ -272,10 +338,10 @@ fn run_kernel_smoke_test(mut command: Command) -> ExitCode {
             let _ = child.wait();
             report_reader_result(reader.join());
             eprintln!(
-                "QEMU kernel smoke test timed out after {} seconds",
+                "QEMU phase {phase:?} timed out after {} seconds",
                 QEMU_TEST_TIMEOUT.as_secs()
             );
-            return ExitCode::FAILURE;
+            return false;
         }
     }
 }

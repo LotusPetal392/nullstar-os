@@ -467,7 +467,29 @@ impl Shell {
             info.cluster_count,
             info.root_entry_count
         );
-        shell_println!("mount: read-only at /");
+        shell_println!(
+            "mount: {} at /; persistent writes are root-level 8.3 files only",
+            if info.writable {
+                "read-write"
+            } else {
+                "read-only"
+            }
+        );
+        if let Some(write_info) = fat::write_info() {
+            shell_println!(
+                "writes: creates={}, truncates={}, calls={}, bytes={}, clusters +{}/-{}, FAT updates={}, directory updates={}, flushes={}, max_file={} KiB",
+                write_info.creates,
+                write_info.truncates,
+                write_info.writes,
+                write_info.bytes_written,
+                write_info.clusters_allocated,
+                write_info.clusters_freed,
+                write_info.fat_entry_updates,
+                write_info.directory_updates,
+                write_info.flushes,
+                write_info.maximum_file_bytes / 1024
+            );
+        }
     }
 
     fn list_files(&self, path: &str) {
@@ -575,6 +597,21 @@ impl Shell {
             vfs::MAX_PATH_COMPONENTS,
             vfs::MAX_READ_WINDOW_BYTES / 1024
         );
+        if let Some(fat_write) = fat::write_info() {
+            shell_println!(
+                "persistent FAT: writable={}, creates={}, truncates={}, writes={}, bytes={}, clusters +{}/-{}, metadata={}/{}, flushes={}",
+                fat_write.writable,
+                fat_write.creates,
+                fat_write.truncates,
+                fat_write.writes,
+                fat_write.bytes_written,
+                fat_write.clusters_allocated,
+                fat_write.clusters_freed,
+                fat_write.fat_entry_updates,
+                fat_write.directory_updates,
+                fat_write.flushes
+            );
+        }
         if let Some(tmpfs) = vfs::tmpfs_info() {
             shell_println!(
                 "tmpfs: {} files={}/{}, bytes={}/{}, per-file={}, writes={}, rejected={}",

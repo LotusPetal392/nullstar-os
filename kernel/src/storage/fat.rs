@@ -15,6 +15,9 @@ const MAX_DIRECTORY_ENTRIES: usize = 16_384;
 const MAX_PATH_COMPONENTS: usize = 32;
 const MAX_LONG_NAME_SLOTS: usize = 20;
 const MAX_FILE_READ_BYTES: usize = 1024 * 1024;
+pub const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
+const ATTR_ARCHIVE: u8 = 0x20;
+const FAT16_END_OF_CHAIN: u16 = 0xffff;
 
 static VOLUME: Mutex<Option<FatVolume>> = Mutex::new(None);
 
@@ -40,6 +43,13 @@ pub enum Error {
     FileNotFound,
     NotDirectory,
     IsDirectory,
+    ReadOnly,
+    WriteUnsupported,
+    RootOnly,
+    InvalidShortName,
+    RootDirectoryFull,
+    FileTooLarge(usize),
+    NoSpace,
     ReadLimitTooLarge(usize),
 }
 
@@ -49,7 +59,7 @@ impl Error {
             Self::AlreadyInitialized => "FAT filesystem is already initialized",
             Self::NotInitialized => "FAT filesystem is not initialized",
             Self::NoSupportedPartition => "no readable FAT volume was found",
-            Self::Ahci(_) => "AHCI block read failed",
+            Self::Ahci(_) => "AHCI block I/O failed",
             Self::AddressOverflow => "FAT address calculation overflowed",
             Self::LbaOutOfRange => "FAT metadata references an LBA outside the partition",
             Self::BlockSizeMismatch { .. } => {
@@ -68,6 +78,13 @@ impl Error {
             Self::FileNotFound => "file was not found",
             Self::NotDirectory => "path component is not a directory",
             Self::IsDirectory => "path identifies a directory rather than a file",
+            Self::ReadOnly => "FAT directory entry is read-only",
+            Self::WriteUnsupported => "writes are supported only on FAT16 volumes",
+            Self::RootOnly => "FAT writes are limited to root-directory regular files",
+            Self::InvalidShortName => "FAT write path is not a supported 8.3 short name",
+            Self::RootDirectoryFull => "FAT fixed root directory contains no free entry",
+            Self::FileTooLarge(_) => "FAT file exceeds the configured write bound",
+            Self::NoSpace => "FAT volume contains too few free clusters",
             Self::ReadLimitTooLarge(_) => "requested file read exceeds the configured bound",
         }
     }
@@ -90,6 +107,10 @@ impl fmt::Display for Error {
                 write!(formatter, "cluster {cluster} has a reserved FAT value")
             }
             Self::BadCluster(cluster) => write!(formatter, "cluster {cluster} is marked bad"),
+            Self::FileTooLarge(size) => write!(
+                formatter,
+                "FAT file size {size} exceeds {MAX_FILE_WRITE_BYTES} bytes"
+            ),
             Self::ReadLimitTooLarge(limit) => write!(
                 formatter,
                 "requested file-read limit {limit} exceeds {MAX_FILE_READ_BYTES} bytes"
@@ -139,6 +160,22 @@ pub struct VolumeInfo {
     pub total_sectors: u64,
     pub cluster_count: u32,
     pub root_entry_count: usize,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WriteInfo {
+    pub writable: bool,
+    pub maximum_file_bytes: usize,
+    pub creates: u64,
+    pub truncates: u64,
+    pub writes: u64,
+    pub bytes_written: u64,
+    pub clusters_allocated: u64,
+    pub clusters_freed: u64,
+    pub fat_entry_updates: u64,
+    pub directory_updates: u64,
+    pub flushes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +227,19 @@ struct FatVolume {
     root_dir_sector_count: u64,
     first_data_sector: u64,
     root_cluster: u32,
+    write_info: WriteInfo,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RootEntryLocation {
+    relative_sector: u64,
+    offset: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RootFileRecord {
+    entry: DirectoryEntry,
+    location: RootEntryLocation,
 }
 
 impl FatVolume {
@@ -396,12 +446,26 @@ impl FatVolume {
                 total_sectors,
                 cluster_count,
                 root_entry_count: 0,
+                writable: fat_type == FatType::Fat16,
             },
             first_fat_sector,
             root_dir_first_sector,
             root_dir_sector_count,
             first_data_sector,
             root_cluster,
+            write_info: WriteInfo {
+                writable: fat_type == FatType::Fat16,
+                maximum_file_bytes: MAX_FILE_WRITE_BYTES,
+                creates: 0,
+                truncates: 0,
+                writes: 0,
+                bytes_written: 0,
+                clusters_allocated: 0,
+                clusters_freed: 0,
+                fat_entry_updates: 0,
+                directory_updates: 0,
+                flushes: 0,
+            },
         };
         volume.info.root_entry_count = volume.scan_directory(volume.root_location())?.len();
         Ok(volume)
@@ -495,6 +559,493 @@ impl FatVolume {
             total_size: entry.size,
             truncated: target_len < entry.size as usize,
         })
+    }
+
+    fn open_root_file(
+        &mut self,
+        path: &str,
+        create: bool,
+        truncate: bool,
+    ) -> Result<DirectoryEntry, Error> {
+        self.require_writable()?;
+        let short_name = encode_root_short_name(path)?;
+        let (record, free_location) = self.find_root_file(&short_name)?;
+        match record {
+            Some(record) => {
+                if record.entry.is_directory() {
+                    return Err(Error::IsDirectory);
+                }
+                if record.entry.is_read_only() {
+                    return Err(Error::ReadOnly);
+                }
+                if truncate {
+                    let entry = self.replace_root_file(&record, &[])?;
+                    self.write_info.truncates = self.write_info.truncates.saturating_add(1);
+                    Ok(entry)
+                } else {
+                    Ok(record.entry)
+                }
+            }
+            None if create => {
+                let location = free_location.ok_or(Error::RootDirectoryFull)?;
+                self.create_root_file(short_name, location)
+            }
+            None => Err(Error::FileNotFound),
+        }
+    }
+
+    fn write_root_file_at(
+        &mut self,
+        path: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<usize, Error> {
+        self.require_writable()?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let short_name = encode_root_short_name(path)?;
+        let (record, _) = self.find_root_file(&short_name)?;
+        let record = record.ok_or(Error::FileNotFound)?;
+        if record.entry.is_directory() {
+            return Err(Error::IsDirectory);
+        }
+        if record.entry.is_read_only() {
+            return Err(Error::ReadOnly);
+        }
+        let offset = usize::try_from(offset).map_err(|_| Error::AddressOverflow)?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(Error::AddressOverflow)?;
+        if end > MAX_FILE_WRITE_BYTES {
+            return Err(Error::FileTooLarge(end));
+        }
+        let old_size = usize::try_from(record.entry.size).map_err(|_| Error::AddressOverflow)?;
+        if old_size > MAX_FILE_WRITE_BYTES {
+            return Err(Error::FileTooLarge(old_size));
+        }
+        let mut contents = if old_size == 0 {
+            Vec::new()
+        } else {
+            let data = self.read_file(path, MAX_FILE_WRITE_BYTES)?;
+            if data.truncated || data.bytes.len() != old_size {
+                return Err(Error::CorruptDirectory);
+            }
+            data.bytes
+        };
+        if end > contents.len() {
+            contents.resize(end, 0);
+        }
+        contents[offset..end].copy_from_slice(bytes);
+        self.replace_root_file(&record, &contents)?;
+        self.write_info.writes = self.write_info.writes.saturating_add(1);
+        self.write_info.bytes_written = self
+            .write_info
+            .bytes_written
+            .saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn append_root_file(&mut self, path: &str, bytes: &[u8]) -> Result<(u64, usize), Error> {
+        self.require_writable()?;
+        let short_name = encode_root_short_name(path)?;
+        let (record, _) = self.find_root_file(&short_name)?;
+        let record = record.ok_or(Error::FileNotFound)?;
+        let offset = u64::from(record.entry.size);
+        let count = self.write_root_file_at(path, offset, bytes)?;
+        Ok((offset, count))
+    }
+
+    fn require_writable(&self) -> Result<(), Error> {
+        if self.info.fat_type != FatType::Fat16 {
+            Err(Error::WriteUnsupported)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn find_root_file(
+        &self,
+        wanted_short_name: &[u8; 11],
+    ) -> Result<(Option<RootFileRecord>, Option<RootEntryLocation>), Error> {
+        if self.info.fat_type != FatType::Fat16 || self.root_dir_sector_count == 0 {
+            return Err(Error::WriteUnsupported);
+        }
+        let mut free_location = None;
+        let end = self
+            .root_dir_first_sector
+            .checked_add(self.root_dir_sector_count)
+            .ok_or(Error::AddressOverflow)?;
+        for relative_sector in self.root_dir_first_sector..end {
+            let block = self.read_volume_sector(relative_sector)?;
+            for (index, entry) in block.chunks_exact(DIRECTORY_ENTRY_SIZE).enumerate() {
+                let location = RootEntryLocation {
+                    relative_sector,
+                    offset: index
+                        .checked_mul(DIRECTORY_ENTRY_SIZE)
+                        .ok_or(Error::AddressOverflow)?,
+                };
+                match entry[0] {
+                    0x00 => return Ok((None, free_location.or(Some(location)))),
+                    0xe5 => {
+                        free_location.get_or_insert(location);
+                        continue;
+                    }
+                    _ => {}
+                }
+                let attributes = entry[11];
+                if attributes == ATTR_LONG_NAME || attributes & ATTR_VOLUME_ID != 0 {
+                    continue;
+                }
+                let mut raw_short_name = [0_u8; 11];
+                raw_short_name.copy_from_slice(&entry[..11]);
+                if raw_short_name[0] == 0x05 {
+                    raw_short_name[0] = 0xe5;
+                }
+                if &raw_short_name == wanted_short_name {
+                    return Ok((
+                        Some(RootFileRecord {
+                            entry: parse_short_directory_entry(entry)?,
+                            location,
+                        }),
+                        free_location,
+                    ));
+                }
+            }
+        }
+        Ok((None, free_location))
+    }
+
+    fn create_root_file(
+        &mut self,
+        short_name: [u8; 11],
+        location: RootEntryLocation,
+    ) -> Result<DirectoryEntry, Error> {
+        let mut entry = [0_u8; DIRECTORY_ENTRY_SIZE];
+        entry[..11].copy_from_slice(&short_name);
+        entry[11] = ATTR_ARCHIVE;
+        // A deterministic 1980-01-01 timestamp keeps the early kernel independent
+        // of wall-clock support while remaining valid FAT metadata.
+        entry[16..18].copy_from_slice(&0x0021_u16.to_le_bytes());
+        entry[18..20].copy_from_slice(&0x0021_u16.to_le_bytes());
+        entry[24..26].copy_from_slice(&0x0021_u16.to_le_bytes());
+        self.write_root_entry_bytes(location, &entry)?;
+        self.flush_storage()?;
+        self.info.root_entry_count = self.info.root_entry_count.saturating_add(1);
+        self.write_info.creates = self.write_info.creates.saturating_add(1);
+        parse_short_directory_entry(&entry)
+    }
+
+    fn replace_root_file(
+        &mut self,
+        record: &RootFileRecord,
+        contents: &[u8],
+    ) -> Result<DirectoryEntry, Error> {
+        if contents.len() > MAX_FILE_WRITE_BYTES {
+            return Err(Error::FileTooLarge(contents.len()));
+        }
+        let old_chain = self.cluster_chain(record.entry.first_cluster)?;
+        let cluster_count = contents
+            .len()
+            .checked_add(self.info.bytes_per_cluster - 1)
+            .ok_or(Error::AddressOverflow)?
+            / self.info.bytes_per_cluster;
+        let new_chain = self.find_free_clusters(cluster_count)?;
+
+        for (index, cluster) in new_chain.iter().copied().enumerate() {
+            let start = index
+                .checked_mul(self.info.bytes_per_cluster)
+                .ok_or(Error::AddressOverflow)?;
+            let end = contents.len().min(
+                start
+                    .checked_add(self.info.bytes_per_cluster)
+                    .ok_or(Error::AddressOverflow)?,
+            );
+            self.write_cluster(cluster, contents.get(start..end).unwrap_or(&[]))?;
+        }
+        if !new_chain.is_empty() {
+            self.flush_storage()?;
+            if let Err(error) = self.link_fat16_chain(&new_chain) {
+                let _ = self.clear_fat16_chain(&new_chain);
+                let _ = self.flush_storage();
+                return Err(error);
+            }
+            self.flush_storage()?;
+        }
+
+        let first_cluster = new_chain.first().copied().unwrap_or(0);
+        let size =
+            u32::try_from(contents.len()).map_err(|_| Error::FileTooLarge(contents.len()))?;
+        let updated_entry = match self.update_root_entry(record, first_cluster, size) {
+            Ok(entry) => entry,
+            Err(error) => {
+                if !new_chain.is_empty() {
+                    let _ = self.clear_fat16_chain(&new_chain);
+                    let _ = self.flush_storage();
+                }
+                return Err(error);
+            }
+        };
+        self.flush_storage()?;
+
+        if !old_chain.is_empty() {
+            self.clear_fat16_chain(&old_chain)?;
+            self.flush_storage()?;
+        }
+        self.write_info.clusters_allocated = self
+            .write_info
+            .clusters_allocated
+            .saturating_add(new_chain.len() as u64);
+        self.write_info.clusters_freed = self
+            .write_info
+            .clusters_freed
+            .saturating_add(old_chain.len() as u64);
+        Ok(updated_entry)
+    }
+
+    fn update_root_entry(
+        &mut self,
+        record: &RootFileRecord,
+        first_cluster: u32,
+        size: u32,
+    ) -> Result<DirectoryEntry, Error> {
+        if first_cluster > u32::from(u16::MAX) {
+            return Err(Error::InvalidCluster(first_cluster));
+        }
+        let mut block = self.read_volume_sector(record.location.relative_sector)?;
+        let end = record
+            .location
+            .offset
+            .checked_add(DIRECTORY_ENTRY_SIZE)
+            .ok_or(Error::AddressOverflow)?;
+        let entry = block
+            .get_mut(record.location.offset..end)
+            .ok_or(Error::CorruptDirectory)?;
+        entry[11] |= ATTR_ARCHIVE;
+        entry[20..22].copy_from_slice(&0_u16.to_le_bytes());
+        entry[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+        entry[28..32].copy_from_slice(&size.to_le_bytes());
+        let parsed = parse_short_directory_entry(entry)?;
+        self.write_volume_sector(record.location.relative_sector, &block)?;
+        self.write_info.directory_updates = self.write_info.directory_updates.saturating_add(1);
+        Ok(parsed)
+    }
+
+    fn write_root_entry_bytes(
+        &mut self,
+        location: RootEntryLocation,
+        entry: &[u8; DIRECTORY_ENTRY_SIZE],
+    ) -> Result<(), Error> {
+        let mut block = self.read_volume_sector(location.relative_sector)?;
+        let end = location
+            .offset
+            .checked_add(DIRECTORY_ENTRY_SIZE)
+            .ok_or(Error::AddressOverflow)?;
+        block
+            .get_mut(location.offset..end)
+            .ok_or(Error::CorruptDirectory)?
+            .copy_from_slice(entry);
+        self.write_volume_sector(location.relative_sector, &block)?;
+        self.write_info.directory_updates = self.write_info.directory_updates.saturating_add(1);
+        Ok(())
+    }
+
+    fn cluster_chain(&self, first_cluster: u32) -> Result<Vec<u32>, Error> {
+        if first_cluster == 0 {
+            return Ok(Vec::new());
+        }
+        self.validate_cluster(first_cluster)?;
+        let mut chain = Vec::new();
+        let mut cluster = first_cluster;
+        loop {
+            if chain.len() >= self.info.cluster_count as usize {
+                return Err(Error::FatChainLoop);
+            }
+            chain.push(cluster);
+            let Some(next) = self.next_cluster(cluster)? else {
+                break;
+            };
+            if chain.contains(&next) {
+                return Err(Error::FatChainLoop);
+            }
+            cluster = next;
+        }
+        Ok(chain)
+    }
+
+    fn find_free_clusters(&self, count: usize) -> Result<Vec<u32>, Error> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut clusters = Vec::with_capacity(count);
+        for cluster in 2..=self.info.cluster_count.saturating_add(1) {
+            if self.read_fat16_entry(cluster)? == 0 {
+                clusters.push(cluster);
+                if clusters.len() == count {
+                    return Ok(clusters);
+                }
+            }
+        }
+        Err(Error::NoSpace)
+    }
+
+    fn read_fat16_entry(&self, cluster: u32) -> Result<u16, Error> {
+        self.read_fat16_entry_from_copy(cluster, 0)
+    }
+
+    fn read_fat16_entry_from_copy(&self, cluster: u32, fat_copy: u8) -> Result<u16, Error> {
+        self.require_writable()?;
+        self.validate_cluster(cluster)?;
+        if fat_copy >= self.info.fat_count {
+            return Err(Error::InvalidPath);
+        }
+        let offset = u64::from(cluster)
+            .checked_mul(2)
+            .ok_or(Error::AddressOverflow)?;
+        let fat_start = self
+            .first_fat_sector
+            .checked_add(
+                u64::from(fat_copy)
+                    .checked_mul(u64::from(self.info.sectors_per_fat))
+                    .ok_or(Error::AddressOverflow)?,
+            )
+            .ok_or(Error::AddressOverflow)?;
+        let fat_byte_offset = fat_start
+            .checked_mul(self.info.bytes_per_sector as u64)
+            .and_then(|value| value.checked_add(offset))
+            .ok_or(Error::AddressOverflow)?;
+        let bytes = self.read_volume_bytes(fat_byte_offset, 2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn verify_root_file_fat_copies(&self, path: &str) -> Result<bool, Error> {
+        self.require_writable()?;
+        let short_name = encode_root_short_name(path)?;
+        let (record, _) = self.find_root_file(&short_name)?;
+        let record = record.ok_or(Error::FileNotFound)?;
+        let chain = self.cluster_chain(record.entry.first_cluster)?;
+        for cluster in chain {
+            let expected = self.read_fat16_entry_from_copy(cluster, 0)?;
+            for fat_copy in 1..self.info.fat_count {
+                if self.read_fat16_entry_from_copy(cluster, fat_copy)? != expected {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn link_fat16_chain(&mut self, chain: &[u32]) -> Result<(), Error> {
+        for (index, cluster) in chain.iter().copied().enumerate() {
+            let value = chain
+                .get(index.saturating_add(1))
+                .copied()
+                .map(|next| next as u16)
+                .unwrap_or(FAT16_END_OF_CHAIN);
+            self.write_fat16_entry(cluster, value)?;
+        }
+        Ok(())
+    }
+
+    fn clear_fat16_chain(&mut self, chain: &[u32]) -> Result<(), Error> {
+        for cluster in chain.iter().copied() {
+            self.write_fat16_entry(cluster, 0)?;
+        }
+        Ok(())
+    }
+
+    fn write_fat16_entry(&mut self, cluster: u32, value: u16) -> Result<(), Error> {
+        self.require_writable()?;
+        self.validate_cluster(cluster)?;
+        let byte_offset = u64::from(cluster)
+            .checked_mul(2)
+            .ok_or(Error::AddressOverflow)?;
+        let sector_delta = byte_offset / self.info.bytes_per_sector as u64;
+        let within_sector = usize::try_from(byte_offset % self.info.bytes_per_sector as u64)
+            .map_err(|_| Error::AddressOverflow)?;
+        if within_sector + 2 > self.info.bytes_per_sector {
+            return Err(Error::CorruptDirectory);
+        }
+        for fat_copy in 0..self.info.fat_count {
+            let relative_sector = self
+                .first_fat_sector
+                .checked_add(
+                    u64::from(fat_copy)
+                        .checked_mul(u64::from(self.info.sectors_per_fat))
+                        .ok_or(Error::AddressOverflow)?,
+                )
+                .and_then(|sector| sector.checked_add(sector_delta))
+                .ok_or(Error::AddressOverflow)?;
+            let mut block = self.read_volume_sector(relative_sector)?;
+            block[within_sector..within_sector + 2].copy_from_slice(&value.to_le_bytes());
+            self.write_volume_sector(relative_sector, &block)?;
+            self.write_info.fat_entry_updates = self.write_info.fat_entry_updates.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn write_cluster(&mut self, cluster: u32, bytes: &[u8]) -> Result<(), Error> {
+        self.validate_cluster(cluster)?;
+        if bytes.len() > self.info.bytes_per_cluster {
+            return Err(Error::FileTooLarge(bytes.len()));
+        }
+        let relative_sector = self.cluster_first_sector(cluster)?;
+        let mut cluster_bytes = vec![0_u8; self.info.bytes_per_cluster];
+        cluster_bytes[..bytes.len()].copy_from_slice(bytes);
+        for sector_index in 0..self.info.sectors_per_cluster {
+            let start = usize::try_from(sector_index)
+                .map_err(|_| Error::AddressOverflow)?
+                .checked_mul(self.info.bytes_per_sector)
+                .ok_or(Error::AddressOverflow)?;
+            let end = start
+                .checked_add(self.info.bytes_per_sector)
+                .ok_or(Error::AddressOverflow)?;
+            self.write_volume_sector(
+                relative_sector
+                    .checked_add(u64::from(sector_index))
+                    .ok_or(Error::AddressOverflow)?,
+                &cluster_bytes[start..end],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn cluster_first_sector(&self, cluster: u32) -> Result<u64, Error> {
+        self.validate_cluster(cluster)?;
+        let relative_sector = self
+            .first_data_sector
+            .checked_add(
+                u64::from(cluster - 2)
+                    .checked_mul(u64::from(self.info.sectors_per_cluster))
+                    .ok_or(Error::AddressOverflow)?,
+            )
+            .ok_or(Error::AddressOverflow)?;
+        let end = relative_sector
+            .checked_add(u64::from(self.info.sectors_per_cluster))
+            .ok_or(Error::AddressOverflow)?;
+        if end > self.info.total_sectors {
+            return Err(Error::LbaOutOfRange);
+        }
+        Ok(relative_sector)
+    }
+
+    fn write_volume_sector(&self, relative_sector: u64, bytes: &[u8]) -> Result<(), Error> {
+        if relative_sector >= self.info.total_sectors || bytes.len() != self.info.bytes_per_sector {
+            return Err(Error::LbaOutOfRange);
+        }
+        let lba = self
+            .partition
+            .start_lba
+            .checked_add(relative_sector)
+            .ok_or(Error::AddressOverflow)?;
+        ahci::write_block(lba, bytes)?;
+        Ok(())
+    }
+
+    fn flush_storage(&mut self) -> Result<(), Error> {
+        ahci::flush()?;
+        self.write_info.flushes = self.write_info.flushes.saturating_add(1);
+        Ok(())
     }
 
     fn find_entry(
@@ -678,6 +1229,60 @@ impl FatVolume {
     }
 }
 
+fn encode_root_short_name(path: &str) -> Result<[u8; 11], Error> {
+    let components = path_components(path)?;
+    if components.len() != 1 {
+        return Err(Error::RootOnly);
+    }
+    let name = components[0];
+    let mut parts = name.split('.');
+    let base = parts.next().ok_or(Error::InvalidShortName)?;
+    let extension = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || base.is_empty()
+        || base.len() > 8
+        || extension.len() > 3
+        || !base.as_bytes().iter().copied().all(valid_short_name_byte)
+        || !extension
+            .as_bytes()
+            .iter()
+            .copied()
+            .all(valid_short_name_byte)
+    {
+        return Err(Error::InvalidShortName);
+    }
+    let mut encoded = [b' '; 11];
+    for (destination, source) in encoded[..8].iter_mut().zip(base.as_bytes()) {
+        *destination = source.to_ascii_uppercase();
+    }
+    for (destination, source) in encoded[8..].iter_mut().zip(extension.as_bytes()) {
+        *destination = source.to_ascii_uppercase();
+    }
+    Ok(encoded)
+}
+
+fn valid_short_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn parse_short_directory_entry(entry: &[u8]) -> Result<DirectoryEntry, Error> {
+    if entry.len() != DIRECTORY_ENTRY_SIZE {
+        return Err(Error::CorruptDirectory);
+    }
+    let short_name = decode_short_name(entry)?;
+    let cluster_high = u32::from(read_u16(entry, 20).ok_or(Error::CorruptDirectory)?);
+    let cluster_low = u32::from(read_u16(entry, 26).ok_or(Error::CorruptDirectory)?);
+    let first_cluster = (cluster_high << 16) | cluster_low;
+    let size = read_u32(entry, 28).ok_or(Error::CorruptDirectory)?;
+    Ok(DirectoryEntry {
+        name: short_name.clone(),
+        short_name,
+        attributes: entry[11],
+        first_cluster,
+        size,
+    })
+}
+
 #[derive(Debug)]
 struct DirectoryParser {
     entries: Vec<DirectoryEntry>,
@@ -837,6 +1442,34 @@ pub fn init(partitions: &PartitionInventory) -> Result<VolumeInfo, Error> {
 
 pub fn info() -> Option<VolumeInfo> {
     VOLUME.lock().as_ref().map(|volume| volume.info.clone())
+}
+
+pub fn write_info() -> Option<WriteInfo> {
+    VOLUME.lock().as_ref().map(|volume| volume.write_info)
+}
+
+pub fn open_file(path: &str, create: bool, truncate: bool) -> Result<DirectoryEntry, Error> {
+    let mut mounted = VOLUME.lock();
+    let volume = mounted.as_mut().ok_or(Error::NotInitialized)?;
+    volume.open_root_file(path, create, truncate)
+}
+
+pub fn write_file_at(path: &str, offset: u64, bytes: &[u8]) -> Result<usize, Error> {
+    let mut mounted = VOLUME.lock();
+    let volume = mounted.as_mut().ok_or(Error::NotInitialized)?;
+    volume.write_root_file_at(path, offset, bytes)
+}
+
+pub fn append_file(path: &str, bytes: &[u8]) -> Result<(u64, usize), Error> {
+    let mut mounted = VOLUME.lock();
+    let volume = mounted.as_mut().ok_or(Error::NotInitialized)?;
+    volume.append_root_file(path, bytes)
+}
+
+pub fn verify_file_fat_copies(path: &str) -> Result<bool, Error> {
+    let mounted = VOLUME.lock();
+    let volume = mounted.as_ref().ok_or(Error::NotInitialized)?;
+    volume.verify_root_file_fat_copies(path)
 }
 
 pub fn list_directory(path: &str) -> Result<Vec<DirectoryEntry>, Error> {
