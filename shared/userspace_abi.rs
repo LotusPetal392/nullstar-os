@@ -20,6 +20,8 @@ pub mod syscall {
     pub const SIGNAL_PROCESS_GROUP: u64 = 12;
     pub const FOREGROUND_PROCESS_GROUP: u64 = 13;
     pub const SEEK: u64 = 14;
+    pub const EXECVE: u64 = 15;
+    pub const SET_DESCRIPTOR_FLAGS: u64 = 16;
 }
 
 pub mod signal {
@@ -54,7 +56,14 @@ pub mod open {
     pub const CREATE: u64 = 1 << 2;
     pub const TRUNCATE: u64 = 1 << 3;
     pub const APPEND: u64 = 1 << 4;
-    pub const ALLOWED_FLAGS: u64 = READ | WRITE | CREATE | TRUNCATE | APPEND;
+    pub const CLOSE_ON_EXEC: u64 = 1 << 5;
+    pub const ALLOWED_FLAGS: u64 =
+        READ | WRITE | CREATE | TRUNCATE | APPEND | CLOSE_ON_EXEC;
+}
+
+pub mod descriptor {
+    pub const CLOSE_ON_EXEC: u64 = 1 << 0;
+    pub const ALLOWED_FLAGS: u64 = CLOSE_ON_EXEC;
 }
 
 pub mod seek {
