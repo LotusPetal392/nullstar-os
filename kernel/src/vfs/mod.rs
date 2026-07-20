@@ -214,7 +214,19 @@ impl fmt::Display for Error {
 
 impl From<fat::Error> for Error {
     fn from(error: fat::Error) -> Self {
-        Self::Fat(error)
+        match error {
+            fat::Error::FileNotFound => Self::NotFound,
+            fat::Error::DirectoryNotFound => Self::NotFound,
+            fat::Error::NotDirectory => Self::NotDirectory,
+            fat::Error::IsDirectory => Self::IsDirectory,
+            fat::Error::ReadOnly | fat::Error::WriteUnsupported => Self::ReadOnly,
+            fat::Error::FileTooLarge(_) => Self::FileTooLarge,
+            fat::Error::NoSpace | fat::Error::RootDirectoryFull => Self::NoSpace,
+            fat::Error::InvalidPath | fat::Error::RootOnly | fat::Error::InvalidShortName => {
+                Self::InvalidPath
+            }
+            other => Self::Fat(other),
+        }
     }
 }
 
@@ -437,7 +449,7 @@ impl FatFileSystem {
                 path: String::from("/"),
                 kind: NodeKind::Directory,
                 size: 0,
-                read_only: true,
+                read_only: fat::info().is_none_or(|volume| !volume.writable),
                 hidden: false,
                 system: false,
             });
@@ -459,10 +471,33 @@ impl FatFileSystem {
                 NodeKind::File
             },
             size: u64::from(entry.size),
-            read_only: true,
+            read_only: entry.is_directory() || entry.is_read_only(),
             hidden: entry.is_hidden(),
             system: entry.is_system(),
         })
+    }
+
+    fn open(self, path: &str, options: OpenOptions) -> Result<Metadata, Error> {
+        let entry = fat::open_file(path, options.create, options.truncate)?;
+        if entry.is_directory() {
+            return Err(Error::IsDirectory);
+        }
+        Ok(Metadata {
+            path: path.to_string(),
+            kind: NodeKind::File,
+            size: u64::from(entry.size),
+            read_only: entry.is_read_only(),
+            hidden: entry.is_hidden(),
+            system: entry.is_system(),
+        })
+    }
+
+    fn write_at(self, path: &str, offset: u64, bytes: &[u8]) -> Result<usize, Error> {
+        fat::write_file_at(path, offset, bytes).map_err(Into::into)
+    }
+
+    fn append(self, path: &str, bytes: &[u8]) -> Result<(u64, usize), Error> {
+        fat::append_file(path, bytes).map_err(Into::into)
     }
 
     fn read_directory(self, path: &str) -> Result<Vec<DirectoryEntry>, Error> {
@@ -524,11 +559,12 @@ fn convert_fat_directory_entry(entry: fat::DirectoryEntry) -> DirectoryEntry {
     };
     let hidden = entry.is_hidden();
     let system = entry.is_system();
+    let read_only = entry.is_directory() || entry.is_read_only();
     DirectoryEntry {
         name: entry.name,
         kind,
         size: u64::from(entry.size),
-        read_only: true,
+        read_only,
         hidden,
         system,
     }
@@ -548,7 +584,7 @@ pub fn mount_fat_root() -> Result<MountInfo, Error> {
         volume_id: volume.volume_id,
         partition_index: volume.partition_index,
         partition_start_lba: volume.partition_start_lba,
-        read_only: true,
+        read_only: !volume.writable,
     };
     *root = Some(MountedRoot { info: info.clone() });
     Ok(info)
@@ -584,10 +620,12 @@ pub fn open(path: &str, options: OpenOptions) -> Result<Metadata, Error> {
     let path = normalize_path(path)?;
     match backend_for_path(&path)? {
         BackendKind::Fat => {
-            if options.write || options.create || options.truncate || options.append {
-                return Err(Error::ReadOnly);
-            }
-            let metadata = FatFileSystem.metadata(&path)?;
+            let metadata = if options.write || options.create || options.truncate || options.append
+            {
+                FatFileSystem.open(&path, options)?
+            } else {
+                FatFileSystem.metadata(&path)?
+            };
             if metadata.is_directory() {
                 return Err(Error::IsDirectory);
             }
@@ -632,7 +670,7 @@ pub fn read_at(path: &str, offset: u64, buffer: &mut [u8]) -> Result<usize, Erro
 pub fn write_at(path: &str, offset: u64, bytes: &[u8]) -> Result<usize, Error> {
     let path = normalize_path(path)?;
     match backend_for_path(&path)? {
-        BackendKind::Fat => Err(Error::ReadOnly),
+        BackendKind::Fat => FatFileSystem.write_at(&path, offset, bytes),
         BackendKind::Tmpfs => TMPFS.lock().write_at(&path, offset, bytes),
     }
 }
@@ -640,7 +678,7 @@ pub fn write_at(path: &str, offset: u64, bytes: &[u8]) -> Result<usize, Error> {
 pub fn append(path: &str, bytes: &[u8]) -> Result<(u64, usize), Error> {
     let path = normalize_path(path)?;
     match backend_for_path(&path)? {
-        BackendKind::Fat => Err(Error::ReadOnly),
+        BackendKind::Fat => FatFileSystem.append(&path, bytes),
         BackendKind::Tmpfs => TMPFS.lock().append(&path, bytes),
     }
 }

@@ -19,4 +19,11 @@ pub trait BlockDevice {
         logical_block_address: u64,
         buffer: &mut [u8],
     ) -> Result<(), Self::Error>;
+
+    /// Write exactly one logical block from `buffer`.
+    fn write_block(&mut self, logical_block_address: u64, buffer: &[u8])
+    -> Result<(), Self::Error>;
+
+    /// Ensure all previously completed writes are durable on the device.
+    fn flush(&mut self) -> Result<(), Self::Error>;
 }

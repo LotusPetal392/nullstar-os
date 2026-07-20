@@ -263,7 +263,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         None
     };
 
-    let filesystem_info = match partition_inventory.as_ref() {
+    let mut filesystem_info = match partition_inventory.as_ref() {
         Some(partitions) => match fat::init(partitions) {
             Ok(info) => {
                 let root_entries = fat::list_directory("/").unwrap_or_default();
@@ -335,6 +335,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!("VFS unavailable: no FAT filesystem is mounted");
         None
     };
+
+    if vfs_info.is_some() {
+        match persistent_fat_self_test() {
+            Ok(PersistentFatPhase::Prepared) => {
+                let writes = fat::write_info().expect("mounted FAT volume lost write accounting");
+                let checksum = persistent_checksum(PERSISTENT_CHAIN_PATH).unwrap_or(0);
+                serial_println!(
+                    "persistent FAT write prepared: files=4, chain_bytes={}, chain_checksum={:#010x}, creates={}, truncates={}, writes={}, bytes={}, clusters=+{}/-{}, FAT_updates={}, directory_updates={}, flushes={}, mirrored=true",
+                    PERSISTENT_CHAIN_BYTES,
+                    checksum,
+                    writes.creates,
+                    writes.truncates,
+                    writes.writes,
+                    writes.bytes_written,
+                    writes.clusters_allocated,
+                    writes.clusters_freed,
+                    writes.fat_entry_updates,
+                    writes.directory_updates,
+                    writes.flushes
+                );
+            }
+            Ok(PersistentFatPhase::Verified) => {
+                let checksum = persistent_checksum(PERSISTENT_CHAIN_PATH).unwrap_or(0);
+                serial_println!(
+                    "persistent FAT write verified: files=4, text_bytes={}, chain_bytes={}, chain_checksum={:#010x}, truncate_bytes={}, hole_bytes={}, mirrored=true, reboot_persistence=true",
+                    PERSISTENT_TEXT_FIRST.len() + PERSISTENT_TEXT_SECOND.len(),
+                    PERSISTENT_CHAIN_BYTES,
+                    checksum,
+                    PERSISTENT_TRUNCATED.len(),
+                    PERSISTENT_HOLE_OFFSET + PERSISTENT_HOLE_TAIL.len()
+                );
+            }
+            Err(error) => {
+                serial_println!("persistent FAT write verification failed: {error}");
+                hlt_loop();
+            }
+        }
+        filesystem_info = fat::info();
+    }
 
     let tmpfs_info = if vfs_info.is_some() {
         match vfs::mount_tmpfs() {
@@ -1095,6 +1134,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "cat /hello.txt | upper > /tmp/pipeline.txt",
         "stderr-probe 2> /tmp/errors.txt",
         "stderr-probe > /tmp/all.txt 2>&1",
+        "pipe-producer > /UFAT.TXT",
+        "pipe-producer >> /UFAT.TXT",
+        "upper < /UFAT.TXT > /UFATUP.TXT",
     ] {
         if let Err(error) = userspace_runtime.inject_terminal_line(command) {
             serial_println!("userspace redirection command `{command}` injection failed: {error}");
@@ -1142,6 +1184,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
+    let fat_message = match vfs::read_file("/UFAT.TXT", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("persistent FAT message verification read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let fat_upper = match vfs::read_file("/UFATUP.TXT", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("persistent FAT upper verification read failed: {error}");
+            hlt_loop();
+        }
+    };
+
     let capacity_options = vfs::OpenOptions {
         read: false,
         write: true,
@@ -1161,10 +1218,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let capacity_size = vfs::metadata("/tmp/capacity.bin")
         .map(|metadata| metadata.size)
         .unwrap_or(u64::MAX);
-    let fat_write_rejected = matches!(
-        vfs::open("/hello.txt", capacity_options),
-        Err(vfs::Error::ReadOnly)
+    let invalid_fat_name_rejected = matches!(
+        vfs::open("/TOO-LONG-NAME.TXT", capacity_options),
+        Err(vfs::Error::InvalidPath)
     );
+    let fat_mirrors_valid = fat::verify_file_fat_copies("/UFAT.TXT").unwrap_or(false)
+        && fat::verify_file_fat_copies("/UFATUP.TXT").unwrap_or(false);
 
     let mut expected_message = Vec::new();
     expected_message.extend_from_slice(b"Hello through a blocking GalacticOS pipe.\n");
@@ -1178,37 +1237,46 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && tmpfs_pipeline.bytes == b"HELLO FROM A GALACTICOS USERSPACE FILE DESCRIPTOR.\n"
         && tmpfs_errors.bytes == b"stderr probe line\n"
         && tmpfs_all.bytes == b"stdout probe line\nstderr probe line\n"
+        && fat_message.bytes == expected_message
+        && fat_upper.bytes == expected_upper
         && matches!(oversized_write, Err(vfs::Error::FileTooLarge))
         && capacity_size == 0
-        && fat_write_rejected
+        && invalid_fat_name_rejected
+        && fat_mirrors_valid
         && tmpfs_snapshot.file_count >= 6
         && tmpfs_snapshot.rejected_writes >= 1;
     if !userspace_redirection_verified {
         serial_println!(
-            "userspace tmpfs/redirection verification failed: message={}, upper={}, pipeline={}, errors={}, all={}, capacity={:?}/{}, fat_read_only={}, files={}, bytes={}, rejected={}",
+            "userspace tmpfs/redirection verification failed: message={}, upper={}, pipeline={}, errors={}, all={}, fat={}/{}, capacity={:?}/{}, invalid_name={}, mirrors={}, files={}, bytes={}, rejected={}",
             tmpfs_message.bytes.len(),
             tmpfs_upper.bytes.len(),
             tmpfs_pipeline.bytes.len(),
             tmpfs_errors.bytes.len(),
             tmpfs_all.bytes.len(),
+            fat_message.bytes.len(),
+            fat_upper.bytes.len(),
             oversized_write,
             capacity_size,
-            fat_write_rejected,
+            invalid_fat_name_rejected,
+            fat_mirrors_valid,
             tmpfs_snapshot.file_count,
             tmpfs_snapshot.total_bytes,
             tmpfs_snapshot.rejected_writes
         );
         hlt_loop();
     }
+    let fat_write_snapshot = fat::write_info().expect("mounted FAT write accounting disappeared");
     serial_println!(
-        "userspace tmpfs redirection verified: files={}, bytes={}, creates={}, truncates={}, writes={}, written={}, rejected={}, stdin_eof=true, shared_offset=true, fat_read_only=true",
+        "userspace tmpfs redirection verified: files={}, bytes={}, creates={}, truncates={}, writes={}, written={}, rejected={}, stdin_eof=true, shared_offset=true, fat_writable=true, fat_writes={}, fat_bytes={}, mirrors=true",
         tmpfs_snapshot.file_count,
         tmpfs_snapshot.total_bytes,
         tmpfs_snapshot.creates,
         tmpfs_snapshot.truncates,
         tmpfs_snapshot.writes,
         tmpfs_snapshot.bytes_written,
-        tmpfs_snapshot.rejected_writes
+        tmpfs_snapshot.rejected_writes,
+        fat_write_snapshot.writes,
+        fat_write_snapshot.bytes_written
     );
     let userspace_redirection_pipe_after = userspace_runtime.pipe_snapshot();
 
@@ -1683,13 +1751,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 17
-        && userspace_shell_result.child_wait_count == 21
+        && userspace_shell_result.child_spawn_count == 20
+        && userspace_shell_result.child_wait_count == 24
         && userspace_shell_result.child_poll_count == 5
         && userspace_shell_result.child_poll_pending_count == 5
         && userspace_shell_result.signal_sent_count == 4
-        && userspace_shell_result.open_count == 8
-        && userspace_shell_result.file_descriptor_inherit_count == 9
+        && userspace_shell_result.open_count == 12
+        && userspace_shell_result.file_descriptor_inherit_count == 13
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
@@ -1707,13 +1775,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs={}, exec_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, opens={}, inherited_files={}, stopped_jobs={}, exec_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
             userspace_shell_result.child_wait_count,
             userspace_shell_result.child_poll_count,
             userspace_shell_result.child_poll_pending_count,
             userspace_shell_result.signal_sent_count,
+            userspace_shell_result.open_count,
+            userspace_shell_result.file_descriptor_inherit_count,
             userspace_stopped_jobs_verified,
             userspace_shell_exec_verified,
             shell_child.parent_process_id,
@@ -1921,6 +1991,164 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             serial_println!("uptime: {elapsed_seconds}s");
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistentFatPhase {
+    Prepared,
+    Verified,
+}
+
+const PERSISTENT_TEXT_PATH: &str = "/PERSIST.TXT";
+const PERSISTENT_CHAIN_PATH: &str = "/CHAIN.BIN";
+const PERSISTENT_TRUNCATE_PATH: &str = "/TRUNC.BIN";
+const PERSISTENT_HOLE_PATH: &str = "/HOLE.BIN";
+const PERSISTENT_TEXT_FIRST: &[u8] = b"persistent-fat-line-one\n";
+const PERSISTENT_TEXT_SECOND: &[u8] = b"persistent-fat-line-two\n";
+const PERSISTENT_TRUNCATED: &[u8] = b"small-after-truncate\n";
+const PERSISTENT_HOLE_OFFSET: usize = 4096;
+const PERSISTENT_HOLE_TAIL: &[u8] = b"tail";
+const PERSISTENT_CHAIN_BYTES: usize = 7000;
+const PERSISTENT_TRUNCATE_SEED_BYTES: usize = 9000;
+
+fn persistent_fat_self_test() -> Result<PersistentFatPhase, vfs::Error> {
+    match vfs::metadata(PERSISTENT_TEXT_PATH) {
+        Ok(_) => {
+            verify_persistent_fat_files()?;
+            Ok(PersistentFatPhase::Verified)
+        }
+        Err(vfs::Error::NotFound) => {
+            prepare_persistent_fat_files()?;
+            verify_persistent_fat_files()?;
+            Ok(PersistentFatPhase::Prepared)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn prepare_persistent_fat_files() -> Result<(), vfs::Error> {
+    create_truncated_fat_file(PERSISTENT_TEXT_PATH)?;
+    write_vfs_bytes(PERSISTENT_TEXT_PATH, 0, PERSISTENT_TEXT_FIRST)?;
+    let (append_offset, appended) = vfs::append(PERSISTENT_TEXT_PATH, PERSISTENT_TEXT_SECOND)?;
+    if append_offset != PERSISTENT_TEXT_FIRST.len() as u64
+        || appended != PERSISTENT_TEXT_SECOND.len()
+    {
+        return Err(vfs::Error::ShortRead {
+            expected: PERSISTENT_TEXT_SECOND.len(),
+            actual: appended,
+        });
+    }
+
+    create_truncated_fat_file(PERSISTENT_CHAIN_PATH)?;
+    let chain = persistent_chain_bytes();
+    write_vfs_bytes(PERSISTENT_CHAIN_PATH, 0, &chain)?;
+
+    create_truncated_fat_file(PERSISTENT_TRUNCATE_PATH)?;
+    let truncate_seed = persistent_pattern(PERSISTENT_TRUNCATE_SEED_BYTES, 29, 7);
+    write_vfs_bytes(PERSISTENT_TRUNCATE_PATH, 0, &truncate_seed)?;
+    vfs::open(
+        PERSISTENT_TRUNCATE_PATH,
+        vfs::OpenOptions {
+            read: false,
+            write: true,
+            create: false,
+            truncate: true,
+            append: false,
+        },
+    )?;
+    write_vfs_bytes(PERSISTENT_TRUNCATE_PATH, 0, PERSISTENT_TRUNCATED)?;
+
+    create_truncated_fat_file(PERSISTENT_HOLE_PATH)?;
+    write_vfs_bytes(
+        PERSISTENT_HOLE_PATH,
+        PERSISTENT_HOLE_OFFSET as u64,
+        PERSISTENT_HOLE_TAIL,
+    )?;
+    Ok(())
+}
+
+fn create_truncated_fat_file(path: &str) -> Result<(), vfs::Error> {
+    vfs::open(
+        path,
+        vfs::OpenOptions {
+            read: false,
+            write: true,
+            create: true,
+            truncate: true,
+            append: false,
+        },
+    )?;
+    Ok(())
+}
+
+fn write_vfs_bytes(path: &str, offset: u64, bytes: &[u8]) -> Result<(), vfs::Error> {
+    let actual = vfs::write_at(path, offset, bytes)?;
+    if actual != bytes.len() {
+        return Err(vfs::Error::ShortRead {
+            expected: bytes.len(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn verify_persistent_fat_files() -> Result<(), vfs::Error> {
+    let mut text = Vec::with_capacity(PERSISTENT_TEXT_FIRST.len() + PERSISTENT_TEXT_SECOND.len());
+    text.extend_from_slice(PERSISTENT_TEXT_FIRST);
+    text.extend_from_slice(PERSISTENT_TEXT_SECOND);
+    verify_vfs_file(PERSISTENT_TEXT_PATH, &text)?;
+
+    let chain = persistent_chain_bytes();
+    verify_vfs_file(PERSISTENT_CHAIN_PATH, &chain)?;
+    verify_vfs_file(PERSISTENT_TRUNCATE_PATH, PERSISTENT_TRUNCATED)?;
+
+    let mut hole = vec![0_u8; PERSISTENT_HOLE_OFFSET + PERSISTENT_HOLE_TAIL.len()];
+    hole[PERSISTENT_HOLE_OFFSET..].copy_from_slice(PERSISTENT_HOLE_TAIL);
+    verify_vfs_file(PERSISTENT_HOLE_PATH, &hole)?;
+
+    for path in [
+        PERSISTENT_TEXT_PATH,
+        PERSISTENT_CHAIN_PATH,
+        PERSISTENT_TRUNCATE_PATH,
+        PERSISTENT_HOLE_PATH,
+    ] {
+        if !fat::verify_file_fat_copies(path)? {
+            return Err(vfs::Error::Fat(fat::Error::CorruptDirectory));
+        }
+    }
+    Ok(())
+}
+
+fn verify_vfs_file(path: &str, expected: &[u8]) -> Result<(), vfs::Error> {
+    let data = vfs::read_file(path, fat::MAX_FILE_WRITE_BYTES)?;
+    if data.truncated || data.total_size != expected.len() as u64 || data.bytes != expected {
+        return Err(vfs::Error::ShortRead {
+            expected: expected.len(),
+            actual: data.bytes.len(),
+        });
+    }
+    Ok(())
+}
+
+fn persistent_chain_bytes() -> Vec<u8> {
+    persistent_pattern(PERSISTENT_CHAIN_BYTES, 17, 3)
+}
+
+fn persistent_pattern(length: usize, multiplier: usize, addend: usize) -> Vec<u8> {
+    (0..length)
+        .map(|index| index.wrapping_mul(multiplier).wrapping_add(addend) as u8)
+        .collect()
+}
+
+fn persistent_checksum(path: &str) -> Result<u32, vfs::Error> {
+    let data = vfs::read_file(path, fat::MAX_FILE_WRITE_BYTES)?;
+    Ok(data
+        .bytes
+        .iter()
+        .copied()
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        }))
 }
 
 fn heap_allocation_self_test() {

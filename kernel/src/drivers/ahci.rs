@@ -8,10 +8,7 @@ use core::{
 };
 
 use spin::Mutex;
-use x86_64::{
-    VirtAddr,
-    structures::paging::{FrameAllocator, Size4KiB},
-};
+use x86_64::{VirtAddr, structures::paging::FrameAllocator};
 
 use crate::{
     acpi::McfgInfo,
@@ -81,7 +78,12 @@ const REGISTER_FIS_COMMAND: u8 = 1 << 7;
 const ATA_COMMAND_IDENTIFY_DEVICE: u8 = 0xec;
 const ATA_COMMAND_READ_DMA: u8 = 0xc8;
 const ATA_COMMAND_READ_DMA_EXT: u8 = 0x25;
+const ATA_COMMAND_WRITE_DMA: u8 = 0xca;
+const ATA_COMMAND_WRITE_DMA_EXT: u8 = 0x35;
+const ATA_COMMAND_FLUSH_CACHE: u8 = 0xe7;
+const ATA_COMMAND_FLUSH_CACHE_EXT: u8 = 0xea;
 const COMMAND_FIS_DWORDS: u32 = 5;
+const COMMAND_HEADER_WRITE: u32 = 1 << 6;
 const COMMAND_HEADER_PRDT_LENGTH_ONE: u32 = 1 << 16;
 const PRDT_INTERRUPT_ON_COMPLETION: u32 = 1 << 31;
 
@@ -771,6 +773,172 @@ impl Controller {
         Err(Error::CommandTimeout)
     }
 
+    fn execute_data_out(
+        &mut self,
+        command: u8,
+        logical_block_address: u64,
+        sector_count: u16,
+        extended_lba: bool,
+        input: &[u8],
+    ) -> Result<(), Error> {
+        if input.is_empty() || input.len() > DMA_PAGE_SIZE {
+            return Err(Error::BufferLength {
+                expected: DMA_PAGE_SIZE,
+                actual: input.len(),
+            });
+        }
+        if self.port.read(PORT_COMMAND_ISSUE) & COMMAND_SLOT != 0
+            || self.port.read(PORT_SATA_ACTIVE) & COMMAND_SLOT != 0
+        {
+            return Err(Error::CommandSlotBusy);
+        }
+        self.port.wait_until_ready()?;
+
+        self.dma.command_and_fis.zero();
+        self.dma.command_table.zero();
+        self.dma.data.zero();
+        unsafe {
+            ptr::copy_nonoverlapping(input.as_ptr(), self.dma.data_ptr(), input.len());
+        }
+
+        let command_table_address = self.dma.command_table.physical_address;
+        let header = CommandHeader {
+            flags_and_prdt_length: COMMAND_FIS_DWORDS
+                | COMMAND_HEADER_WRITE
+                | COMMAND_HEADER_PRDT_LENGTH_ONE,
+            bytes_transferred: 0,
+            command_table_base: command_table_address as u32,
+            command_table_base_upper: (command_table_address >> 32) as u32,
+            reserved: [0; 4],
+        };
+
+        let mut command_fis = [0_u8; 64];
+        command_fis[0] = REGISTER_HOST_TO_DEVICE_FIS_TYPE;
+        command_fis[1] = REGISTER_FIS_COMMAND;
+        command_fis[2] = command;
+        command_fis[4] = logical_block_address as u8;
+        command_fis[5] = (logical_block_address >> 8) as u8;
+        command_fis[6] = (logical_block_address >> 16) as u8;
+        command_fis[7] = 1 << 6;
+        if extended_lba {
+            command_fis[8] = (logical_block_address >> 24) as u8;
+            command_fis[9] = (logical_block_address >> 32) as u8;
+            command_fis[10] = (logical_block_address >> 40) as u8;
+            command_fis[12] = sector_count as u8;
+            command_fis[13] = (sector_count >> 8) as u8;
+        } else {
+            command_fis[7] |= ((logical_block_address >> 24) as u8) & 0x0f;
+            command_fis[12] = sector_count as u8;
+        }
+
+        let data_address = self.dma.data.physical_address;
+        let command_table = CommandTable {
+            command_fis,
+            atapi_command: [0; 16],
+            reserved: [0; 48],
+            physical_region: PhysicalRegionDescriptor {
+                data_base: data_address as u32,
+                data_base_upper: (data_address >> 32) as u32,
+                reserved: 0,
+                byte_count_and_flags: (input.len() as u32 - 1) | PRDT_INTERRUPT_ON_COMPLETION,
+            },
+        };
+
+        unsafe {
+            self.dma.command_header_ptr().write(header);
+            self.dma.command_table_ptr().write(command_table);
+        }
+        compiler_fence(Ordering::Release);
+
+        self.port.write(PORT_INTERRUPT_STATUS, u32::MAX);
+        self.port.write(PORT_SATA_ERROR, u32::MAX);
+        self.port.write(PORT_COMMAND_ISSUE, COMMAND_SLOT);
+
+        for _ in 0..COMMAND_COMPLETION_SPINS {
+            if self.port.read(PORT_INTERRUPT_STATUS) & PORT_IS_TASK_FILE_ERROR != 0 {
+                return Err(Error::TaskFileError);
+            }
+            if self.port.read(PORT_COMMAND_ISSUE) & COMMAND_SLOT == 0 {
+                compiler_fence(Ordering::Acquire);
+                if self.port.read(PORT_TASK_FILE_DATA) & PORT_TFD_ERROR != 0 {
+                    return Err(Error::TaskFileError);
+                }
+                let transferred = unsafe {
+                    ptr::read_volatile(&(*self.dma.command_header_ptr()).bytes_transferred)
+                } as usize;
+                if transferred < input.len() {
+                    return Err(Error::TransferIncomplete {
+                        expected: input.len(),
+                        actual: transferred,
+                    });
+                }
+                self.port.write(PORT_INTERRUPT_STATUS, u32::MAX);
+                return Ok(());
+            }
+            spin_loop();
+        }
+
+        Err(Error::CommandTimeout)
+    }
+
+    fn execute_non_data(&mut self, command: u8) -> Result<(), Error> {
+        if self.port.read(PORT_COMMAND_ISSUE) & COMMAND_SLOT != 0
+            || self.port.read(PORT_SATA_ACTIVE) & COMMAND_SLOT != 0
+        {
+            return Err(Error::CommandSlotBusy);
+        }
+        self.port.wait_until_ready()?;
+        self.dma.command_and_fis.zero();
+        self.dma.command_table.zero();
+
+        let command_table_address = self.dma.command_table.physical_address;
+        let header = CommandHeader {
+            flags_and_prdt_length: COMMAND_FIS_DWORDS,
+            bytes_transferred: 0,
+            command_table_base: command_table_address as u32,
+            command_table_base_upper: (command_table_address >> 32) as u32,
+            reserved: [0; 4],
+        };
+        let mut command_fis = [0_u8; 64];
+        command_fis[0] = REGISTER_HOST_TO_DEVICE_FIS_TYPE;
+        command_fis[1] = REGISTER_FIS_COMMAND;
+        command_fis[2] = command;
+        let command_table = CommandTable {
+            command_fis,
+            atapi_command: [0; 16],
+            reserved: [0; 48],
+            physical_region: PhysicalRegionDescriptor {
+                data_base: 0,
+                data_base_upper: 0,
+                reserved: 0,
+                byte_count_and_flags: 0,
+            },
+        };
+        unsafe {
+            self.dma.command_header_ptr().write(header);
+            self.dma.command_table_ptr().write(command_table);
+        }
+        compiler_fence(Ordering::Release);
+        self.port.write(PORT_INTERRUPT_STATUS, u32::MAX);
+        self.port.write(PORT_SATA_ERROR, u32::MAX);
+        self.port.write(PORT_COMMAND_ISSUE, COMMAND_SLOT);
+        for _ in 0..COMMAND_COMPLETION_SPINS {
+            if self.port.read(PORT_INTERRUPT_STATUS) & PORT_IS_TASK_FILE_ERROR != 0 {
+                return Err(Error::TaskFileError);
+            }
+            if self.port.read(PORT_COMMAND_ISSUE) & COMMAND_SLOT == 0 {
+                compiler_fence(Ordering::Acquire);
+                if self.port.read(PORT_TASK_FILE_DATA) & PORT_TFD_ERROR != 0 {
+                    return Err(Error::TaskFileError);
+                }
+                self.port.write(PORT_INTERRUPT_STATUS, u32::MAX);
+                return Ok(());
+            }
+            spin_loop();
+        }
+        Err(Error::CommandTimeout)
+    }
+
     fn info(&self) -> &DiskInfo {
         self.info
             .as_ref()
@@ -825,6 +993,50 @@ impl BlockDevice for Controller {
             )
         }
     }
+
+    fn write_block(
+        &mut self,
+        logical_block_address: u64,
+        buffer: &[u8],
+    ) -> Result<(), Self::Error> {
+        if buffer.len() != self.block_size() {
+            return Err(Error::BufferLength {
+                expected: self.block_size(),
+                actual: buffer.len(),
+            });
+        }
+        if logical_block_address >= self.block_count() {
+            return Err(Error::LbaOutOfRange);
+        }
+        if self.lba48 {
+            self.execute_data_out(
+                ATA_COMMAND_WRITE_DMA_EXT,
+                logical_block_address,
+                1,
+                true,
+                buffer,
+            )
+        } else {
+            if logical_block_address > 0x0fff_ffff {
+                return Err(Error::LbaOutOfRange);
+            }
+            self.execute_data_out(
+                ATA_COMMAND_WRITE_DMA,
+                logical_block_address,
+                1,
+                false,
+                buffer,
+            )
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.execute_non_data(if self.lba48 {
+            ATA_COMMAND_FLUSH_CACHE_EXT
+        } else {
+            ATA_COMMAND_FLUSH_CACHE
+        })
+    }
 }
 
 pub fn init(
@@ -865,6 +1077,18 @@ pub fn read_block(logical_block_address: u64, buffer: &mut [u8]) -> Result<(), E
     let mut device = DEVICE.lock();
     let device = device.as_mut().ok_or(Error::NotInitialized)?;
     device.read_block(logical_block_address, buffer)
+}
+
+pub fn write_block(logical_block_address: u64, buffer: &[u8]) -> Result<(), Error> {
+    let mut device = DEVICE.lock();
+    let device = device.as_mut().ok_or(Error::NotInitialized)?;
+    device.write_block(logical_block_address, buffer)
+}
+
+pub fn flush() -> Result<(), Error> {
+    let mut device = DEVICE.lock();
+    let device = device.as_mut().ok_or(Error::NotInitialized)?;
+    device.flush()
 }
 
 fn is_ahci_controller(function: &Function) -> bool {
