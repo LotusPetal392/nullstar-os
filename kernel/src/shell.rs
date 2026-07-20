@@ -695,12 +695,18 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, child spawns={}, waits={}, execs={} (failed={}), signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, execs={} (failed={}), forks={} (failed={}), COW={}/{}, shared={}/{}, signals={} (stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
             snapshot.spawned,
             snapshot.child_spawns,
             snapshot.child_waits,
             snapshot.execs,
             snapshot.exec_failures,
+            snapshot.forks,
+            snapshot.fork_failures,
+            snapshot.cow_faults,
+            snapshot.cow_copies,
+            snapshot.shared_frames,
+            snapshot.shared_references,
             snapshot.signals_sent,
             snapshot.stop_deliveries,
             snapshot.continue_deliveries,
@@ -778,6 +784,12 @@ impl Shell {
                 result.exec_failure_count,
                 result.close_on_exec_count,
                 result.exec_frames_reclaimed
+            );
+            shell_println!(
+                "  fork/COW: forks={}, faults={}, private copies={}",
+                result.fork_count,
+                result.cow_fault_count,
+                result.cow_copy_count
             );
             shell_println!(
                 "  terminal: reads={}, bytes={}, blocked reads={}",

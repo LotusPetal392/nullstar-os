@@ -22,6 +22,7 @@ pub mod syscall {
     pub const SEEK: u64 = 14;
     pub const EXECVE: u64 = 15;
     pub const SET_DESCRIPTOR_FLAGS: u64 = 16;
+    pub const FORK: u64 = 17;
 }
 
 pub mod signal {
