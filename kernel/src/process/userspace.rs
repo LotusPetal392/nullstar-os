@@ -61,6 +61,9 @@ const SYSCALL_SEEK: u64 = abi::syscall::SEEK;
 const SYSCALL_EXECVE: u64 = abi::syscall::EXECVE;
 const SYSCALL_SET_DESCRIPTOR_FLAGS: u64 = abi::syscall::SET_DESCRIPTOR_FLAGS;
 const SYSCALL_FORK: u64 = abi::syscall::FORK;
+const SYSCALL_SIGNAL_ACTION: u64 = abi::syscall::SIGNAL_ACTION;
+const SYSCALL_SIGNAL_MASK: u64 = abi::syscall::SIGNAL_MASK;
+const SYSCALL_SIGNAL_RETURN: u64 = abi::syscall::SIGNAL_RETURN;
 
 pub const SIGNAL_INTERRUPT: u64 = abi::signal::INTERRUPT;
 pub const SIGNAL_TERMINATE: u64 = abi::signal::TERMINATE;
@@ -101,9 +104,15 @@ const SEEK_CURRENT: u64 = abi::seek::CURRENT;
 const SEEK_END: u64 = abi::seek::END;
 const SHELL_PROCESS_TASK_NAME: &str = "user-shell-process";
 const USER_RFLAGS: u64 = 0x202;
+const RFLAGS_DIRECTION: u64 = 1 << 10;
 const PAGE_BYTES: u64 = Size4KiB::SIZE;
+const SIGNAL_TABLE_SIZE: usize = abi::signal::MAX as usize + 1;
+const SIGNAL_SUPPORTED_MASK: u64 = abi::signal::SUPPORTED_MASK;
+const SIGNAL_UNBLOCKABLE_MASK: u64 = abi::signal::UNBLOCKABLE_MASK;
+const SIGNAL_RED_ZONE_BYTES: u64 = 128;
 
 const ERR_NO_ENTRY: i64 = abi::errno::NO_ENTRY;
+const ERR_INTERRUPTED: i64 = abi::errno::INTERRUPTED;
 const ERR_NO_PROCESS: i64 = abi::errno::NO_PROCESS;
 const ERR_IO: i64 = abi::errno::IO;
 const ERR_ARGUMENT_TOO_LARGE: i64 = abi::errno::ARGUMENT_TOO_LARGE;
@@ -463,6 +472,12 @@ pub struct ProcessResult {
     pub cow_copy_count: u64,
     pub signal_sent_count: u64,
     pub signal_received_count: u64,
+    pub signal_handler_count: u64,
+    pub signal_return_count: u64,
+    pub signal_ignored_count: u64,
+    pub signal_interrupted_syscall_count: u64,
+    pub signal_frame_failure_count: u64,
+    pub pending_signal_peak: u64,
     pub stop_count: u64,
     pub continue_count: u64,
     pub pipe_pair_count: u64,
@@ -513,6 +528,12 @@ pub struct ManagerSnapshot {
     pub peak_shared_frames: usize,
     pub peak_shared_references: usize,
     pub signals_sent: u64,
+    pub signal_handlers: u64,
+    pub signal_returns: u64,
+    pub signal_ignores: u64,
+    pub signal_interruptions: u64,
+    pub signal_frame_failures: u64,
+    pub pending_signals: usize,
     pub stop_deliveries: u64,
     pub continue_deliveries: u64,
     pub pipe_pairs: u64,
@@ -749,6 +770,16 @@ struct PendingCowFault {
     page_address: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ActiveSignalFrame {
+    signal: u64,
+    previous_mask: u64,
+    saved_context: SavedContext,
+    frame_address: u64,
+    cookie: u64,
+    restorer: u64,
+}
+
 struct OpenFileState {
     path: String,
     offset: u64,
@@ -820,6 +851,11 @@ struct Process {
     pending_exec: Option<PendingExec>,
     pending_fork: Option<PendingFork>,
     pending_cow_fault: Option<PendingCowFault>,
+    signal_actions: [abi::signal_action::Action; SIGNAL_TABLE_SIZE],
+    signal_mask: u64,
+    pending_signals: u64,
+    active_signal: Option<ActiveSignalFrame>,
+    pending_signal_peak: u64,
     syscall_count: u64,
     write_count: u64,
     yield_count: u64,
@@ -853,6 +889,11 @@ struct Process {
     cow_copy_count: u64,
     signal_sent_count: u64,
     signal_received_count: u64,
+    signal_handler_count: u64,
+    signal_return_count: u64,
+    signal_ignored_count: u64,
+    signal_interrupted_syscall_count: u64,
+    signal_frame_failure_count: u64,
     stop_count: u64,
     continue_count: u64,
     pipe_pair_count: u64,
@@ -879,7 +920,7 @@ impl Process {
         }
     }
 
-    fn stop(&mut self, signal: u64) -> bool {
+    fn stop(&mut self, signal: u64, record_received: bool) -> bool {
         if !matches!(self.state, ProcessState::Runnable | ProcessState::Blocked) {
             return false;
         }
@@ -887,12 +928,14 @@ impl Process {
         self.state = ProcessState::Stopped;
         self.last_stop_signal = Some(signal);
         self.pending_parent_status = Some(stopped_child_status(signal));
-        self.signal_received_count = self.signal_received_count.saturating_add(1);
+        if record_received {
+            self.signal_received_count = self.signal_received_count.saturating_add(1);
+        }
         self.stop_count = self.stop_count.saturating_add(1);
         true
     }
 
-    fn continue_running(&mut self) -> bool {
+    fn continue_running(&mut self, record_received: bool) -> bool {
         if self.state != ProcessState::Stopped {
             return false;
         }
@@ -901,13 +944,52 @@ impl Process {
             .take()
             .unwrap_or(ProcessState::Runnable);
         self.pending_parent_status = Some(abi::child_status::CONTINUED);
-        self.signal_received_count = self.signal_received_count.saturating_add(1);
+        if record_received {
+            self.signal_received_count = self.signal_received_count.saturating_add(1);
+        }
         self.continue_count = self.continue_count.saturating_add(1);
         true
     }
 
     fn take_parent_status(&mut self) -> Option<u64> {
         self.pending_parent_status.take()
+    }
+
+    fn signal_action(&self, signal: u64) -> abi::signal_action::Action {
+        usize::try_from(signal)
+            .ok()
+            .and_then(|index| self.signal_actions.get(index).copied())
+            .unwrap_or(abi::signal_action::Action::DEFAULT)
+    }
+
+    fn signal_is_masked(&self, signal: u64) -> bool {
+        self.signal_mask & abi::signal::bit(signal) != 0
+    }
+
+    fn queue_signal(&mut self, signal: u64) -> bool {
+        let bit = abi::signal::bit(signal);
+        if bit == 0 {
+            return false;
+        }
+        let was_new = self.pending_signals & bit == 0;
+        self.pending_signals |= bit;
+        self.pending_signal_peak = self
+            .pending_signal_peak
+            .max(u64::from(self.pending_signals.count_ones()));
+        was_new
+    }
+
+    fn clear_pending_signal(&mut self, signal: u64) {
+        self.pending_signals &= !abi::signal::bit(signal);
+    }
+
+    fn reset_signal_actions_for_exec(&mut self) {
+        for action in &mut self.signal_actions {
+            if action.handler != abi::signal_action::IGNORE {
+                *action = abi::signal_action::Action::DEFAULT;
+            }
+        }
+        self.active_signal = None;
     }
 
     fn result(
@@ -967,6 +1049,12 @@ impl Process {
             cow_copy_count: self.cow_copy_count,
             signal_sent_count: self.signal_sent_count,
             signal_received_count: self.signal_received_count,
+            signal_handler_count: self.signal_handler_count,
+            signal_return_count: self.signal_return_count,
+            signal_ignored_count: self.signal_ignored_count,
+            signal_interrupted_syscall_count: self.signal_interrupted_syscall_count,
+            signal_frame_failure_count: self.signal_frame_failure_count,
+            pending_signal_peak: self.pending_signal_peak,
             stop_count: self.stop_count,
             continue_count: self.continue_count,
             pipe_pair_count: self.pipe_pair_count,
@@ -994,6 +1082,11 @@ struct ProcessManager {
     cow_faults: u64,
     cow_copies: u64,
     signals_sent: u64,
+    signal_handlers: u64,
+    signal_returns: u64,
+    signal_ignores: u64,
+    signal_interruptions: u64,
+    signal_frame_failures: u64,
     stop_deliveries: u64,
     continue_deliveries: u64,
     pipe_pairs: u64,
@@ -1022,6 +1115,11 @@ impl ProcessManager {
             cow_faults: 0,
             cow_copies: 0,
             signals_sent: 0,
+            signal_handlers: 0,
+            signal_returns: 0,
+            signal_ignores: 0,
+            signal_interruptions: 0,
+            signal_frame_failures: 0,
             stop_deliveries: 0,
             continue_deliveries: 0,
             pipe_pairs: 0,
@@ -1072,6 +1170,16 @@ impl ProcessManager {
             peak_shared_frames: shared.peak_frames,
             peak_shared_references: shared.peak_references,
             signals_sent: self.signals_sent,
+            signal_handlers: self.signal_handlers,
+            signal_returns: self.signal_returns,
+            signal_ignores: self.signal_ignores,
+            signal_interruptions: self.signal_interruptions,
+            signal_frame_failures: self.signal_frame_failures,
+            pending_signals: self
+                .processes
+                .iter()
+                .map(|process| process.pending_signals.count_ones() as usize)
+                .sum(),
             stop_deliveries: self.stop_deliveries,
             continue_deliveries: self.continue_deliveries,
             pipe_pairs: self.pipe_pairs,
@@ -1608,6 +1716,11 @@ fn spawn_with_mode(
         pending_exec: None,
         pending_fork: None,
         pending_cow_fault: None,
+        signal_actions: [abi::signal_action::Action::DEFAULT; SIGNAL_TABLE_SIZE],
+        signal_mask: 0,
+        pending_signals: 0,
+        active_signal: None,
+        pending_signal_peak: 0,
         syscall_count: 0,
         write_count: 0,
         yield_count: 0,
@@ -1641,6 +1754,11 @@ fn spawn_with_mode(
         cow_copy_count: 0,
         signal_sent_count: 0,
         signal_received_count: 0,
+        signal_handler_count: 0,
+        signal_return_count: 0,
+        signal_ignored_count: 0,
+        signal_interrupted_syscall_count: 0,
+        signal_frame_failure_count: 0,
         stop_count: 0,
         continue_count: 0,
         pipe_pair_count: 0,
@@ -1741,6 +1859,8 @@ struct ForkSnapshot {
     stdin_target: Option<StreamTarget>,
     stdout_target: Option<StreamTarget>,
     stderr_target: Option<StreamTarget>,
+    signal_actions: [abi::signal_action::Action; SIGNAL_TABLE_SIZE],
+    signal_mask: u64,
     context: SavedContext,
 }
 
@@ -2224,6 +2344,8 @@ impl Runtime {
                 stdin_target: parent.stdin_target.clone(),
                 stdout_target: parent.stdout_target.clone(),
                 stderr_target: parent.stderr_target.clone(),
+                signal_actions: parent.signal_actions,
+                signal_mask: parent.signal_mask,
                 context: unsafe { *(request.stack_pointer as *const SavedContext) },
             }
         };
@@ -2320,6 +2442,11 @@ impl Runtime {
                 pending_exec: None,
                 pending_fork: None,
                 pending_cow_fault: None,
+                signal_actions: snapshot.signal_actions,
+                signal_mask: snapshot.signal_mask,
+                pending_signals: 0,
+                active_signal: None,
+                pending_signal_peak: 0,
                 syscall_count: 0,
                 write_count: 0,
                 yield_count: 0,
@@ -2353,6 +2480,11 @@ impl Runtime {
                 cow_copy_count: 0,
                 signal_sent_count: 0,
                 signal_received_count: 0,
+                signal_handler_count: 0,
+                signal_return_count: 0,
+                signal_ignored_count: 0,
+                signal_interrupted_syscall_count: 0,
+                signal_frame_failure_count: 0,
                 stop_count: 0,
                 continue_count: 0,
                 pipe_pair_count: 0,
@@ -2442,7 +2574,7 @@ impl Runtime {
         Ok(completed)
     }
 
-    fn resolve_cow_page(&mut self, process_id: u64, page_address: u64) -> Result<bool, Error> {
+    fn make_cow_page_private(&mut self, process_id: u64, page_address: u64) -> Result<bool, Error> {
         let (page_table_address, page_info) = {
             let manager = PROCESS_MANAGER.lock();
             let process = manager
@@ -2517,13 +2649,23 @@ impl Runtime {
             }
             process.pages[page_index].frame = replacement;
             process.pages[page_index].copy_on_write = false;
-            process.pending_cow_fault = None;
-            process.make_runnable();
         }
         if copied {
             manager.cow_copies = manager.cow_copies.saturating_add(1);
         }
-        drop(manager);
+        Ok(copied)
+    }
+
+    fn resolve_cow_page(&mut self, process_id: u64, page_address: u64) -> Result<bool, Error> {
+        let copied = self.make_cow_page_private(process_id, page_address)?;
+        {
+            let mut manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .process_mut(process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            process.pending_cow_fault = None;
+            process.make_runnable();
+        }
         if !scheduler::wake_process(process_id) {
             return Err(Error::ProcessNotFound(process_id));
         }
@@ -2556,6 +2698,322 @@ impl Runtime {
         }
         Ok(completed)
     }
+    fn prepare_signal_frame_pages(
+        &mut self,
+        process_id: u64,
+        address: u64,
+        length: usize,
+    ) -> Result<(), Error> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = address
+            .checked_add(length as u64)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(Error::AddressOverflow)?;
+        let first_page = align_down(address);
+        let last_page = align_down(end);
+        let copy_on_write_pages = {
+            let manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            process
+                .pages
+                .iter()
+                .filter(|page| {
+                    page.copy_on_write
+                        && page.virtual_address >= first_page
+                        && page.virtual_address <= last_page
+                })
+                .map(|page| page.virtual_address)
+                .collect::<Vec<_>>()
+        };
+        for page_address in copy_on_write_pages {
+            let _ = self.make_cow_page_private(process_id, page_address)?;
+        }
+        Ok(())
+    }
+
+    fn interrupt_signal_wait(&mut self, process_id: u64) -> Result<bool, Error> {
+        #[derive(Clone, Copy)]
+        enum InterruptedWait {
+            Terminal,
+            PipeRead(PipeId),
+            PipeWrite(PipeId),
+            Child,
+        }
+
+        let interrupted =
+            cpu_interrupts::without_interrupts(|| -> Result<Option<InterruptedWait>, Error> {
+                let mut manager = PROCESS_MANAGER.lock();
+                let process = manager
+                    .process_mut(process_id)
+                    .ok_or(Error::ProcessNotFound(process_id))?;
+                if process.state != ProcessState::Blocked {
+                    return Ok(None);
+                }
+                let (stack_pointer, kind) =
+                    if let Some(pending) = process.pending_terminal_read.take() {
+                        (pending.stack_pointer, InterruptedWait::Terminal)
+                    } else if let Some(pending) = process.pending_pipe_read.take() {
+                        (
+                            pending.stack_pointer,
+                            InterruptedWait::PipeRead(pending.pipe_id),
+                        )
+                    } else if let Some(pending) = process.pending_pipe_write.take() {
+                        (
+                            pending.stack_pointer,
+                            InterruptedWait::PipeWrite(pending.pipe_id),
+                        )
+                    } else if let Some(pending) = process.pending_child_wait.take() {
+                        (pending.stack_pointer, InterruptedWait::Child)
+                    } else {
+                        return Ok(None);
+                    };
+                let registers = unsafe { &mut *(stack_pointer as *mut SavedRegisters) };
+                registers.rax = error_return(ERR_INTERRUPTED);
+                process.make_runnable();
+                process.signal_interrupted_syscall_count =
+                    process.signal_interrupted_syscall_count.saturating_add(1);
+                manager.signal_interruptions = manager.signal_interruptions.saturating_add(1);
+                Ok(Some(kind))
+            })?;
+
+        let Some(interrupted) = interrupted else {
+            return Ok(false);
+        };
+        if !scheduler::wake_process(process_id) {
+            return Err(Error::ProcessNotFound(process_id));
+        }
+        match interrupted {
+            InterruptedWait::Terminal => terminal::note_wakeup(),
+            InterruptedWait::PipeRead(pipe_id) => {
+                let _ = pipe::note_reader_wakeup(pipe_id);
+            }
+            InterruptedWait::PipeWrite(pipe_id) => {
+                let _ = pipe::note_writer_wakeup(pipe_id);
+            }
+            InterruptedWait::Child => {}
+        }
+        Ok(true)
+    }
+
+    fn install_signal_frame(
+        &mut self,
+        process_id: u64,
+        signal: u64,
+        action: abi::signal_action::Action,
+    ) -> Result<(), Error> {
+        let kernel_stack_pointer = scheduler::process_stack_pointer(process_id)
+            .ok_or(Error::ProcessNotFound(process_id))?;
+        let saved_context = unsafe { *(kernel_stack_pointer as *const SavedContext) };
+        let frame_size = size_of::<abi::signal_action::Frame>();
+        let frame_limit = saved_context
+            .stack_pointer
+            .checked_sub(SIGNAL_RED_ZONE_BYTES)
+            .ok_or(Error::StackLayoutInvalid)?;
+        let unaligned = frame_limit
+            .checked_sub(frame_size as u64)
+            .ok_or(Error::StackLayoutInvalid)?;
+        let frame_address = (unaligned & !0xf)
+            .checked_sub(8)
+            .ok_or(Error::StackLayoutInvalid)?;
+        if frame_address & 0xf != 8
+            || !user_range_allows(process_id, frame_address, frame_size, true)
+        {
+            return Err(Error::InvalidUserRange);
+        }
+
+        self.prepare_signal_frame_pages(process_id, frame_address, frame_size)?;
+        let previous_mask = {
+            let manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            if process.state != ProcessState::Runnable || process.active_signal.is_some() {
+                return Err(Error::InvalidArgument);
+            }
+            process.signal_mask
+        };
+        let cookie = abi::signal_action::FRAME_MAGIC
+            ^ process_id.rotate_left(17)
+            ^ frame_address.rotate_right(7)
+            ^ signal.rotate_left(3);
+        let frame = abi::signal_action::Frame {
+            return_address: action.restorer,
+            magic: abi::signal_action::FRAME_MAGIC,
+            signal,
+            previous_mask,
+            cookie,
+        };
+        let frame_bytes = unsafe {
+            slice::from_raw_parts(
+                (&frame as *const abi::signal_action::Frame).cast::<u8>(),
+                frame_size,
+            )
+        };
+        {
+            let manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .processes
+                .iter()
+                .find(|process| process.process_id == process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            write_user_bytes(
+                frame_address,
+                frame_bytes,
+                self.physical_memory_offset,
+                &process.pages,
+            )?;
+        }
+
+        unsafe {
+            let context = &mut *(kernel_stack_pointer as *mut SavedContext);
+            context.rip = action.handler;
+            context.stack_pointer = frame_address;
+            context.rdi = signal;
+            context.rsi = frame_address;
+            context.rflags &= !RFLAGS_DIRECTION;
+        }
+        let mut manager = PROCESS_MANAGER.lock();
+        let process = manager
+            .process_mut(process_id)
+            .ok_or(Error::ProcessNotFound(process_id))?;
+        process.clear_pending_signal(signal);
+        process.signal_mask =
+            (previous_mask | action.mask | abi::signal::bit(signal)) & !SIGNAL_UNBLOCKABLE_MASK;
+        process.active_signal = Some(ActiveSignalFrame {
+            signal,
+            previous_mask,
+            saved_context,
+            frame_address,
+            cookie,
+            restorer: action.restorer,
+        });
+        if action.flags & abi::signal_action::RESET_HANDLER != 0 {
+            process.signal_actions[signal as usize] = abi::signal_action::Action::DEFAULT;
+        }
+        process.signal_handler_count = process.signal_handler_count.saturating_add(1);
+        manager.signal_handlers = manager.signal_handlers.saturating_add(1);
+        Ok(())
+    }
+
+    fn service_pending_signals(&mut self) -> Result<usize, Error> {
+        let candidates = {
+            let manager = PROCESS_MANAGER.lock();
+            manager
+                .processes
+                .iter()
+                .filter_map(|process| {
+                    if !process.is_live() || process.state == ProcessState::Stopped {
+                        return None;
+                    }
+                    let deliverable = process.pending_signals & !process.signal_mask;
+                    if deliverable == 0 {
+                        return None;
+                    }
+                    let signal = u64::from(deliverable.trailing_zeros()) + 1;
+                    Some((
+                        process.process_id,
+                        process.state,
+                        signal,
+                        process.signal_action(signal),
+                        process.active_signal.is_some(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut completed = 0usize;
+        for (process_id, state, signal, action, active) in candidates {
+            if action.handler == abi::signal_action::IGNORE {
+                let mut manager = PROCESS_MANAGER.lock();
+                if let Some(process) = manager.process_mut(process_id) {
+                    process.clear_pending_signal(signal);
+                    process.signal_ignored_count = process.signal_ignored_count.saturating_add(1);
+                    manager.signal_ignores = manager.signal_ignores.saturating_add(1);
+                    completed = completed.saturating_add(1);
+                }
+                continue;
+            }
+
+            if action.handler == abi::signal_action::DEFAULT {
+                {
+                    let mut manager = PROCESS_MANAGER.lock();
+                    if let Some(process) = manager.process_mut(process_id) {
+                        process.clear_pending_signal(signal);
+                    }
+                }
+                match default_signal_action(signal) {
+                    Some(DefaultSignalAction::Terminate) => {
+                        let _ = terminate_process_with_signal(process_id, signal, false);
+                    }
+                    Some(DefaultSignalAction::Stop) => {
+                        let process_group_id = PROCESS_MANAGER
+                            .lock()
+                            .processes
+                            .iter()
+                            .find(|process| process.process_id == process_id)
+                            .map(|process| process.process_group_id);
+                        if stop_process_with_signal(process_id, signal, false) {
+                            if let Some(process_group_id) = process_group_id {
+                                restore_group_terminal(process_group_id);
+                            }
+                        }
+                    }
+                    Some(DefaultSignalAction::Continue) => {
+                        let _ = continue_process_for_signal(process_id, false);
+                    }
+                    None => {}
+                }
+                completed = completed.saturating_add(1);
+                continue;
+            }
+
+            if active {
+                continue;
+            }
+            if state == ProcessState::Blocked && !self.interrupt_signal_wait(process_id)? {
+                continue;
+            }
+            match self.install_signal_frame(process_id, signal, action) {
+                Ok(()) => {
+                    crate::serial_println!(
+                        "userspace signal handler entered: pid={}, signal={}, handler={:#018x}",
+                        process_id,
+                        signal,
+                        action.handler
+                    );
+                }
+                Err(error) => {
+                    {
+                        let mut manager = PROCESS_MANAGER.lock();
+                        if let Some(process) = manager.process_mut(process_id) {
+                            process.signal_frame_failure_count =
+                                process.signal_frame_failure_count.saturating_add(1);
+                        }
+                        manager.signal_frame_failures =
+                            manager.signal_frame_failures.saturating_add(1);
+                    }
+                    let _ = terminate_process_with_signal(process_id, signal, false);
+                    crate::serial_println!(
+                        "userspace signal frame failed: pid={}, signal={}, error={}",
+                        process_id,
+                        signal,
+                        error
+                    );
+                }
+            }
+            completed = completed.saturating_add(1);
+        }
+        Ok(completed)
+    }
+
     fn replace_process_image(
         &mut self,
         process_id: u64,
@@ -2638,6 +3096,7 @@ impl Runtime {
             process.ranges = core::mem::take(&mut address_space.ranges);
             process.pages = core::mem::take(&mut address_space.pages);
             process.pending_exec = None;
+            process.reset_signal_actions_for_exec();
             process.exec_count = process.exec_count.saturating_add(1);
 
             let open_before = process.open_files.len();
@@ -2814,6 +3273,7 @@ impl Runtime {
     pub fn poll(&mut self) -> Result<usize, Error> {
         terminal::poll_keyboard();
         service_terminal_control();
+        self.service_pending_signals()?;
         let reaped = reap(&mut self.frame_allocator)?;
         self.service_cow_faults()?;
         service_terminal_reads(self.physical_memory_offset)?;
@@ -2821,6 +3281,7 @@ impl Runtime {
         self.service_fork_requests()?;
         self.service_child_requests()?;
         self.service_exec_requests()?;
+        self.service_pending_signals()?;
         Ok(reaped)
     }
 
@@ -2932,6 +3393,17 @@ impl Runtime {
             }
         }
         Ok(completed)
+    }
+
+    pub fn signal_process_group(
+        &mut self,
+        process_group_id: u64,
+        signal: u64,
+    ) -> Result<usize, Error> {
+        deliver_signal_group(None, process_group_id, signal).map_err(|error| match error {
+            ERR_NO_PROCESS => Error::InvalidProcessGroup(process_group_id),
+            _ => Error::InvalidArgument,
+        })
     }
 
     pub fn terminal_active(&self) -> bool {
@@ -3303,22 +3775,32 @@ pub fn general_protection_interrupt_entry_address() -> VirtAddr {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usize {
-    let registers = unsafe { &mut *(current_stack_pointer as *mut SavedRegisters) };
+    let registers_pointer = current_stack_pointer as *mut SavedRegisters;
+    let syscall_number = unsafe { (*registers_pointer).rax };
     let Some(process_id) = scheduler::current_process_id() else {
-        registers.rax = error_return(ERR_NOT_IMPLEMENTED);
+        unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
         return current_stack_pointer;
     };
 
     {
         let mut manager = PROCESS_MANAGER.lock();
         let Some(process) = manager.process_mut(process_id) else {
-            registers.rax = error_return(ERR_NOT_IMPLEMENTED);
+            unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
             return current_stack_pointer;
         };
         process.syscall_count = process.syscall_count.saturating_add(1);
     }
 
-    match registers.rax {
+    if syscall_number == SYSCALL_SIGNAL_RETURN {
+        match syscall_signal_return(process_id, current_stack_pointer) {
+            Ok(context) => unsafe { (current_stack_pointer as *mut SavedContext).write(context) },
+            Err(error) => unsafe { (*registers_pointer).rax = error_return(error) },
+        }
+        return current_stack_pointer;
+    }
+
+    let registers = unsafe { &mut *registers_pointer };
+    match syscall_number {
         SYSCALL_WRITE => match syscall_write(
             process_id,
             registers.rdi,
@@ -3438,6 +3920,15 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             }
             ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
         },
+        SYSCALL_SIGNAL_ACTION => {
+            registers.rax =
+                syscall_signal_action(process_id, registers.rdi, registers.rsi, registers.rdx);
+            current_stack_pointer
+        }
+        SYSCALL_SIGNAL_MASK => {
+            registers.rax = syscall_signal_mask(process_id, registers.rdi, registers.rsi);
+            current_stack_pointer
+        }
         SYSCALL_EXIT => {
             let exit_code = registers.rdi;
             {
@@ -3767,6 +4258,7 @@ fn syscall_fork(process_id: u64, current_stack_pointer: usize) -> ControlOutcome
         || process.pending_exec.is_some()
         || process.pending_fork.is_some()
         || process.pending_cow_fault.is_some()
+        || process.active_signal.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -3950,6 +4442,228 @@ fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {
         .unwrap_or_else(|| error_return(ERR_TRY_AGAIN))
 }
 
+fn signal_is_supported(signal: u64) -> bool {
+    abi::signal::bit(signal) & SIGNAL_SUPPORTED_MASK != 0
+}
+
+fn signal_is_catchable(signal: u64) -> bool {
+    signal_is_supported(signal) && signal != SIGNAL_STOP
+}
+
+fn user_executable_address(process_id: u64, address: u64) -> bool {
+    PROCESS_MANAGER
+        .lock()
+        .processes
+        .iter()
+        .find(|process| process.process_id == process_id)
+        .is_some_and(|process| {
+            process
+                .ranges
+                .iter()
+                .any(|range| range.executable && range.contains(address, 1))
+        })
+}
+
+fn read_user_signal_action(
+    process_id: u64,
+    address: u64,
+) -> Result<abi::signal_action::Action, i64> {
+    if !user_range_allows(
+        process_id,
+        address,
+        size_of::<abi::signal_action::Action>(),
+        false,
+    ) {
+        return Err(ERR_BAD_ADDRESS);
+    }
+    Ok(unsafe { ptr::read_unaligned(address as *const abi::signal_action::Action) })
+}
+
+fn write_user_signal_action(
+    process_id: u64,
+    address: u64,
+    action: abi::signal_action::Action,
+) -> Result<(), i64> {
+    if !user_range_allows(
+        process_id,
+        address,
+        size_of::<abi::signal_action::Action>(),
+        true,
+    ) {
+        return Err(ERR_BAD_ADDRESS);
+    }
+    unsafe { ptr::write_unaligned(address as *mut abi::signal_action::Action, action) };
+    Ok(())
+}
+
+fn validate_signal_action(
+    process_id: u64,
+    signal: u64,
+    mut action: abi::signal_action::Action,
+) -> Result<abi::signal_action::Action, i64> {
+    if action.mask & !SIGNAL_SUPPORTED_MASK != 0
+        || action.flags & !abi::signal_action::ALLOWED_FLAGS != 0
+    {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    action.mask &= !SIGNAL_UNBLOCKABLE_MASK;
+    match action.handler {
+        abi::signal_action::DEFAULT | abi::signal_action::IGNORE => {
+            if signal == SIGNAL_STOP && action.handler != abi::signal_action::DEFAULT {
+                return Err(ERR_INVALID_ARGUMENT);
+            }
+            action.restorer = 0;
+        }
+        _ => {
+            if !signal_is_catchable(signal)
+                || !user_executable_address(process_id, action.handler)
+                || !user_executable_address(process_id, action.restorer)
+            {
+                return Err(ERR_INVALID_ARGUMENT);
+            }
+        }
+    }
+    Ok(action)
+}
+
+fn syscall_signal_action(
+    process_id: u64,
+    signal: u64,
+    action_address: u64,
+    previous_address: u64,
+) -> u64 {
+    if !signal_is_supported(signal) {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    if previous_address != 0
+        && !user_range_allows(
+            process_id,
+            previous_address,
+            size_of::<abi::signal_action::Action>(),
+            true,
+        )
+    {
+        return error_return(ERR_BAD_ADDRESS);
+    }
+    let action = if action_address == 0 {
+        None
+    } else {
+        match read_user_signal_action(process_id, action_address)
+            .and_then(|action| validate_signal_action(process_id, signal, action))
+        {
+            Ok(action) => Some(action),
+            Err(error) => return error_return(error),
+        }
+    };
+
+    let (previous, ignored_pending) = {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            return error_return(ERR_NO_PROCESS);
+        };
+        let previous = process.signal_action(signal);
+        let mut ignored_pending = false;
+        if let Some(action) = action {
+            let index = signal as usize;
+            process.signal_actions[index] = action;
+            if action.handler == abi::signal_action::IGNORE
+                && process.pending_signals & abi::signal::bit(signal) != 0
+            {
+                process.clear_pending_signal(signal);
+                process.signal_ignored_count = process.signal_ignored_count.saturating_add(1);
+                ignored_pending = true;
+            }
+        }
+        if ignored_pending {
+            manager.signal_ignores = manager.signal_ignores.saturating_add(1);
+        }
+        (previous, ignored_pending)
+    };
+    let _ = ignored_pending;
+
+    if previous_address != 0 {
+        if let Err(error) = write_user_signal_action(process_id, previous_address, previous) {
+            return error_return(error);
+        }
+    }
+    0
+}
+
+fn syscall_signal_mask(process_id: u64, how: u64, mask: u64) -> u64 {
+    if mask & !SIGNAL_SUPPORTED_MASK != 0 {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    let mask = mask & !SIGNAL_UNBLOCKABLE_MASK;
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return error_return(ERR_NO_PROCESS);
+    };
+    let previous = process.signal_mask;
+    process.signal_mask = match how {
+        abi::signal_mask::BLOCK => process.signal_mask | mask,
+        abi::signal_mask::UNBLOCK => process.signal_mask & !mask,
+        abi::signal_mask::SET => mask,
+        _ => return error_return(ERR_INVALID_ARGUMENT),
+    };
+    previous
+}
+
+fn syscall_signal_return(
+    process_id: u64,
+    current_stack_pointer: usize,
+) -> Result<SavedContext, i64> {
+    let (active, current_user_stack) = {
+        let manager = PROCESS_MANAGER.lock();
+        let process = manager
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+            .ok_or(ERR_NO_PROCESS)?;
+        validate_kernel_context_pointer(process, current_stack_pointer).map_err(|_| ERR_IO)?;
+        let active = process.active_signal.ok_or(ERR_INVALID_ARGUMENT)?;
+        let context = unsafe { &*(current_stack_pointer as *const SavedContext) };
+        (active, context.stack_pointer)
+    };
+    let expected_stack = active
+        .frame_address
+        .checked_add(size_of::<u64>() as u64)
+        .ok_or(ERR_BAD_ADDRESS)?;
+    if current_user_stack != expected_stack
+        || !user_range_allows(
+            process_id,
+            active.frame_address,
+            size_of::<abi::signal_action::Frame>(),
+            false,
+        )
+    {
+        return Err(ERR_BAD_ADDRESS);
+    }
+    let frame =
+        unsafe { ptr::read_unaligned(active.frame_address as *const abi::signal_action::Frame) };
+    if frame.return_address != active.restorer
+        || frame.magic != abi::signal_action::FRAME_MAGIC
+        || frame.signal != active.signal
+        || frame.previous_mask != active.previous_mask
+        || frame.cookie != active.cookie
+    {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+
+    let mut manager = PROCESS_MANAGER.lock();
+    let process = manager.process_mut(process_id).ok_or(ERR_NO_PROCESS)?;
+    if process
+        .active_signal
+        .is_none_or(|current| current.cookie != active.cookie)
+    {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    process.active_signal = None;
+    process.signal_mask = active.previous_mask;
+    process.signal_return_count = process.signal_return_count.saturating_add(1);
+    manager.signal_returns = manager.signal_returns.saturating_add(1);
+    Ok(active.saved_context)
+}
+
 fn syscall_signal_process_group(process_id: u64, process_group_id: u64, signal: u64) -> u64 {
     match deliver_signal_group(Some(process_id), process_group_id, signal) {
         Ok(count) => count as u64,
@@ -3965,18 +4679,177 @@ fn syscall_foreground_process_group(process_id: u64, process_group_id: u64) -> u
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SignalAction {
+enum DefaultSignalAction {
     Terminate,
     Stop,
     Continue,
 }
 
-fn signal_action(signal: u64) -> Option<SignalAction> {
+fn default_signal_action(signal: u64) -> Option<DefaultSignalAction> {
     match signal {
-        SIGNAL_INTERRUPT | SIGNAL_TERMINATE => Some(SignalAction::Terminate),
-        SIGNAL_STOP | SIGNAL_TERMINAL_STOP => Some(SignalAction::Stop),
-        SIGNAL_CONTINUE => Some(SignalAction::Continue),
+        SIGNAL_INTERRUPT | SIGNAL_TERMINATE => Some(DefaultSignalAction::Terminate),
+        SIGNAL_STOP | SIGNAL_TERMINAL_STOP => Some(DefaultSignalAction::Stop),
+        SIGNAL_CONTINUE => Some(DefaultSignalAction::Continue),
         _ => None,
+    }
+}
+
+fn terminate_process_with_signal(process_id: u64, signal: u64, record_received: bool) -> bool {
+    if !scheduler::terminate_process(process_id) {
+        return false;
+    }
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return false;
+    };
+    process.state = ProcessState::Signaled;
+    process.stopped_resume_state = None;
+    process.pending_parent_status = None;
+    process.termination = Some(TerminationReason::Signal(signal));
+    process.pending_signals = 0;
+    process.active_signal = None;
+    if record_received {
+        process.signal_received_count = process.signal_received_count.saturating_add(1);
+    }
+    manager.signaled = manager.signaled.saturating_add(1);
+    true
+}
+
+fn stop_process_with_signal(process_id: u64, signal: u64, record_received: bool) -> bool {
+    if !scheduler::stop_process(process_id) {
+        return false;
+    }
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return false;
+    };
+    if !process.stop(signal, record_received) {
+        return false;
+    }
+    manager.stop_deliveries = manager.stop_deliveries.saturating_add(1);
+    true
+}
+
+fn continue_process_for_signal(process_id: u64, record_received: bool) -> bool {
+    if !scheduler::continue_process(process_id) {
+        return false;
+    }
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return false;
+    };
+    if !process.continue_running(record_received) {
+        return false;
+    }
+    manager.continue_deliveries = manager.continue_deliveries.saturating_add(1);
+    true
+}
+
+#[derive(Clone, Copy)]
+struct SignalDelivery {
+    accepted: bool,
+    stopped: bool,
+}
+
+fn deliver_signal_to_process(process_id: u64, signal: u64) -> SignalDelivery {
+    let (state, action, masked) = {
+        let manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id && process.is_live())
+        else {
+            return SignalDelivery {
+                accepted: false,
+                stopped: false,
+            };
+        };
+        (
+            process.state,
+            process.signal_action(signal),
+            process.signal_is_masked(signal),
+        )
+    };
+
+    let continued = signal == SIGNAL_CONTINUE
+        && state == ProcessState::Stopped
+        && continue_process_for_signal(process_id, false);
+
+    if signal == SIGNAL_STOP {
+        let stopped = stop_process_with_signal(process_id, signal, true);
+        return SignalDelivery {
+            accepted: stopped,
+            stopped,
+        };
+    }
+
+    if action.handler == abi::signal_action::IGNORE {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            return SignalDelivery {
+                accepted: false,
+                stopped: false,
+            };
+        };
+        process.signal_received_count = process.signal_received_count.saturating_add(1);
+        process.signal_ignored_count = process.signal_ignored_count.saturating_add(1);
+        process.clear_pending_signal(signal);
+        manager.signal_ignores = manager.signal_ignores.saturating_add(1);
+        return SignalDelivery {
+            accepted: true,
+            stopped: false,
+        };
+    }
+
+    if action.handler != abi::signal_action::DEFAULT || masked {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            return SignalDelivery {
+                accepted: false,
+                stopped: false,
+            };
+        };
+        process.signal_received_count = process.signal_received_count.saturating_add(1);
+        process.queue_signal(signal);
+        return SignalDelivery {
+            accepted: true,
+            stopped: false,
+        };
+    }
+
+    match default_signal_action(signal) {
+        Some(DefaultSignalAction::Terminate) => SignalDelivery {
+            accepted: terminate_process_with_signal(process_id, signal, true),
+            stopped: false,
+        },
+        Some(DefaultSignalAction::Stop) => {
+            let stopped = stop_process_with_signal(process_id, signal, true);
+            SignalDelivery {
+                accepted: stopped,
+                stopped,
+            }
+        }
+        Some(DefaultSignalAction::Continue) => {
+            if continued {
+                let mut manager = PROCESS_MANAGER.lock();
+                if let Some(process) = manager.process_mut(process_id) {
+                    process.signal_received_count = process.signal_received_count.saturating_add(1);
+                }
+            } else if state != ProcessState::Stopped {
+                let mut manager = PROCESS_MANAGER.lock();
+                if let Some(process) = manager.process_mut(process_id) {
+                    process.signal_received_count = process.signal_received_count.saturating_add(1);
+                }
+            }
+            SignalDelivery {
+                accepted: continued || state != ProcessState::Stopped,
+                stopped: false,
+            }
+        }
+        None => SignalDelivery {
+            accepted: false,
+            stopped: false,
+        },
     }
 }
 
@@ -3985,9 +4858,9 @@ fn deliver_signal_group(
     process_group_id: u64,
     signal: u64,
 ) -> Result<usize, i64> {
-    let Some(action) = signal_action(signal) else {
+    if !signal_is_supported(signal) {
         return Err(ERR_INVALID_ARGUMENT);
-    };
+    }
     let target_process_ids = {
         let manager = PROCESS_MANAGER.lock();
         if let Some(owner_process_id) = owner_process_id {
@@ -4003,19 +4876,7 @@ fn deliver_signal_group(
         manager
             .processes
             .iter()
-            .filter(|process| {
-                process.process_group_id == process_group_id
-                    && match action {
-                        SignalAction::Terminate => process.is_live(),
-                        SignalAction::Stop => {
-                            matches!(
-                                process.state,
-                                ProcessState::Runnable | ProcessState::Blocked
-                            )
-                        }
-                        SignalAction::Continue => process.state == ProcessState::Stopped,
-                    }
-            })
+            .filter(|process| process.process_group_id == process_group_id && process.is_live())
             .map(|process| process.process_id)
             .collect::<Vec<_>>()
     };
@@ -4023,61 +4884,27 @@ fn deliver_signal_group(
         return Err(ERR_NO_PROCESS);
     }
 
-    let mut delivered = Vec::new();
+    let mut count = 0usize;
+    let mut stopped = false;
     for target_process_id in target_process_ids {
-        let changed = match action {
-            SignalAction::Terminate => scheduler::terminate_process(target_process_id),
-            SignalAction::Stop => scheduler::stop_process(target_process_id),
-            SignalAction::Continue => scheduler::continue_process(target_process_id),
-        };
-        if changed {
-            delivered.push(target_process_id);
-        }
+        let delivery = deliver_signal_to_process(target_process_id, signal);
+        count = count.saturating_add(usize::from(delivery.accepted));
+        stopped |= delivery.stopped;
     }
-    if delivered.is_empty() {
+    if count == 0 {
         return Err(ERR_NO_PROCESS);
     }
 
-    let count = delivered.len();
     let mut manager = PROCESS_MANAGER.lock();
-    for target_process_id in &delivered {
-        let Some(process) = manager.process_mut(*target_process_id) else {
-            continue;
-        };
-        match action {
-            SignalAction::Terminate => {
-                process.state = ProcessState::Signaled;
-                process.stopped_resume_state = None;
-                process.pending_parent_status = None;
-                process.termination = Some(TerminationReason::Signal(signal));
-                process.signal_received_count = process.signal_received_count.saturating_add(1);
-            }
-            SignalAction::Stop => {
-                let _ = process.stop(signal);
-            }
-            SignalAction::Continue => {
-                let _ = process.continue_running();
-            }
-        }
-    }
     if let Some(owner_process_id) = owner_process_id {
         if let Some(owner) = manager.process_mut(owner_process_id) {
             owner.signal_sent_count = owner.signal_sent_count.saturating_add(count as u64);
         }
     }
     manager.signals_sent = manager.signals_sent.saturating_add(count as u64);
-    match action {
-        SignalAction::Terminate => manager.signaled = manager.signaled.saturating_add(count as u64),
-        SignalAction::Stop => {
-            manager.stop_deliveries = manager.stop_deliveries.saturating_add(count as u64)
-        }
-        SignalAction::Continue => {
-            manager.continue_deliveries = manager.continue_deliveries.saturating_add(count as u64)
-        }
-    }
     drop(manager);
 
-    if action == SignalAction::Stop {
+    if stopped {
         restore_group_terminal(process_group_id);
     }
 

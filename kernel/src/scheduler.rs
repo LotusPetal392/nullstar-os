@@ -547,6 +547,20 @@ impl Scheduler {
         }
     }
 
+    fn process_stack_pointer(&self, process_id: u64) -> Option<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .find(|(index, task)| {
+                *index != self.current_task
+                    && task.kind == TaskKind::UserProcess
+                    && task.state != TaskState::Zombie
+                    && task.process_id == Some(process_id)
+            })
+            .map(|(_, task)| task.stack_pointer)
+            .filter(|stack_pointer| *stack_pointer != 0)
+    }
+
     fn replace_process_image(
         &mut self,
         process_id: u64,
@@ -923,6 +937,10 @@ pub fn block_current(current_stack_pointer: usize) -> usize {
 
 pub fn wake_process(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().wake_process(process_id))
+}
+
+pub fn process_stack_pointer(process_id: u64) -> Option<usize> {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().process_stack_pointer(process_id))
 }
 
 pub fn replace_process_image(

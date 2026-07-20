@@ -106,3 +106,21 @@ name = "fork_target"
 path = "src/bin/fork_target.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "signal_handler_probe"
+path = "src/bin/signal_handler_probe.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "signal_lifecycle_probe"
+path = "src/bin/signal_lifecycle_probe.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "signal_lifecycle_target"
+path = "src/bin/signal_lifecycle_target.rs"
+test = false
+bench = false

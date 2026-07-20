@@ -23,6 +23,9 @@ pub mod syscall {
     pub const EXECVE: u64 = 15;
     pub const SET_DESCRIPTOR_FLAGS: u64 = 16;
     pub const FORK: u64 = 17;
+    pub const SIGNAL_ACTION: u64 = 18;
+    pub const SIGNAL_MASK: u64 = 19;
+    pub const SIGNAL_RETURN: u64 = 20;
 }
 
 pub mod signal {
@@ -31,6 +34,71 @@ pub mod signal {
     pub const CONTINUE: u64 = 18;
     pub const STOP: u64 = 19;
     pub const TERMINAL_STOP: u64 = 20;
+    pub const MAX: u64 = 63;
+
+    pub const fn bit(signal: u64) -> u64 {
+        if signal == 0 || signal > MAX {
+            0
+        } else {
+            1_u64 << (signal - 1)
+        }
+    }
+
+    pub const SUPPORTED_MASK: u64 = bit(INTERRUPT)
+        | bit(TERMINATE)
+        | bit(CONTINUE)
+        | bit(STOP)
+        | bit(TERMINAL_STOP);
+    pub const UNBLOCKABLE_MASK: u64 = bit(STOP);
+}
+
+pub mod signal_action {
+    pub const DEFAULT: u64 = 0;
+    pub const IGNORE: u64 = 1;
+    pub const RESET_HANDLER: u64 = 1 << 0;
+    pub const ALLOWED_FLAGS: u64 = RESET_HANDLER;
+    pub const FRAME_MAGIC: u64 = 0x4741_4c41_4354_5347;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Action {
+        pub handler: u64,
+        pub mask: u64,
+        pub flags: u64,
+        pub restorer: u64,
+    }
+
+    impl Action {
+        pub const DEFAULT: Self = Self {
+            handler: DEFAULT,
+            mask: 0,
+            flags: 0,
+            restorer: 0,
+        };
+
+        pub const IGNORE: Self = Self {
+            handler: IGNORE,
+            mask: 0,
+            flags: 0,
+            restorer: 0,
+        };
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Frame {
+        pub return_address: u64,
+        pub magic: u64,
+        pub signal: u64,
+        pub previous_mask: u64,
+        pub cookie: u64,
+    }
+}
+
+pub mod signal_mask {
+    pub const BLOCK: u64 = 0;
+    pub const UNBLOCK: u64 = 1;
+    pub const SET: u64 = 2;
 }
 
 pub mod child_status {
@@ -84,6 +152,7 @@ pub mod limits {
 
 pub mod errno {
     pub const NO_ENTRY: i64 = -2;
+    pub const INTERRUPTED: i64 = -4;
     pub const NO_PROCESS: i64 = -3;
     pub const IO: i64 = -5;
     pub const ARGUMENT_TOO_LARGE: i64 = -7;
