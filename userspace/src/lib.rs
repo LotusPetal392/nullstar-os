@@ -4,6 +4,7 @@
 pub mod args;
 pub mod environment;
 pub mod heap;
+pub mod platform;
 pub mod supervisor;
 pub mod syscall;
 
