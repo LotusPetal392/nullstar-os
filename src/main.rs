@@ -37,11 +37,14 @@ const USER_STOPPED_JOB_TEST_MARKER: &str = "userspace stopped jobs verified:";
 const USER_TMPFS_TEST_MARKER: &str = "userspace tmpfs redirection verified:";
 const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals verified:";
 const USER_SIGNAL_HANDLER_TEST_MARKER: &str = "userspace handled signals verified:";
+const NORMAL_BOOT_MODE_MARKER: &str = "boot mode selected: normal";
+const NORMAL_BOOT_READY_MARKER: &str = "normal boot ready:";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Default)]
 struct Options {
     headless: bool,
+    boot_check: bool,
     test: bool,
 }
 
@@ -53,6 +56,8 @@ fn main() -> ExitCode {
 
     if options.test {
         run_kernel_smoke_test(&options)
+    } else if options.boot_check {
+        run_normal_boot_check(&options)
     } else {
         run_interactive(qemu_command(&options))
     }
@@ -64,7 +69,21 @@ fn parse_options() -> Result<Options, ExitCode> {
     for argument in env::args().skip(1) {
         match argument.as_str() {
             "--headless" => options.headless = true,
+            "--boot-check" => {
+                if options.test {
+                    eprintln!("--boot-check and --test cannot be used together");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
+                options.boot_check = true;
+                options.headless = true;
+            }
             "--test" => {
+                if options.boot_check {
+                    eprintln!("--boot-check and --test cannot be used together");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
                 options.test = true;
                 options.headless = true;
             }
@@ -84,8 +103,9 @@ fn parse_options() -> Result<Options, ExitCode> {
 }
 
 fn print_usage() {
-    println!("Usage: cargo run -- [--headless] [--test]");
+    println!("Usage: cargo run -- [--headless] [--boot-check | --test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
+    println!("  --boot-check  Verify that the normal image reaches the interactive shell");
     println!(
         "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, process environments, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
     );
@@ -112,7 +132,7 @@ fn qemu_command_for_image(options: &Options, image: &Path) -> Command {
         command.args(["-display", "none"]);
     }
 
-    if options.test {
+    if options.test || options.boot_check {
         command.args(["-no-reboot", "-no-shutdown"]);
     }
 
@@ -130,6 +150,20 @@ fn run_interactive(mut command: Command) -> ExitCode {
     }
 }
 
+fn run_normal_boot_check(options: &Options) -> ExitCode {
+    let mut normal_mode_selected = false;
+    let passed = run_qemu_until(qemu_command(options), "normal boot check", move |line| {
+        normal_mode_selected |= line.contains(NORMAL_BOOT_MODE_MARKER);
+        normal_mode_selected && line.contains(NORMAL_BOOT_READY_MARKER)
+    });
+    if passed {
+        println!("QEMU normal boot check passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmokePhase {
     PreparePersistentFat,
@@ -137,7 +171,7 @@ enum SmokePhase {
 }
 
 fn run_kernel_smoke_test(options: &Options) -> ExitCode {
-    let source_image = Path::new(env!("BIOS_IMAGE"));
+    let source_image = Path::new(env!("SMOKE_TEST_BIOS_IMAGE"));
     let test_image = persistent_test_image_path();
     let _ = fs::remove_file(&test_image);
     if let Err(error) = fs::copy(source_image, &test_image) {
@@ -177,7 +211,111 @@ fn persistent_test_image_path() -> PathBuf {
     ))
 }
 
-fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
+fn run_qemu_phase(command: Command, phase: SmokePhase) -> bool {
+    let mut heap_ready = false;
+    let mut framebuffer_ready = false;
+    let mut acpi_ready = false;
+    let mut lapic_timer_ready = false;
+    let mut scheduler_ready = false;
+    let mut pcie_ready = false;
+    let mut ahci_ready = false;
+    let mut partitions_ready = false;
+    let mut fat_ready = false;
+    let mut fat_persistent_ready = false;
+    let mut vfs_ready = false;
+    let mut elf_ready = false;
+    let mut userspace_ready = false;
+    let mut user_file_io_ready = false;
+    let mut user_rust_runtime_ready = false;
+    let mut user_exec_ready = false;
+    let mut user_fork_ready = false;
+    let mut user_environment_ready = false;
+    let mut user_terminal_ready = false;
+    let mut user_pipe_ready = false;
+    let mut user_shell_ready = false;
+    let mut user_pipeline_output_ready = false;
+    let mut user_pipeline_ready = false;
+    let mut user_background_ready = false;
+    let mut user_stopped_job_ready = false;
+    let mut user_tmpfs_ready = false;
+    let mut user_signal_ready = false;
+    let mut user_signal_handler_ready = false;
+
+    let label = match phase {
+        SmokePhase::PreparePersistentFat => "persistent FAT preparation",
+        SmokePhase::VerifyCompleteSystem => "complete-system smoke test",
+    };
+    run_qemu_until(command, label, move |line| {
+        if phase == SmokePhase::PreparePersistentFat {
+            return line.contains(FAT_PERSIST_PREPARED_MARKER)
+                || line.contains(FAT_PERSIST_VERIFIED_MARKER);
+        }
+
+        heap_ready |= line.contains(HEAP_TEST_MARKER);
+        framebuffer_ready |= line.contains(FRAMEBUFFER_TEST_MARKER);
+        acpi_ready |= line.contains(ACPI_TEST_MARKER);
+        lapic_timer_ready |= line.contains(LAPIC_TIMER_TEST_MARKER);
+        scheduler_ready |= line.contains(SCHEDULER_TEST_MARKER);
+        pcie_ready |= line.contains(PCIE_TEST_MARKER);
+        ahci_ready |= line.contains(AHCI_TEST_MARKER);
+        partitions_ready |= line.contains(PARTITION_TEST_MARKER);
+        fat_ready |= line.contains(FAT_TEST_MARKER);
+        fat_persistent_ready |= line.contains(FAT_PERSIST_VERIFIED_MARKER);
+        vfs_ready |= line.contains(VFS_TEST_MARKER);
+        elf_ready |= line.contains(ELF_TEST_MARKER);
+        userspace_ready |= line.contains(USERSPACE_TEST_MARKER);
+        user_file_io_ready |= line.contains(USER_FILE_IO_TEST_MARKER);
+        user_rust_runtime_ready |= line.contains(USER_RUST_RUNTIME_TEST_MARKER);
+        user_exec_ready |= line.contains(USER_EXEC_TEST_MARKER);
+        user_fork_ready |= line.contains(USER_FORK_TEST_MARKER);
+        user_environment_ready |= line.contains(USER_ENVIRONMENT_TEST_MARKER);
+        user_terminal_ready |= line.contains(USER_TERMINAL_TEST_MARKER);
+        user_pipe_ready |= line.contains(USER_PIPE_TEST_MARKER);
+        user_shell_ready |= line.contains(USER_SHELL_TEST_MARKER);
+        user_pipeline_output_ready |= line.contains(USER_PIPELINE_OUTPUT_MARKER);
+        user_pipeline_ready |= line.contains(USER_PIPELINE_TEST_MARKER);
+        user_background_ready |= line.contains(USER_BACKGROUND_TEST_MARKER);
+        user_stopped_job_ready |= line.contains(USER_STOPPED_JOB_TEST_MARKER);
+        user_tmpfs_ready |= line.contains(USER_TMPFS_TEST_MARKER);
+        user_signal_ready |= line.contains(USER_SIGNAL_TEST_MARKER);
+        user_signal_handler_ready |= line.contains(USER_SIGNAL_HANDLER_TEST_MARKER);
+
+        heap_ready
+            && framebuffer_ready
+            && acpi_ready
+            && lapic_timer_ready
+            && scheduler_ready
+            && pcie_ready
+            && ahci_ready
+            && partitions_ready
+            && fat_ready
+            && fat_persistent_ready
+            && vfs_ready
+            && elf_ready
+            && userspace_ready
+            && user_file_io_ready
+            && user_rust_runtime_ready
+            && user_exec_ready
+            && user_fork_ready
+            && user_environment_ready
+            && user_terminal_ready
+            && user_pipe_ready
+            && user_shell_ready
+            && user_pipeline_output_ready
+            && user_pipeline_ready
+            && user_background_ready
+            && user_stopped_job_ready
+            && user_tmpfs_ready
+            && user_signal_ready
+            && user_signal_handler_ready
+    })
+}
+
+fn run_qemu_until(
+    mut command: Command,
+    label: &'static str,
+    mut completion: impl FnMut(&str) -> bool + Send + 'static,
+) -> bool {
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
     let mut child = match command.spawn() {
@@ -197,107 +335,13 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
     let (marker_sender, marker_receiver) = mpsc::channel();
     let reader = thread::spawn(move || -> io::Result<()> {
         let mut terminal = io::stdout().lock();
-        let mut heap_ready = false;
-        let mut framebuffer_ready = false;
-        let mut acpi_ready = false;
-        let mut lapic_timer_ready = false;
-        let mut scheduler_ready = false;
-        let mut pcie_ready = false;
-        let mut ahci_ready = false;
-        let mut partitions_ready = false;
-        let mut fat_ready = false;
-        let mut fat_persistent_ready = false;
-        let mut vfs_ready = false;
-        let mut elf_ready = false;
-        let mut userspace_ready = false;
-        let mut user_file_io_ready = false;
-        let mut user_rust_runtime_ready = false;
-        let mut user_exec_ready = false;
-        let mut user_fork_ready = false;
-        let mut user_environment_ready = false;
-        let mut user_terminal_ready = false;
-        let mut user_pipe_ready = false;
-        let mut user_shell_ready = false;
-        let mut user_pipeline_output_ready = false;
-        let mut user_pipeline_ready = false;
-        let mut user_background_ready = false;
-        let mut user_stopped_job_ready = false;
-        let mut user_tmpfs_ready = false;
-        let mut user_signal_ready = false;
-        let mut user_signal_handler_ready = false;
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
             writeln!(terminal, "{line}")?;
             terminal.flush()?;
 
-            if phase == SmokePhase::PreparePersistentFat
-                && (line.contains(FAT_PERSIST_PREPARED_MARKER)
-                    || line.contains(FAT_PERSIST_VERIFIED_MARKER))
-            {
-                let _ = marker_sender.send(());
-                break;
-            }
-
-            heap_ready |= line.contains(HEAP_TEST_MARKER);
-            framebuffer_ready |= line.contains(FRAMEBUFFER_TEST_MARKER);
-            acpi_ready |= line.contains(ACPI_TEST_MARKER);
-            lapic_timer_ready |= line.contains(LAPIC_TIMER_TEST_MARKER);
-            scheduler_ready |= line.contains(SCHEDULER_TEST_MARKER);
-            pcie_ready |= line.contains(PCIE_TEST_MARKER);
-            ahci_ready |= line.contains(AHCI_TEST_MARKER);
-            partitions_ready |= line.contains(PARTITION_TEST_MARKER);
-            fat_ready |= line.contains(FAT_TEST_MARKER);
-            fat_persistent_ready |= line.contains(FAT_PERSIST_VERIFIED_MARKER);
-            vfs_ready |= line.contains(VFS_TEST_MARKER);
-            elf_ready |= line.contains(ELF_TEST_MARKER);
-            userspace_ready |= line.contains(USERSPACE_TEST_MARKER);
-            user_file_io_ready |= line.contains(USER_FILE_IO_TEST_MARKER);
-            user_rust_runtime_ready |= line.contains(USER_RUST_RUNTIME_TEST_MARKER);
-            user_exec_ready |= line.contains(USER_EXEC_TEST_MARKER);
-            user_fork_ready |= line.contains(USER_FORK_TEST_MARKER);
-            user_environment_ready |= line.contains(USER_ENVIRONMENT_TEST_MARKER);
-            user_terminal_ready |= line.contains(USER_TERMINAL_TEST_MARKER);
-            user_pipe_ready |= line.contains(USER_PIPE_TEST_MARKER);
-            user_shell_ready |= line.contains(USER_SHELL_TEST_MARKER);
-            user_pipeline_output_ready |= line.contains(USER_PIPELINE_OUTPUT_MARKER);
-            user_pipeline_ready |= line.contains(USER_PIPELINE_TEST_MARKER);
-            user_background_ready |= line.contains(USER_BACKGROUND_TEST_MARKER);
-            user_stopped_job_ready |= line.contains(USER_STOPPED_JOB_TEST_MARKER);
-            user_tmpfs_ready |= line.contains(USER_TMPFS_TEST_MARKER);
-            user_signal_ready |= line.contains(USER_SIGNAL_TEST_MARKER);
-            user_signal_handler_ready |= line.contains(USER_SIGNAL_HANDLER_TEST_MARKER);
-
-            if phase == SmokePhase::VerifyCompleteSystem
-                && heap_ready
-                && framebuffer_ready
-                && acpi_ready
-                && lapic_timer_ready
-                && scheduler_ready
-                && pcie_ready
-                && ahci_ready
-                && partitions_ready
-                && fat_ready
-                && fat_persistent_ready
-                && vfs_ready
-                && elf_ready
-                && userspace_ready
-                && user_file_io_ready
-                && user_rust_runtime_ready
-                && user_exec_ready
-                && user_fork_ready
-                && user_environment_ready
-                && user_terminal_ready
-                && user_pipe_ready
-                && user_shell_ready
-                && user_pipeline_output_ready
-                && user_pipeline_ready
-                && user_background_ready
-                && user_stopped_job_ready
-                && user_tmpfs_ready
-                && user_signal_ready
-                && user_signal_handler_ready
-            {
+            if completion(&line) {
                 let _ = marker_sender.send(());
                 break;
             }
@@ -319,7 +363,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
                 let _ = child.kill();
                 let _ = child.wait();
                 report_reader_result(reader.join());
-                eprintln!("QEMU stopped producing serial output during phase {phase:?}");
+                eprintln!("QEMU stopped producing serial output during {label}");
                 return false;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -328,7 +372,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
         match child.try_wait() {
             Ok(Some(status)) => {
                 report_reader_result(reader.join());
-                eprintln!("QEMU exited with status {status} during phase {phase:?}");
+                eprintln!("QEMU exited with status {status} during {label}");
                 return false;
             }
             Ok(None) => {}
@@ -336,7 +380,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
                 let _ = child.kill();
                 let _ = child.wait();
                 report_reader_result(reader.join());
-                eprintln!("Could not query QEMU status during phase {phase:?}: {error}");
+                eprintln!("Could not query QEMU status during {label}: {error}");
                 return false;
             }
         }
@@ -346,7 +390,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
             let _ = child.wait();
             report_reader_result(reader.join());
             eprintln!(
-                "QEMU phase {phase:?} timed out after {} seconds",
+                "QEMU {label} timed out after {} seconds",
                 QEMU_TEST_TIMEOUT.as_secs()
             );
             return false;

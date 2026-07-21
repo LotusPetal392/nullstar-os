@@ -49,9 +49,6 @@ pub struct TimerInfo {
     pub period_femtoseconds: u64,
     pub frequency_hz: u64,
     pub counter_is_64_bit: bool,
-    pub comparator_count: u8,
-    pub legacy_irq_capable: bool,
-    pub vendor_id: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,9 +100,6 @@ impl Hpet {
                 period_femtoseconds,
                 frequency_hz,
                 counter_is_64_bit: capabilities & (1 << 13) != 0,
-                comparator_count: (((capabilities >> 8) & 0x1f) as u8).saturating_add(1),
-                legacy_irq_capable: capabilities & (1 << 15) != 0,
-                vendor_id: ((capabilities >> 16) & 0xffff) as u16,
             },
         };
 
@@ -125,8 +119,7 @@ impl Hpet {
 
     pub fn measure_duration(self, duration_femtoseconds: u64) -> Result<Measurement, Error> {
         let target_ticks =
-            (u128::from(duration_femtoseconds) + u128::from(self.info.period_femtoseconds) - 1)
-                / u128::from(self.info.period_femtoseconds);
+            u128::from(duration_femtoseconds).div_ceil(u128::from(self.info.period_femtoseconds));
         let target_ticks =
             u64::try_from(target_ticks.max(1)).map_err(|_| Error::IntervalTooLong)?;
         let elapsed_ticks = self.wait_ticks(target_ticks)?;

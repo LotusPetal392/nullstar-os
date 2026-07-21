@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
@@ -11,9 +12,11 @@ use core::{alloc::Layout, panic::PanicInfo};
 use x86_64::VirtAddr;
 
 mod arch;
+mod boot_mode;
 mod drivers;
 mod memory;
 mod process;
+mod process_completion;
 mod scheduler;
 mod shell;
 mod storage;
@@ -139,8 +142,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         interrupt_controller.timer_source,
         interrupts::timer_ticks()
     );
-    heap_allocation_self_test();
-
     let pci_inventory = match acpi_info.as_ref().and_then(|info| info.mcfg.as_ref()) {
         Some(mcfg) => match pci::enumerate(mcfg, physical_memory_offset, physical_memory_end) {
             Ok(inventory) => {
@@ -336,7 +337,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         None
     };
 
-    if vfs_info.is_some() {
+    let boot_mode = detect_boot_mode();
+    serial_println!("boot mode selected: {}", boot_mode.description());
+    if boot_mode.is_smoke_test() {
+        heap_allocation_self_test();
+    }
+
+    if boot_mode.is_smoke_test() && vfs_info.is_some() {
         match persistent_fat_self_test() {
             Ok(PersistentFatPhase::Prepared) => {
                 let writes = fat::write_info().expect("mounted FAT volume lost write accounting");
@@ -399,6 +406,59 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         None
     };
 
+    let scheduler_mode = if boot_mode.is_smoke_test() {
+        scheduler::InitMode::SmokeTest
+    } else {
+        scheduler::InitMode::Normal
+    };
+    let scheduler_initial = match scheduler::init(scheduler_mode) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            serial_println!(
+                "failed to initialize the scheduler: {}",
+                error.description()
+            );
+            hlt_loop();
+        }
+    };
+    serial_println!(
+        "scheduler initialized: tasks={}, quantum_ticks={}, mode={}",
+        scheduler_initial.task_count,
+        scheduler_initial.quantum_ticks,
+        boot_mode.description()
+    );
+
+    if !boot_mode.is_smoke_test() {
+        let userspace_runtime =
+            userspace::Runtime::new(mapper, frame_allocator, physical_memory_offset);
+        let runtime_memory = userspace_runtime.memory_stats();
+        let usable_frames = runtime_memory.usable_frames;
+        let allocated_frames = runtime_memory.allocated_frames;
+        let remaining_frames = runtime_memory.remaining_frames;
+
+        println!("GalacticOS");
+        println!("-------------");
+        println!();
+        println!("Normal boot complete. Smoke tests were not run.");
+        println!("Kernel services and the interactive shell are ready.");
+        serial_println!(
+            "normal boot ready: usable_frames={}, allocated_frames={}, remaining_frames={}",
+            usable_frames,
+            allocated_frames,
+            remaining_frames
+        );
+
+        let system_info = shell::SystemInfo::new(
+            acpi_info,
+            interrupt_controller,
+            pci_inventory,
+            storage_info,
+            partition_inventory,
+            filesystem_info,
+        );
+        enter_interactive_shell(system_info, userspace_runtime);
+    }
+
     let elf_image = if vfs_info.is_some() {
         match elf::validate_first_in_directory("/") {
             Ok(image) => {
@@ -437,22 +497,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!("ELF validation unavailable: VFS is not initialized");
         None
     };
-
-    let scheduler_initial = match scheduler::init() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            serial_println!(
-                "failed to initialize the scheduler: {}",
-                error.description()
-            );
-            hlt_loop();
-        }
-    };
-    serial_println!(
-        "scheduler initialized: tasks={}, quantum_ticks={}",
-        scheduler_initial.task_count,
-        scheduler_initial.quantum_ticks
-    );
 
     let scheduler_verified = scheduler::wait_for_self_test();
     serial_println!(
@@ -530,7 +574,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         fault_spawn.owned_frames
     );
 
-    let process_snapshot = userspace::wait_for_all(&mut frame_allocator, 2);
+    let process_snapshot = userspace::wait_for_processes(
+        &mut frame_allocator,
+        &[init_spawn.process_id, fault_spawn.process_id],
+    );
     let process_frame_after = frame_allocator.allocated_frame_count();
     for result in &process_snapshot.results {
         serial_println!(
@@ -573,14 +620,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && process_snapshot.exited == 1
         && process_snapshot.faulted == 1
         && process_snapshot.reaped == 2
+        && process_snapshot.waitable_zombies == 0
         && init_valid
         && fault_valid
         && frame_balance;
     if !process_verified {
         serial_println!(
-            "process isolation verification failed: spawned={}, active={}, exited={}, faulted={}, reaped={}, baseline_frames={}, final_frames={}, init_valid={}, fault_valid={}",
+            "process isolation verification failed: spawned={}, active={}, zombies={}, exited={}, faulted={}, reaped={}, baseline_frames={}, final_frames={}, init_valid={}, fault_valid={}",
             process_snapshot.spawned,
             process_snapshot.active,
+            process_snapshot.waitable_zombies,
             process_snapshot.exited,
             process_snapshot.faulted,
             process_snapshot.reaped,
@@ -593,7 +642,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     let init_result = init_result.expect("validated init result disappeared");
     serial_println!(
-        "process isolation verified: spawned={}, exited={}, faulted={}, reaped={}, frames_reclaimed={}, frame_balance={}, init_schedules={}, init_runtime_ticks={}",
+        "process isolation verified: spawned={}, exited={}, faulted={}, reaped={}, zombies=0, frames_reclaimed={}, frame_balance={}, init_schedules={}, init_runtime_ticks={}",
         process_snapshot.spawned,
         process_snapshot.exited,
         process_snapshot.faulted,
@@ -1724,6 +1773,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
 
+    serial_println!("userspace stopped-job test starting");
     let stopped_jobs_before = userspace::snapshot();
     if let Err(error) =
         userspace_runtime.inject_terminal_line("signal-probe | upper | pipe-consumer")
@@ -1742,6 +1792,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             hlt_loop();
         }
     };
+    serial_println!(
+        "userspace stopped-job foreground group ready: group={}, members={}",
+        foreground_signal_group.process_group_id,
+        foreground_signal_group.process_ids.len()
+    );
     let terminal_before_suspend = userspace_runtime.terminal_snapshot();
     let foreground_stop_deliveries = match userspace_runtime.inject_terminal_suspend() {
         Ok(count) => count,
@@ -2168,9 +2223,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
         && userspace_shell_result.child_spawn_count == 22
-        && userspace_shell_result.child_wait_count == 26
+        && userspace_shell_result.child_wait_count
+            == userspace_shell_result
+                .child_spawn_count
+                .saturating_add(foreground_stop_deliveries as u64)
         && userspace_shell_result.child_poll_count == 5
-        && userspace_shell_result.child_poll_pending_count == 5
+        && userspace_shell_result.child_poll_pending_count >= 1
+        && userspace_shell_result.child_poll_pending_count
+            < userspace_shell_result.child_poll_count
         && userspace_shell_result.signal_sent_count == 4
         && userspace_shell_result.open_count == 13
         && userspace_shell_result.file_descriptor_inherit_count == 14
@@ -2186,18 +2246,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && userspace_background_verified
         && userspace_stopped_jobs_verified
         && userspace_signals_verified
+        && stopped_jobs_after.waitable_zombies == 0
         && userspace_runtime
             .terminal_snapshot()
             .foreground_process
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, opens={}, inherited_files={}, environment={}/{}, stopped_jobs={}, exec_child={}, environment_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, zombies={}, signals={}, opens={}, inherited_files={}, environment={}/{}, stopped_jobs={}, exec_child={}, environment_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
             userspace_shell_result.child_wait_count,
             userspace_shell_result.child_poll_count,
             userspace_shell_result.child_poll_pending_count,
+            stopped_jobs_after.waitable_zombies,
             userspace_shell_result.signal_sent_count,
             userspace_shell_result.open_count,
             userspace_shell_result.file_descriptor_inherit_count,
@@ -2263,7 +2325,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Partition table unavailable");
     }
     if filesystem_info.is_some() {
-        println!("Read-only FAT filesystem mounted");
+        println!("FAT filesystem mounted");
     } else {
         println!("FAT filesystem unavailable");
     }
@@ -2386,9 +2448,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("kernel entered kernel_main");
 
     let system_info = shell::SystemInfo::new(
-        usable_frames,
-        allocated_frames,
-        remaining_frames,
         acpi_info,
         interrupt_controller,
         pci_inventory,
@@ -2396,6 +2455,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         partition_inventory,
         filesystem_info,
     );
+    enter_interactive_shell(system_info, userspace_runtime);
+}
+
+fn detect_boot_mode() -> boot_mode::BootMode {
+    match vfs::read_file(boot_mode::BOOT_MODE_PATH, 32) {
+        Ok(file) => match boot_mode::BootMode::parse(&file.bytes) {
+            Some(mode) => mode,
+            None => {
+                serial_println!(
+                    "invalid {} contents; defaulting to normal boot",
+                    boot_mode::BOOT_MODE_PATH
+                );
+                boot_mode::BootMode::Normal
+            }
+        },
+        Err(error) => {
+            serial_println!(
+                "could not read {} ({error}); defaulting to normal boot",
+                boot_mode::BOOT_MODE_PATH
+            );
+            boot_mode::BootMode::Normal
+        }
+    }
+}
+
+fn enter_interactive_shell(
+    system_info: shell::SystemInfo,
+    userspace_runtime: userspace::Runtime,
+) -> ! {
     let mut interactive_shell = shell::Shell::new(system_info, userspace_runtime);
     interactive_shell.start();
 

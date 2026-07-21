@@ -23,7 +23,9 @@ use x86_64::{
     },
 };
 
-use crate::{gdt, memory::BootInfoFrameAllocator, scheduler, vfs};
+use crate::{
+    gdt, memory::BootInfoFrameAllocator, process_completion::CompletionQueue, scheduler, vfs,
+};
 
 use super::{
     elf::{self, Image, ImageType, LoadSegment},
@@ -115,6 +117,11 @@ const SIGNAL_TABLE_SIZE: usize = abi::signal::MAX as usize + 1;
 const SIGNAL_SUPPORTED_MASK: u64 = abi::signal::SUPPORTED_MASK;
 const SIGNAL_UNBLOCKABLE_MASK: u64 = abi::signal::UNBLOCKABLE_MASK;
 const SIGNAL_RED_ZONE_BYTES: u64 = 128;
+pub const MAX_PROCESS_SLOTS: usize = 64;
+const PROCESS_HISTORY_LIMIT: usize = 128;
+// PID zero is reserved for the kernel reaper. Children assigned to it have no
+// userspace owner and therefore never become waitable zombies.
+const KERNEL_REAPER_PROCESS_ID: u64 = 0;
 
 const ERR_NO_ENTRY: i64 = abi::errno::NO_ENTRY;
 const ERR_INTERRUPTED: i64 = abi::errno::INTERRUPTED;
@@ -547,6 +554,8 @@ pub struct ManagerSnapshot {
     pub pipe_pairs: u64,
     pub pipe_descriptor_inherits: u64,
     pub file_descriptor_inherits: u64,
+    pub waitable_zombies: usize,
+    pub process_limit: usize,
     pub active: usize,
     pub blocked: usize,
     pub stopped: usize,
@@ -600,6 +609,7 @@ pub enum Error {
     InvalidDescriptor(u64),
     InvalidProcessGroup(u64),
     TerminalBusy,
+    ProcessLimitReached,
     Pipe(pipe::Error),
     ProcessNotFound(u64),
     Scheduler(scheduler::InitError),
@@ -641,6 +651,7 @@ impl Error {
             Self::InvalidDescriptor(_) => "userspace file descriptor is invalid",
             Self::InvalidProcessGroup(_) => "userspace process group is invalid",
             Self::TerminalBusy => "another userspace process owns the terminal",
+            Self::ProcessLimitReached => "userspace process limit was reached",
             Self::Pipe(_) => "kernel pipe operation failed",
             Self::ProcessNotFound(_) => "userspace process bookkeeping is missing",
             Self::Scheduler(_) => "scheduler rejected the userspace task",
@@ -1005,7 +1016,7 @@ impl Process {
 
     fn reset_signal_actions_for_exec(&mut self) {
         for action in &mut self.signal_actions {
-            if action.handler != abi::signal_action::IGNORE {
+            if action.handler != abi::signal_action::Action::IGNORE.handler {
                 *action = abi::signal_action::Action::DEFAULT;
             }
         }
@@ -1093,7 +1104,7 @@ impl Process {
 struct ProcessManager {
     next_process_id: u64,
     processes: Vec<Process>,
-    completed: Vec<ProcessResult>,
+    completions: CompletionQueue<ProcessResult>,
     spawned: u64,
     child_spawns: u64,
     child_waits: u64,
@@ -1127,7 +1138,7 @@ impl ProcessManager {
         Self {
             next_process_id: 1,
             processes: Vec::new(),
-            completed: Vec::new(),
+            completions: CompletionQueue::new(PROCESS_HISTORY_LIMIT),
             spawned: 0,
             child_spawns: 0,
             child_waits: 0,
@@ -1177,6 +1188,54 @@ impl ProcessManager {
         Some(self.processes.remove(index))
     }
 
+    fn process_slots_in_use(&self) -> usize {
+        self.processes
+            .len()
+            .saturating_add(self.completions.pending_len())
+    }
+
+    fn ensure_process_slot(&self) -> Result<(), Error> {
+        if self.process_slots_in_use() >= MAX_PROCESS_SLOTS {
+            Err(Error::ProcessLimitReached)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn take_result(&mut self, process_id: u64) -> Option<ProcessResult> {
+        self.completions
+            .take_pending_where(|result| result.process_id == process_id)
+    }
+
+    fn take_child_result(
+        &mut self,
+        parent_process_id: u64,
+        child_process_id: u64,
+    ) -> Option<ProcessResult> {
+        self.completions.take_pending_where(|result| {
+            result.process_id == child_process_id
+                && result.parent_process_id == Some(parent_process_id)
+        })
+    }
+
+    fn orphan_children_of(&mut self, parent_process_id: u64) {
+        for child in &mut self.processes {
+            if child.parent_process_id == Some(parent_process_id) {
+                child.parent_process_id = Some(KERNEL_REAPER_PROCESS_ID);
+            }
+            if child.terminal_parent == Some(parent_process_id) {
+                child.terminal_parent = None;
+            }
+        }
+        self.completions
+            .discard_pending_where(|result| result.parent_process_id == Some(parent_process_id));
+    }
+
+    fn record_result(&mut self, result: ProcessResult) {
+        let waitable = result.parent_process_id != Some(KERNEL_REAPER_PROCESS_ID);
+        self.completions.record(result, waitable);
+    }
+
     fn snapshot(&self) -> ManagerSnapshot {
         let shared = SHARED_USER_FRAMES.lock();
         ManagerSnapshot {
@@ -1210,6 +1269,8 @@ impl ProcessManager {
             pipe_pairs: self.pipe_pairs,
             pipe_descriptor_inherits: self.pipe_descriptor_inherits,
             file_descriptor_inherits: self.file_descriptor_inherits,
+            waitable_zombies: self.completions.pending_len(),
+            process_limit: MAX_PROCESS_SLOTS,
             active: self
                 .processes
                 .iter()
@@ -1235,7 +1296,7 @@ impl ProcessManager {
             signaled: self.signaled,
             reaped: self.reaped,
             frames_reclaimed: self.frames_reclaimed,
-            results: self.completed.clone(),
+            results: self.completions.history().iter().cloned().collect(),
         }
     }
 }
@@ -1410,9 +1471,9 @@ fn validate_kernel_context_pointer(process: &Process, context_pointer: usize) ->
     let context_end = context_pointer
         .checked_add(size_of::<SavedContext>())
         .ok_or(Error::StackLayoutInvalid)?;
-    if stack_start % align_of::<u128>() != 0
-        || stack_top % 16 != 0
-        || context_pointer % 16 != 0
+    if !stack_start.is_multiple_of(align_of::<u128>())
+        || !stack_top.is_multiple_of(16)
+        || !context_pointer.is_multiple_of(16)
         || context_pointer != expected_pointer
         || context_pointer < stack_start
         || context_end > stack_top
@@ -1608,30 +1669,32 @@ pub fn spawn_with_args(
     physical_memory_offset: VirtAddr,
 ) -> Result<SpawnInfo, Error> {
     spawn_with_mode(
-        path,
-        task_name,
-        image,
-        arguments,
-        &[],
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        SpawnRequest {
+            path,
+            task_name,
+            image,
+            arguments,
+            environment: &[],
+            foreground: false,
+            stdin_target: None,
+            stdout_target: None,
+            stderr_target: None,
+            parent_process_id: None,
+            terminal_parent: None,
+            process_group_id: None,
+        },
         kernel_mapper,
         frame_allocator,
         physical_memory_offset,
     )
 }
 
-fn spawn_with_mode(
-    path: &str,
+struct SpawnRequest<'a> {
+    path: &'a str,
     task_name: &'static str,
-    image: &Image,
-    arguments: &[&str],
-    environment: &[&str],
+    image: &'a Image,
+    arguments: &'a [&'a str],
+    environment: &'a [&'a str],
     foreground: bool,
     stdin_target: Option<StreamTarget>,
     stdout_target: Option<StreamTarget>,
@@ -1639,13 +1702,32 @@ fn spawn_with_mode(
     parent_process_id: Option<u64>,
     terminal_parent: Option<u64>,
     process_group_id: Option<u64>,
+}
+
+fn spawn_with_mode(
+    request: SpawnRequest<'_>,
     kernel_mapper: &mut OffsetPageTable<'_>,
     frame_allocator: &mut BootInfoFrameAllocator,
     physical_memory_offset: VirtAddr,
 ) -> Result<SpawnInfo, Error> {
-    if scheduler::snapshot().current_task_kind != scheduler::TaskKind::Bootstrap {
+    let SpawnRequest {
+        path,
+        task_name,
+        image,
+        arguments,
+        environment,
+        foreground,
+        stdin_target,
+        stdout_target,
+        stderr_target,
+        parent_process_id,
+        terminal_parent,
+        process_group_id,
+    } = request;
+    if scheduler::current_task_kind() != scheduler::TaskKind::Bootstrap {
         return Err(Error::SchedulerNotOnBootstrapTask);
     }
+    PROCESS_MANAGER.lock().ensure_process_slot()?;
 
     let mut kernel_stack = vec![0_u128; KERNEL_TRANSITION_STACK_WORDS].into_boxed_slice();
     let kernel_stack_start = kernel_stack.as_mut_ptr() as usize;
@@ -1659,17 +1741,17 @@ fn spawn_with_mode(
     let initial_stack_pointer = kernel_stack_top
         .checked_sub(size_of::<SavedContext>())
         .ok_or(Error::StackLayoutInvalid)?;
-    if kernel_stack_start % align_of::<u128>() != 0
-        || kernel_stack_top % 16 != 0
-        || initial_stack_pointer % 16 != 0
+    if !kernel_stack_start.is_multiple_of(align_of::<u128>())
+        || !kernel_stack_top.is_multiple_of(16)
+        || !initial_stack_pointer.is_multiple_of(16)
     {
         return Err(Error::StackLayoutInvalid);
     }
 
     for address in [
-        galactic_syscall_interrupt_entry as usize as u64,
-        galactic_page_fault_interrupt_entry as usize as u64,
-        galactic_general_protection_interrupt_entry as usize as u64,
+        galactic_syscall_interrupt_entry as *const () as usize as u64,
+        galactic_page_fault_interrupt_entry as *const () as usize as u64,
+        galactic_general_protection_interrupt_entry as *const () as usize as u64,
         scheduler::timer_interrupt_entry_address().as_u64(),
         kernel_stack_start as u64,
         physical_memory_offset.as_u64(),
@@ -1891,7 +1973,6 @@ struct ForkSnapshot {
     mapped_pages: usize,
     load_segments: usize,
     guard_page_address: u64,
-    page_table_address: u64,
     ranges: Vec<UserRange>,
     pages: Vec<UserPage>,
     open_files: Vec<OpenFile>,
@@ -2138,15 +2219,6 @@ impl Runtime {
         self.spawn_mode(path, arguments, &[], false)
     }
 
-    pub fn spawn_with_environment(
-        &mut self,
-        path: &str,
-        arguments: &[&str],
-        environment: &[&str],
-    ) -> Result<SpawnInfo, Error> {
-        self.spawn_mode(path, arguments, environment, false)
-    }
-
     pub fn spawn_foreground(&mut self, path: &str, arguments: &[&str]) -> Result<SpawnInfo, Error> {
         self.spawn_mode(path, arguments, &[], true)
     }
@@ -2172,18 +2244,20 @@ impl Runtime {
         argv.push(path);
         argv.extend_from_slice(arguments);
         spawn_with_mode(
-            path,
-            SHELL_PROCESS_TASK_NAME,
-            &image,
-            &argv,
-            environment,
-            foreground,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            SpawnRequest {
+                path,
+                task_name: SHELL_PROCESS_TASK_NAME,
+                image: &image,
+                arguments: &argv,
+                environment,
+                foreground,
+                stdin_target: None,
+                stdout_target: None,
+                stderr_target: None,
+                parent_process_id: None,
+                terminal_parent: None,
+                process_group_id: None,
+            },
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -2202,18 +2276,20 @@ impl Runtime {
         argv.push(path);
         argv.extend_from_slice(arguments);
         spawn_with_mode(
-            path,
-            SHELL_PROCESS_TASK_NAME,
-            &image,
-            &argv,
-            &[],
-            false,
-            stdin_pipe.map(StreamTarget::Pipe),
-            stdout_pipe.map(StreamTarget::Pipe),
-            None,
-            None,
-            None,
-            None,
+            SpawnRequest {
+                path,
+                task_name: SHELL_PROCESS_TASK_NAME,
+                image: &image,
+                arguments: &argv,
+                environment: &[],
+                foreground: false,
+                stdin_target: stdin_pipe.map(StreamTarget::Pipe),
+                stdout_target: stdout_pipe.map(StreamTarget::Pipe),
+                stderr_target: None,
+                parent_process_id: None,
+                terminal_parent: None,
+                process_group_id: None,
+            },
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -2331,18 +2407,20 @@ impl Runtime {
         argv.extend(request.arguments.iter().map(String::as_str));
         let environment: Vec<&str> = environment.iter().map(String::as_str).collect();
         let result = spawn_with_mode(
-            &request.path,
-            SHELL_PROCESS_TASK_NAME,
-            &image,
-            &argv,
-            &environment,
-            request.foreground,
-            stdin_target.clone(),
-            stdout_target.clone(),
-            stderr_target.clone(),
-            Some(parent_process_id),
-            request.foreground.then_some(parent_process_id),
-            process_group_id,
+            SpawnRequest {
+                path: &request.path,
+                task_name: SHELL_PROCESS_TASK_NAME,
+                image: &image,
+                arguments: &argv,
+                environment: &environment,
+                foreground: request.foreground,
+                stdin_target: stdin_target.clone(),
+                stdout_target: stdout_target.clone(),
+                stderr_target: stderr_target.clone(),
+                parent_process_id: Some(parent_process_id),
+                terminal_parent: request.foreground.then_some(parent_process_id),
+                process_group_id,
+            },
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -2387,6 +2465,7 @@ impl Runtime {
     }
 
     fn fork_process(&mut self, parent_process_id: u64, request: PendingFork) -> Result<u64, Error> {
+        PROCESS_MANAGER.lock().ensure_process_slot()?;
         let snapshot = {
             let manager = PROCESS_MANAGER.lock();
             let parent = manager
@@ -2406,7 +2485,6 @@ impl Runtime {
                 mapped_pages: parent.mapped_pages,
                 load_segments: parent.load_segments,
                 guard_page_address: parent.guard_page_address,
-                page_table_address: parent.page_table_address,
                 ranges: parent.ranges.clone(),
                 pages: parent.pages.clone(),
                 open_files: parent.open_files.clone(),
@@ -2445,9 +2523,9 @@ impl Runtime {
         let child_stack_pointer = kernel_stack_top
             .checked_sub(size_of::<SavedContext>())
             .ok_or(Error::StackLayoutInvalid)?;
-        if kernel_stack_start % align_of::<u128>() != 0
-            || kernel_stack_top % 16 != 0
-            || child_stack_pointer % 16 != 0
+        if !kernel_stack_start.is_multiple_of(align_of::<u128>())
+            || !kernel_stack_top.is_multiple_of(16)
+            || !child_stack_pointer.is_multiple_of(16)
         {
             release_fork_resources(&snapshot);
             for frame in address_space.page_table_frames.drain(..) {
@@ -3032,10 +3110,10 @@ impl Runtime {
                             .iter()
                             .find(|process| process.process_id == process_id)
                             .map(|process| process.process_group_id);
-                        if stop_process_with_signal(process_id, signal, false) {
-                            if let Some(process_group_id) = process_group_id {
-                                restore_group_terminal(process_group_id);
-                            }
+                        if stop_process_with_signal(process_id, signal, false)
+                            && let Some(process_group_id) = process_group_id
+                        {
+                            restore_group_terminal(process_group_id);
                         }
                     }
                     Some(DefaultSignalAction::Continue) => {
@@ -3319,13 +3397,9 @@ impl Runtime {
     pub fn wait(&mut self, process_id: u64) -> Result<ProcessResult, Error> {
         loop {
             self.poll()?;
-            let manager = PROCESS_MANAGER.lock();
-            if let Some(result) = manager
-                .completed
-                .iter()
-                .find(|result| result.process_id == process_id)
-            {
-                return Ok(result.clone());
+            let mut manager = PROCESS_MANAGER.lock();
+            if let Some(result) = manager.take_result(process_id) {
+                return Ok(result);
             }
             if !manager
                 .processes
@@ -3420,12 +3494,8 @@ impl Runtime {
             let serviced = cpu_interrupts::without_interrupts(|| -> Result<bool, Error> {
                 let mut manager = PROCESS_MANAGER.lock();
                 let final_status = manager
-                    .completed
-                    .iter()
-                    .find(|result| {
-                        result.process_id == request.child_process_id
-                            && result.parent_process_id == Some(parent_process_id)
-                    })
+                    .take_child_result(parent_process_id, request.child_process_id)
+                    .as_ref()
                     .map(child_status);
                 let status = if final_status.is_some() {
                     final_status
@@ -3493,10 +3563,6 @@ impl Runtime {
         Ok(handled)
     }
 
-    pub fn reap(&mut self) -> Result<usize, Error> {
-        self.poll()
-    }
-
     pub fn wait_until_process_path(&mut self, process_id: u64, path: &str) -> Result<(), Error> {
         loop {
             self.poll()?;
@@ -3509,7 +3575,8 @@ impl Runtime {
                         .find(|process| process.process_id == process_id);
                     let active_match = active.is_some_and(|process| process.path == path);
                     let completed_match = manager
-                        .completed
+                        .completions
+                        .history()
                         .iter()
                         .any(|result| result.process_id == process_id && result.path == path);
                     (active_match, active.is_some(), completed_match)
@@ -3574,7 +3641,8 @@ impl Runtime {
             if let Some(result) = cpu_interrupts::without_interrupts(|| {
                 PROCESS_MANAGER
                     .lock()
-                    .completed
+                    .completions
+                    .history()
                     .iter()
                     .find(|result| {
                         result.parent_process_id == Some(parent_process_id) && result.path == path
@@ -3635,12 +3703,11 @@ impl Runtime {
     ) -> Result<ProcessGroupInfo, Error> {
         loop {
             self.poll()?;
-            if let Some(info) = child_group_info(parent_process_id, process_group_id) {
-                if info.process_ids.len() >= minimum_members
-                    && info.stopped == info.process_ids.len()
-                {
-                    return Ok(info);
-                }
+            if let Some(info) = child_group_info(parent_process_id, process_group_id)
+                && info.process_ids.len() >= minimum_members
+                && info.stopped == info.process_ids.len()
+            {
+                return Ok(info);
             }
             hlt();
         }
@@ -3654,10 +3721,11 @@ impl Runtime {
     ) -> Result<ProcessGroupInfo, Error> {
         loop {
             self.poll()?;
-            if let Some(info) = child_group_info(parent_process_id, process_group_id) {
-                if info.process_ids.len() >= minimum_members && info.stopped == 0 {
-                    return Ok(info);
-                }
+            if let Some(info) = child_group_info(parent_process_id, process_group_id)
+                && info.process_ids.len() >= minimum_members
+                && info.stopped == 0
+            {
+                return Ok(info);
             }
             hlt();
         }
@@ -3677,7 +3745,8 @@ impl Runtime {
                         && process.process_group_id == process_group_id
                 });
                 let results = manager
-                    .completed
+                    .completions
+                    .history()
                     .iter()
                     .filter(|result| {
                         result.parent_process_id == Some(parent_process_id)
@@ -3736,42 +3805,20 @@ impl Runtime {
     }
 }
 
-pub fn wait_for_all(
+pub fn wait_for_processes(
     frame_allocator: &mut BootInfoFrameAllocator,
-    expected_processes: usize,
+    process_ids: &[u64],
 ) -> ManagerSnapshot {
+    let mut pending = process_ids.to_vec();
     loop {
         let _ = reap(frame_allocator);
-        let snapshot = snapshot();
-        if snapshot.results.len() >= expected_processes && snapshot.active == 0 {
-            return snapshot;
+        cpu_interrupts::without_interrupts(|| {
+            let mut manager = PROCESS_MANAGER.lock();
+            pending.retain(|process_id| manager.take_result(*process_id).is_none());
+        });
+        if pending.is_empty() {
+            return snapshot();
         }
-        hlt();
-    }
-}
-
-pub fn wait_for(
-    frame_allocator: &mut BootInfoFrameAllocator,
-    process_id: u64,
-) -> Result<ProcessResult, Error> {
-    loop {
-        let _ = reap(frame_allocator)?;
-        let manager = PROCESS_MANAGER.lock();
-        if let Some(result) = manager
-            .completed
-            .iter()
-            .find(|result| result.process_id == process_id)
-        {
-            return Ok(result.clone());
-        }
-        if !manager
-            .processes
-            .iter()
-            .any(|process| process.process_id == process_id)
-        {
-            return Err(Error::ProcessNotFound(process_id));
-        }
-        drop(manager);
         hlt();
     }
 }
@@ -3812,14 +3859,16 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
             }
         }
         let frames_reclaimed = release_owned_frames(&mut process.owned_frames, frame_allocator);
+        debug_assert_eq!(process.task_id, task.task_id);
         let result = process.result(frames_reclaimed, task.scheduled_count, task.runtime_ticks)?;
         cpu_interrupts::without_interrupts(|| {
             let mut manager = PROCESS_MANAGER.lock();
+            manager.orphan_children_of(process_id);
             manager.reaped = manager.reaped.saturating_add(1);
             manager.frames_reclaimed = manager
                 .frames_reclaimed
                 .saturating_add(frames_reclaimed as u64);
-            manager.completed.push(result);
+            manager.record_result(result);
         });
         reaped = reaped.saturating_add(1);
     }
@@ -3831,20 +3880,16 @@ pub fn snapshot() -> ManagerSnapshot {
     cpu_interrupts::without_interrupts(|| PROCESS_MANAGER.lock().snapshot())
 }
 
-pub fn last_result() -> Option<ProcessResult> {
-    PROCESS_MANAGER.lock().completed.last().cloned()
-}
-
 pub fn syscall_interrupt_entry_address() -> VirtAddr {
-    VirtAddr::new(galactic_syscall_interrupt_entry as usize as u64)
+    VirtAddr::new(galactic_syscall_interrupt_entry as *const () as usize as u64)
 }
 
 pub fn page_fault_interrupt_entry_address() -> VirtAddr {
-    VirtAddr::new(galactic_page_fault_interrupt_entry as usize as u64)
+    VirtAddr::new(galactic_page_fault_interrupt_entry as *const () as usize as u64)
 }
 
 pub fn general_protection_interrupt_entry_address() -> VirtAddr {
-    VirtAddr::new(galactic_general_protection_interrupt_entry as usize as u64)
+    VirtAddr::new(galactic_general_protection_interrupt_entry as *const () as usize as u64)
 }
 
 #[unsafe(no_mangle)]
@@ -3921,13 +3966,15 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
         }
         SYSCALL_SPAWN_COMMAND => match syscall_spawn_command(
             process_id,
-            registers.rdi,
-            registers.rsi,
-            registers.rdx,
-            registers.r10,
-            registers.r8,
-            registers.r9,
-            registers.rbx,
+            SpawnSyscallArgs {
+                address: registers.rdi,
+                length: registers.rsi,
+                flags: registers.rdx,
+                stdin_descriptor: registers.r10,
+                stdout_descriptor: registers.r8,
+                stderr_descriptor: registers.r9,
+                process_group_argument: registers.rbx,
+            },
             current_stack_pointer,
         ) {
             ControlOutcome::Ready(result) => {
@@ -4219,8 +4266,7 @@ enum ControlOutcome {
     Blocked,
 }
 
-fn syscall_spawn_command(
-    process_id: u64,
+struct SpawnSyscallArgs {
     address: u64,
     length: u64,
     flags: u64,
@@ -4228,8 +4274,22 @@ fn syscall_spawn_command(
     stdout_descriptor: u64,
     stderr_descriptor: u64,
     process_group_argument: u64,
+}
+
+fn syscall_spawn_command(
+    process_id: u64,
+    arguments: SpawnSyscallArgs,
     current_stack_pointer: usize,
 ) -> ControlOutcome {
+    let SpawnSyscallArgs {
+        address,
+        length,
+        flags,
+        stdin_descriptor,
+        stdout_descriptor,
+        stderr_descriptor,
+        process_group_argument,
+    } = arguments;
     let allowed_flags = abi::spawn::ALLOWED_FLAGS;
     if flags & !allowed_flags != 0 {
         return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
@@ -4452,11 +4512,8 @@ fn syscall_wait_child(
 ) -> ControlOutcome {
     let mut manager = PROCESS_MANAGER.lock();
     let final_status = manager
-        .completed
-        .iter()
-        .find(|result| {
-            result.process_id == child_process_id && result.parent_process_id == Some(process_id)
-        })
+        .take_child_result(process_id, child_process_id)
+        .as_ref()
         .map(child_status);
     if let Some(status) = final_status {
         note_child_wait(&mut manager, process_id);
@@ -4494,39 +4551,37 @@ fn syscall_wait_child(
 
 fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {
     let mut manager = PROCESS_MANAGER.lock();
-    let completed = manager
-        .completed
-        .iter()
-        .find(|result| {
-            result.process_id == child_process_id && result.parent_process_id == Some(process_id)
-        })
-        .cloned();
-    let active_child = manager.processes.iter().find(|child| {
+    let completed_status = manager
+        .take_child_result(process_id, child_process_id)
+        .as_ref()
+        .map(child_status);
+    let active_child_index = manager.processes.iter().position(|child| {
         child.process_id == child_process_id
             && child.parent_process_id == Some(process_id)
             && child.is_live()
     });
-    if completed.is_none() && active_child.is_none() {
+    if completed_status.is_none() && active_child_index.is_none() {
         return error_return(ERR_NO_CHILD);
     }
-    let stopped_status = active_child.and_then(|child| {
-        (child.state == ProcessState::Stopped)
-            .then(|| stopped_child_status(child.last_stop_signal.unwrap_or(SIGNAL_STOP)))
-    });
+    let child_status =
+        active_child_index.and_then(|index| manager.processes[index].take_parent_status());
 
-    let pending = completed.is_none() && stopped_status.is_none();
-    let Some(process) = manager.process_mut(process_id) else {
-        return error_return(ERR_NO_CHILD);
-    };
-    process.child_poll_count = process.child_poll_count.saturating_add(1);
-    if pending {
-        process.child_poll_pending_count = process.child_poll_pending_count.saturating_add(1);
+    let pending = completed_status.is_none() && child_status.is_none();
+    {
+        let Some(process) = manager.process_mut(process_id) else {
+            return error_return(ERR_NO_CHILD);
+        };
+        process.child_poll_count = process.child_poll_count.saturating_add(1);
+        if pending {
+            process.child_poll_pending_count = process.child_poll_pending_count.saturating_add(1);
+        }
+    }
+    if completed_status.is_some() {
+        note_child_wait(&mut manager, process_id);
     }
 
-    completed
-        .as_ref()
-        .map(child_status)
-        .or(stopped_status)
+    completed_status
+        .or(child_status)
         .unwrap_or_else(|| error_return(ERR_TRY_AGAIN))
 }
 
@@ -4669,10 +4724,10 @@ fn syscall_signal_action(
     };
     let _ = ignored_pending;
 
-    if previous_address != 0 {
-        if let Err(error) = write_user_signal_action(process_id, previous_address, previous) {
-            return error_return(error);
-        }
+    if previous_address != 0
+        && let Err(error) = write_user_signal_action(process_id, previous_address, previous)
+    {
+        return error_return(error);
     }
     0
 }
@@ -5044,12 +5099,7 @@ fn deliver_signal_to_process(process_id: u64, signal: u64) -> SignalDelivery {
             }
         }
         Some(DefaultSignalAction::Continue) => {
-            if continued {
-                let mut manager = PROCESS_MANAGER.lock();
-                if let Some(process) = manager.process_mut(process_id) {
-                    process.signal_received_count = process.signal_received_count.saturating_add(1);
-                }
-            } else if state != ProcessState::Stopped {
+            if continued || state != ProcessState::Stopped {
                 let mut manager = PROCESS_MANAGER.lock();
                 if let Some(process) = manager.process_mut(process_id) {
                     process.signal_received_count = process.signal_received_count.saturating_add(1);
@@ -5110,10 +5160,10 @@ fn deliver_signal_group(
     }
 
     let mut manager = PROCESS_MANAGER.lock();
-    if let Some(owner_process_id) = owner_process_id {
-        if let Some(owner) = manager.process_mut(owner_process_id) {
-            owner.signal_sent_count = owner.signal_sent_count.saturating_add(count as u64);
-        }
+    if let Some(owner_process_id) = owner_process_id
+        && let Some(owner) = manager.process_mut(owner_process_id)
+    {
+        owner.signal_sent_count = owner.signal_sent_count.saturating_add(count as u64);
     }
     manager.signals_sent = manager.signals_sent.saturating_add(count as u64);
     drop(manager);
@@ -5190,13 +5240,12 @@ fn foreground_process_group(owner_process_id: u64, process_group_id: u64) -> Res
         }
     }
 
-    if stopped {
-        if let Err(error) =
+    if stopped
+        && let Err(error) =
             deliver_signal_group(Some(owner_process_id), process_group_id, SIGNAL_CONTINUE)
-        {
-            let _ = terminal::transfer(foreground_process_id, owner_process_id);
-            return Err(error);
-        }
+    {
+        let _ = terminal::transfer(foreground_process_id, owner_process_id);
+        return Err(error);
     }
     Ok(active_count)
 }
@@ -5240,7 +5289,7 @@ fn active_child_group(
         process.parent_process_id == Some(parent_process_id)
             && process.path == path
             && process.is_live()
-            && foreground_process.map_or(true, |foreground| process.process_id == foreground)
+            && foreground_process.is_none_or(|foreground| process.process_id == foreground)
     })?;
     let process_group_id = anchor.process_group_id;
     let info = child_group_info_locked(&manager, parent_process_id, process_group_id)?;
@@ -5346,6 +5395,9 @@ fn process_error_number(error: &Error) -> i64 {
         | Error::ArgumentBytesTooLarge => ERR_INVALID_ARGUMENT,
         Error::TooManyEnvironmentVariables | Error::EnvironmentBytesTooLarge => {
             ERR_ARGUMENT_TOO_LARGE
+        }
+        Error::ProcessLimitReached | Error::Scheduler(scheduler::InitError::TaskLimitReached) => {
+            ERR_TRY_AGAIN
         }
         Error::InvalidProcessGroup(_) => ERR_NO_PROCESS,
         Error::TerminalBusy => ERR_IO,
@@ -5595,10 +5647,7 @@ fn decode_open_options(mut flags: u64) -> Result<(vfs::OpenOptions, bool), i64> 
         truncate: flags & OPEN_TRUNCATE != 0,
         append: flags & OPEN_APPEND != 0,
     };
-    if !o.read && !o.write
-        || (o.create || o.truncate || o.append) && !o.write
-        || o.truncate && o.append
-    {
+    if !o.write && (!o.read || o.create || o.truncate || o.append) || o.truncate && o.append {
         return Err(ERR_INVALID_ARGUMENT);
     }
     Ok((o, flags & OPEN_CLOSE_ON_EXEC != 0))

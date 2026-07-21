@@ -22,11 +22,11 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
 
     let mut heap = BumpHeap::<4096>::new();
-    {
+    let block_length = {
         let Some(block) = heap.allocate(257, 16) else {
             syscall::exit(1);
         };
-        if block.as_ptr() as usize % 16 != 0 {
+        if !(block.as_ptr() as usize).is_multiple_of(16) {
             syscall::exit(1);
         }
         for (index, byte) in block.iter_mut().enumerate() {
@@ -35,13 +35,17 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         if block[0] != 0 || block[256] != 0 {
             syscall::exit(1);
         }
+        block.len()
+    };
 
+    let copy_matches = {
         let Some(copy) = heap.copy_bytes(argument, 8) else {
             syscall::exit(1);
         };
-        if copy != argument || heap.used() <= block.len() {
-            syscall::exit(1);
-        }
+        copy == argument
+    };
+    if !copy_matches || heap.used() <= block_length {
+        syscall::exit(1);
     }
 
     heap.reset();

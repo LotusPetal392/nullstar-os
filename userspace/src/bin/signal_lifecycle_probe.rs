@@ -40,7 +40,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             Ok(mask) => mask,
             Err(_) => syscall::exit(4),
         };
-        if inherited.handler_address() != inherited_handler as usize as u64
+        if inherited.handler_address() != inherited_handler as *const () as usize as u64
             || !inherited.mask().contains(signal::INTERRUPT)
             || inherited.flags() != SignalActionFlags::RESET_HANDLER
             || !mask.contains(signal::INTERRUPT)

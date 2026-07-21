@@ -22,6 +22,7 @@ use crate::gdt;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_STACK_WORDS: usize = KERNEL_STACK_SIZE / size_of::<u128>();
 const DEFAULT_QUANTUM_TICKS: u64 = 5;
+pub const MAX_TASKS: usize = 67;
 pub const MAX_SNAPSHOT_TASKS: usize = 16;
 const INITIAL_RFLAGS: u64 = 0x202;
 
@@ -99,6 +100,7 @@ pub enum InitError {
     NotInitialized,
     StackLayoutInvalid,
     InvalidUserContext,
+    TaskLimitReached,
 }
 
 impl InitError {
@@ -108,8 +110,15 @@ impl InitError {
             Self::NotInitialized => "scheduler is not initialized",
             Self::StackLayoutInvalid => "kernel-thread stack layout is invalid",
             Self::InvalidUserContext => "userspace task context is invalid",
+            Self::TaskLimitReached => "scheduler task limit was reached",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitMode {
+    Normal,
+    SmokeTest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +255,8 @@ struct Task {
     stopped_resume_state: Option<TaskState>,
     process_id: Option<u64>,
     stack_pointer: usize,
-    stack: Option<Box<[u128]>>,
+    // Owns kernel-thread stack storage for as long as the task is scheduled.
+    _stack: Option<Box<[u128]>>,
     stack_bytes: usize,
     address_space: AddressSpace,
     privilege_stack_top: Option<VirtAddr>,
@@ -264,7 +274,7 @@ impl Task {
             stopped_resume_state: None,
             process_id: None,
             stack_pointer: 0,
-            stack: None,
+            _stack: None,
             stack_bytes: 0,
             address_space,
             privilege_stack_top: None,
@@ -292,7 +302,10 @@ impl Task {
             .checked_sub(size_of::<SavedContext>())
             .ok_or(InitError::StackLayoutInvalid)?;
 
-        if stack_start % align_of::<u128>() != 0 || stack_end % 16 != 0 || stack_pointer % 16 != 0 {
+        if !stack_start.is_multiple_of(align_of::<u128>())
+            || !stack_end.is_multiple_of(16)
+            || !stack_pointer.is_multiple_of(16)
+        {
             return Err(InitError::StackLayoutInvalid);
         }
 
@@ -329,7 +342,7 @@ impl Task {
             stopped_resume_state: None,
             process_id: None,
             stack_pointer,
-            stack: Some(stack),
+            _stack: Some(stack),
             stack_bytes,
             address_space,
             privilege_stack_top: None,
@@ -348,7 +361,7 @@ impl Task {
         page_table_frame: PhysFrame<Size4KiB>,
     ) -> Result<Self, InitError> {
         if stack_pointer == 0
-            || stack_pointer % 16 != 0
+            || !stack_pointer.is_multiple_of(16)
             || kernel_stack_top.as_u64() == 0
             || kernel_stack_bytes == 0
         {
@@ -363,7 +376,7 @@ impl Task {
             stopped_resume_state: None,
             process_id: Some(process_id),
             stack_pointer,
-            stack: None,
+            _stack: None,
             stack_bytes: kernel_stack_bytes,
             address_space: AddressSpace::user(page_table_frame),
             privilege_stack_top: Some(kernel_stack_top),
@@ -422,7 +435,7 @@ impl Scheduler {
         }
     }
 
-    fn initialize(&mut self) -> Result<(), InitError> {
+    fn initialize(&mut self, mode: InitMode) -> Result<(), InitError> {
         if self.running || !self.tasks.is_empty() {
             return Err(InitError::AlreadyInitialized);
         }
@@ -432,14 +445,19 @@ impl Scheduler {
         let bootstrap_id = self.allocate_task_id();
         self.tasks
             .push(Task::bootstrap(bootstrap_id, kernel_address_space));
-        self.spawn_kernel("scheduler-probe-a", scheduler_probe_a)?;
-        self.spawn_kernel("scheduler-probe-b", scheduler_probe_b)?;
+        if mode == InitMode::SmokeTest {
+            self.spawn_kernel("scheduler-probe-a", scheduler_probe_a)?;
+            self.spawn_kernel("scheduler-probe-b", scheduler_probe_b)?;
+        }
         self.running = true;
         gdt::reset_privilege_stack();
         Ok(())
     }
 
     fn spawn_kernel(&mut self, name: &'static str, entry: ThreadEntry) -> Result<u64, InitError> {
+        if self.tasks.len() >= MAX_TASKS {
+            return Err(InitError::TaskLimitReached);
+        }
         let address_space = self.kernel_address_space.ok_or(InitError::NotInitialized)?;
         let id = self.allocate_task_id();
         self.tasks
@@ -458,6 +476,9 @@ impl Scheduler {
     ) -> Result<u64, InitError> {
         if !self.running {
             return Err(InitError::NotInitialized);
+        }
+        if self.tasks.len() >= MAX_TASKS {
+            return Err(InitError::TaskLimitReached);
         }
         let id = self.allocate_task_id();
         self.tasks.push(Task::user_process(
@@ -567,7 +588,7 @@ impl Scheduler {
         stack_pointer: usize,
         page_table_frame: PhysFrame<Size4KiB>,
     ) -> bool {
-        if stack_pointer == 0 || stack_pointer % 16 != 0 {
+        if stack_pointer == 0 || !stack_pointer.is_multiple_of(16) {
             return false;
         }
         let current = self.current_task;
@@ -598,12 +619,6 @@ impl Scheduler {
                     || (task.state == TaskState::Stopped
                         && task.stopped_resume_state == Some(TaskState::Blocked)))
         })
-    }
-
-    fn is_process_stopped(&self, process_id: u64) -> bool {
-        self.tasks
-            .iter()
-            .any(|task| task.process_id == Some(process_id) && task.state == TaskState::Stopped)
     }
 
     fn stop_process(&mut self, process_id: u64) -> bool {
@@ -865,13 +880,13 @@ struct SavedContext {
     stack_segment: u64,
 }
 
-pub fn init() -> Result<Snapshot, InitError> {
+pub fn init(mode: InitMode) -> Result<Snapshot, InitError> {
     PROBE_A_HEARTBEATS.store(0, Ordering::Relaxed);
     PROBE_B_HEARTBEATS.store(0, Ordering::Relaxed);
 
     cpu_interrupts::without_interrupts(|| {
         let mut scheduler = SCHEDULER.lock();
-        scheduler.initialize()?;
+        scheduler.initialize(mode)?;
         Ok(scheduler.snapshot())
     })
 }
@@ -963,10 +978,6 @@ pub fn is_process_blocked(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().is_process_blocked(process_id))
 }
 
-pub fn is_process_stopped(process_id: u64) -> bool {
-    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().is_process_stopped(process_id))
-}
-
 pub fn stop_process(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().stop_process(process_id))
 }
@@ -988,11 +999,11 @@ pub fn reap_zombie_processes() -> Vec<ReapedProcessTask> {
 }
 
 pub fn timer_interrupt_entry_address() -> VirtAddr {
-    VirtAddr::new(galactic_timer_interrupt_entry as usize as u64)
+    VirtAddr::new(galactic_timer_interrupt_entry as *const () as usize as u64)
 }
 
 fn thread_entry_trampoline_address() -> VirtAddr {
-    VirtAddr::new(galactic_thread_entry_trampoline as usize as u64)
+    VirtAddr::new(galactic_thread_entry_trampoline as *const () as usize as u64)
 }
 
 extern "C" fn scheduler_probe_a() -> ! {

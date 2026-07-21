@@ -3,6 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 
 const HELLO_TEXT: &str = "Hello from a GalacticOS userspace file descriptor.\n";
+const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
+const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
 
 fn main() {
     let output_directory = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR was not set"));
@@ -102,49 +104,71 @@ fn main() {
     let hello_text = output_directory.join("hello.txt");
     fs::write(&hello_text, HELLO_TEXT).expect("failed to create userspace file-I/O fixture");
 
+    let build_image = |boot_mode: &[u8]| {
+        let mut image = bootloader::DiskImageBuilder::new(kernel_binary.clone());
+        image.set_file_contents(String::from("BOOTMODE"), boot_mode.to_vec());
+        image.set_file(String::from("init"), userspace_init.clone());
+        image.set_file(String::from("fault-probe"), userspace_fault_probe.clone());
+        image.set_file(String::from("cat"), userspace_cat.clone());
+        image.set_file(String::from("readline"), userspace_readline.clone());
+        image.set_file(
+            String::from("pipe-producer"),
+            userspace_pipe_producer.clone(),
+        );
+        image.set_file(
+            String::from("pipe-consumer"),
+            userspace_pipe_consumer.clone(),
+        );
+        image.set_file(String::from("upper"), userspace_upper.clone());
+        image.set_file(String::from("delay"), userspace_delay.clone());
+        image.set_file(String::from("signal-probe"), userspace_signal_probe.clone());
+        image.set_file(
+            String::from("runtime-probe"),
+            userspace_runtime_probe.clone(),
+        );
+        image.set_file(String::from("stderr-probe"), userspace_stderr_probe.clone());
+        image.set_file(String::from("exec"), userspace_exec.clone());
+        image.set_file(String::from("exec-source"), userspace_exec_source.clone());
+        image.set_file(String::from("exec-target"), userspace_exec_target.clone());
+        image.set_file(String::from("fork-probe"), userspace_fork_probe.clone());
+        image.set_file(String::from("fork-target"), userspace_fork_target.clone());
+        image.set_file(
+            String::from("signal-handler-probe"),
+            userspace_signal_handler_probe.clone(),
+        );
+        image.set_file(
+            String::from("signal-lifecycle-probe"),
+            userspace_signal_lifecycle_probe.clone(),
+        );
+        image.set_file(
+            String::from("signal-lifecycle-target"),
+            userspace_signal_lifecycle_target.clone(),
+        );
+        image.set_file(
+            String::from("environment-probe"),
+            userspace_environment_probe.clone(),
+        );
+        image.set_file(
+            String::from("environment-target"),
+            userspace_environment_target.clone(),
+        );
+        image.set_file(String::from("ush"), userspace_shell.clone());
+        image.set_file(String::from("hello.txt"), hello_text.clone());
+        image
+    };
+
     let bios_image = output_directory.join("galactic-os-bios.img");
-    let mut image = bootloader::DiskImageBuilder::new(kernel_binary);
-    image.set_file(String::from("init"), userspace_init);
-    image.set_file(String::from("fault-probe"), userspace_fault_probe);
-    image.set_file(String::from("cat"), userspace_cat);
-    image.set_file(String::from("readline"), userspace_readline);
-    image.set_file(String::from("pipe-producer"), userspace_pipe_producer);
-    image.set_file(String::from("pipe-consumer"), userspace_pipe_consumer);
-    image.set_file(String::from("upper"), userspace_upper);
-    image.set_file(String::from("delay"), userspace_delay);
-    image.set_file(String::from("signal-probe"), userspace_signal_probe);
-    image.set_file(String::from("runtime-probe"), userspace_runtime_probe);
-    image.set_file(String::from("stderr-probe"), userspace_stderr_probe);
-    image.set_file(String::from("exec"), userspace_exec);
-    image.set_file(String::from("exec-source"), userspace_exec_source);
-    image.set_file(String::from("exec-target"), userspace_exec_target);
-    image.set_file(String::from("fork-probe"), userspace_fork_probe);
-    image.set_file(String::from("fork-target"), userspace_fork_target);
-    image.set_file(
-        String::from("signal-handler-probe"),
-        userspace_signal_handler_probe,
-    );
-    image.set_file(
-        String::from("signal-lifecycle-probe"),
-        userspace_signal_lifecycle_probe,
-    );
-    image.set_file(
-        String::from("signal-lifecycle-target"),
-        userspace_signal_lifecycle_target,
-    );
-    image.set_file(
-        String::from("environment-probe"),
-        userspace_environment_probe,
-    );
-    image.set_file(
-        String::from("environment-target"),
-        userspace_environment_target,
-    );
-    image.set_file(String::from("ush"), userspace_shell);
-    image.set_file(String::from("hello.txt"), hello_text);
-    image
+    build_image(NORMAL_BOOT_MODE)
         .create_bios_image(&bios_image)
         .expect("failed to create BIOS disk image");
+    let smoke_test_bios_image = output_directory.join("galactic-os-smoke-test-bios.img");
+    build_image(SMOKE_TEST_BOOT_MODE)
+        .create_bios_image(&smoke_test_bios_image)
+        .expect("failed to create smoke-test BIOS disk image");
 
     println!("cargo:rustc-env=BIOS_IMAGE={}", bios_image.display());
+    println!(
+        "cargo:rustc-env=SMOKE_TEST_BIOS_IMAGE={}",
+        smoke_test_bios_image.display()
+    );
 }

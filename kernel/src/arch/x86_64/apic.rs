@@ -421,17 +421,29 @@ impl IoApic {
     }
 }
 
-pub fn init(
-    madt: &MadtInfo,
-    hpet_info: Option<&HpetInfo>,
-    physical_memory_offset: VirtAddr,
-    physical_memory_end: u64,
-    timer_vector: u8,
-    keyboard_vector: u8,
-    spurious_vector: u8,
-    timer_hz: u64,
-) -> Result<ControllerInfo, InitError> {
-    let features = unsafe { __cpuid(1) };
+pub(super) struct InitConfig<'a> {
+    pub madt: &'a MadtInfo,
+    pub hpet_info: Option<&'a HpetInfo>,
+    pub physical_memory_offset: VirtAddr,
+    pub physical_memory_end: u64,
+    pub timer_vector: u8,
+    pub keyboard_vector: u8,
+    pub spurious_vector: u8,
+    pub timer_hz: u64,
+}
+
+pub(super) fn init(config: InitConfig<'_>) -> Result<ControllerInfo, InitError> {
+    let InitConfig {
+        madt,
+        hpet_info,
+        physical_memory_offset,
+        physical_memory_end,
+        timer_vector,
+        keyboard_vector,
+        spurious_vector,
+        timer_hz,
+    } = config;
+    let features = __cpuid(1);
     if features.edx & (1 << 9) == 0 {
         return Err(InitError::CpuDoesNotSupportApic);
     }

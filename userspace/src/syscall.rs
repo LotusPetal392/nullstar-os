@@ -162,7 +162,7 @@ impl SignalAction {
             handler: handler as usize as u64,
             mask: mask.bits(),
             flags: flags.bits(),
-            restorer: galactic_userspace_signal_restorer as usize as u64,
+            restorer: galactic_userspace_signal_restorer as *const () as usize as u64,
         })
     }
 

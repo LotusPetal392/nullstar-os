@@ -25,14 +25,12 @@ static TMPFS: Mutex<TmpFileSystem> = Mutex::new(TmpFileSystem::new());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSystemKind {
     Fat,
-    Tmpfs,
 }
 
 impl fmt::Display for FileSystemKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fat => formatter.write_str("fat"),
-            Self::Tmpfs => formatter.write_str("tmpfs"),
         }
     }
 }
@@ -132,18 +130,6 @@ pub struct OpenOptions {
     pub create: bool,
     pub truncate: bool,
     pub append: bool,
-}
-
-impl OpenOptions {
-    pub const fn read_only() -> Self {
-        Self {
-            read: true,
-            write: false,
-            create: false,
-            truncate: false,
-            append: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

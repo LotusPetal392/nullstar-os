@@ -33,9 +33,6 @@ macro_rules! shell_println {
 
 #[derive(Debug)]
 pub struct SystemInfo {
-    usable_frames: u64,
-    allocated_frames: u64,
-    remaining_frames: u64,
     acpi: Option<acpi::AcpiInfo>,
     interrupt_controller: interrupts::ControllerInfo,
     pci_inventory: Option<pci::Inventory>,
@@ -46,9 +43,6 @@ pub struct SystemInfo {
 
 impl SystemInfo {
     pub fn new(
-        usable_frames: u64,
-        allocated_frames: u64,
-        remaining_frames: u64,
         acpi: Option<acpi::AcpiInfo>,
         interrupt_controller: interrupts::ControllerInfo,
         pci_inventory: Option<pci::Inventory>,
@@ -57,9 +51,6 @@ impl SystemInfo {
         filesystem: Option<fat::VolumeInfo>,
     ) -> Self {
         Self {
-            usable_frames,
-            allocated_frames,
-            remaining_frames,
             acpi,
             interrupt_controller,
             pci_inventory,
@@ -88,8 +79,7 @@ impl Shell {
         let console_columns = console::text_columns().unwrap_or(DEFAULT_CONSOLE_COLUMNS);
         let max_input_chars = console_columns
             .saturating_sub(PROMPT.len() + 1)
-            .min(MAX_COMMAND_LENGTH)
-            .max(1);
+            .clamp(1, MAX_COMMAND_LENGTH);
 
         Self {
             input: String::new(),
@@ -224,6 +214,13 @@ impl Shell {
             "fs" => self.print_filesystem(),
             "vfs" => self.print_vfs(),
             "ls" => self.list_files(words.next().unwrap_or("/")),
+            "stat" => {
+                let Some(path) = words.next() else {
+                    shell_println!("usage: stat <path>");
+                    return ShellAction::Continue;
+                };
+                self.stat_file(path);
+            }
             "cat" => {
                 let Some(path) = words.next() else {
                     shell_println!("usage: cat <path>");
@@ -339,8 +336,9 @@ impl Shell {
             info.lba48
         );
         shell_println!(
-            "AHCI: ABAR={:#x}, version={:#010x}, slots={}, PI={:#010x}, DMA64={}",
+            "AHCI: ABAR={:#x}, PCI command={:#06x}, version={:#010x}, slots={}, PI={:#010x}, DMA64={}",
             info.abar,
+            info.pci_command,
             info.hba_version,
             info.command_slots,
             info.implemented_ports,
@@ -430,6 +428,9 @@ impl Shell {
             if let Some(unique_guid) = entry.unique_guid {
                 shell_println!("  unique GUID: {unique_guid}");
             }
+            if entry.attributes != 0 {
+                shell_println!("  attributes: {:#018x}", entry.attributes);
+            }
         }
         if inventory.truncated {
             shell_println!("warning: partition inventory reached its configured bound");
@@ -449,10 +450,11 @@ impl Shell {
             info.partition_start_lba
         );
         shell_println!(
-            "volume: label=`{}`, id={:#010x}, sectors={}",
+            "volume: label=`{}`, id={:#010x}, sectors={}, partition_blocks={}",
             info.volume_label,
             info.volume_id,
-            info.total_sectors
+            info.total_sectors,
+            info.partition_block_count
         );
         shell_println!(
             "geometry: {} bytes/sector, {} sectors/cluster, {} bytes/cluster",
@@ -461,7 +463,8 @@ impl Shell {
             info.bytes_per_cluster
         );
         shell_println!(
-            "FAT: copies={}, sectors/copy={}, clusters={}, root entries={}",
+            "FAT: reserved={}, copies={}, sectors/copy={}, clusters={}, root entries={}",
+            info.reserved_sectors,
             info.fat_count,
             info.sectors_per_fat,
             info.cluster_count,
@@ -520,6 +523,21 @@ impl Shell {
                 entry.name,
                 suffix
             );
+        }
+    }
+
+    fn stat_file(&self, path: &str) {
+        match vfs::metadata(path) {
+            Ok(metadata) => shell_println!(
+                "{}: kind={}, size={}, read_only={}, hidden={}, system={}",
+                metadata.path,
+                metadata.kind,
+                metadata.size,
+                metadata.read_only,
+                metadata.hidden,
+                metadata.system
+            ),
+            Err(error) => shell_println!("stat: {error}"),
         }
     }
 
@@ -732,7 +750,7 @@ impl Shell {
         let snapshot = userspace::snapshot();
         let scheduler = crate::scheduler::snapshot();
         shell_println!(
-            "process manager: spawned={}, child spawns={}, waits={}, execs={} (failed={}), forks={} (failed={}), COW={}/{}, shared={}/{}, signals={} (handlers={}, returns={}, ignored={}, interrupted={}, frame_failures={}, pending={}, stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, exited={}, faulted={}, signaled={}, reaped={}",
+            "process manager: spawned={}, child spawns={}, waits={}, execs={} (failed={}), forks={} (failed={}), COW={}/{}, shared={}/{}, signals={} (handlers={}, returns={}, ignored={}, interrupted={}, frame_failures={}, pending={}, stop={}, continue={}), pipe pairs={}, inherited fds={}/{}, active={}, blocked={}, stopped={}, zombies={}, process_limit={}, exited={}, faulted={}, signaled={}, reaped={}",
             snapshot.spawned,
             snapshot.child_spawns,
             snapshot.child_waits,
@@ -759,6 +777,8 @@ impl Shell {
             snapshot.active,
             snapshot.blocked,
             snapshot.stopped,
+            snapshot.waitable_zombies,
+            snapshot.process_limit,
             snapshot.exited,
             snapshot.faulted,
             snapshot.signaled,
@@ -773,6 +793,35 @@ impl Shell {
             scheduler.zombie_task_count,
             scheduler.address_space_switches
         );
+        shell_println!(
+            "scheduler: running={}, tasks={} (runnable={}), current={} `{}` kind={} pid={:?}, quantum={}, switches={} (preemptions={}, voluntary={}), truncated={}",
+            scheduler.running,
+            scheduler.task_count,
+            scheduler.runnable_task_count,
+            scheduler.current_task_id,
+            scheduler.current_task_name,
+            scheduler.current_task_kind,
+            scheduler.current_process_id,
+            scheduler.quantum_ticks,
+            scheduler.context_switches,
+            scheduler.preemptions,
+            scheduler.voluntary_switches,
+            scheduler.truncated
+        );
+        for task in scheduler.tasks() {
+            shell_println!(
+                "task={} `{}` kind={} state={} pid={:?}, stack={} bytes, pml4={:#x}, schedules={}, runtime_ticks={}",
+                task.id,
+                task.name,
+                task.kind,
+                task.state,
+                task.process_id,
+                task.stack_bytes,
+                task.page_table_address,
+                task.scheduled_count,
+                task.runtime_ticks
+            );
+        }
         if snapshot.results.is_empty() {
             shell_println!("userspace: no process has completed");
             return;
@@ -939,6 +988,17 @@ impl Shell {
                 pipe.bytes_read,
                 pipe.bytes_written
             );
+            shell_println!(
+                "  calls={}/{}, blocked={}/{}, wakeups={}/{}, endpoint retains={}/{}",
+                pipe.read_calls,
+                pipe.write_calls,
+                pipe.blocked_reads,
+                pipe.blocked_writes,
+                pipe.reader_wakeups,
+                pipe.writer_wakeups,
+                pipe.reader_retains,
+                pipe.writer_retains
+            );
         }
     }
 
@@ -967,7 +1027,8 @@ impl Shell {
                 info.local_apic_timer_divisor.unwrap_or(0)
             );
             shell_println!(
-                "HPET calibration: frequency={} Hz, period={} fs, 64-bit={}",
+                "HPET calibration: ticks={}, frequency={} Hz, period={} fs, 64-bit={}",
+                info.calibration_hpet_ticks.unwrap_or(0),
                 info.hpet_frequency_hz.unwrap_or(0),
                 info.hpet_period_femtoseconds.unwrap_or(0),
                 info.hpet_counter_is_64_bit.unwrap_or(false)
@@ -1049,9 +1110,11 @@ impl Shell {
                 function.class_description()
             );
             shell_println!(
-                "  header={}, revision={:02x}, multifunction={}, IRQ line={}, pin={}",
+                "  header={}, revision={:02x}, command={:#06x}, status={:#06x}, multifunction={}, IRQ line={}, pin={}",
                 function.header_kind,
                 function.revision_id,
+                function.command,
+                function.status,
                 function.multifunction,
                 function.interrupt_line,
                 function.interrupt_pin
@@ -1308,6 +1371,7 @@ fn print_help() {
     shell_println!("  fs               show the mounted FAT volume");
     shell_println!("  vfs              show the root VFS mount");
     shell_println!("  ls [path]        list a VFS directory");
+    shell_println!("  stat <path>      show VFS metadata");
     shell_println!("  cat <path>       preview a VFS file");
     shell_println!("  elf <path>       validate an ELF64 executable");
     shell_println!("  process          show process scheduling and fault results");
