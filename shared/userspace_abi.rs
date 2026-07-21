@@ -182,11 +182,8 @@ pub mod signal {
         }
     }
 
-    pub const SUPPORTED_MASK: u64 = bit(INTERRUPT)
-        | bit(TERMINATE)
-        | bit(CONTINUE)
-        | bit(STOP)
-        | bit(TERMINAL_STOP);
+    pub const SUPPORTED_MASK: u64 =
+        bit(INTERRUPT) | bit(TERMINATE) | bit(CONTINUE) | bit(STOP) | bit(TERMINAL_STOP);
     pub const UNBLOCKABLE_MASK: u64 = bit(STOP);
 }
 
@@ -264,8 +261,7 @@ pub mod open {
     pub const TRUNCATE: u64 = 1 << 3;
     pub const APPEND: u64 = 1 << 4;
     pub const CLOSE_ON_EXEC: u64 = 1 << 5;
-    pub const ALLOWED_FLAGS: u64 =
-        READ | WRITE | CREATE | TRUNCATE | APPEND | CLOSE_ON_EXEC;
+    pub const ALLOWED_FLAGS: u64 = READ | WRITE | CREATE | TRUNCATE | APPEND | CLOSE_ON_EXEC;
 }
 
 pub mod descriptor {
