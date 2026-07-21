@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     heap::BumpHeap,
     platform::{self, DirectoryEntry},
-    syscall::{self, STDERR, STDIN, STDOUT},
+    syscall::{self, OpenFlags, STDERR, STDIN, STDOUT},
 };
 
 userspace::entry!(rust_main);
@@ -55,7 +55,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if heap.used() != 0 || heap.remaining() != heap.capacity() {
         syscall::exit(1);
     }
-    if !platform_probe() {
+    if !platform_probe(argument) {
         syscall::exit(1);
     }
     if syscall::getpid().is_err() || syscall::write_all(STDOUT, SUCCESS).is_err() {
@@ -64,7 +64,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     syscall::exit(0)
 }
 
-fn platform_probe() -> bool {
+fn platform_probe(argument: &[u8]) -> bool {
     let Ok(info) = platform::system_info() else {
         return false;
     };
@@ -125,6 +125,7 @@ fn platform_probe() -> bool {
     }
 
     if !descriptor_probe()
+        || (argument != b"runtime-smoke" && !ordinary_descriptor_probe())
         || platform::getppid().is_err()
         || platform::kill(u64::MAX, signal::TERMINATE).err() != Some(platform::Errno::NO_PROCESS)
     {
@@ -175,6 +176,49 @@ fn descriptor_probe() -> bool {
         return false;
     }
     platform::fstat(STDERR).is_ok_and(|stat| stat.kind == file::KIND_TERMINAL)
+}
+
+fn ordinary_descriptor_probe() -> bool {
+    let Ok(descriptor) = syscall::open(b"/hello.txt", OpenFlags::READ) else {
+        return false;
+    };
+    let Ok(stat) = platform::fstat(descriptor) else {
+        let _ = syscall::close(descriptor);
+        return false;
+    };
+    if !stat.is_file() {
+        let _ = syscall::close(descriptor);
+        return false;
+    }
+
+    let Ok(duplicate) = platform::dup(descriptor) else {
+        let _ = syscall::close(descriptor);
+        return false;
+    };
+    let Ok(reference) = syscall::open(b"/hello.txt", OpenFlags::READ) else {
+        let _ = syscall::close(duplicate);
+        let _ = syscall::close(descriptor);
+        return false;
+    };
+
+    let mut first = [0_u8; 1];
+    let mut second = [0_u8; 1];
+    let mut expected = [0_u8; 2];
+    let shared_offset = syscall::read(descriptor, &mut first).ok() == Some(1)
+        && syscall::read(duplicate, &mut second).ok() == Some(1)
+        && syscall::read(reference, &mut expected).ok() == Some(2)
+        && first[0] == expected[0]
+        && second[0] == expected[1];
+
+    const DUP2_TARGET: u64 = 15;
+    let dup2_ok = platform::dup2(descriptor, DUP2_TARGET).ok() == Some(DUP2_TARGET)
+        && platform::fstat(DUP2_TARGET).is_ok();
+
+    let _ = syscall::close(DUP2_TARGET);
+    let _ = syscall::close(reference);
+    let _ = syscall::close(duplicate);
+    let _ = syscall::close(descriptor);
+    shared_offset && dup2_ok
 }
 
 fn ascii_eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
