@@ -19,13 +19,17 @@ experimentation, not production use or untrusted workloads.
 - ELF64 ring-3 processes, file descriptors, pipes, `fork` with copy-on-write,
   transactional `exec`, parent/child waiting, environments, process groups,
   terminal ownership, and a focused signal implementation
+- a documented userspace platform ABI with system discovery, file metadata,
+  paged directory reads, per-process working directories, descriptor
+  duplication, parent-process lookup, and direct child signaling
 - a PID 1 userspace supervisor, a userspace shell (`ush`) with pipelines,
   redirection, variables, background jobs and basic job control, and an
   emergency kernel diagnostic shell
 - separate normal-boot and destructive smoke-test images, plus host-side unit
   tests and a local pre-push check script
 
-See [Architecture](docs/architecture.md) for how these pieces fit together and
+See [Architecture](docs/architecture.md) for how these pieces fit together,
+[Userspace ABI](docs/syscall-abi.md) for the ring-3 contract, and
 [Development](docs/development.md) for the toolchain, test workflow, and common
 build issues.
 
@@ -142,6 +146,9 @@ images, and launches QEMU.
   names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
+- The platform ABI accepts relative paths for metadata, directory, and working-
+  directory operations; the older `open`, `spawn_command`, and `execve` paths
+  retain their existing rules for now.
 - Process, descriptor, pipe, environment, job, and filesystem resources have
   fixed bounds. These keep failure behavior deterministic while the kernel is
   still evolving.

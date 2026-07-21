@@ -8,6 +8,10 @@ pub const SYSCALL_VECTOR: u8 = 0x80;
 /// Process identifier reserved for the first userspace process.
 pub const INIT_PROCESS_ID: u64 = 1;
 
+/// First documented version of the GalacticOS userspace ABI.
+pub const ABI_VERSION_MAJOR: u64 = 1;
+pub const ABI_VERSION_MINOR: u64 = 0;
+
 pub mod syscall {
     pub const WRITE: u64 = 1;
     pub const YIELD: u64 = 2;
@@ -31,6 +35,135 @@ pub mod syscall {
     pub const SIGNAL_RETURN: u64 = 20;
     pub const ENVIRONMENT_SET: u64 = 21;
     pub const ENVIRONMENT_UNSET: u64 = 22;
+
+    // Userspace platform ABI v1.
+    pub const SYSTEM_INFO: u64 = 23;
+    pub const STAT: u64 = 24;
+    pub const FSTAT: u64 = 25;
+    pub const READ_DIRECTORY: u64 = 26;
+    pub const CHDIR: u64 = 27;
+    pub const GETCWD: u64 = 28;
+    pub const DUP: u64 = 29;
+    pub const DUP2: u64 = 30;
+    pub const GETPPID: u64 = 31;
+    pub const KILL: u64 = 32;
+}
+
+pub mod capability {
+    pub const FILE_METADATA: u64 = 1 << 0;
+    pub const DIRECTORY_READ: u64 = 1 << 1;
+    pub const WORKING_DIRECTORY: u64 = 1 << 2;
+    pub const DESCRIPTOR_DUPLICATION: u64 = 1 << 3;
+    pub const PARENT_PROCESS: u64 = 1 << 4;
+    pub const DIRECT_SIGNALS: u64 = 1 << 5;
+
+    pub const PLATFORM_V1: u64 = FILE_METADATA
+        | DIRECTORY_READ
+        | WORKING_DIRECTORY
+        | DESCRIPTOR_DUPLICATION
+        | PARENT_PROCESS
+        | DIRECT_SIGNALS;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemInfo {
+    pub abi_major: u64,
+    pub abi_minor: u64,
+    pub capabilities: u64,
+    pub page_size: u64,
+    pub maximum_open_files: u64,
+    pub maximum_path_bytes: u64,
+    pub maximum_directory_entries: u64,
+    pub init_process_id: u64,
+}
+
+impl SystemInfo {
+    pub const EMPTY: Self = Self {
+        abi_major: 0,
+        abi_minor: 0,
+        capabilities: 0,
+        page_size: 0,
+        maximum_open_files: 0,
+        maximum_path_bytes: 0,
+        maximum_directory_entries: 0,
+        init_process_id: 0,
+    };
+}
+
+pub mod file {
+    pub const KIND_FILE: u64 = 1;
+    pub const KIND_DIRECTORY: u64 = 2;
+    pub const KIND_TERMINAL: u64 = 3;
+    pub const KIND_PIPE: u64 = 4;
+
+    pub const FLAG_READ_ONLY: u64 = 1 << 0;
+    pub const FLAG_HIDDEN: u64 = 1 << 1;
+    pub const FLAG_SYSTEM: u64 = 1 << 2;
+
+    /// Directory records keep one trailing byte available for a NUL terminator
+    /// when callers choose to present the name as a C-compatible string.
+    pub const DIRECTORY_ENTRY_NAME_CAPACITY: usize = 256;
+    pub const MAX_DIRECTORY_ENTRY_NAME_BYTES: usize = DIRECTORY_ENTRY_NAME_CAPACITY - 1;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Stat {
+        pub kind: u64,
+        pub size: u64,
+        pub flags: u64,
+    }
+
+    impl Stat {
+        pub const EMPTY: Self = Self {
+            kind: 0,
+            size: 0,
+            flags: 0,
+        };
+
+        pub const fn is_file(self) -> bool {
+            self.kind == KIND_FILE
+        }
+
+        pub const fn is_directory(self) -> bool {
+            self.kind == KIND_DIRECTORY
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DirectoryEntry {
+        pub kind: u64,
+        pub size: u64,
+        pub flags: u64,
+        pub name_length: u64,
+        pub name: [u8; DIRECTORY_ENTRY_NAME_CAPACITY],
+    }
+
+    impl DirectoryEntry {
+        pub const EMPTY: Self = Self {
+            kind: 0,
+            size: 0,
+            flags: 0,
+            name_length: 0,
+            name: [0; DIRECTORY_ENTRY_NAME_CAPACITY],
+        };
+
+        pub fn name(&self) -> &[u8] {
+            let length = usize::try_from(self.name_length)
+                .unwrap_or(MAX_DIRECTORY_ENTRY_NAME_BYTES)
+                .min(MAX_DIRECTORY_ENTRY_NAME_BYTES);
+            &self.name[..length]
+        }
+
+        pub const fn is_file(self) -> bool {
+            self.kind == KIND_FILE
+        }
+
+        pub const fn is_directory(self) -> bool {
+            self.kind == KIND_DIRECTORY
+        }
+    }
 }
 
 pub mod signal {
@@ -49,11 +182,8 @@ pub mod signal {
         }
     }
 
-    pub const SUPPORTED_MASK: u64 = bit(INTERRUPT)
-        | bit(TERMINATE)
-        | bit(CONTINUE)
-        | bit(STOP)
-        | bit(TERMINAL_STOP);
+    pub const SUPPORTED_MASK: u64 =
+        bit(INTERRUPT) | bit(TERMINATE) | bit(CONTINUE) | bit(STOP) | bit(TERMINAL_STOP);
     pub const UNBLOCKABLE_MASK: u64 = bit(STOP);
 }
 
@@ -131,8 +261,7 @@ pub mod open {
     pub const TRUNCATE: u64 = 1 << 3;
     pub const APPEND: u64 = 1 << 4;
     pub const CLOSE_ON_EXEC: u64 = 1 << 5;
-    pub const ALLOWED_FLAGS: u64 =
-        READ | WRITE | CREATE | TRUNCATE | APPEND | CLOSE_ON_EXEC;
+    pub const ALLOWED_FLAGS: u64 = READ | WRITE | CREATE | TRUNCATE | APPEND | CLOSE_ON_EXEC;
 }
 
 pub mod descriptor {
@@ -156,23 +285,29 @@ pub mod limits {
     pub const MAX_ENVIRONMENT_BYTES: usize = 4096;
     pub const MAX_ENVIRONMENT_NAME_BYTES: usize = 64;
     pub const MAX_COMMAND_BYTES: usize = 512;
+    pub const MAX_PATH_BYTES: usize = 4096;
+    pub const MAX_DIRECTORY_ENTRIES_PER_CALL: usize = 32;
 }
 
 pub mod errno {
     pub const NO_ENTRY: i64 = -2;
-    pub const INTERRUPTED: i64 = -4;
     pub const NO_PROCESS: i64 = -3;
+    pub const INTERRUPTED: i64 = -4;
     pub const IO: i64 = -5;
     pub const ARGUMENT_TOO_LARGE: i64 = -7;
     pub const BAD_FILE_DESCRIPTOR: i64 = -9;
     pub const NO_CHILD: i64 = -10;
     pub const TRY_AGAIN: i64 = -11;
+    pub const PERMISSION: i64 = -13;
     pub const BAD_ADDRESS: i64 = -14;
+    pub const NOT_DIRECTORY: i64 = -20;
     pub const IS_DIRECTORY: i64 = -21;
     pub const INVALID_ARGUMENT: i64 = -22;
     pub const TOO_MANY_OPEN_FILES: i64 = -24;
     pub const NO_SPACE: i64 = -28;
     pub const READ_ONLY: i64 = -30;
     pub const BROKEN_PIPE: i64 = -32;
+    pub const RANGE: i64 = -34;
+    pub const NAME_TOO_LONG: i64 = -36;
     pub const NOT_IMPLEMENTED: i64 = -38;
 }
