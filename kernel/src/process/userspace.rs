@@ -64,6 +64,8 @@ const SYSCALL_FORK: u64 = abi::syscall::FORK;
 const SYSCALL_SIGNAL_ACTION: u64 = abi::syscall::SIGNAL_ACTION;
 const SYSCALL_SIGNAL_MASK: u64 = abi::syscall::SIGNAL_MASK;
 const SYSCALL_SIGNAL_RETURN: u64 = abi::syscall::SIGNAL_RETURN;
+const SYSCALL_ENVIRONMENT_SET: u64 = abi::syscall::ENVIRONMENT_SET;
+const SYSCALL_ENVIRONMENT_UNSET: u64 = abi::syscall::ENVIRONMENT_UNSET;
 
 pub const SIGNAL_INTERRUPT: u64 = abi::signal::INTERRUPT;
 pub const SIGNAL_TERMINATE: u64 = abi::signal::TERMINATE;
@@ -83,6 +85,9 @@ const MAX_SYSCALL_READ_BYTES: usize = abi::limits::MAX_SYSCALL_READ_BYTES;
 const MAX_OPEN_FILES: usize = abi::limits::MAX_OPEN_FILES;
 const MAX_ARGUMENTS: usize = abi::limits::MAX_ARGUMENTS;
 const MAX_ARGUMENT_BYTES: usize = abi::limits::MAX_ARGUMENT_BYTES;
+const MAX_ENVIRONMENT_VARIABLES: usize = abi::limits::MAX_ENVIRONMENT_VARIABLES;
+const MAX_ENVIRONMENT_BYTES: usize = abi::limits::MAX_ENVIRONMENT_BYTES;
+const MAX_ENVIRONMENT_NAME_BYTES: usize = abi::limits::MAX_ENVIRONMENT_NAME_BYTES;
 const MAX_COMMAND_BYTES: usize = abi::limits::MAX_COMMAND_BYTES;
 const SPAWN_FOREGROUND: u64 = abi::spawn::FOREGROUND;
 const SPAWN_USE_DESCRIPTORS: u64 = abi::spawn::USE_DESCRIPTORS;
@@ -468,6 +473,8 @@ pub struct ProcessResult {
     pub close_on_exec_count: u64,
     pub exec_frames_reclaimed: u64,
     pub fork_count: u64,
+    pub environment_count: usize,
+    pub environment_change_count: u64,
     pub cow_fault_count: u64,
     pub cow_copy_count: u64,
     pub signal_sent_count: u64,
@@ -521,6 +528,7 @@ pub struct ManagerSnapshot {
     pub exec_failures: u64,
     pub forks: u64,
     pub fork_failures: u64,
+    pub environment_changes: u64,
     pub cow_faults: u64,
     pub cow_copies: u64,
     pub shared_frames: usize,
@@ -585,6 +593,9 @@ pub enum Error {
     StackLayoutInvalid,
     TooManyArguments,
     ArgumentBytesTooLarge,
+    TooManyEnvironmentVariables,
+    EnvironmentBytesTooLarge,
+    InvalidEnvironment,
     InvalidArgument,
     InvalidDescriptor(u64),
     InvalidProcessGroup(u64),
@@ -619,6 +630,13 @@ impl Error {
             Self::ArgumentBytesTooLarge => {
                 "userspace argument strings exceed the configured stack bound"
             }
+            Self::TooManyEnvironmentVariables => {
+                "userspace environment variable count exceeds the configured bound"
+            }
+            Self::EnvironmentBytesTooLarge => {
+                "userspace environment strings exceed the configured stack bound"
+            }
+            Self::InvalidEnvironment => "userspace environment entry is invalid",
             Self::InvalidArgument => "userspace argument contains an invalid byte",
             Self::InvalidDescriptor(_) => "userspace file descriptor is invalid",
             Self::InvalidProcessGroup(_) => "userspace process group is invalid",
@@ -824,6 +842,7 @@ struct Process {
     terminal_parent: Option<u64>,
     task_id: u64,
     path: String,
+    environment: Vec<String>,
     state: ProcessState,
     stopped_resume_state: Option<ProcessState>,
     last_stop_signal: Option<u64>,
@@ -885,6 +904,7 @@ struct Process {
     close_on_exec_count: u64,
     exec_frames_reclaimed: u64,
     fork_count: u64,
+    environment_change_count: u64,
     cow_fault_count: u64,
     cow_copy_count: u64,
     signal_sent_count: u64,
@@ -1045,6 +1065,8 @@ impl Process {
             close_on_exec_count: self.close_on_exec_count,
             exec_frames_reclaimed: self.exec_frames_reclaimed,
             fork_count: self.fork_count,
+            environment_count: self.environment.len(),
+            environment_change_count: self.environment_change_count,
             cow_fault_count: self.cow_fault_count,
             cow_copy_count: self.cow_copy_count,
             signal_sent_count: self.signal_sent_count,
@@ -1079,6 +1101,7 @@ struct ProcessManager {
     exec_failures: u64,
     forks: u64,
     fork_failures: u64,
+    environment_changes: u64,
     cow_faults: u64,
     cow_copies: u64,
     signals_sent: u64,
@@ -1112,6 +1135,7 @@ impl ProcessManager {
             exec_failures: 0,
             forks: 0,
             fork_failures: 0,
+            environment_changes: 0,
             cow_faults: 0,
             cow_copies: 0,
             signals_sent: 0,
@@ -1163,6 +1187,7 @@ impl ProcessManager {
             exec_failures: self.exec_failures,
             forks: self.forks,
             fork_failures: self.fork_failures,
+            environment_changes: self.environment_changes,
             cow_faults: self.cow_faults,
             cow_copies: self.cow_copies,
             shared_frames: shared.frames.len(),
@@ -1402,6 +1427,7 @@ impl BuiltAddressSpace {
         path: &str,
         image: &Image,
         arguments: &[&str],
+        environment: &[String],
         kernel_mapper: &mut OffsetPageTable<'_>,
         frame_allocator: &mut BootInfoFrameAllocator,
         physical_memory_offset: VirtAddr,
@@ -1411,6 +1437,7 @@ impl BuiltAddressSpace {
             path,
             image,
             arguments,
+            environment,
             kernel_mapper,
             &mut tracking,
             physical_memory_offset,
@@ -1431,6 +1458,7 @@ impl BuiltAddressSpace {
         path: &str,
         image: &Image,
         arguments: &[&str],
+        environment: &[String],
         kernel_mapper: &mut OffsetPageTable<'_>,
         frame_allocator: &mut TrackingFrameAllocator<'_>,
         physical_memory_offset: VirtAddr,
@@ -1531,8 +1559,13 @@ impl BuiltAddressSpace {
             return Err(Error::InvalidUserRange);
         }
 
-        let stack_pointer =
-            build_initial_stack(arguments, physical_memory_offset, &pages, stack_start)?;
+        let stack_pointer = build_initial_stack(
+            arguments,
+            environment,
+            physical_memory_offset,
+            &pages,
+            stack_start,
+        )?;
 
         Ok(Self {
             page_table_frame,
@@ -1579,6 +1612,7 @@ pub fn spawn_with_args(
         task_name,
         image,
         arguments,
+        &[],
         false,
         None,
         None,
@@ -1597,6 +1631,7 @@ fn spawn_with_mode(
     task_name: &'static str,
     image: &Image,
     arguments: &[&str],
+    environment: &[&str],
     foreground: bool,
     stdin_target: Option<StreamTarget>,
     stdout_target: Option<StreamTarget>,
@@ -1644,10 +1679,12 @@ fn spawn_with_mode(
         }
     }
 
+    let environment = collect_environment(environment)?;
     let mut address_space = BuiltAddressSpace::build(
         path,
         image,
         arguments,
+        &environment,
         kernel_mapper,
         frame_allocator,
         physical_memory_offset,
@@ -1689,6 +1726,7 @@ fn spawn_with_mode(
         terminal_parent,
         task_id: 0,
         path: path.to_string(),
+        environment,
         state: ProcessState::Runnable,
         stopped_resume_state: None,
         last_stop_signal: None,
@@ -1750,6 +1788,7 @@ fn spawn_with_mode(
         close_on_exec_count: 0,
         exec_frames_reclaimed: 0,
         fork_count: 0,
+        environment_change_count: 0,
         cow_fault_count: 0,
         cow_copy_count: 0,
         signal_sent_count: 0,
@@ -1846,6 +1885,7 @@ pub struct PipelineResult {
 #[derive(Clone)]
 struct ForkSnapshot {
     path: String,
+    environment: Vec<String>,
     process_group_id: u64,
     entry_point: u64,
     mapped_pages: usize,
@@ -2095,17 +2135,36 @@ impl Runtime {
     }
 
     pub fn spawn(&mut self, path: &str, arguments: &[&str]) -> Result<SpawnInfo, Error> {
-        self.spawn_mode(path, arguments, false)
+        self.spawn_mode(path, arguments, &[], false)
+    }
+
+    pub fn spawn_with_environment(
+        &mut self,
+        path: &str,
+        arguments: &[&str],
+        environment: &[&str],
+    ) -> Result<SpawnInfo, Error> {
+        self.spawn_mode(path, arguments, environment, false)
     }
 
     pub fn spawn_foreground(&mut self, path: &str, arguments: &[&str]) -> Result<SpawnInfo, Error> {
-        self.spawn_mode(path, arguments, true)
+        self.spawn_mode(path, arguments, &[], true)
+    }
+
+    pub fn spawn_foreground_with_environment(
+        &mut self,
+        path: &str,
+        arguments: &[&str],
+        environment: &[&str],
+    ) -> Result<SpawnInfo, Error> {
+        self.spawn_mode(path, arguments, environment, true)
     }
 
     fn spawn_mode(
         &mut self,
         path: &str,
         arguments: &[&str],
+        environment: &[&str],
         foreground: bool,
     ) -> Result<SpawnInfo, Error> {
         let image = elf::validate(path)?;
@@ -2117,6 +2176,7 @@ impl Runtime {
             SHELL_PROCESS_TASK_NAME,
             &image,
             &argv,
+            environment,
             foreground,
             None,
             None,
@@ -2146,6 +2206,7 @@ impl Runtime {
             SHELL_PROCESS_TASK_NAME,
             &image,
             &argv,
+            &[],
             false,
             stdin_pipe.map(StreamTarget::Pipe),
             stdout_pipe.map(StreamTarget::Pipe),
@@ -2199,7 +2260,7 @@ impl Runtime {
         parent_process_id: u64,
         request: &PendingChildSpawn,
     ) -> Result<SpawnInfo, Error> {
-        let (stdin_target, stdout_target, stderr_target, process_group_id) =
+        let (stdin_target, stdout_target, stderr_target, process_group_id, environment) =
             cpu_interrupts::without_interrupts(|| {
                 let manager = PROCESS_MANAGER.lock();
                 let parent = manager
@@ -2238,7 +2299,13 @@ impl Runtime {
                 } else {
                     Some(inherited_group)
                 };
-                Ok::<_, Error>((stdin_target, stdout_target, stderr_target, process_group_id))
+                Ok::<_, Error>((
+                    stdin_target,
+                    stdout_target,
+                    stderr_target,
+                    process_group_id,
+                    parent.environment.clone(),
+                ))
             })?;
         retain_stream_target(&stdin_target, StreamAccess::Read)?;
         if let Err(error) = retain_stream_target(&stdout_target, StreamAccess::Write) {
@@ -2262,11 +2329,13 @@ impl Runtime {
         let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
         argv.push(request.path.as_str());
         argv.extend(request.arguments.iter().map(String::as_str));
+        let environment: Vec<&str> = environment.iter().map(String::as_str).collect();
         let result = spawn_with_mode(
             &request.path,
             SHELL_PROCESS_TASK_NAME,
             &image,
             &argv,
+            &environment,
             request.foreground,
             stdin_target.clone(),
             stdout_target.clone(),
@@ -2331,6 +2400,7 @@ impl Runtime {
             validate_kernel_context_pointer(parent, request.stack_pointer)?;
             ForkSnapshot {
                 path: parent.path.clone(),
+                environment: parent.environment.clone(),
                 process_group_id: parent.process_group_id,
                 entry_point: parent.entry_point,
                 mapped_pages: parent.mapped_pages,
@@ -2415,6 +2485,7 @@ impl Runtime {
                 terminal_parent: None,
                 task_id,
                 path: snapshot.path.clone(),
+                environment: snapshot.environment.clone(),
                 state: ProcessState::Runnable,
                 stopped_resume_state: None,
                 last_stop_signal: None,
@@ -2476,6 +2547,7 @@ impl Runtime {
                 close_on_exec_count: 0,
                 exec_frames_reclaimed: 0,
                 fork_count: 0,
+                environment_change_count: 0,
                 cow_fault_count: 0,
                 cow_copy_count: 0,
                 signal_sent_count: 0,
@@ -3020,7 +3092,7 @@ impl Runtime {
         mut request: PendingExec,
     ) -> Result<(), Error> {
         let context_pointer = request.stack_pointer;
-        {
+        let environment = {
             let manager = PROCESS_MANAGER.lock();
             let process = manager
                 .processes
@@ -3031,7 +3103,8 @@ impl Runtime {
                 return Err(Error::InvalidArgument);
             }
             validate_kernel_context_pointer(process, context_pointer)?;
-        }
+            process.environment.clone()
+        };
 
         let image = elf::validate(&request.path)?;
         let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
@@ -3041,6 +3114,7 @@ impl Runtime {
             &request.path,
             &image,
             &argv,
+            &environment,
             &mut self.mapper,
             &mut self.frame_allocator,
             self.physical_memory_offset,
@@ -3929,6 +4003,20 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
             registers.rax = syscall_signal_mask(process_id, registers.rdi, registers.rsi);
             current_stack_pointer
         }
+        SYSCALL_ENVIRONMENT_SET => {
+            registers.rax = syscall_environment_set(
+                process_id,
+                registers.rdi,
+                registers.rsi,
+                registers.rdx,
+                registers.r10,
+            );
+            current_stack_pointer
+        }
+        SYSCALL_ENVIRONMENT_UNSET => {
+            registers.rax = syscall_environment_unset(process_id, registers.rdi, registers.rsi);
+            current_stack_pointer
+        }
         SYSCALL_EXIT => {
             let exit_code = registers.rdi;
             {
@@ -4608,6 +4696,132 @@ fn syscall_signal_mask(process_id: u64, how: u64, mask: u64) -> u64 {
     previous
 }
 
+fn syscall_environment_set(
+    process_id: u64,
+    name_address: u64,
+    name_length: u64,
+    value_address: u64,
+    value_length: u64,
+) -> u64 {
+    let name = match user_text(
+        process_id,
+        name_address,
+        name_length,
+        MAX_ENVIRONMENT_NAME_BYTES,
+    ) {
+        Ok(name) if valid_environment_name(&name) => name,
+        Ok(_) => return error_return(ERR_INVALID_ARGUMENT),
+        Err(error) => return error_return(error),
+    };
+    let value = match user_text_allow_empty(
+        process_id,
+        value_address,
+        value_length,
+        MAX_ENVIRONMENT_BYTES,
+    ) {
+        Ok(value) => value,
+        Err(error) => return error_return(error),
+    };
+    let entry_bytes = match name
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(value.len()))
+        .and_then(|length| length.checked_add(1))
+    {
+        Some(length) => length,
+        None => return error_return(ERR_ARGUMENT_TOO_LARGE),
+    };
+    if entry_bytes > MAX_ENVIRONMENT_BYTES {
+        return error_return(ERR_ARGUMENT_TOO_LARGE);
+    }
+    let mut entry = String::with_capacity(entry_bytes.saturating_sub(1));
+    entry.push_str(&name);
+    entry.push('=');
+    entry.push_str(&value);
+
+    let mut manager = PROCESS_MANAGER.lock();
+    let changed = {
+        let Some(process) = manager.process_mut(process_id) else {
+            return error_return(ERR_NO_PROCESS);
+        };
+        let existing = process
+            .environment
+            .iter()
+            .position(|candidate| environment_name(candidate) == Some(name.as_str()));
+        if existing.is_none() && process.environment.len() >= MAX_ENVIRONMENT_VARIABLES {
+            return error_return(ERR_NO_SPACE);
+        }
+        let current_bytes = match environment_serialized_bytes(&process.environment) {
+            Some(bytes) => bytes,
+            None => return error_return(ERR_IO),
+        };
+        let old_bytes = existing
+            .map(|index| process.environment[index].len().saturating_add(1))
+            .unwrap_or(0);
+        let total_bytes = current_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(entry_bytes);
+        if total_bytes > MAX_ENVIRONMENT_BYTES {
+            return error_return(ERR_ARGUMENT_TOO_LARGE);
+        }
+        match existing {
+            Some(index) if process.environment[index] == entry => false,
+            Some(index) => {
+                process.environment[index] = entry;
+                true
+            }
+            None => {
+                process.environment.push(entry);
+                true
+            }
+        }
+    };
+    if changed {
+        let process = manager
+            .process_mut(process_id)
+            .expect("environment process disappeared during update");
+        process.environment_change_count = process.environment_change_count.saturating_add(1);
+        manager.environment_changes = manager.environment_changes.saturating_add(1);
+    }
+    0
+}
+
+fn syscall_environment_unset(process_id: u64, name_address: u64, name_length: u64) -> u64 {
+    let name = match user_text(
+        process_id,
+        name_address,
+        name_length,
+        MAX_ENVIRONMENT_NAME_BYTES,
+    ) {
+        Ok(name) if valid_environment_name(&name) => name,
+        Ok(_) => return error_return(ERR_INVALID_ARGUMENT),
+        Err(error) => return error_return(error),
+    };
+    let mut manager = PROCESS_MANAGER.lock();
+    let changed = {
+        let Some(process) = manager.process_mut(process_id) else {
+            return error_return(ERR_NO_PROCESS);
+        };
+        let Some(index) = process
+            .environment
+            .iter()
+            .position(|candidate| environment_name(candidate) == Some(name.as_str()))
+        else {
+            return 0;
+        };
+        process.environment.remove(index);
+        true
+    };
+    if changed {
+        let process = manager
+            .process_mut(process_id)
+            .expect("environment process disappeared during removal");
+        process.environment_change_count = process.environment_change_count.saturating_add(1);
+        manager.environment_changes = manager.environment_changes.saturating_add(1);
+    }
+    0
+}
+
 fn syscall_signal_return(
     process_id: u64,
     current_stack_pointer: usize,
@@ -5126,8 +5340,12 @@ fn process_error_number(error: &Error) -> i64 {
         Error::Vfs(vfs::Error::NotFound) | Error::Elf(elf::Error::Vfs(vfs::Error::NotFound)) => {
             ERR_NO_ENTRY
         }
-        Error::InvalidArgument | Error::TooManyArguments | Error::ArgumentBytesTooLarge => {
-            ERR_INVALID_ARGUMENT
+        Error::InvalidArgument
+        | Error::InvalidEnvironment
+        | Error::TooManyArguments
+        | Error::ArgumentBytesTooLarge => ERR_INVALID_ARGUMENT,
+        Error::TooManyEnvironmentVariables | Error::EnvironmentBytesTooLarge => {
+            ERR_ARGUMENT_TOO_LARGE
         }
         Error::InvalidProcessGroup(_) => ERR_NO_PROCESS,
         Error::TerminalBusy => ERR_IO,
@@ -5327,6 +5545,30 @@ fn user_text(process_id: u64, address: u64, length: u64, maximum: usize) -> Resu
     let length = usize::try_from(length).map_err(|_| ERR_ARGUMENT_TOO_LARGE)?;
     if length == 0 || length > maximum {
         return Err(ERR_ARGUMENT_TOO_LARGE);
+    }
+    if !user_range_allows(process_id, address, length, false) {
+        return Err(ERR_BAD_ADDRESS);
+    }
+    let bytes = unsafe { slice::from_raw_parts(address as *const u8, length) };
+    if bytes.contains(&0) {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    let text = str::from_utf8(bytes).map_err(|_| ERR_INVALID_ARGUMENT)?;
+    Ok(String::from(text))
+}
+
+fn user_text_allow_empty(
+    process_id: u64,
+    address: u64,
+    length: u64,
+    maximum: usize,
+) -> Result<String, i64> {
+    let length = usize::try_from(length).map_err(|_| ERR_ARGUMENT_TOO_LARGE)?;
+    if length > maximum {
+        return Err(ERR_ARGUMENT_TOO_LARGE);
+    }
+    if length == 0 {
+        return Ok(String::new());
     }
     if !user_range_allows(process_id, address, length, false) {
         return Err(ERR_BAD_ADDRESS);
@@ -5910,8 +6152,64 @@ fn vfs_errno(error: &vfs::Error) -> i64 {
     }
 }
 
+fn valid_environment_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_ENVIRONMENT_NAME_BYTES {
+        return false;
+    }
+    let first = bytes[0];
+    if !matches!(first, b'A'..=b'Z' | b'a'..=b'z' | b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|byte| matches!(*byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+fn environment_name(entry: &str) -> Option<&str> {
+    let (name, _) = entry.split_once('=')?;
+    valid_environment_name(name).then_some(name)
+}
+
+fn environment_serialized_bytes(environment: &[String]) -> Option<usize> {
+    environment.iter().try_fold(0usize, |total, entry| {
+        total.checked_add(entry.len().checked_add(1)?)
+    })
+}
+
+fn collect_environment(environment: &[&str]) -> Result<Vec<String>, Error> {
+    if environment.len() > MAX_ENVIRONMENT_VARIABLES {
+        return Err(Error::TooManyEnvironmentVariables);
+    }
+    let mut entries: Vec<String> = Vec::with_capacity(environment.len());
+    let mut total_bytes = 0usize;
+    for entry in environment {
+        if entry.as_bytes().contains(&0) {
+            return Err(Error::InvalidEnvironment);
+        }
+        let Some(name) = environment_name(entry) else {
+            return Err(Error::InvalidEnvironment);
+        };
+        if entries
+            .iter()
+            .any(|existing| environment_name(existing) == Some(name))
+        {
+            return Err(Error::InvalidEnvironment);
+        }
+        total_bytes = total_bytes
+            .checked_add(entry.len().saturating_add(1))
+            .ok_or(Error::EnvironmentBytesTooLarge)?;
+        if total_bytes > MAX_ENVIRONMENT_BYTES {
+            return Err(Error::EnvironmentBytesTooLarge);
+        }
+        entries.push(String::from(*entry));
+    }
+    Ok(entries)
+}
+
 fn build_initial_stack(
     arguments: &[&str],
+    environment: &[String],
     physical_memory_offset: VirtAddr,
     pages: &[UserPage],
     stack_start: u64,
@@ -5930,9 +6228,23 @@ fn build_initial_stack(
     if argument_bytes > MAX_ARGUMENT_BYTES {
         return Err(Error::ArgumentBytesTooLarge);
     }
+    if environment.len() > MAX_ENVIRONMENT_VARIABLES {
+        return Err(Error::TooManyEnvironmentVariables);
+    }
+    let environment_bytes =
+        environment_serialized_bytes(environment).ok_or(Error::EnvironmentBytesTooLarge)?;
+    if environment
+        .iter()
+        .any(|entry| entry.as_bytes().contains(&0) || environment_name(entry).is_none())
+    {
+        return Err(Error::InvalidEnvironment);
+    }
+    if environment_bytes > MAX_ENVIRONMENT_BYTES {
+        return Err(Error::EnvironmentBytesTooLarge);
+    }
 
     let mut cursor = USER_STACK_TOP;
-    let mut pointers = Vec::with_capacity(arguments.len());
+    let mut argument_pointers = Vec::with_capacity(arguments.len());
     for argument in arguments.iter().rev() {
         cursor = cursor
             .checked_sub(argument.len().saturating_add(1) as u64)
@@ -5944,12 +6256,30 @@ fn build_initial_stack(
             physical_memory_offset,
             pages,
         )?;
-        pointers.push(cursor);
+        argument_pointers.push(cursor);
     }
-    pointers.reverse();
+    argument_pointers.reverse();
+
+    let mut environment_pointers = Vec::with_capacity(environment.len());
+    for entry in environment.iter().rev() {
+        cursor = cursor
+            .checked_sub(entry.len().saturating_add(1) as u64)
+            .ok_or(Error::StackLayoutInvalid)?;
+        write_user_bytes(cursor, entry.as_bytes(), physical_memory_offset, pages)?;
+        write_user_bytes(
+            cursor + entry.len() as u64,
+            &[0],
+            physical_memory_offset,
+            pages,
+        )?;
+        environment_pointers.push(cursor);
+    }
+    environment_pointers.reverse();
 
     let table_words = 1usize
-        .checked_add(pointers.len())
+        .checked_add(argument_pointers.len())
+        .and_then(|words| words.checked_add(1))
+        .and_then(|words| words.checked_add(environment_pointers.len()))
         .and_then(|words| words.checked_add(2))
         .ok_or(Error::StackLayoutInvalid)?;
     let table_bytes = table_words
@@ -5964,8 +6294,10 @@ fn build_initial_stack(
     }
 
     let mut table = Vec::with_capacity(table_words);
-    table.push(pointers.len() as u64);
-    table.extend(pointers.iter().copied());
+    table.push(argument_pointers.len() as u64);
+    table.extend(argument_pointers.iter().copied());
+    table.push(0);
+    table.extend(environment_pointers.iter().copied());
     table.push(0);
     table.push(0);
     for (index, value) in table.iter().copied().enumerate() {

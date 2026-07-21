@@ -87,6 +87,14 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_signal_lifecycle_target")
             .expect("userspace signal-lifecycle-target artifact path was not set"),
     );
+    let userspace_environment_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_environment_probe")
+            .expect("userspace environment-probe artifact path was not set"),
+    );
+    let userspace_environment_target = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_environment_target")
+            .expect("userspace environment-target artifact path was not set"),
+    );
     let userspace_shell = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_ush")
             .expect("userspace shell artifact path was not set"),
@@ -123,6 +131,14 @@ fn main() {
     image.set_file(
         String::from("signal-lifecycle-target"),
         userspace_signal_lifecycle_target,
+    );
+    image.set_file(
+        String::from("environment-probe"),
+        userspace_environment_probe,
+    );
+    image.set_file(
+        String::from("environment-target"),
+        userspace_environment_target,
     );
     image.set_file(String::from("ush"), userspace_shell);
     image.set_file(String::from("hello.txt"), hello_text);

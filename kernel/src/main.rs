@@ -1101,6 +1101,109 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         handled_signal_result.pending_signal_peak
     );
 
+    let environment_before = userspace::snapshot();
+    let environment_memory_before = userspace_runtime.memory_stats();
+    let environment_spawn = match userspace_runtime.spawn_foreground_with_environment(
+        "/environment-probe",
+        &[],
+        &["BASE=seed", "REMOVE=gone"],
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            serial_println!("userspace environment probe spawn failed: {error}");
+            hlt_loop();
+        }
+    };
+    let environment_parent = match userspace_runtime.wait(environment_spawn.process_id) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace environment probe wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    let environment_after = userspace::snapshot();
+    let environment_memory_after = userspace_runtime.memory_stats();
+    let environment_child = environment_after.results.iter().find(|result| {
+        result.parent_process_id == Some(environment_spawn.process_id)
+            && result.path == "/environment-target"
+    });
+    let environment_change_delta = environment_after
+        .environment_changes
+        .saturating_sub(environment_before.environment_changes);
+    let environment_fork_delta = environment_after
+        .forks
+        .saturating_sub(environment_before.forks);
+    let environment_exec_delta = environment_after
+        .execs
+        .saturating_sub(environment_before.execs);
+    let environment_wait_delta = environment_after
+        .child_waits
+        .saturating_sub(environment_before.child_waits);
+    let userspace_environments_verified = environment_parent.process_id
+        == environment_spawn.process_id
+        && environment_parent.path == "/environment-target"
+        && environment_parent.exit_code() == Some(32)
+        && environment_parent.fork_count == 1
+        && environment_parent.child_wait_count == 1
+        && environment_parent.exec_count == 1
+        && environment_parent.environment_count == 2
+        && environment_parent.environment_change_count == 3
+        && environment_child.is_some_and(|child| {
+            child.exit_code() == Some(31)
+                && child.process_group_id == environment_spawn.process_group_id
+                && child.exec_count == 1
+                && child.environment_count == 2
+                && child.environment_change_count == 0
+        })
+        && environment_change_delta == 3
+        && environment_fork_delta == 1
+        && environment_exec_delta == 2
+        && environment_wait_delta == 1
+        && environment_after.active == environment_before.active
+        && environment_memory_after.allocated_frames == environment_memory_before.allocated_frames
+        && userspace_runtime
+            .terminal_snapshot()
+            .foreground_process
+            .is_none();
+    if !userspace_environments_verified {
+        serial_println!(
+            "userspace environment verification failed: parent={}/{}/{:?}, parent_fork={}, parent_wait={}, parent_exec={}, parent_env={}/{}, child={:?}, deltas={}/{}/{}/{}, active={}/{}, frames={}/{}",
+            environment_parent.process_id,
+            environment_parent.path,
+            environment_parent.exit_code(),
+            environment_parent.fork_count,
+            environment_parent.child_wait_count,
+            environment_parent.exec_count,
+            environment_parent.environment_count,
+            environment_parent.environment_change_count,
+            environment_child.map(|child| (
+                child.process_id,
+                child.exit_code(),
+                child.process_group_id,
+                child.exec_count,
+                child.environment_count,
+                child.environment_change_count
+            )),
+            environment_change_delta,
+            environment_fork_delta,
+            environment_exec_delta,
+            environment_wait_delta,
+            environment_before.active,
+            environment_after.active,
+            environment_memory_before.allocated_frames,
+            environment_memory_after.allocated_frames
+        );
+        hlt_loop();
+    }
+    let environment_child =
+        environment_child.expect("validated environment lifecycle child disappeared");
+    serial_println!(
+        "userspace environments verified: parent_pid={}, child_pid={}, changes={}, variables=2, envp_initial=true, fork_inherited=true, exec_preserved=true, frame_balance=true",
+        environment_parent.process_id,
+        environment_child.process_id,
+        environment_change_delta
+    );
+
     const TERMINAL_TEST_LINE: &str = "hello from canonical stdin";
     let terminal_spawn = match userspace_runtime.spawn_foreground("/readline", &[]) {
         Ok(info) => info,
@@ -1228,6 +1331,106 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         };
     if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
         serial_println!("userspace shell did not regain its prompt: {error}");
+        hlt_loop();
+    }
+
+    if let Err(error) = userspace_runtime.inject_terminal_line("SHELL_PATH=/hello.txt") {
+        serial_println!("userspace shell variable assignment injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!(
+            "userspace shell variable assignment did not return to the prompt: {error}"
+        );
+        hlt_loop();
+    }
+    if let Err(error) =
+        userspace_runtime.inject_terminal_line("SHELL_OUTPUT=/tmp/shell-variable.txt")
+    {
+        serial_println!("userspace shell output variable assignment failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell output assignment did not return to the prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("cat ${SHELL_PATH} > $SHELL_OUTPUT")
+    {
+        serial_println!("userspace shell variable expansion injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell variable expansion did not return to the prompt: {error}");
+        hlt_loop();
+    }
+    let shell_variable_output = match vfs::read_file("/tmp/shell-variable.txt", 256) {
+        Ok(data) => data,
+        Err(error) => {
+            serial_println!("userspace shell variable output read failed: {error}");
+            hlt_loop();
+        }
+    };
+    let shell_variable_expansion_verified = shell_variable_output.bytes.as_slice()
+        == b"Hello from a GalacticOS userspace file descriptor.\n";
+    if !shell_variable_expansion_verified {
+        serial_println!(
+            "userspace shell variable expansion verification failed: output_bytes={}",
+            shell_variable_output.bytes.len()
+        );
+        hlt_loop();
+    }
+
+    if let Err(error) = userspace_runtime.inject_terminal_line("export SHELL_VALUE=expanded") {
+        serial_println!("userspace shell export injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell export did not return to the prompt: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("environment-target shell") {
+        serial_println!("userspace shell environment child injection failed: {error}");
+        hlt_loop();
+    }
+    let shell_environment_child = match userspace_runtime
+        .wait_for_child_path(userspace_shell.process_id, "/environment-target")
+    {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("userspace shell environment child wait failed: {error}");
+            hlt_loop();
+        }
+    };
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!(
+            "userspace shell did not regain its prompt after environment child: {error}"
+        );
+        hlt_loop();
+    }
+    let shell_environment_child_verified = shell_environment_child.parent_process_id
+        == Some(userspace_shell.process_id)
+        && shell_environment_child.path == "/environment-target"
+        && shell_environment_child.exit_code() == Some(0)
+        && shell_environment_child.environment_count == 1
+        && shell_environment_child.environment_change_count == 0;
+    if !shell_environment_child_verified {
+        serial_println!(
+            "userspace shell environment child verification failed: parent={:?}/{}, path={}, exit={:?}, environment={}/{},",
+            shell_environment_child.parent_process_id,
+            userspace_shell.process_id,
+            shell_environment_child.path,
+            shell_environment_child.exit_code(),
+            shell_environment_child.environment_count,
+            shell_environment_child.environment_change_count
+        );
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.inject_terminal_line("unset SHELL_VALUE") {
+        serial_println!("userspace shell unset injection failed: {error}");
+        hlt_loop();
+    }
+    if let Err(error) = userspace_runtime.wait_until_terminal_read(userspace_shell.process_id) {
+        serial_println!("userspace shell unset did not return to the prompt: {error}");
         hlt_loop();
     }
 
@@ -1941,14 +2144,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         terminal_after_interrupt.interrupts
     );
 
+    let userspace_shell_environment_verified = shell_variable_expansion_verified
+        && shell_environment_child_verified
+        && userspace_shell_result.environment_count == 0
+        && userspace_shell_result.environment_change_count == 2;
+    if !userspace_shell_environment_verified {
+        serial_println!(
+            "userspace shell environment verification failed: expansion={}, child={}, final_environment={}/{}, child_environment={}/{}",
+            shell_variable_expansion_verified,
+            shell_environment_child_verified,
+            userspace_shell_result.environment_count,
+            userspace_shell_result.environment_change_count,
+            shell_environment_child.environment_count,
+            shell_environment_child.environment_change_count
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace shell variables verified: shell_pid={}, child_pid={}, changes=2, local_expansion=true, redirect_expansion=true, export_inherited=true, unset=true",
+        userspace_shell_result.process_id,
+        shell_environment_child.process_id
+    );
+
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
-        && userspace_shell_result.child_spawn_count == 20
-        && userspace_shell_result.child_wait_count == 24
+        && userspace_shell_result.child_spawn_count == 22
+        && userspace_shell_result.child_wait_count == 26
         && userspace_shell_result.child_poll_count == 5
         && userspace_shell_result.child_poll_pending_count == 5
         && userspace_shell_result.signal_sent_count == 4
-        && userspace_shell_result.open_count == 12
-        && userspace_shell_result.file_descriptor_inherit_count == 13
+        && userspace_shell_result.open_count == 13
+        && userspace_shell_result.file_descriptor_inherit_count == 14
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
@@ -1957,6 +2182,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && userspace_redirection_verified
         && userspace_exec_verified
         && userspace_shell_exec_verified
+        && userspace_shell_environment_verified
         && userspace_background_verified
         && userspace_stopped_jobs_verified
         && userspace_signals_verified
@@ -1966,7 +2192,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, opens={}, inherited_files={}, stopped_jobs={}, exec_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, opens={}, inherited_files={}, environment={}/{}, stopped_jobs={}, exec_child={}, environment_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
             userspace_shell_result.child_wait_count,
@@ -1975,8 +2201,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             userspace_shell_result.signal_sent_count,
             userspace_shell_result.open_count,
             userspace_shell_result.file_descriptor_inherit_count,
+            userspace_shell_result.environment_count,
+            userspace_shell_result.environment_change_count,
             userspace_stopped_jobs_verified,
             userspace_shell_exec_verified,
+            userspace_shell_environment_verified,
             shell_child.parent_process_id,
             shell_child.exit_code(),
             shell_child.open_count,
@@ -1986,7 +2215,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
     serial_println!(
-        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, stopped_jobs=1, exec_jobs=1, child_exit=0, child_bytes={}",
+        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, environment_changes=2, stopped_jobs=1, exec_jobs=1, child_exit=0, child_bytes={}",
         userspace_shell_result.process_id,
         shell_child.process_id,
         userspace_shell_result.child_spawn_count,
@@ -2072,6 +2301,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("Transactional userspace exec verified");
     } else {
         println!("Userspace exec unavailable");
+    }
+    if userspace_environments_verified {
+        println!("Userspace process environments verified");
+    } else {
+        println!("Userspace process environments unavailable");
     }
     if userspace_handled_signals_verified {
         println!("Userspace signal handlers verified");

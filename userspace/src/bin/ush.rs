@@ -2,7 +2,8 @@
 #![no_main]
 
 use userspace::{
-    abi::signal,
+    abi::{limits, signal},
+    environment::Environment,
     syscall::{
         self, ChildStatus, FileDescriptor, OpenFlags, PipePair, ProcessGroupId, ProcessId, STDERR,
         STDIN, STDOUT, SpawnFlags,
@@ -17,9 +18,12 @@ const PATH_BYTES: usize = 256;
 const MAX_STAGES: usize = 8;
 const MAX_PIPES: usize = MAX_STAGES - 1;
 const MAX_JOBS: usize = 4;
+const MAX_VARIABLES: usize = limits::MAX_ENVIRONMENT_VARIABLES;
+const VARIABLE_NAME_BYTES: usize = limits::MAX_ENVIRONMENT_NAME_BYTES;
+const VARIABLE_VALUE_BYTES: usize = COMMAND_BYTES;
 
 const PROMPT: &[u8] = b"ush> ";
-const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N exit\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
+const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
 const REDIRECTION_SYNTAX_FAILURE: &[u8] = b"ush: invalid redirection syntax\n";
@@ -39,6 +43,12 @@ const SPAWN_FAILURE: &[u8] = b"ush: spawn failed\n";
 const WAIT_FAILURE: &[u8] = b"ush: wait failed\n";
 const WAIT_COMPLETE: &[u8] = b"ush: background jobs complete\n";
 const NO_JOBS: &[u8] = b"ush: no background jobs\n";
+const VARIABLE_USAGE: &[u8] = b"ush: expected NAME or NAME=value\n";
+const VARIABLE_NAME_FAILURE: &[u8] = b"ush: invalid variable name\n";
+const VARIABLE_VALUE_FAILURE: &[u8] = b"ush: variable value is too long\n";
+const VARIABLE_LIMIT_FAILURE: &[u8] = b"ush: variable table is full\n";
+const VARIABLE_UPDATE_FAILURE: &[u8] = b"ush: environment update failed\n";
+const EXPANSION_FAILURE: &[u8] = b"ush: variable expansion failed\n";
 
 #[derive(Clone, Copy)]
 struct ByteBuffer<const N: usize> {
@@ -59,6 +69,25 @@ impl<const N: usize> ByteBuffer<N> {
         }
         self.bytes[..source.len()].copy_from_slice(source);
         self.len = source.len();
+        true
+    }
+    fn push_byte(&mut self, byte: u8) -> bool {
+        if self.len == N {
+            return false;
+        }
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        true
+    }
+    fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+        let Some(end) = self.len.checked_add(bytes.len()) else {
+            return false;
+        };
+        if end > N {
+            return false;
+        }
+        self.bytes[self.len..end].copy_from_slice(bytes);
+        self.len = end;
         true
     }
     fn push_token(&mut self, token: &[u8]) -> bool {
@@ -82,6 +111,33 @@ impl<const N: usize> ByteBuffer<N> {
         true
     }
 }
+#[derive(Clone, Copy)]
+struct Variable {
+    name: ByteBuffer<VARIABLE_NAME_BYTES>,
+    value: ByteBuffer<VARIABLE_VALUE_BYTES>,
+    exported: bool,
+}
+
+impl Variable {
+    const EMPTY: Self = Self {
+        name: ByteBuffer::EMPTY,
+        value: ByteBuffer::EMPTY,
+        exported: false,
+    };
+
+    const fn is_active(self) -> bool {
+        self.name.len != 0
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VariableError {
+    InvalidName,
+    ValueTooLong,
+    TableFull,
+    System,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RedirectMode {
     Read,
@@ -173,6 +229,9 @@ enum Builtin {
     Wait(WaitTarget),
     Foreground(JobTarget),
     Background(JobTarget),
+    Export,
+    Unset,
+    Environment,
     Exit,
     Kill(JobTarget),
 }
@@ -234,10 +293,11 @@ struct Shell {
     pipes: [PipePair; MAX_PIPES],
     children: [ProcessId; MAX_STAGES],
     jobs: [Job; MAX_JOBS],
+    variables: [Variable; MAX_VARIABLES],
 }
 impl Shell {
-    const fn new() -> Self {
-        Self {
+    fn new(initial_stack: *const usize) -> Self {
+        let mut shell = Self {
             command: [0; COMMAND_BYTES],
             pipes: [PipePair {
                 reader: 0,
@@ -245,7 +305,10 @@ impl Shell {
             }; MAX_PIPES],
             children: [0; MAX_STAGES],
             jobs: [Job::EMPTY; MAX_JOBS],
-        }
+            variables: [Variable::EMPTY; MAX_VARIABLES],
+        };
+        shell.import_environment(initial_stack);
+        shell
     }
     fn run(&mut self) -> ! {
         loop {
@@ -260,7 +323,7 @@ impl Shell {
                 self.terminate_all_jobs();
                 syscall::exit(0);
             }
-            let parsed = match parse_line(&self.command[..count]) {
+            let mut parsed = match parse_line(&self.command[..count]) {
                 Ok(v) => v,
                 Err(ParseError::EmptyStage) => {
                     self.error(SYNTAX_FAILURE);
@@ -282,6 +345,19 @@ impl Shell {
             if parsed.count == 0 {
                 continue;
             }
+            if parsed.count == 1 && split_assignment(parsed.stages[0].command.as_slice()).is_some()
+            {
+                if parsed.background {
+                    self.error(BUILTIN_BACKGROUND_FAILURE);
+                    continue;
+                }
+                if parsed.stages[0].has_redirection() {
+                    self.error(BUILTIN_REDIRECTION_FAILURE);
+                    continue;
+                }
+                self.run_assignment(parsed.stages[0].command.as_slice());
+                continue;
+            }
             let builtin = if parsed.count == 1 {
                 detect_builtin(parsed.stages[0].command.as_slice())
             } else {
@@ -296,7 +372,11 @@ impl Shell {
                     self.error(BUILTIN_REDIRECTION_FAILURE);
                     continue;
                 }
-                self.run_builtin(builtin);
+                self.run_builtin(builtin, parsed.stages[0].command.as_slice());
+                continue;
+            }
+            if !self.expand_parsed(&mut parsed) {
+                self.error(EXPANSION_FAILURE);
                 continue;
             }
             let slot = if parsed.background {
@@ -317,7 +397,7 @@ impl Shell {
             }
         }
     }
-    fn run_builtin(&mut self, b: Builtin) {
+    fn run_builtin(&mut self, b: Builtin, command: &[u8]) {
         match b {
             Builtin::Help => self.output(HELP),
             Builtin::Jobs => self.print_jobs(),
@@ -336,6 +416,9 @@ impl Shell {
             Builtin::Foreground(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
             Builtin::Background(JobTarget::Job(s)) => self.background_job(s),
             Builtin::Background(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
+            Builtin::Export => self.export_variable(command_arguments(command)),
+            Builtin::Unset => self.unset_variable(command_arguments(command)),
+            Builtin::Environment => self.print_environment(),
             Builtin::Exit => {
                 self.terminate_all_jobs();
                 syscall::exit(0)
@@ -344,6 +427,251 @@ impl Shell {
             Builtin::Kill(JobTarget::Job(s)) => self.kill_job(s),
         }
     }
+    fn import_environment(&mut self, initial_stack: *const usize) {
+        let environment = unsafe { Environment::from_stack(initial_stack) };
+        for entry in environment.iter() {
+            let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+                continue;
+            };
+            let name = &entry[..separator];
+            let value = &entry[separator.saturating_add(1)..];
+            if !valid_variable_name(name) || value.len() > VARIABLE_VALUE_BYTES {
+                continue;
+            }
+            let Some(index) = self
+                .variables
+                .iter()
+                .position(|variable| !variable.is_active())
+            else {
+                break;
+            };
+            let mut variable = Variable::EMPTY;
+            if !variable.name.copy_from(name) || !variable.value.copy_from(value) {
+                continue;
+            }
+            variable.exported = true;
+            self.variables[index] = variable;
+        }
+    }
+
+    fn variable_index(&self, name: &[u8]) -> Option<usize> {
+        self.variables
+            .iter()
+            .position(|variable| variable.is_active() && variable.name.as_slice() == name)
+    }
+
+    fn variable_value(&self, name: &[u8]) -> Option<&[u8]> {
+        let index = self.variable_index(name)?;
+        Some(self.variables[index].value.as_slice())
+    }
+
+    fn set_variable(
+        &mut self,
+        name: &[u8],
+        value: &[u8],
+        force_export: bool,
+    ) -> Result<(), VariableError> {
+        if !valid_variable_name(name) {
+            return Err(VariableError::InvalidName);
+        }
+        if value.len() > VARIABLE_VALUE_BYTES {
+            return Err(VariableError::ValueTooLong);
+        }
+        let existing = self.variable_index(name);
+        let index = match existing {
+            Some(index) => index,
+            None => self
+                .variables
+                .iter()
+                .position(|variable| !variable.is_active())
+                .ok_or(VariableError::TableFull)?,
+        };
+        let exported = force_export || existing.is_some_and(|slot| self.variables[slot].exported);
+        if exported && syscall::environment_set(name, value).is_err() {
+            return Err(VariableError::System);
+        }
+        let mut variable = Variable::EMPTY;
+        if !variable.name.copy_from(name) || !variable.value.copy_from(value) {
+            return Err(VariableError::ValueTooLong);
+        }
+        variable.exported = exported;
+        self.variables[index] = variable;
+        Ok(())
+    }
+
+    fn run_assignment(&mut self, command: &[u8]) {
+        let Some((name, value)) = split_assignment(command) else {
+            self.error(VARIABLE_NAME_FAILURE);
+            return;
+        };
+        let mut expanded = ByteBuffer::<VARIABLE_VALUE_BYTES>::EMPTY;
+        if !self.expand_bytes(value, &mut expanded) {
+            self.error(VARIABLE_VALUE_FAILURE);
+            return;
+        }
+        if let Err(error) = self.set_variable(name, expanded.as_slice(), false) {
+            self.report_variable_error(error);
+        }
+    }
+
+    fn export_variable(&mut self, arguments: &[u8]) {
+        let arguments = trim_horizontal(arguments);
+        if arguments.is_empty() {
+            self.error(VARIABLE_USAGE);
+            return;
+        }
+        if let Some((name, value)) = split_assignment(arguments) {
+            let mut expanded = ByteBuffer::<VARIABLE_VALUE_BYTES>::EMPTY;
+            if !self.expand_bytes(value, &mut expanded) {
+                self.error(VARIABLE_VALUE_FAILURE);
+                return;
+            }
+            if let Err(error) = self.set_variable(name, expanded.as_slice(), true) {
+                self.report_variable_error(error);
+            }
+            return;
+        }
+        if !valid_variable_name(arguments)
+            || arguments.iter().any(|byte| is_horizontal_space(*byte))
+        {
+            self.error(VARIABLE_USAGE);
+            return;
+        }
+        let value = self
+            .variable_index(arguments)
+            .map(|index| self.variables[index].value)
+            .unwrap_or(ByteBuffer::EMPTY);
+        if let Err(error) = self.set_variable(arguments, value.as_slice(), true) {
+            self.report_variable_error(error);
+        }
+    }
+
+    fn unset_variable(&mut self, arguments: &[u8]) {
+        let name = trim_horizontal(arguments);
+        if !valid_variable_name(name) || name.iter().any(|byte| is_horizontal_space(*byte)) {
+            self.error(VARIABLE_USAGE);
+            return;
+        }
+        if syscall::environment_unset(name).is_err() {
+            self.error(VARIABLE_UPDATE_FAILURE);
+            return;
+        }
+        if let Some(index) = self.variable_index(name) {
+            self.variables[index] = Variable::EMPTY;
+        }
+    }
+
+    fn print_environment(&self) {
+        for variable in self
+            .variables
+            .iter()
+            .filter(|variable| variable.is_active() && variable.exported)
+        {
+            self.output(variable.name.as_slice());
+            self.output(b"=");
+            self.output(variable.value.as_slice());
+            self.output(b"\n");
+        }
+    }
+
+    fn report_variable_error(&self, error: VariableError) {
+        self.error(match error {
+            VariableError::InvalidName => VARIABLE_NAME_FAILURE,
+            VariableError::ValueTooLong => VARIABLE_VALUE_FAILURE,
+            VariableError::TableFull => VARIABLE_LIMIT_FAILURE,
+            VariableError::System => VARIABLE_UPDATE_FAILURE,
+        });
+    }
+
+    fn expand_parsed(&self, parsed: &mut ParsedLine) -> bool {
+        for stage in &mut parsed.stages[..parsed.count] {
+            let mut command = ByteBuffer::<COMMAND_BYTES>::EMPTY;
+            if !self.expand_bytes(stage.command.as_slice(), &mut command) || command.len == 0 {
+                return false;
+            }
+            stage.command = command;
+            if let Some(redirect) = &mut stage.stdin {
+                if !self.expand_redirect(redirect) {
+                    return false;
+                }
+            }
+            if let Some(redirect) = &mut stage.stdout {
+                if !self.expand_redirect(redirect) {
+                    return false;
+                }
+            }
+            if let StderrRedirect::File(redirect) = &mut stage.stderr {
+                if !self.expand_redirect(redirect) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn expand_redirect(&self, redirect: &mut FileRedirect) -> bool {
+        let mut path = ByteBuffer::<PATH_BYTES>::EMPTY;
+        if !self.expand_bytes(redirect.path.as_slice(), &mut path) || path.len == 0 {
+            return false;
+        }
+        redirect.path = path;
+        true
+    }
+
+    fn expand_bytes<const N: usize>(&self, input: &[u8], output: &mut ByteBuffer<N>) -> bool {
+        let mut cursor = 0usize;
+        while cursor < input.len() {
+            if input[cursor] != b'$' {
+                if !output.push_byte(input[cursor]) {
+                    return false;
+                }
+                cursor = cursor.saturating_add(1);
+                continue;
+            }
+            if cursor.saturating_add(1) == input.len() {
+                return output.push_byte(b'$');
+            }
+            if input[cursor.saturating_add(1)] == b'{' {
+                let name_start = cursor.saturating_add(2);
+                let Some(relative_end) = input[name_start..].iter().position(|byte| *byte == b'}')
+                else {
+                    return false;
+                };
+                let name_end = name_start.saturating_add(relative_end);
+                let name = &input[name_start..name_end];
+                if !valid_variable_name(name) {
+                    return false;
+                }
+                if let Some(value) = self.variable_value(name) {
+                    if !output.push_bytes(value) {
+                        return false;
+                    }
+                }
+                cursor = name_end.saturating_add(1);
+                continue;
+            }
+            let name_start = cursor.saturating_add(1);
+            if !is_variable_name_start(input[name_start]) {
+                if !output.push_byte(b'$') {
+                    return false;
+                }
+                cursor = cursor.saturating_add(1);
+                continue;
+            }
+            let mut name_end = name_start.saturating_add(1);
+            while name_end < input.len() && is_variable_name_continue(input[name_end]) {
+                name_end = name_end.saturating_add(1);
+            }
+            if let Some(value) = self.variable_value(&input[name_start..name_end]) {
+                if !output.push_bytes(value) {
+                    return false;
+                }
+            }
+            cursor = name_end;
+        }
+        true
+    }
+
     fn run_single(&mut self, parsed: ParsedLine, job_slot: Option<usize>) {
         let stage = parsed.stages[0];
         let d = match self.open_stage(&stage, None, None) {
@@ -1010,8 +1338,47 @@ fn detect_builtin(command: &[u8]) -> Option<Builtin> {
         b"fg" => Some(Builtin::Foreground(parse_job_target(arguments))),
         b"bg" => Some(Builtin::Background(parse_job_target(arguments))),
         b"kill" => Some(Builtin::Kill(parse_job_target(arguments))),
+        b"export" => Some(Builtin::Export),
+        b"unset" => Some(Builtin::Unset),
+        b"env" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => {
+            Some(Builtin::Environment)
+        }
         _ => None,
     }
+}
+
+fn command_arguments(command: &[u8]) -> &[u8] {
+    let token_end = command
+        .iter()
+        .position(|byte| is_horizontal_space(*byte))
+        .unwrap_or(command.len());
+    &command[token_end..]
+}
+
+fn is_variable_name_start(byte: u8) -> bool {
+    matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'_')
+}
+
+fn is_variable_name_continue(byte: u8) -> bool {
+    is_variable_name_start(byte) || byte.is_ascii_digit()
+}
+
+fn valid_variable_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= VARIABLE_NAME_BYTES
+        && is_variable_name_start(name[0])
+        && name[1..]
+            .iter()
+            .all(|byte| is_variable_name_continue(*byte))
+}
+
+fn split_assignment(command: &[u8]) -> Option<(&[u8], &[u8])> {
+    if command.iter().any(|byte| is_horizontal_space(*byte)) {
+        return None;
+    }
+    let separator = command.iter().position(|byte| *byte == b'=')?;
+    let name = &command[..separator];
+    valid_variable_name(name).then_some((name, &command[separator.saturating_add(1)..]))
 }
 
 fn parse_wait_target(bytes: &[u8]) -> WaitTarget {
@@ -1061,7 +1428,7 @@ const fn is_line_trailing(byte: u8) -> bool {
     is_horizontal_space(byte) || byte == b'\n' || byte == b'\r'
 }
 
-extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
-    let mut shell = Shell::new();
+extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+    let mut shell = Shell::new(initial_stack);
     shell.run()
 }
