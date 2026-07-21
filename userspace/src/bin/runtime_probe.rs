@@ -163,19 +163,32 @@ fn descriptor_probe() -> bool {
     let Ok(stdout_stat) = platform::fstat(STDOUT) else {
         return false;
     };
-    if stdout_stat.kind != file::KIND_TERMINAL {
+    if !matches!(stdout_stat.kind, file::KIND_TERMINAL | file::KIND_FILE) {
         return false;
     }
-    if platform::dup(STDOUT).err() != Some(platform::Errno::NOT_IMPLEMENTED) {
-        return false;
+
+    match platform::dup(STDOUT) {
+        Ok(duplicate) if stdout_stat.kind == file::KIND_FILE => {
+            let duplicate_matches = platform::fstat(duplicate)
+                .is_ok_and(|stat| stat.kind == stdout_stat.kind && stat.flags == stdout_stat.flags);
+            if syscall::close(duplicate).is_err() || !duplicate_matches {
+                return false;
+            }
+        }
+        Err(error)
+            if stdout_stat.kind == file::KIND_TERMINAL
+                && error == platform::Errno::NOT_IMPLEMENTED => {}
+        _ => return false,
     }
+
     if platform::dup2(STDOUT, STDOUT).ok() != Some(STDOUT)
         || platform::dup2(STDOUT, STDERR).ok() != Some(STDERR)
         || platform::dup2(STDOUT, STDIN).err() != Some(platform::Errno::BAD_FILE_DESCRIPTOR)
     {
         return false;
     }
-    platform::fstat(STDERR).is_ok_and(|stat| stat.kind == file::KIND_TERMINAL)
+    platform::fstat(STDERR)
+        .is_ok_and(|stat| stat.kind == stdout_stat.kind && stat.flags == stdout_stat.flags)
 }
 
 fn ordinary_descriptor_probe() -> bool {
