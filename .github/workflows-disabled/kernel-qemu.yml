@@ -1,3 +1,7 @@
+# GitHub Actions is temporarily disabled for this repository. GitHub only
+# discovers workflow files under .github/workflows, so this definition is
+# parked here for preservation. Move it back to
+# .github/workflows/kernel-qemu.yml to restore automatic checks.
 name: Kernel QEMU smoke test
 
 on:

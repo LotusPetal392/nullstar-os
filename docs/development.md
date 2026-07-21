@@ -31,6 +31,12 @@ All three should identify `nightly-2026-02-01` when invoked here. An explicit
 
 ## Local checks
 
+GitHub Actions are temporarily disabled. The preserved workflow is parked at
+`.github/workflows-disabled/kernel-qemu.yml`; move it back to
+`.github/workflows/kernel-qemu.yml` to restore automatic pull-request and
+`main`-branch checks. While it is disabled, the complete local check below is
+the required pre-push verification path.
+
 Use the checked-in wrapper rather than maintaining a separate command list:
 
 ```sh

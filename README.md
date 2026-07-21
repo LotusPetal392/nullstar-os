@@ -102,6 +102,9 @@ Run `help` in either shell for its authoritative command list.
 
 ## Testing locally
 
+GitHub Actions are temporarily disabled. Until the workflow is restored, these
+local checks are the required verification path for every change.
+
 Run the fast checks while iterating:
 
 ```sh
