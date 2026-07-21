@@ -1,0 +1,173 @@
+# GalacticOS architecture
+
+This document describes the implemented system as it exists today. It is a
+map of the code, not a promise of stable internal APIs.
+
+## Build topology
+
+The repository contains three Cargo packages with two target environments:
+
+```mermaid
+flowchart LR
+    H[Host package<br/>galactic-os] --> K[Kernel artifact<br/>x86_64-unknown-none]
+    H --> U[Userspace artifacts<br/>x86_64-unknown-none]
+    K --> B[Root build.rs]
+    U --> B
+    B --> N[Normal BIOS image]
+    B --> S[Smoke-test BIOS image]
+    N --> Q[QEMU q35 runner]
+    S --> Q
+```
+
+The root `galactic-os` package is a normal host executable. Cargo's unstable
+artifact-dependency support builds `kernel` and every declared `userspace`
+binary for `x86_64-unknown-none`. The root build script embeds those artifacts,
+the boot-mode marker, and test fixtures into images produced by
+`bootloader 0.11`.
+
+Both images contain the same kernel and userspace programs. Their `/BOOTMODE`
+file selects one of two paths:
+
+- `normal` initializes services and enters the interactive kernel shell.
+- `smoke-test` runs deterministic subsystem probes and emits serial markers for
+  the host harness. The persistence test uses two boots of a temporary image.
+
+## Boot sequence
+
+The kernel enters through `bootloader_api` with a framebuffer, memory map,
+physical-memory mapping, kernel stack, and optional ACPI RSDP address.
+Initialization proceeds in dependency order:
+
+1. Create the page-table mapper and physical-frame allocator, then map the
+   kernel heap.
+2. Parse ACPI data and initialize the framebuffer console.
+3. Load the GDT/TSS and IDT, select APIC or legacy PIC interrupt routing, and
+   start the LAPIC timer or PIT fallback.
+4. Enumerate PCIe through MCFG/ECAM, initialize an AHCI disk, and discover its
+   MBR or GPT partitions.
+5. Mount the first supported FAT volume at `/`, then mount tmpfs at `/tmp`.
+6. Initialize the scheduler and branch into normal or smoke-test behavior.
+
+Serial logging remains available throughout boot, including before the
+framebuffer is ready. Fatal early-boot failures report a diagnostic and halt.
+
+## Platform and interrupt layer
+
+Architecture-specific code lives under `kernel/src/arch/x86_64`:
+
+- `gdt.rs` installs kernel/user segments, a TSS, and the double-fault stack.
+- `interrupts.rs` owns the IDT, exception paths, hardware IRQ routing, timer
+  accounting, keyboard delivery, and the `int 0x80` syscall entry.
+- `acpi.rs`, `apic.rs`, and `hpet.rs` validate firmware tables and configure the
+  preferred APIC/LAPIC timer path. The PIC and PIT remain fallback paths.
+
+The timer interrupt supplies monotonic ticks and drives scheduler preemption.
+The PS/2 keyboard interrupt queues scancodes; decoding and shell work happen
+outside IRQ context.
+
+## Memory and scheduling
+
+The kernel uses the bootloader's memory map for 4 KiB physical frames and keeps
+reclaimed frames available for reuse. A mapped kernel heap provides dynamic
+allocation with aligned splitting and adjacent free-block coalescing.
+
+The scheduler owns bootstrap, kernel-thread, and user-process tasks. Each task
+has a kernel stack and saved interrupt context. Timer interrupts can switch
+between runnable tasks; blocked processes are made runnable when their I/O,
+child, signal, or terminal condition changes.
+
+The normal image starts only the services needed for interactive use. Scheduler
+stress probes and other destructive checks are restricted to the smoke image.
+
+## Userspace and process lifecycle
+
+Userspace programs are statically linked ELF64 images with custom `_start`
+entries from the `userspace` crate. They run in ring 3 with separate page tables
+and use software interrupt `0x80` for the GalacticOS syscall ABI. The shared
+numeric ABI is defined once in `shared/userspace_abi.rs` and included by both
+sides.
+
+The process manager owns:
+
+- address spaces and copy-on-write fork state
+- argument and environment blocks
+- file-descriptor tables and close-on-exec behavior
+- parent/child relationships, process groups, and terminal ownership
+- pending, blocked, ignored, default, and handled signal state
+- exit, signal, stop, and continue notifications
+
+Final child status is consumable once. Stop/continue transitions are also
+one-shot observations. Orphans are adopted by an internal kernel reaper, while
+bounded completion history supports diagnostics without retaining live process
+resources indefinitely.
+
+`exec` validates and constructs a replacement image before committing it, so a
+failed load leaves the original process intact. `fork` initially shares
+read-only pages and copies a page when either process writes to it.
+
+## Filesystems and I/O
+
+The storage path is:
+
+```text
+PCIe ECAM -> AHCI controller -> block device -> MBR/GPT -> FAT -> VFS
+```
+
+FAT12, FAT16, and FAT32 volumes can be read. The current write path is narrower:
+it supports regular FAT16 root-directory files with valid 8.3 names and mirrors
+updates across FAT copies. `/tmp` is a separate in-memory filesystem used for
+temporary files, shell redirection, and tests.
+
+Processes access files, terminals, and pipes through descriptors. Pipes have
+bounded buffers and wake blocked readers or writers as state changes. The
+terminal tracks a foreground process group so keyboard-generated interrupt and
+stop events reach the correct pipeline.
+
+## Shells
+
+The kernel shell in `kernel/src/shell.rs` is a diagnostic and control surface.
+It can inspect initialized subsystems and start or wait for userspace programs.
+
+The ring-3 `ush` program in `userspace/src/bin/ush.rs` exercises the userspace
+ABI. It implements pipelines, descriptor redirection, variables and exported
+environments, background jobs, foreground/background transitions, and signal-
+based `Ctrl-C`/`Ctrl-Z` handling.
+
+## Resource bounds
+
+Bounds are explicit so exhaustion returns a defined error instead of growing
+kernel state forever. Important current limits include:
+
+| Resource | Limit |
+| --- | ---: |
+| Live process slots | 64 |
+| Scheduler tasks | 67 |
+| Retained completion-history entries | 128 |
+| Kernel pipe objects | 32 |
+| Open descriptors per process | 16 |
+| Arguments per process | 16 |
+| Environment variables per process | 16 |
+| `ush` pipeline stages | 8 |
+| `ush` background jobs | 4 |
+| tmpfs files | 32 |
+| tmpfs file size | 64 KiB |
+| tmpfs total size | 256 KiB |
+| FAT read/write window per file | 1 MiB |
+
+The constants in the implementation remain authoritative. Shared userspace ABI
+limits live in `shared/userspace_abi.rs`; subsystem-specific bounds are next to
+their owning implementations.
+
+## Verification model
+
+Three layers cover different failure classes:
+
+1. Host-side unit tests exercise target-independent parsing, completion queues,
+   and the userspace bump heap.
+2. A normal-boot check verifies that production boot reaches the shell without
+   executing smoke-only work.
+3. The two-boot QEMU smoke suite validates the integrated hardware, storage,
+   VFS, scheduler, process, syscall, shell, job-control, and signal paths.
+
+The host runner treats serial markers as contracts and applies a timeout to each
+QEMU phase. See [Development](development.md) for the commands.
