@@ -88,6 +88,7 @@ pub struct ControllerInfo {
     pub local_apic_timer_ticks_per_second: Option<u64>,
     pub local_apic_timer_initial_count: Option<u32>,
     pub local_apic_timer_divisor: Option<u32>,
+    pub calibration_hpet_ticks: Option<u64>,
     pub hpet_period_femtoseconds: Option<u64>,
     pub hpet_frequency_hz: Option<u64>,
     pub hpet_counter_is_64_bit: Option<bool>,
@@ -113,6 +114,7 @@ impl ControllerInfo {
             local_apic_timer_ticks_per_second: None,
             local_apic_timer_initial_count: None,
             local_apic_timer_divisor: None,
+            calibration_hpet_ticks: None,
             hpet_period_femtoseconds: None,
             hpet_frequency_hz: None,
             hpet_counter_is_64_bit: None,
@@ -146,6 +148,7 @@ impl ControllerInfo {
             local_apic_timer_ticks_per_second: local_timer.map(|timer| timer.ticks_per_second),
             local_apic_timer_initial_count: local_timer.map(|timer| timer.initial_count),
             local_apic_timer_divisor: local_timer.map(|timer| timer.divisor),
+            calibration_hpet_ticks: local_timer.map(|timer| timer.calibration_hpet_ticks),
             hpet_period_femtoseconds: local_timer.map(|timer| timer.hpet_period_femtoseconds),
             hpet_frequency_hz: local_timer.map(|timer| timer.hpet_frequency_hz),
             hpet_counter_is_64_bit: local_timer.map(|timer| timer.hpet_counter_is_64_bit),
@@ -193,16 +196,16 @@ pub fn init(
     configure_pit();
 
     let controller = match madt {
-        Some(madt) => match apic::init(
+        Some(madt) => match apic::init(apic::InitConfig {
             madt,
-            hpet,
+            hpet_info: hpet,
             physical_memory_offset,
             physical_memory_end,
-            TIMER_VECTOR,
-            KEYBOARD_VECTOR,
-            SPURIOUS_VECTOR,
-            TIMER_HZ,
-        ) {
+            timer_vector: TIMER_VECTOR,
+            keyboard_vector: KEYBOARD_VECTOR,
+            spurious_vector: SPURIOUS_VECTOR,
+            timer_hz: TIMER_HZ,
+        }) {
             Ok(apic_info) => {
                 ACTIVE_CONTROLLER.store(CONTROLLER_APIC, Ordering::Release);
                 ControllerInfo::apic(apic_info)

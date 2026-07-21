@@ -208,7 +208,6 @@ impl DirectoryEntry {
 #[derive(Debug, Clone)]
 pub struct FileData {
     pub bytes: Vec<u8>,
-    pub total_size: u32,
     pub truncated: bool,
 }
 
@@ -529,7 +528,6 @@ impl FatVolume {
         if target_len == 0 {
             return Ok(FileData {
                 bytes,
-                total_size: entry.size,
                 truncated: false,
             });
         }
@@ -556,7 +554,6 @@ impl FatVolume {
 
         Ok(FileData {
             bytes,
-            total_size: entry.size,
             truncated: target_len < entry.size as usize,
         })
     }
@@ -1300,7 +1297,7 @@ impl DirectoryParser {
     }
 
     fn consume(&mut self, bytes: &[u8]) -> Result<bool, Error> {
-        if bytes.len() % DIRECTORY_ENTRY_SIZE != 0 {
+        if !bytes.len().is_multiple_of(DIRECTORY_ENTRY_SIZE) {
             return Err(Error::CorruptDirectory);
         }
         for entry in bytes.chunks_exact(DIRECTORY_ENTRY_SIZE) {

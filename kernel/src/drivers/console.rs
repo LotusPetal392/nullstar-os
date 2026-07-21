@@ -82,20 +82,12 @@ pub fn clear() {
     with_console(|console| console.clear_screen());
 }
 
-pub fn write_char(character: char) {
-    with_console(|console| console.write_char(character));
-}
-
 pub fn backspace() {
     with_console(|console| console.backspace());
 }
 
 pub fn text_columns() -> Option<usize> {
     with_console(|console| console.text_columns())
-}
-
-pub fn stats() -> Option<Stats> {
-    with_console(|console| console.stats())
 }
 
 #[doc(hidden)]

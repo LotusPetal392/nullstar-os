@@ -115,7 +115,7 @@ pub enum Error {
     PortBusyTimeout,
     CommandSlotBusy,
     CommandTimeout,
-    TaskFileError,
+    TaskFileFault,
     TransferIncomplete { expected: usize, actual: usize },
     IdentifyDataInvalid,
     UnsupportedLogicalBlockSize(u32),
@@ -146,7 +146,7 @@ impl Error {
             Self::PortBusyTimeout => "AHCI port remained busy before command submission",
             Self::CommandSlotBusy => "AHCI command slot zero is busy",
             Self::CommandTimeout => "AHCI command did not complete",
-            Self::TaskFileError => "AHCI reported an ATA task-file error",
+            Self::TaskFileFault => "AHCI reported an ATA task-file error",
             Self::TransferIncomplete { .. } => "AHCI completed an incomplete DMA transfer",
             Self::IdentifyDataInvalid => "ATA IDENTIFY data is invalid",
             Self::UnsupportedLogicalBlockSize(_) => "ATA logical block size is unsupported",
@@ -503,7 +503,9 @@ struct IdentifyData {
 }
 
 struct Controller {
-    hba: MmioRegion,
+    // Retains ownership of the controller-wide MMIO mapping for the lifetime
+    // of the selected port.
+    _hba: MmioRegion,
     port: Port,
     dma: DmaResources,
     logical_block_size: usize,
@@ -575,7 +577,7 @@ impl Controller {
         )?;
 
         let mut controller = Self {
-            hba,
+            _hba: hba,
             port,
             dma,
             logical_block_size: 0,
@@ -739,12 +741,12 @@ impl Controller {
 
         for _ in 0..COMMAND_COMPLETION_SPINS {
             if self.port.read(PORT_INTERRUPT_STATUS) & PORT_IS_TASK_FILE_ERROR != 0 {
-                return Err(Error::TaskFileError);
+                return Err(Error::TaskFileFault);
             }
             if self.port.read(PORT_COMMAND_ISSUE) & COMMAND_SLOT == 0 {
                 compiler_fence(Ordering::Acquire);
                 if self.port.read(PORT_TASK_FILE_DATA) & PORT_TFD_ERROR != 0 {
-                    return Err(Error::TaskFileError);
+                    return Err(Error::TaskFileFault);
                 }
 
                 let transferred = unsafe {
@@ -856,12 +858,12 @@ impl Controller {
 
         for _ in 0..COMMAND_COMPLETION_SPINS {
             if self.port.read(PORT_INTERRUPT_STATUS) & PORT_IS_TASK_FILE_ERROR != 0 {
-                return Err(Error::TaskFileError);
+                return Err(Error::TaskFileFault);
             }
             if self.port.read(PORT_COMMAND_ISSUE) & COMMAND_SLOT == 0 {
                 compiler_fence(Ordering::Acquire);
                 if self.port.read(PORT_TASK_FILE_DATA) & PORT_TFD_ERROR != 0 {
-                    return Err(Error::TaskFileError);
+                    return Err(Error::TaskFileFault);
                 }
                 let transferred = unsafe {
                     ptr::read_volatile(&(*self.dma.command_header_ptr()).bytes_transferred)
@@ -924,12 +926,12 @@ impl Controller {
         self.port.write(PORT_COMMAND_ISSUE, COMMAND_SLOT);
         for _ in 0..COMMAND_COMPLETION_SPINS {
             if self.port.read(PORT_INTERRUPT_STATUS) & PORT_IS_TASK_FILE_ERROR != 0 {
-                return Err(Error::TaskFileError);
+                return Err(Error::TaskFileFault);
             }
             if self.port.read(PORT_COMMAND_ISSUE) & COMMAND_SLOT == 0 {
                 compiler_fence(Ordering::Acquire);
                 if self.port.read(PORT_TASK_FILE_DATA) & PORT_TFD_ERROR != 0 {
-                    return Err(Error::TaskFileError);
+                    return Err(Error::TaskFileFault);
                 }
                 self.port.write(PORT_INTERRUPT_STATUS, u32::MAX);
                 return Ok(());

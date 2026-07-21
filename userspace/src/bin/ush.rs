@@ -150,29 +150,26 @@ struct FileRedirect {
     mode: RedirectMode,
 }
 #[derive(Clone, Copy)]
-enum StderrRedirect {
-    Default,
-    File(FileRedirect),
-    Stdout,
-}
-#[derive(Clone, Copy)]
 struct Stage {
     command: ByteBuffer<COMMAND_BYTES>,
     stdin: Option<FileRedirect>,
     stdout: Option<FileRedirect>,
-    stderr: StderrRedirect,
+    stderr: Option<FileRedirect>,
+    stderr_to_stdout: bool,
 }
 impl Stage {
     const EMPTY: Self = Self {
         command: ByteBuffer::EMPTY,
         stdin: None,
         stdout: None,
-        stderr: StderrRedirect::Default,
+        stderr: None,
+        stderr_to_stdout: false,
     };
     fn has_redirection(self) -> bool {
         self.stdin.is_some()
             || self.stdout.is_some()
-            || !matches!(self.stderr, StderrRedirect::Default)
+            || self.stderr.is_some()
+            || self.stderr_to_stdout
     }
 }
 #[derive(Clone, Copy)]
@@ -207,6 +204,7 @@ enum JobState {
 #[derive(Clone, Copy)]
 struct Job {
     process_ids: [ProcessId; MAX_STAGES],
+    final_statuses: [Option<ChildStatus>; MAX_STAGES],
     process_count: usize,
     process_group: ProcessGroupId,
     state: JobState,
@@ -214,6 +212,7 @@ struct Job {
 impl Job {
     const EMPTY: Self = Self {
         process_ids: [0; MAX_STAGES],
+        final_statuses: [None; MAX_STAGES],
         process_count: 0,
         process_group: 0,
         state: JobState::Running,
@@ -590,20 +589,20 @@ impl Shell {
                 return false;
             }
             stage.command = command;
-            if let Some(redirect) = &mut stage.stdin {
-                if !self.expand_redirect(redirect) {
-                    return false;
-                }
+            if let Some(redirect) = &mut stage.stdin
+                && !self.expand_redirect(redirect)
+            {
+                return false;
             }
-            if let Some(redirect) = &mut stage.stdout {
-                if !self.expand_redirect(redirect) {
-                    return false;
-                }
+            if let Some(redirect) = &mut stage.stdout
+                && !self.expand_redirect(redirect)
+            {
+                return false;
             }
-            if let StderrRedirect::File(redirect) = &mut stage.stderr {
-                if !self.expand_redirect(redirect) {
-                    return false;
-                }
+            if let Some(redirect) = &mut stage.stderr
+                && !self.expand_redirect(redirect)
+            {
+                return false;
             }
         }
         true
@@ -642,10 +641,10 @@ impl Shell {
                 if !valid_variable_name(name) {
                     return false;
                 }
-                if let Some(value) = self.variable_value(name) {
-                    if !output.push_bytes(value) {
-                        return false;
-                    }
+                if let Some(value) = self.variable_value(name)
+                    && !output.push_bytes(value)
+                {
+                    return false;
                 }
                 cursor = name_end.saturating_add(1);
                 continue;
@@ -662,10 +661,10 @@ impl Shell {
             while name_end < input.len() && is_variable_name_continue(input[name_end]) {
                 name_end = name_end.saturating_add(1);
             }
-            if let Some(value) = self.variable_value(&input[name_start..name_end]) {
-                if !output.push_bytes(value) {
-                    return false;
-                }
+            if let Some(value) = self.variable_value(&input[name_start..name_end])
+                && !output.push_bytes(value)
+            {
+                return false;
             }
             cursor = name_end;
         }
@@ -749,7 +748,7 @@ impl Shell {
                 Err(()) => {
                     self.close_pipes(pipe_count);
                     for i in stage_index + 1..parsed.count {
-                        let _ = self.wait_final(self.children[i]);
+                        let _ = Self::wait_final(self.children[i]);
                     }
                     self.error(REDIRECTION_OPEN_FAILURE);
                     return;
@@ -788,7 +787,7 @@ impl Shell {
                 Err(_) => {
                     self.close_pipes(pipe_count);
                     for i in stage_index + 1..parsed.count {
-                        let _ = self.wait_final(self.children[i]);
+                        let _ = Self::wait_final(self.children[i]);
                     }
                     self.error(SPAWN_FAILURE);
                     return;
@@ -833,10 +832,10 @@ impl Shell {
                 }
             }
         }
-        match stage.stderr {
-            StderrRedirect::Default => {}
-            StderrRedirect::Stdout => d.stderr = d.stdout,
-            StderrRedirect::File(r) => match open_redirect(r) {
+        if stage.stderr_to_stdout {
+            d.stderr = d.stdout;
+        } else if let Some(r) = stage.stderr {
+            match open_redirect(r) {
                 Ok(fd) => {
                     d.stderr = Some(fd);
                     d.remember(fd)
@@ -845,7 +844,7 @@ impl Shell {
                     self.close_stage_descriptors(&d);
                     return Err(());
                 }
-            },
+            }
         }
         Ok(d)
     }
@@ -855,15 +854,16 @@ impl Shell {
         }
     }
     fn finish_foreground(&mut self, process_count: usize, process_group: ProcessGroupId) {
-        let children = self.children;
-        let summary = self.wait_children(&children, process_count);
+        let mut job = self.make_job(process_count, process_group, JobState::Running);
+        let summary = Self::wait_children(&mut job);
         if summary.stopped {
             if let Some(slot) = self.reserve_job() {
-                self.store_job(slot, process_count, process_group, JobState::Stopped);
+                job.state = JobState::Stopped;
+                self.jobs[slot] = job;
                 self.print_job(slot);
             } else {
                 let _ = syscall::signal_process_group(process_group, signal::TERMINATE);
-                self.collect_children(&children, process_count);
+                Self::collect_children(&job.process_ids, job.process_count);
                 self.error(JOB_LIMIT_FAILURE);
             }
         } else if summary.failed {
@@ -879,18 +879,19 @@ impl Shell {
             return;
         }
         if self.jobs[slot].state == JobState::Running {
-            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+            let state = poll_job(&mut self.jobs[slot]);
+            self.jobs[slot].state = state;
         }
-        let job = self.jobs[slot];
         if matches!(
-            job.state,
+            self.jobs[slot].state,
             JobState::Done | JobState::Failed | JobState::Signaled
         ) {
             let _ = self.wait_job(slot);
             return;
         }
-        if syscall::foreground_process_group(job.process_group).is_err() {
-            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+        if syscall::foreground_process_group(self.jobs[slot].process_group).is_err() {
+            let state = poll_job(&mut self.jobs[slot]);
+            self.jobs[slot].state = state;
             if matches!(
                 self.jobs[slot].state,
                 JobState::Done | JobState::Failed | JobState::Signaled
@@ -903,7 +904,7 @@ impl Shell {
         }
 
         self.jobs[slot].state = JobState::Running;
-        let summary = self.wait_children(&job.process_ids, job.process_count);
+        let summary = Self::wait_children(&mut self.jobs[slot]);
         if summary.stopped {
             self.jobs[slot].state = JobState::Stopped;
             self.print_job(slot);
@@ -923,7 +924,8 @@ impl Shell {
             return;
         }
         if self.jobs[slot].state == JobState::Running {
-            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+            let state = poll_job(&mut self.jobs[slot]);
+            self.jobs[slot].state = state;
         }
         if self.jobs[slot].state != JobState::Stopped {
             self.error(JOB_NOT_STOPPED);
@@ -943,14 +945,14 @@ impl Shell {
             return false;
         }
         if self.jobs[slot].state == JobState::Running {
-            self.jobs[slot].state = poll_job(&self.jobs[slot]);
+            let state = poll_job(&mut self.jobs[slot]);
+            self.jobs[slot].state = state;
         }
         if self.jobs[slot].state == JobState::Stopped {
             self.error(JOB_STOPPED);
             return false;
         }
-        let job = self.jobs[slot];
-        match self.collect_job(&job) {
+        match Self::collect_job(&mut self.jobs[slot]) {
             CollectResult::Complete => {
                 self.jobs[slot] = Job::EMPTY;
                 true
@@ -976,14 +978,14 @@ impl Shell {
                 continue;
             }
             if self.jobs[slot].state == JobState::Running {
-                self.jobs[slot].state = poll_job(&self.jobs[slot]);
+                let state = poll_job(&mut self.jobs[slot]);
+                self.jobs[slot].state = state;
             }
             if self.jobs[slot].state == JobState::Stopped {
                 stopped = true;
                 continue;
             }
-            let job = self.jobs[slot];
-            match self.collect_job(&job) {
+            match Self::collect_job(&mut self.jobs[slot]) {
                 CollectResult::Complete => self.jobs[slot] = Job::EMPTY,
                 CollectResult::Stopped => {
                     self.jobs[slot].state = JobState::Stopped;
@@ -1004,10 +1006,12 @@ impl Shell {
         }
     }
 
-    fn collect_job(&self, job: &Job) -> CollectResult {
-        for process_id in &job.process_ids[..job.process_count] {
+    fn collect_job(job: &mut Job) -> CollectResult {
+        let mut failed = false;
+        let mut signaled = false;
+        for index in 0..job.process_count {
             loop {
-                let status = match syscall::wait_child(*process_id) {
+                let status = match Self::wait_status(job, index) {
                     Ok(status) => status,
                     Err(_) => return CollectResult::Failed,
                 };
@@ -1017,10 +1021,16 @@ impl Shell {
                 if status.stopped_signal().is_some() {
                     return CollectResult::Stopped;
                 }
+                job.final_statuses[index] = Some(status);
+                classify_status(status, &mut failed, &mut signaled);
                 break;
             }
         }
-        CollectResult::Complete
+        if failed || signaled {
+            CollectResult::Failed
+        } else {
+            CollectResult::Complete
+        }
     }
 
     fn terminate_all_jobs(&mut self) {
@@ -1033,8 +1043,7 @@ impl Shell {
             if !self.jobs[slot].is_active() {
                 continue;
             }
-            let job = self.jobs[slot];
-            self.collect_children(&job.process_ids, job.process_count);
+            Self::collect_job(&mut self.jobs[slot]);
             self.jobs[slot] = Job::EMPTY;
         }
     }
@@ -1053,10 +1062,10 @@ impl Shell {
         self.print_job(slot);
     }
 
-    fn wait_children(&self, process_ids: &[ProcessId; MAX_STAGES], count: usize) -> WaitSummary {
+    fn wait_children(job: &mut Job) -> WaitSummary {
         let mut summary = WaitSummary::default();
-        for process_id in &process_ids[..count] {
-            match self.wait_noncontinued(*process_id) {
+        for index in 0..job.process_count {
+            match Self::wait_noncontinued(job, index) {
                 Ok(status) => {
                     if status.stopped_signal().is_some() {
                         summary.stopped = true;
@@ -1065,6 +1074,9 @@ impl Shell {
                     } else if status.signal().is_some() || !status.success() {
                         summary.failed = true;
                     }
+                    if !status.continued() && status.stopped_signal().is_none() {
+                        job.final_statuses[index] = Some(status);
+                    }
                 }
                 Err(_) => summary.failed = true,
             }
@@ -1072,16 +1084,23 @@ impl Shell {
         summary
     }
 
-    fn wait_noncontinued(&self, process_id: ProcessId) -> syscall::Result<ChildStatus> {
+    fn wait_noncontinued(job: &mut Job, index: usize) -> syscall::Result<ChildStatus> {
         loop {
-            let status = syscall::wait_child(process_id)?;
+            let status = Self::wait_status(job, index)?;
             if !status.continued() {
                 return Ok(status);
             }
         }
     }
 
-    fn wait_final(&self, process_id: ProcessId) -> syscall::Result<ChildStatus> {
+    fn wait_status(job: &Job, index: usize) -> syscall::Result<ChildStatus> {
+        match job.final_statuses[index] {
+            Some(status) => Ok(status),
+            None => syscall::wait_child(job.process_ids[index]),
+        }
+    }
+
+    fn wait_final(process_id: ProcessId) -> syscall::Result<ChildStatus> {
         loop {
             let status = syscall::wait_child(process_id)?;
             if status.continued() || status.stopped_signal().is_some() {
@@ -1091,9 +1110,9 @@ impl Shell {
         }
     }
 
-    fn collect_children(&self, process_ids: &[ProcessId; MAX_STAGES], count: usize) {
+    fn collect_children(process_ids: &[ProcessId; MAX_STAGES], count: usize) {
         for process_id in &process_ids[..count] {
-            let _ = self.wait_final(*process_id);
+            let _ = Self::wait_final(*process_id);
         }
     }
 
@@ -1119,12 +1138,21 @@ impl Shell {
         process_group: ProcessGroupId,
         state: JobState,
     ) {
+        self.jobs[slot] = self.make_job(process_count, process_group, state);
+    }
+
+    fn make_job(
+        &self,
+        process_count: usize,
+        process_group: ProcessGroupId,
+        state: JobState,
+    ) -> Job {
         let mut job = Job::EMPTY;
         job.process_count = process_count;
         job.process_group = process_group;
         job.process_ids[..process_count].copy_from_slice(&self.children[..process_count]);
         job.state = state;
-        self.jobs[slot] = job;
+        job
     }
 
     fn print_jobs(&mut self) {
@@ -1135,7 +1163,8 @@ impl Shell {
             }
             found = true;
             if self.jobs[slot].state == JobState::Running {
-                self.jobs[slot].state = poll_job(&self.jobs[slot]);
+                let state = poll_job(&mut self.jobs[slot]);
+                self.jobs[slot].state = state;
             }
             self.print_job(slot);
         }
@@ -1169,15 +1198,23 @@ impl Shell {
     }
 }
 
-fn poll_job(job: &Job) -> JobState {
+fn poll_job(job: &mut Job) -> JobState {
     let mut running = false;
     let mut stopped = false;
     let mut failed = false;
     let mut signaled = false;
-    for process_id in &job.process_ids[..job.process_count] {
-        match syscall::try_wait_child(*process_id) {
+    for index in 0..job.process_count {
+        if let Some(status) = job.final_statuses[index] {
+            classify_status(status, &mut failed, &mut signaled);
+            continue;
+        }
+        match syscall::try_wait_child(job.process_ids[index]) {
             Ok(status) if status.stopped_signal().is_some() => stopped = true,
-            Ok(status) => classify_status(status, &mut failed, &mut signaled),
+            Ok(status) if status.continued() => running = true,
+            Ok(status) => {
+                job.final_statuses[index] = Some(status);
+                classify_status(status, &mut failed, &mut signaled);
+            }
             Err(error) if error == syscall::Errno::TRY_AGAIN => running = true,
             Err(_) => failed = true,
         }
@@ -1282,11 +1319,17 @@ fn parse_stage(bytes: &[u8]) -> Result<Stage, ParseError> {
                 match token {
                     b"<" => stage.stdin = Some(r),
                     b">" | b">>" => stage.stdout = Some(r),
-                    b"2>" | b"2>>" => stage.stderr = StderrRedirect::File(r),
+                    b"2>" | b"2>>" => {
+                        stage.stderr = Some(r);
+                        stage.stderr_to_stdout = false;
+                    }
                     _ => return Err(ParseError::RedirectionSyntax),
                 }
             }
-            b"2>&1" => stage.stderr = StderrRedirect::Stdout,
+            b"2>&1" => {
+                stage.stderr = None;
+                stage.stderr_to_stdout = true;
+            }
             _ => {
                 if !stage.command.push_token(token) {
                     return Err(ParseError::RedirectionSyntax);
