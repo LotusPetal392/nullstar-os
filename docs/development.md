@@ -65,9 +65,10 @@ cargo +nightly-2026-02-01 run --locked --quiet -- --boot-check
 cargo +nightly-2026-02-01 run --locked --quiet -- --test
 ```
 
-The first command verifies normal boot. The second creates a temporary smoke
-image and boots it twice to verify persistent FAT writes as well as the complete
-subsystem suite. QEMU must be installed for the full path.
+The first command verifies that normal boot executes PID 1 and reaches the
+userspace shell. The second creates a temporary smoke image and boots it twice
+to verify persistent FAT writes as well as the complete subsystem suite. QEMU
+must be installed for the full path.
 
 Do not substitute `cargo build --workspace` for the release-build command. That
 mode also tries to link the freestanding `_start` binaries as host executables,

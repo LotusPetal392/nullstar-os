@@ -11,6 +11,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "process_probe"
+path = "src/bin/process_probe.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "fault_probe"
 path = "src/bin/fault_probe.rs"
 test = false

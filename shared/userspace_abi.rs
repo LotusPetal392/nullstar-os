@@ -5,6 +5,9 @@
 /// Software interrupt vector used by the GalacticOS userspace ABI.
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
+/// Process identifier reserved for the first userspace process.
+pub const INIT_PROCESS_ID: u64 = 1;
+
 pub mod syscall {
     pub const WRITE: u64 = 1;
     pub const YIELD: u64 = 2;

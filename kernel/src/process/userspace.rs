@@ -43,6 +43,7 @@ mod abi {
 }
 
 pub const SYSCALL_VECTOR: u8 = abi::SYSCALL_VECTOR;
+pub const INIT_PROCESS_ID: u64 = abi::INIT_PROCESS_ID;
 
 const PAGE_FAULT_VECTOR: u64 = 14;
 const GENERAL_PROTECTION_VECTOR: u64 = 13;
@@ -1136,7 +1137,7 @@ struct ProcessManager {
 impl ProcessManager {
     const fn new() -> Self {
         Self {
-            next_process_id: 1,
+            next_process_id: INIT_PROCESS_ID,
             processes: Vec::new(),
             completions: CompletionQueue::new(PROCESS_HISTORY_LIMIT),
             spawned: 0,
@@ -3552,6 +3553,16 @@ impl Runtime {
 
     pub fn terminal_active(&self) -> bool {
         terminal::foreground_process().is_some()
+    }
+
+    pub fn process_is_active(&self, process_id: u64) -> bool {
+        cpu_interrupts::without_interrupts(|| {
+            PROCESS_MANAGER
+                .lock()
+                .processes
+                .iter()
+                .any(|process| process.process_id == process_id && process.is_live())
+        })
     }
 
     pub fn handle_terminal_key(&mut self, key: pc_keyboard::DecodedKey) -> Result<bool, Error> {
