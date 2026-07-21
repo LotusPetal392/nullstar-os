@@ -35,6 +35,7 @@ use super::{
 
 pub use super::{pipe::Snapshot as PipeSnapshot, terminal::Snapshot as TerminalSnapshot};
 
+#[allow(dead_code)]
 mod abi {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
