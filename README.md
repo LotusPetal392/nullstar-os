@@ -19,8 +19,9 @@ experimentation, not production use or untrusted workloads.
 - ELF64 ring-3 processes, file descriptors, pipes, `fork` with copy-on-write,
   transactional `exec`, parent/child waiting, environments, process groups,
   terminal ownership, and a focused signal implementation
-- a kernel diagnostic shell and a userspace shell (`ush`) with pipelines,
-  redirection, variables, background jobs, and basic job control
+- a PID 1 userspace supervisor, a userspace shell (`ush`) with pipelines,
+  redirection, variables, background jobs and basic job control, and an
+  emergency kernel diagnostic shell
 - separate normal-boot and destructive smoke-test images, plus host-side unit
   tests and a local pre-push check script
 
@@ -59,7 +60,7 @@ prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 | --- | --- |
 | `cargo run` | Boot the normal image with the QEMU display enabled. |
 | `cargo run -- --headless` | Boot normally without a display; serial output only. |
-| `cargo run -- --boot-check` | Boot the normal image headlessly and exit after the interactive shell is ready. |
+| `cargo run -- --boot-check` | Boot headlessly and exit after PID 1 launches the userspace shell. |
 | `cargo run -- --test` | Run the full headless smoke suite, including persistent FAT verification across two boots. |
 | `cargo run -- --help` | Show all runner options. |
 
@@ -68,22 +69,9 @@ so its persistence checks do not modify the normal boot image.
 
 ## Using the shells
 
-Normal boot ends at the kernel shell. Its commands inspect hardware and kernel
-state or launch bundled userspace programs. For example:
-
-```text
-help
-memory
-pci
-disk
-ls /
-cat /hello.txt
-run /cat /hello.txt
-ush
-```
-
-The `ush` command starts the userspace shell. Program names may omit the leading
-slash. A short session might look like this:
+Normal boot starts `/init` as PID 1. Init launches `ush` as the foreground
+userspace shell and supervises it. Program names may omit the leading slash. A
+short session might look like this:
 
 ```text
 ush> cat /hello.txt | upper
@@ -98,7 +86,12 @@ ush> wait
 ush> exit
 ```
 
-Run `help` in either shell for its authoritative command list.
+After `exit`, init starts a fresh shell. Run `help` for the authoritative
+userspace command list.
+
+If init cannot start or terminates unexpectedly, the kernel enters its emergency
+diagnostic shell. That shell exposes hardware and kernel-state commands such as
+`memory`, `interrupts`, `pci`, `disk`, and `process`.
 
 ## Testing locally
 

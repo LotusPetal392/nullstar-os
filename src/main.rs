@@ -39,7 +39,35 @@ const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals veri
 const USER_SIGNAL_HANDLER_TEST_MARKER: &str = "userspace handled signals verified:";
 const NORMAL_BOOT_MODE_MARKER: &str = "boot mode selected: normal";
 const NORMAL_BOOT_READY_MARKER: &str = "normal boot ready:";
+const NORMAL_BOOT_INIT_MARKER: &str = "userspace init ready: pid=1";
+const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
+const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Default)]
+struct NormalBootProgress {
+    mode_selected: bool,
+    kernel_ready: bool,
+    init_ready: bool,
+    init_launched_shell: bool,
+    shell_ready: bool,
+}
+
+impl NormalBootProgress {
+    fn observe(&mut self, line: &str) -> bool {
+        self.mode_selected |= line.contains(NORMAL_BOOT_MODE_MARKER);
+        self.kernel_ready |= line.contains(NORMAL_BOOT_READY_MARKER);
+        self.init_ready |= line.contains(NORMAL_BOOT_INIT_MARKER);
+        self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
+        self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
+
+        self.mode_selected
+            && self.kernel_ready
+            && self.init_ready
+            && self.init_launched_shell
+            && self.shell_ready
+    }
+}
 
 #[derive(Debug, Default)]
 struct Options {
@@ -105,7 +133,7 @@ fn parse_options() -> Result<Options, ExitCode> {
 fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--boot-check | --test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
-    println!("  --boot-check  Verify that the normal image reaches the interactive shell");
+    println!("  --boot-check  Verify that PID 1 launches the userspace shell");
     println!(
         "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, process environments, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
     );
@@ -151,10 +179,9 @@ fn run_interactive(mut command: Command) -> ExitCode {
 }
 
 fn run_normal_boot_check(options: &Options) -> ExitCode {
-    let mut normal_mode_selected = false;
+    let mut progress = NormalBootProgress::default();
     let passed = run_qemu_until(qemu_command(options), "normal boot check", move |line| {
-        normal_mode_selected |= line.contains(NORMAL_BOOT_MODE_MARKER);
-        normal_mode_selected && line.contains(NORMAL_BOOT_READY_MARKER)
+        progress.observe(line)
     });
     if passed {
         println!("QEMU normal boot check passed");
@@ -410,4 +437,32 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
     eprintln!("Could not start QEMU: {error}");
     eprintln!("Make sure qemu-system-x86_64 is installed.");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NORMAL_BOOT_INIT_MARKER, NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_MODE_MARKER,
+        NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER, NormalBootProgress,
+    };
+
+    #[test]
+    fn normal_boot_requires_userspace_init_and_shell() {
+        let mut progress = NormalBootProgress::default();
+
+        assert!(!progress.observe(NORMAL_BOOT_MODE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_READY_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_INIT_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_INIT_SHELL_MARKER));
+        assert!(progress.observe(NORMAL_BOOT_SHELL_MARKER));
+    }
+
+    #[test]
+    fn kernel_readiness_alone_does_not_complete_normal_boot() {
+        let mut progress = NormalBootProgress::default();
+
+        assert!(!progress.observe(NORMAL_BOOT_MODE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_READY_MARKER));
+        assert!(!progress.observe("Interactive shell ready"));
+    }
 }

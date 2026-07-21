@@ -440,7 +440,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("-------------");
         println!();
         println!("Normal boot complete. Smoke tests were not run.");
-        println!("Kernel services and the interactive shell are ready.");
+        println!("Kernel services are ready. Starting userspace.");
         serial_println!(
             "normal boot ready: usable_frames={}, allocated_frames={}, remaining_frames={}",
             usable_frames,
@@ -456,7 +456,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             partition_inventory,
             filesystem_info,
         );
-        enter_interactive_shell(system_info, userspace_runtime);
+        enter_userspace(system_info, userspace_runtime);
     }
 
     let elf_image = if vfs_info.is_some() {
@@ -509,10 +509,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     let process_frame_baseline = frame_allocator.allocated_frame_count();
-    let init_image = match elf::validate("/init") {
+    let process_probe_image = match elf::validate("/process-probe") {
         Ok(image) => image,
         Err(error) => {
-            serial_println!("userspace init validation failed: {error}");
+            serial_println!("userspace process-probe validation failed: {error}");
             hlt_loop();
         }
     };
@@ -524,29 +524,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
-    let init_spawn = match userspace::spawn(
-        "/init",
-        "user-init",
-        &init_image,
+    let process_probe_spawn = match userspace::spawn(
+        "/process-probe",
+        "user-process-probe",
+        &process_probe_image,
         &mut mapper,
         &mut frame_allocator,
         physical_memory_offset,
     ) {
         Ok(info) => info,
         Err(error) => {
-            serial_println!("failed to spawn /init: {error}");
+            serial_println!("failed to spawn /process-probe: {error}");
             hlt_loop();
         }
     };
     serial_println!(
         "userspace process spawned: pid={}, task={}, path={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, owned_frames={}",
-        init_spawn.process_id,
-        init_spawn.task_id,
-        init_spawn.path,
-        init_spawn.entry_point,
-        init_spawn.page_table_address,
-        init_spawn.mapped_pages,
-        init_spawn.owned_frames
+        process_probe_spawn.process_id,
+        process_probe_spawn.task_id,
+        process_probe_spawn.path,
+        process_probe_spawn.entry_point,
+        process_probe_spawn.page_table_address,
+        process_probe_spawn.mapped_pages,
+        process_probe_spawn.owned_frames
     );
 
     let fault_spawn = match userspace::spawn(
@@ -576,7 +576,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let process_snapshot = userspace::wait_for_processes(
         &mut frame_allocator,
-        &[init_spawn.process_id, fault_spawn.process_id],
+        &[process_probe_spawn.process_id, fault_spawn.process_id],
     );
     let process_frame_after = frame_allocator.allocated_frame_count();
     for result in &process_snapshot.results {
@@ -596,15 +596,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
-    let init_result = process_snapshot
+    let process_probe_result = process_snapshot
         .results
         .iter()
-        .find(|result| result.path == "/init");
+        .find(|result| result.path == "/process-probe");
     let fault_result = process_snapshot
         .results
         .iter()
         .find(|result| result.path == "/fault-probe");
-    let init_valid = init_result
+    let process_probe_valid = process_probe_result
         .map(|result| {
             result.exit_code() == Some(42)
                 && result.scheduled_count >= 2
@@ -621,12 +621,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && process_snapshot.faulted == 1
         && process_snapshot.reaped == 2
         && process_snapshot.waitable_zombies == 0
-        && init_valid
+        && process_probe_valid
         && fault_valid
         && frame_balance;
     if !process_verified {
         serial_println!(
-            "process isolation verification failed: spawned={}, active={}, zombies={}, exited={}, faulted={}, reaped={}, baseline_frames={}, final_frames={}, init_valid={}, fault_valid={}",
+            "process isolation verification failed: spawned={}, active={}, zombies={}, exited={}, faulted={}, reaped={}, baseline_frames={}, final_frames={}, process_probe_valid={}, fault_valid={}",
             process_snapshot.spawned,
             process_snapshot.active,
             process_snapshot.waitable_zombies,
@@ -635,22 +635,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             process_snapshot.reaped,
             process_frame_baseline,
             process_frame_after,
-            init_valid,
+            process_probe_valid,
             fault_valid
         );
         hlt_loop();
     }
-    let init_result = init_result.expect("validated init result disappeared");
+    let process_probe_result =
+        process_probe_result.expect("validated process-probe result disappeared");
     serial_println!(
-        "process isolation verified: spawned={}, exited={}, faulted={}, reaped={}, zombies=0, frames_reclaimed={}, frame_balance={}, init_schedules={}, init_runtime_ticks={}",
+        "process isolation verified: spawned={}, exited={}, faulted={}, reaped={}, zombies=0, frames_reclaimed={}, frame_balance={}, probe_schedules={}, probe_runtime_ticks={}",
         process_snapshot.spawned,
         process_snapshot.exited,
         process_snapshot.faulted,
         process_snapshot.reaped,
         process_snapshot.frames_reclaimed,
         frame_balance,
-        init_result.scheduled_count,
-        init_result.runtime_ticks
+        process_probe_result.scheduled_count,
+        process_probe_result.runtime_ticks
     );
 
     let mut userspace_runtime =
@@ -2476,6 +2477,58 @@ fn detect_boot_mode() -> boot_mode::BootMode {
                 boot_mode::BOOT_MODE_PATH
             );
             boot_mode::BootMode::Normal
+        }
+    }
+}
+
+fn enter_userspace(system_info: shell::SystemInfo, mut userspace_runtime: userspace::Runtime) -> ! {
+    let init = match userspace_runtime.spawn_foreground("/init", &[]) {
+        Ok(init) => init,
+        Err(error) => {
+            serial_println!("failed to start userspace init: {error}");
+            println!("Userspace init failed to start.");
+            println!("Entering the emergency kernel shell.");
+            enter_interactive_shell(system_info, userspace_runtime);
+        }
+    };
+    if init.process_id != userspace::INIT_PROCESS_ID {
+        serial_println!(
+            "userspace init received unexpected pid: expected={}, actual={}",
+            userspace::INIT_PROCESS_ID,
+            init.process_id
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "userspace init started: pid={}, group={}, task={}, path={}, entry={:#018x}",
+        init.process_id,
+        init.process_group_id,
+        init.task_id,
+        init.path,
+        init.entry_point
+    );
+
+    let mut reported_seconds = 0;
+    loop {
+        x86_64::instructions::hlt();
+        if let Err(error) = userspace_runtime.poll() {
+            serial_println!("userspace runtime poll failed: {error}");
+        }
+        if !userspace_runtime.process_is_active(init.process_id) {
+            serial_println!(
+                "userspace init terminated: pid={}; entering emergency kernel shell",
+                init.process_id
+            );
+            println!();
+            println!("Userspace init terminated.");
+            println!("Entering the emergency kernel shell.");
+            enter_interactive_shell(system_info, userspace_runtime);
+        }
+
+        let elapsed_seconds = interrupts::timer_ticks() / interrupts::TIMER_HZ;
+        if elapsed_seconds > reported_seconds {
+            reported_seconds = elapsed_seconds;
+            serial_println!("uptime: {elapsed_seconds}s");
         }
     }
 }

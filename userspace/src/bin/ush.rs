@@ -23,6 +23,7 @@ const VARIABLE_NAME_BYTES: usize = limits::MAX_ENVIRONMENT_NAME_BYTES;
 const VARIABLE_VALUE_BYTES: usize = COMMAND_BYTES;
 
 const PROMPT: &[u8] = b"ush> ";
+const READY: &[u8] = b"userspace shell ready\n";
 const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
@@ -310,6 +311,9 @@ impl Shell {
         shell
     }
     fn run(&mut self) -> ! {
+        if syscall::write_all(STDOUT, READY).is_err() {
+            syscall::exit(1);
+        }
         loop {
             if syscall::write_all(STDOUT, PROMPT).is_err() {
                 syscall::exit(1);

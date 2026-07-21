@@ -28,7 +28,8 @@ the boot-mode marker, and test fixtures into images produced by
 Both images contain the same kernel and userspace programs. Their `/BOOTMODE`
 file selects one of two paths:
 
-- `normal` initializes services and enters the interactive kernel shell.
+- `normal` initializes services, starts `/init` as PID 1, and lets init launch
+  the foreground userspace shell.
 - `smoke-test` runs deterministic subsystem probes and emits serial markers for
   the host harness. The persistence test uses two boots of a temporary image.
 
@@ -47,6 +48,9 @@ Initialization proceeds in dependency order:
    MBR or GPT partitions.
 5. Mount the first supported FAT volume at `/`, then mount tmpfs at `/tmp`.
 6. Initialize the scheduler and branch into normal or smoke-test behavior.
+7. On normal boot, create PID 1 from `/init`; init launches and supervises
+   `/ush`. If init cannot start or later terminates, enter the emergency kernel
+   shell.
 
 Serial logging remains available throughout boot, including before the
 framebuffer is ready. Fatal early-boot failures report a diagnostic and halt.
@@ -87,6 +91,13 @@ and use software interrupt `0x80` for the GalacticOS syscall ABI. The shared
 numeric ABI is defined once in `shared/userspace_abi.rs` and included by both
 sides.
 
+Normal boot reserves process identifier 1 for `/init`. Init remains outside the
+interactive process group, launches `/ush` as a foreground child group, waits
+for shell state changes, restores a stopped shell, and starts a fresh shell
+after final exit or signal termination. Direct shell children remain owned and
+reaped by `ush`; abandoned descendants continue to use the bounded internal
+kernel reaper.
+
 The process manager owns:
 
 - address spaces and copy-on-write fork state
@@ -126,12 +137,15 @@ stop events reach the correct pipeline.
 ## Shells
 
 The kernel shell in `kernel/src/shell.rs` is a diagnostic and control surface.
-It can inspect initialized subsystems and start or wait for userspace programs.
+It can inspect initialized subsystems and start or wait for userspace programs,
+but normal boot reaches it only as an emergency fallback when init is
+unavailable.
 
 The ring-3 `ush` program in `userspace/src/bin/ush.rs` exercises the userspace
 ABI. It implements pipelines, descriptor redirection, variables and exported
 environments, background jobs, foreground/background transitions, and signal-
-based `Ctrl-C`/`Ctrl-Z` handling.
+based `Ctrl-C`/`Ctrl-Z` handling. PID 1 keeps the machine usable by restarting
+`ush` after the shell exits.
 
 ## Resource bounds
 
