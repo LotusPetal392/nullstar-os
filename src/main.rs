@@ -26,6 +26,7 @@ const USER_FILE_IO_TEST_MARKER: &str = "userspace file I/O verified:";
 const USER_RUST_RUNTIME_TEST_MARKER: &str = "userspace Rust runtime verified:";
 const USER_EXEC_TEST_MARKER: &str = "userspace transactional exec verified:";
 const USER_FORK_TEST_MARKER: &str = "userspace copy-on-write fork verified:";
+const USER_ENVIRONMENT_TEST_MARKER: &str = "userspace environments verified:";
 const USER_TERMINAL_TEST_MARKER: &str = "userspace terminal verified:";
 const USER_PIPE_TEST_MARKER: &str = "userspace pipe verified:";
 const USER_SHELL_TEST_MARKER: &str = "userspace shell verified:";
@@ -36,7 +37,7 @@ const USER_STOPPED_JOB_TEST_MARKER: &str = "userspace stopped jobs verified:";
 const USER_TMPFS_TEST_MARKER: &str = "userspace tmpfs redirection verified:";
 const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals verified:";
 const USER_SIGNAL_HANDLER_TEST_MARKER: &str = "userspace handled signals verified:";
-const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(180);
+const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Default)]
 struct Options {
@@ -86,7 +87,7 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--test]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!(
-        "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
+        "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, process environments, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
     );
 }
 
@@ -213,6 +214,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
         let mut user_rust_runtime_ready = false;
         let mut user_exec_ready = false;
         let mut user_fork_ready = false;
+        let mut user_environment_ready = false;
         let mut user_terminal_ready = false;
         let mut user_pipe_ready = false;
         let mut user_shell_ready = false;
@@ -254,6 +256,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
             user_rust_runtime_ready |= line.contains(USER_RUST_RUNTIME_TEST_MARKER);
             user_exec_ready |= line.contains(USER_EXEC_TEST_MARKER);
             user_fork_ready |= line.contains(USER_FORK_TEST_MARKER);
+            user_environment_ready |= line.contains(USER_ENVIRONMENT_TEST_MARKER);
             user_terminal_ready |= line.contains(USER_TERMINAL_TEST_MARKER);
             user_pipe_ready |= line.contains(USER_PIPE_TEST_MARKER);
             user_shell_ready |= line.contains(USER_SHELL_TEST_MARKER);
@@ -283,6 +286,7 @@ fn run_qemu_phase(mut command: Command, phase: SmokePhase) -> bool {
                 && user_rust_runtime_ready
                 && user_exec_ready
                 && user_fork_ready
+                && user_environment_ready
                 && user_terminal_ready
                 && user_pipe_ready
                 && user_shell_ready

@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod args;
+pub mod environment;
 pub mod heap;
 pub mod syscall;
 

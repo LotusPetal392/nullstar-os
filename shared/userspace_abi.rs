@@ -26,6 +26,8 @@ pub mod syscall {
     pub const SIGNAL_ACTION: u64 = 18;
     pub const SIGNAL_MASK: u64 = 19;
     pub const SIGNAL_RETURN: u64 = 20;
+    pub const ENVIRONMENT_SET: u64 = 21;
+    pub const ENVIRONMENT_UNSET: u64 = 22;
 }
 
 pub mod signal {
@@ -147,6 +149,9 @@ pub mod limits {
     pub const MAX_OPEN_FILES: usize = 16;
     pub const MAX_ARGUMENTS: usize = 16;
     pub const MAX_ARGUMENT_BYTES: usize = 4096;
+    pub const MAX_ENVIRONMENT_VARIABLES: usize = 16;
+    pub const MAX_ENVIRONMENT_BYTES: usize = 4096;
+    pub const MAX_ENVIRONMENT_NAME_BYTES: usize = 64;
     pub const MAX_COMMAND_BYTES: usize = 512;
 }
 

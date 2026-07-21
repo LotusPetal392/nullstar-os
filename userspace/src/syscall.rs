@@ -72,6 +72,8 @@ impl Errno {
     pub const NO_CHILD: Self = Self((-abi_errno::NO_CHILD) as i32);
     pub const TRY_AGAIN: Self = Self((-abi_errno::TRY_AGAIN) as i32);
     pub const INVALID_ARGUMENT: Self = Self((-abi_errno::INVALID_ARGUMENT) as i32);
+    pub const ARGUMENT_TOO_LARGE: Self = Self((-abi_errno::ARGUMENT_TOO_LARGE) as i32);
+    pub const NO_SPACE: Self = Self((-abi_errno::NO_SPACE) as i32);
 
     pub const fn code(self) -> i32 {
         self.0
@@ -610,6 +612,34 @@ pub fn signal_mask(how: SignalMaskHow, mask: SignalMask) -> Result<SignalMask> {
 
 pub fn current_signal_mask() -> Result<SignalMask> {
     signal_mask(SignalMaskHow::Block, SignalMask::EMPTY)
+}
+
+pub fn environment_set(name: &[u8], value: &[u8]) -> Result<()> {
+    let mut result = syscall::ENVIRONMENT_SET;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") name.as_ptr() as u64,
+            in("rsi") name.len() as u64,
+            in("rdx") value.as_ptr() as u64,
+            in("r10") value.len() as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn environment_unset(name: &[u8]) -> Result<()> {
+    let mut result = syscall::ENVIRONMENT_UNSET;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") name.as_ptr() as u64,
+            in("rsi") name.len() as u64,
+        );
+    }
+    decode(result).map(|_| ())
 }
 
 pub fn exit(code: u64) -> ! {

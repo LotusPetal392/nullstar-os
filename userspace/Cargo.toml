@@ -124,3 +124,15 @@ name = "signal_lifecycle_target"
 path = "src/bin/signal_lifecycle_target.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "environment_probe"
+path = "src/bin/environment_probe.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "environment_target"
+path = "src/bin/environment_target.rs"
+test = false
+bench = false
