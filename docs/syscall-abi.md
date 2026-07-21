@@ -51,12 +51,13 @@ directory, then updates that entry. Fork, spawn, and exec already preserve the
 process environment, so they also preserve the working directory.
 
 The platform `stat`, `read_directory`, and `chdir` calls accept absolute paths
-or paths relative to the calling process's working directory. `.` and `..` are
-normalized by the VFS.
+or paths relative to the calling process's working directory. The platform path
+resolver canonicalizes `.`, `..`, and repeated separators before VFS lookup.
 
 `PWD` is reserved. The ordinary environment mutation syscalls reject attempts
 to set or unset it, preventing a process from claiming a directory that the VFS
-did not validate.
+did not validate. Because working-directory state uses the bounded process
+environment, `PWD` counts toward the environment entry and byte limits.
 
 The older `open`, `spawn_command`, and `execve` calls retain their existing path
 rules in this milestone. Converting those operations to relative-path-aware,
