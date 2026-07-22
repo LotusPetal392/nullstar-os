@@ -30,7 +30,7 @@ const USER_ENVIRONMENT_TEST_MARKER: &str = "userspace environments verified:";
 const USER_TERMINAL_TEST_MARKER: &str = "userspace terminal verified:";
 const USER_PIPE_TEST_MARKER: &str = "userspace pipe verified:";
 const USER_SHELL_TEST_MARKER: &str = "userspace shell verified:";
-const USER_PIPELINE_OUTPUT_MARKER: &str = "HELLO THROUGH A BLOCKING GALACTICOS PIPE.";
+const USER_PIPELINE_OUTPUT_MARKER: &str = "HELLO THROUGH A BLOCKING NULLSTAR OS PIPE.";
 const USER_PIPELINE_TEST_MARKER: &str = "userspace multi-stage pipeline verified:";
 const USER_BACKGROUND_TEST_MARKER: &str = "userspace background jobs verified:";
 const USER_STOPPED_JOB_TEST_MARKER: &str = "userspace stopped jobs verified:";
@@ -233,7 +233,7 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
 
 fn persistent_test_image_path() -> PathBuf {
     env::temp_dir().join(format!(
-        "galactic-os-persistent-fat-{}.img",
+        "nullstar-os-persistent-fat-{}.img",
         std::process::id()
     ))
 }
