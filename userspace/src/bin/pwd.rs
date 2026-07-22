@@ -16,9 +16,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         Ok(path) => path,
         Err(_) => syscall::exit(1),
     };
-    if syscall::write_all(STDOUT, path).is_err()
-        || syscall::write_all(STDOUT, b"\n").is_err()
-    {
+    if syscall::write_all(STDOUT, path).is_err() || syscall::write_all(STDOUT, b"\n").is_err() {
         syscall::exit(1);
     }
     syscall::exit(0)
