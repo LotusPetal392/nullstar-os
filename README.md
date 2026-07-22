@@ -21,7 +21,8 @@ experimentation, not production use or untrusted workloads.
   terminal ownership, and a focused signal implementation
 - a documented userspace platform ABI with system discovery, file metadata,
   paged directory reads, per-process working directories, descriptor
-  duplication, parent-process lookup, and direct child signaling
+  duplication, parent-process lookup, direct child signaling, and controlled
+  process-group reassignment
 - a PID 1 userspace supervisor, a userspace shell (`ush`) with pipelines,
   redirection, variables, background jobs and basic job control, and an
   emergency kernel diagnostic shell
@@ -149,6 +150,9 @@ images, and launches QEMU.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`
   operations accept explicit relative paths. Bare executable names still use
   the root-directory command namespace rather than a configurable search path.
+- Descriptor-free new-process-group launches use `fork`, process-group control,
+  and `execve`. Descriptor-bearing launches, joined pipeline stages, and the
+  `/exec` compatibility launcher still use the legacy atomic spawn syscall.
 - Process, descriptor, pipe, environment, job, and filesystem resources have
   fixed bounds. These keep failure behavior deterministic while the kernel is
   still evolving.
