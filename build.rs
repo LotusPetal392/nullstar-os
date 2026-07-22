@@ -35,6 +35,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_pwd")
             .expect("userspace pwd artifact path was not set"),
     );
+    let userspace_stat = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_stat")
+            .expect("userspace stat artifact path was not set"),
+    );
     let userspace_readline = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_readline")
             .expect("userspace readline artifact path was not set"),
@@ -127,6 +131,7 @@ fn main() {
         image.set_file(String::from("cat"), userspace_cat.clone());
         image.set_file(String::from("ls"), userspace_ls.clone());
         image.set_file(String::from("pwd"), userspace_pwd.clone());
+        image.set_file(String::from("stat"), userspace_stat.clone());
         image.set_file(String::from("readline"), userspace_readline.clone());
         image.set_file(
             String::from("pipe-producer"),
