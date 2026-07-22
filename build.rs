@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-const HELLO_TEXT: &str = "Hello from a GalacticOS userspace file descriptor.\n";
+const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n";
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
 
@@ -175,11 +175,11 @@ fn main() {
         image
     };
 
-    let bios_image = output_directory.join("galactic-os-bios.img");
+    let bios_image = output_directory.join("nullstar-os-bios.img");
     build_image(NORMAL_BOOT_MODE)
         .create_bios_image(&bios_image)
         .expect("failed to create BIOS disk image");
-    let smoke_test_bios_image = output_directory.join("galactic-os-smoke-test-bios.img");
+    let smoke_test_bios_image = output_directory.join("nullstar-os-smoke-test-bios.img");
     build_image(SMOKE_TEST_BOOT_MODE)
         .create_bios_image(&smoke_test_bios_image)
         .expect("failed to create smoke-test BIOS disk image");
