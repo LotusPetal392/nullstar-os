@@ -98,9 +98,8 @@ fn platform_set_process_group(
 
     manager.processes[target_index].process_group_id = process_group_id;
     if generic_launch {
-        manager.processes[caller_index].child_spawn_count = manager.processes[caller_index]
-            .child_spawn_count
-            .saturating_add(1);
+        let parent = &mut manager.processes[caller_index];
+        parent.child_spawn_count = parent.child_spawn_count.saturating_add(1);
         manager.child_spawns = manager.child_spawns.saturating_add(1);
     }
     drop(manager);
@@ -178,12 +177,19 @@ fn platform_foreground_process_group(process_id: u64, process_group_id: u64) -> 
         if !terminal::transfer(parent_process_id, process_id) {
             return error_return(ERR_IO);
         }
-        let mut manager = PROCESS_MANAGER.lock();
-        let Some(process) = manager.process_mut(process_id) else {
+        let updated = {
+            let mut manager = PROCESS_MANAGER.lock();
+            if let Some(process) = manager.process_mut(process_id) {
+                process.terminal_parent = Some(parent_process_id);
+                true
+            } else {
+                false
+            }
+        };
+        if !updated {
             let _ = terminal::transfer(process_id, parent_process_id);
             return error_return(ERR_NO_PROCESS);
-        };
-        process.terminal_parent = Some(parent_process_id);
+        }
         return members.len() as u64;
     }
 
