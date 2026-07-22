@@ -1,4 +1,4 @@
-# GalacticOS architecture
+# NullStar OS architecture
 
 This document describes the implemented system as it exists today. It is a
 map of the code, not a promise of stable internal APIs.
@@ -9,7 +9,7 @@ The repository contains three Cargo packages with two target environments:
 
 ```mermaid
 flowchart LR
-    H[Host package<br/>galactic-os] --> K[Kernel artifact<br/>x86_64-unknown-none]
+    H[Host package<br/>nullstar-os] --> K[Kernel artifact<br/>x86_64-unknown-none]
     H --> U[Userspace artifacts<br/>x86_64-unknown-none]
     K --> B[Root build.rs]
     U --> B
@@ -19,7 +19,7 @@ flowchart LR
     S --> Q
 ```
 
-The root `galactic-os` package is a normal host executable. Cargo's unstable
+The root `nullstar-os` package is a normal host executable. Cargo's unstable
 artifact-dependency support builds `kernel` and every declared `userspace`
 binary for `x86_64-unknown-none`. The root build script embeds those artifacts,
 the boot-mode marker, and test fixtures into images produced by
@@ -87,7 +87,7 @@ stress probes and other destructive checks are restricted to the smoke image.
 
 Userspace programs are statically linked ELF64 images with custom `_start`
 entries from the `userspace` crate. They run in ring 3 with separate page tables
-and use software interrupt `0x80` for the GalacticOS syscall ABI. The shared
+and use software interrupt `0x80` for the NullStar OS syscall ABI. The shared
 numeric ABI is defined once in `shared/userspace_abi.rs` and included by both
 sides.
 
