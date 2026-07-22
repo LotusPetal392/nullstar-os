@@ -47,8 +47,8 @@ number of directory records accepted by one call.
 
 Every process starts in `/` unless its inherited environment contains the
 kernel-managed `PWD` entry. `chdir` validates that the target exists and is a
-directory, then updates that entry. Fork, spawn, and exec already preserve the
-process environment, so they also preserve the working directory.
+directory, then updates that entry. Fork, spawn, and exec preserve the process
+environment, so they also preserve the working directory.
 
 The `stat`, `read_directory`, `chdir`, and legacy `open` calls accept absolute
 paths or paths relative to the calling process's working directory. The shared
@@ -56,14 +56,21 @@ path resolver canonicalizes `.`, `..`, and repeated separators before VFS
 lookup. This also makes shell redirection targets relative to the shell's
 current directory.
 
+`spawn_command` and `execve` use two executable-name modes:
+
+- names without a slash, such as `cat`, retain the root command namespace and
+  resolve to `/cat`;
+- explicit relative paths containing a slash, such as `./cat`, `../cat`, or
+  `tools/cat`, resolve against the calling process's working directory and are
+  canonicalized before image lookup.
+
+Absolute executable paths retain their existing behavior. This milestone does
+not add a configurable `PATH` search list.
+
 `PWD` is reserved. The ordinary environment mutation syscalls reject attempts
 to set or unset it, preventing a process from claiming a directory that the VFS
 did not validate. Because working-directory state uses the bounded process
 environment, `PWD` counts toward the environment entry and byte limits.
-
-`spawn_command` and `execve` retain their existing executable-path rules in this
-milestone. Converting command execution to cwd-aware explicit relative paths
-remains follow-up work.
 
 ## Metadata and directory records
 
