@@ -4,6 +4,7 @@
 use userspace::{
     abi::{limits, signal},
     environment::Environment,
+    platform,
     syscall::{
         self, ChildStatus, FileDescriptor, OpenFlags, PipePair, ProcessGroupId, ProcessId, STDERR,
         STDIN, STDOUT, SpawnFlags,
@@ -24,7 +25,7 @@ const VARIABLE_VALUE_BYTES: usize = COMMAND_BYTES;
 
 const PROMPT: &[u8] = b"ush> ";
 const READY: &[u8] = b"userspace shell ready\n";
-const HELP: &[u8] = b"builtins: help jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
+const HELP: &[u8] = b"builtins: help cd DIRECTORY jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
 const REDIRECTION_SYNTAX_FAILURE: &[u8] = b"ush: invalid redirection syntax\n";
@@ -50,6 +51,8 @@ const VARIABLE_VALUE_FAILURE: &[u8] = b"ush: variable value is too long\n";
 const VARIABLE_LIMIT_FAILURE: &[u8] = b"ush: variable table is full\n";
 const VARIABLE_UPDATE_FAILURE: &[u8] = b"ush: environment update failed\n";
 const EXPANSION_FAILURE: &[u8] = b"ush: variable expansion failed\n";
+const CHANGE_DIRECTORY_USAGE: &[u8] = b"ush: expected exactly one directory\n";
+const CHANGE_DIRECTORY_FAILURE: &[u8] = b"ush: cd failed\n";
 
 #[derive(Clone, Copy)]
 struct ByteBuffer<const N: usize> {
@@ -225,6 +228,7 @@ impl Job {
 #[derive(Clone, Copy)]
 enum Builtin {
     Help,
+    ChangeDirectory,
     Jobs,
     Wait(WaitTarget),
     Foreground(JobTarget),
@@ -403,6 +407,9 @@ impl Shell {
     fn run_builtin(&mut self, b: Builtin, command: &[u8]) {
         match b {
             Builtin::Help => self.output(HELP),
+            Builtin::ChangeDirectory => {
+                self.change_directory(command_arguments(command));
+            }
             Builtin::Jobs => self.print_jobs(),
             Builtin::Wait(WaitTarget::All) => match self.wait_all_jobs() {
                 WaitAllResult::Complete => self.output(WAIT_COMPLETE),
@@ -1200,6 +1207,57 @@ impl Shell {
     fn error(&self, bytes: &[u8]) {
         let _ = syscall::write_all(STDERR, bytes);
     }
+
+    fn change_directory(&mut self, arguments: &[u8]) {
+        let arguments = trim_horizontal(arguments);
+        if arguments.is_empty() || arguments.iter().any(|byte| is_horizontal_space(*byte)) {
+            self.error(CHANGE_DIRECTORY_USAGE);
+            return;
+        }
+
+        let mut path = ByteBuffer::<PATH_BYTES>::EMPTY;
+        if !self.expand_bytes(arguments, &mut path) || path.as_slice().is_empty() {
+            self.error(EXPANSION_FAILURE);
+            return;
+        }
+
+        if platform::chdir(path.as_slice()).is_err() {
+            self.error(CHANGE_DIRECTORY_FAILURE);
+            return;
+        }
+
+        // Keep the shell's local variable table synchronized with the
+        // kernel-managed PWD value without calling environment_set(), because
+        // the platform ABI intentionally reserves PWD.
+        let mut working_directory = [0_u8; limits::MAX_PATH_BYTES + 1];
+        let Ok(working_directory) = platform::getcwd(&mut working_directory) else {
+            self.error(CHANGE_DIRECTORY_FAILURE);
+            return;
+        };
+
+        let index = match self.variable_index(b"PWD") {
+            Some(index) => index,
+            None => {
+                let Some(index) = self
+                    .variables
+                    .iter()
+                    .position(|variable| !variable.is_active())
+                else {
+                    self.error(VARIABLE_LIMIT_FAILURE);
+                    return;
+                };
+                index
+            }
+        };
+
+        let mut variable = Variable::EMPTY;
+        if !variable.name.copy_from(b"PWD") || !variable.value.copy_from(working_directory) {
+            self.error(CHANGE_DIRECTORY_FAILURE);
+            return;
+        }
+        variable.exported = true;
+        self.variables[index] = variable;
+    }
 }
 
 fn poll_job(job: &mut Job) -> JobState {
@@ -1379,6 +1437,7 @@ fn detect_builtin(command: &[u8]) -> Option<Builtin> {
     let arguments = &command[token_end..];
     match &command[..token_end] {
         b"help" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => Some(Builtin::Help),
+        b"cd" => Some(Builtin::ChangeDirectory),
         b"jobs" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => Some(Builtin::Jobs),
         b"exit" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => Some(Builtin::Exit),
         b"wait" => Some(Builtin::Wait(parse_wait_target(arguments))),
