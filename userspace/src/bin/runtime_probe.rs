@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     heap::BumpHeap,
     platform::{self, DirectoryEntry},
-    syscall::{self, OpenFlags, STDERR, STDIN, STDOUT},
+    syscall::{self, OpenFlags, SpawnFlags, STDERR, STDIN, STDOUT},
 };
 
 userspace::entry!(rust_main);
@@ -111,7 +111,7 @@ fn platform_probe(argument: &[u8]) -> bool {
     if platform::read_directory(b".", 0, &mut directory_page).is_err() {
         return false;
     }
-    if argument != b"runtime-smoke" && !relative_open_probe() {
+    if argument != b"runtime-smoke" && (!relative_open_probe() || !relative_spawn_probe()) {
         return false;
     }
     if syscall::environment_set(b"PWD", b"/").is_ok() {
@@ -149,6 +149,20 @@ fn relative_open_probe() -> bool {
         && closed
         && platform::stat(b"/tmp/cwd-open.txt")
             .is_ok_and(|stat| stat.is_file() && stat.size == CONTENTS.len() as u64)
+}
+
+fn relative_spawn_probe() -> bool {
+    let Ok(process_id) = syscall::spawn_command(
+        b"../pwd",
+        SpawnFlags::EMPTY,
+        None,
+        None,
+        None,
+        None,
+    ) else {
+        return false;
+    };
+    syscall::wait_child(process_id).is_ok_and(|status| status.success())
 }
 
 fn root_directory_has_expected_entries() -> bool {
