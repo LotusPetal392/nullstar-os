@@ -1,6 +1,6 @@
-# GalacticOS userspace ABI
+# NullStar OS userspace ABI
 
-GalacticOS exposes a small Rust-oriented ring-3 ABI through software interrupt
+NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 `0x80`. The shared numeric and structure definitions live in
 `shared/userspace_abi.rs`; kernel and userspace include that file directly so
 they cannot silently disagree about call numbers or layouts.
@@ -99,7 +99,7 @@ cannot yet be represented as an ordinary descriptor numbered 3 or higher.
 
 ## Direct signals
 
-`kill` uses the focused GalacticOS signal set. A process may target one of its
+`kill` uses the focused NullStar OS signal set. A process may target one of its
 direct children. Other targets return `EPERM`; missing or completed targets
 return `ESRCH`. Process-group signaling and shell job control continue to use
 the existing group-oriented syscall.
