@@ -29,8 +29,7 @@ fn main() {
             .expect("userspace cat artifact path was not set"),
     );
     let userspace_ls = PathBuf::from(
-        env::var_os("CARGO_BIN_FILE_USERSPACE_ls")
-            .expect("userspace ls artifact path was not set"),
+        env::var_os("CARGO_BIN_FILE_USERSPACE_ls").expect("userspace ls artifact path was not set"),
     );
     let userspace_pwd = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_pwd")
