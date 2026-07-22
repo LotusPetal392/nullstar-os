@@ -60,9 +60,7 @@ pub fn process_group_syscall_interrupt_entry_address() -> VirtAddr {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn galactic_process_group_syscall_dispatch(
-    current_stack_pointer: usize,
-) -> usize {
+pub extern "C" fn galactic_process_group_syscall_dispatch(current_stack_pointer: usize) -> usize {
     let registers_pointer = current_stack_pointer as *mut SavedRegisters;
     let syscall_number = unsafe { (*registers_pointer).rax };
     if !matches!(
