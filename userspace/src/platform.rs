@@ -6,6 +6,7 @@ use crate::abi::{self, syscall};
 
 pub type FileDescriptor = u64;
 pub type ProcessId = u64;
+pub type ProcessGroupId = u64;
 
 pub use crate::abi::{
     SystemInfo,
@@ -183,4 +184,32 @@ pub fn kill(process_id: ProcessId, signal: u64) -> Result<()> {
         );
     }
     decode(result).map(|_| ())
+}
+
+pub fn get_process_group(process_id: ProcessId) -> Result<ProcessGroupId> {
+    let mut result = syscall::GET_PROCESS_GROUP;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") process_id,
+        );
+    }
+    decode(result)
+}
+
+pub fn set_process_group(
+    process_id: ProcessId,
+    process_group: ProcessGroupId,
+) -> Result<ProcessGroupId> {
+    let mut result = syscall::SET_PROCESS_GROUP;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") process_id,
+            in("rsi") process_group,
+        );
+    }
+    decode(result)
 }

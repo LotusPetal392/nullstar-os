@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 0;
+pub const ABI_VERSION_MINOR: u64 = 1;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -47,6 +47,8 @@ pub mod syscall {
     pub const DUP2: u64 = 30;
     pub const GETPPID: u64 = 31;
     pub const KILL: u64 = 32;
+    pub const GET_PROCESS_GROUP: u64 = 33;
+    pub const SET_PROCESS_GROUP: u64 = 34;
 }
 
 pub mod capability {
@@ -56,13 +58,15 @@ pub mod capability {
     pub const DESCRIPTOR_DUPLICATION: u64 = 1 << 3;
     pub const PARENT_PROCESS: u64 = 1 << 4;
     pub const DIRECT_SIGNALS: u64 = 1 << 5;
+    pub const PROCESS_GROUP_CONTROL: u64 = 1 << 6;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
         | WORKING_DIRECTORY
         | DESCRIPTOR_DUPLICATION
         | PARENT_PROCESS
-        | DIRECT_SIGNALS;
+        | DIRECT_SIGNALS
+        | PROCESS_GROUP_CONTROL;
 }
 
 #[repr(C)]
