@@ -153,3 +153,9 @@ name = "pwd"
 path = "src/bin/pwd.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "stat"
+path = "src/bin/stat.rs"
+test = false
+bench = false
