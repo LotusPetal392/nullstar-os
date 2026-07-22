@@ -146,9 +146,9 @@ images, and launches QEMU.
   names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
-- The platform ABI accepts relative paths for metadata, directory, and working-
-  directory operations; the older `open`, `spawn_command`, and `execve` paths
-  retain their existing rules for now.
+- Metadata, directory, working-directory, and `open` operations accept paths
+  relative to the calling process. `spawn_command` and `execve` retain their
+  existing executable-path rules for now.
 - Process, descriptor, pipe, environment, job, and filesystem resources have
   fixed bounds. These keep failure behavior deterministic while the kernel is
   still evolving.

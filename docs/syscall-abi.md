@@ -50,18 +50,20 @@ kernel-managed `PWD` entry. `chdir` validates that the target exists and is a
 directory, then updates that entry. Fork, spawn, and exec already preserve the
 process environment, so they also preserve the working directory.
 
-The platform `stat`, `read_directory`, and `chdir` calls accept absolute paths
-or paths relative to the calling process's working directory. The platform path
-resolver canonicalizes `.`, `..`, and repeated separators before VFS lookup.
+The `stat`, `read_directory`, `chdir`, and legacy `open` calls accept absolute
+paths or paths relative to the calling process's working directory. The shared
+path resolver canonicalizes `.`, `..`, and repeated separators before VFS
+lookup. This also makes shell redirection targets relative to the shell's
+current directory.
 
 `PWD` is reserved. The ordinary environment mutation syscalls reject attempts
 to set or unset it, preventing a process from claiming a directory that the VFS
 did not validate. Because working-directory state uses the bounded process
 environment, `PWD` counts toward the environment entry and byte limits.
 
-The older `open`, `spawn_command`, and `execve` calls retain their existing path
-rules in this milestone. Converting those operations to relative-path-aware,
-generic process primitives remains follow-up work.
+`spawn_command` and `execve` retain their existing executable-path rules in this
+milestone. Converting command execution to cwd-aware explicit relative paths
+remains follow-up work.
 
 ## Metadata and directory records
 

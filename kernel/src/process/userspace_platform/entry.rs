@@ -67,9 +67,11 @@ pub fn platform_syscall_interrupt_entry_address() -> VirtAddr {
 pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usize) -> usize {
     let registers_pointer = current_stack_pointer as *mut SavedRegisters;
     let syscall_number = unsafe { (*registers_pointer).rax };
+    let cwd_aware_legacy_call = platform_cwd_aware_legacy_call(syscall_number);
 
     if !platform_syscall_number(syscall_number)
         && !platform_reserved_environment_call(syscall_number, registers_pointer)
+        && !cwd_aware_legacy_call
     {
         return galactic_syscall_dispatch(current_stack_pointer);
     }
@@ -79,11 +81,23 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
         return current_stack_pointer;
     };
 
-    // Keep the existing exact smoke-test counter stable: the legacy dispatcher
-    // continues to account for calls 1 through 22, while platform ABI calls
-    // are deliberately excluded until versioned syscall metrics are added.
+    if cwd_aware_legacy_call {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
+            return current_stack_pointer;
+        };
+        process.syscall_count = process.syscall_count.saturating_add(1);
+    }
+
+    // Keep the existing exact smoke-test counter stable: legacy calls continue
+    // to be counted, while platform ABI calls are deliberately excluded until
+    // versioned syscall metrics are added.
     let registers = unsafe { &mut *registers_pointer };
     registers.rax = match syscall_number {
+        abi::syscall::OPEN => {
+            platform_open(process_id, registers.rdi, registers.rsi, registers.rdx)
+        }
         abi::syscall::SYSTEM_INFO => platform_system_info(process_id, registers.rdi, registers.rsi),
         abi::syscall::STAT => platform_stat(
             process_id,
@@ -115,6 +129,10 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
+}
+
+fn platform_cwd_aware_legacy_call(number: u64) -> bool {
+    number == abi::syscall::OPEN
 }
 
 fn platform_syscall_number(number: u64) -> bool {
@@ -154,6 +172,60 @@ fn platform_reserved_environment_call(
         MAX_ENVIRONMENT_NAME_BYTES,
     )
     .is_ok_and(|name| name == PLATFORM_WORKING_DIRECTORY_NAME)
+}
+
+fn platform_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
+    let (options, close_on_exec) = match decode_open_options(flags) {
+        Ok(decoded) => decoded,
+        Err(error) => return error_return(error),
+    };
+    let path = match platform_user_path(process_id, address, length) {
+        Ok(path) => path,
+        Err(error) => return error_return(error),
+    };
+    let descriptor = {
+        let manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager
+            .processes
+            .iter()
+            .find(|process| process.process_id == process_id)
+        else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        };
+        if descriptor_count(process) >= MAX_OPEN_FILES {
+            return error_return(ERR_TOO_MANY_OPEN_FILES);
+        }
+        let Some(descriptor) = allocate_descriptor(process) else {
+            return error_return(ERR_TOO_MANY_OPEN_FILES);
+        };
+        descriptor
+    };
+    let metadata = match vfs::open(&path, options) {
+        Ok(metadata) => metadata,
+        Err(error) => return error_return(vfs_errno(&error)),
+    };
+    let offset = if options.append { metadata.size } else { 0 };
+    let handle = Arc::new(Mutex::new(OpenFileState {
+        path: metadata.path,
+        offset,
+        readable: options.read,
+        writable: options.write,
+        append: options.append,
+    }));
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+    };
+    if descriptor_in_use(process, descriptor) {
+        return error_return(ERR_TOO_MANY_OPEN_FILES);
+    }
+    process.open_files.push(OpenFile {
+        descriptor,
+        handle,
+        close_on_exec,
+    });
+    process.open_count = process.open_count.saturating_add(1);
+    descriptor
 }
 
 fn platform_system_info(process_id: u64, address: u64, length: u64) -> u64 {
