@@ -94,6 +94,42 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
     // to be counted, while platform ABI calls are deliberately excluded until
     // versioned syscall metrics are added.
     let registers = unsafe { &mut *registers_pointer };
+    if syscall_number == abi::syscall::SPAWN_COMMAND {
+        return match platform_spawn_command(
+            process_id,
+            SpawnSyscallArgs {
+                address: registers.rdi,
+                length: registers.rsi,
+                flags: registers.rdx,
+                stdin_descriptor: registers.r10,
+                stdout_descriptor: registers.r8,
+                stderr_descriptor: registers.r9,
+                process_group_argument: registers.rbx,
+            },
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        };
+    }
+    if syscall_number == abi::syscall::EXECVE {
+        return match platform_execve(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        };
+    }
+
     registers.rax = match syscall_number {
         abi::syscall::OPEN => {
             platform_open(process_id, registers.rdi, registers.rsi, registers.rdx)
@@ -132,7 +168,10 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
 }
 
 fn platform_cwd_aware_legacy_call(number: u64) -> bool {
-    number == abi::syscall::OPEN
+    matches!(
+        number,
+        abi::syscall::OPEN | abi::syscall::SPAWN_COMMAND | abi::syscall::EXECVE
+    )
 }
 
 fn platform_syscall_number(number: u64) -> bool {
@@ -226,6 +265,209 @@ fn platform_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 
     });
     process.open_count = process.open_count.saturating_add(1);
     descriptor
+}
+
+fn platform_spawn_command(
+    process_id: u64,
+    arguments: SpawnSyscallArgs,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
+    let SpawnSyscallArgs {
+        address,
+        length,
+        flags,
+        stdin_descriptor,
+        stdout_descriptor,
+        stderr_descriptor,
+        process_group_argument,
+    } = arguments;
+    if flags & !abi::spawn::ALLOWED_FLAGS != 0 {
+        return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
+    }
+    let new_process_group = flags & SPAWN_NEW_PROCESS_GROUP != 0;
+    let join_process_group = flags & SPAWN_JOIN_PROCESS_GROUP != 0;
+    if new_process_group && join_process_group {
+        return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
+    }
+    let process_group_id = if join_process_group {
+        if process_group_argument == DEFAULT_PROCESS_GROUP {
+            return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT));
+        }
+        Some(process_group_argument)
+    } else {
+        None
+    };
+    let command = match user_text(process_id, address, length, MAX_COMMAND_BYTES) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let (path, arguments) = match platform_parse_command_line(process_id, &command) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let use_descriptors = flags & SPAWN_USE_DESCRIPTORS != 0;
+    let stdin_descriptor =
+        (use_descriptors && stdin_descriptor != DEFAULT_DESCRIPTOR).then_some(stdin_descriptor);
+    let stdout_descriptor =
+        (use_descriptors && stdout_descriptor != DEFAULT_DESCRIPTOR).then_some(stdout_descriptor);
+    let stderr_descriptor =
+        (use_descriptors && stderr_descriptor != DEFAULT_DESCRIPTOR).then_some(stderr_descriptor);
+
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return ControlOutcome::Ready(error_return(ERR_NO_CHILD));
+    };
+    if resolve_stream_descriptor(process, stdin_descriptor, StreamAccess::Read).is_err()
+        || resolve_stream_descriptor(process, stdout_descriptor, StreamAccess::Write).is_err()
+        || resolve_stream_descriptor(process, stderr_descriptor, StreamAccess::Write).is_err()
+    {
+        return ControlOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+    }
+    if process.pending_child_spawn.is_some()
+        || process.pending_child_wait.is_some()
+        || process.pending_exec.is_some()
+        || process.pending_fork.is_some()
+    {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_child_spawn = Some(PendingChildSpawn {
+        path,
+        arguments,
+        foreground: flags & SPAWN_FOREGROUND != 0,
+        stdin_descriptor,
+        stdout_descriptor,
+        stderr_descriptor,
+        new_process_group,
+        process_group_id,
+        stack_pointer: current_stack_pointer,
+    });
+    process.state = ProcessState::Blocked;
+    ControlOutcome::Blocked
+}
+
+fn platform_execve(
+    process_id: u64,
+    address: u64,
+    length: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
+    let command = match user_text(process_id, address, length, MAX_COMMAND_BYTES) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let (path, arguments) = match platform_parse_command_line(process_id, &command) {
+        Ok(command) => command,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return ControlOutcome::Ready(error_return(ERR_NO_PROCESS));
+    };
+    if process.pending_terminal_read.is_some()
+        || process.pending_pipe_read.is_some()
+        || process.pending_pipe_write.is_some()
+        || process.pending_child_spawn.is_some()
+        || process.pending_child_wait.is_some()
+        || process.pending_exec.is_some()
+        || process.pending_fork.is_some()
+    {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_exec = Some(PendingExec {
+        path,
+        arguments,
+        stack_pointer: current_stack_pointer,
+    });
+    process.state = ProcessState::Blocked;
+    ControlOutcome::Blocked
+}
+
+fn platform_parse_command_line(
+    process_id: u64,
+    command: &str,
+) -> Result<(String, Vec<String>), i64> {
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return Err(ERR_INVALID_ARGUMENT);
+    };
+    let path = if program.starts_with('/') {
+        String::from(program)
+    } else if program.contains('/') {
+        platform_resolve_path(process_id, program)?
+    } else {
+        let mut path = String::from("/");
+        path.push_str(program);
+        path
+    };
+    let mut arguments = Vec::new();
+    let mut argument_bytes = path.len().saturating_add(1);
+    for argument in words {
+        if arguments.len().saturating_add(1) >= MAX_ARGUMENTS {
+            return Err(ERR_ARGUMENT_TOO_LARGE);
+        }
+        argument_bytes = argument_bytes.saturating_add(argument.len().saturating_add(1));
+        if argument_bytes > MAX_ARGUMENT_BYTES {
+            return Err(ERR_ARGUMENT_TOO_LARGE);
+        }
+        arguments.push(String::from(argument));
+    }
+    Ok((path, arguments))
+}
+
+fn platform_resolve_path(process_id: u64, path: &str) -> Result<String, i64> {
+    let directory = platform_working_directory(process_id);
+    let separator = usize::from(directory != "/");
+    let capacity = directory
+        .len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(path.len()))
+        .ok_or(abi::errno::NAME_TOO_LONG)?;
+    let mut candidate = String::with_capacity(capacity);
+    candidate.push_str(&directory);
+    if separator != 0 {
+        candidate.push('/');
+    }
+    candidate.push_str(path);
+
+    let mut components = Vec::new();
+    for component in candidate.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => {
+                if components.len() >= vfs::MAX_PATH_COMPONENTS {
+                    return Err(ERR_INVALID_ARGUMENT);
+                }
+                components.push(component);
+            }
+        }
+    }
+
+    let required = components
+        .iter()
+        .enumerate()
+        .try_fold(1usize, |length, (index, component)| {
+            length
+                .checked_add(usize::from(index != 0))
+                .and_then(|length| length.checked_add(component.len()))
+        })
+        .ok_or(abi::errno::NAME_TOO_LONG)?;
+    if required > abi::limits::MAX_PATH_BYTES {
+        return Err(abi::errno::NAME_TOO_LONG);
+    }
+
+    let mut resolved = String::with_capacity(required);
+    resolved.push('/');
+    for component in components {
+        if resolved.len() > 1 {
+            resolved.push('/');
+        }
+        resolved.push_str(component);
+    }
+    Ok(resolved)
 }
 
 fn platform_system_info(process_id: u64, address: u64, length: u64) -> u64 {
