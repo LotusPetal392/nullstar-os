@@ -1,4 +1,4 @@
-//! Safe wrappers for the documented GalacticOS userspace platform ABI.
+//! Safe wrappers for the documented NullStar OS userspace platform ABI.
 
 use core::{arch::asm, mem::size_of};
 
