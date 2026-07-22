@@ -100,7 +100,6 @@ path = "src/bin/exec_target.rs"
 test = false
 bench = false
 
-
 [[bin]]
 name = "fork_probe"
 path = "src/bin/fork_probe.rs"
@@ -140,5 +139,17 @@ bench = false
 [[bin]]
 name = "environment_target"
 path = "src/bin/environment_target.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "pwd"
+path = "src/bin/pwd.rs"
 test = false
 bench = false
