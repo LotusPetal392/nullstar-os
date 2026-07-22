@@ -436,7 +436,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let allocated_frames = runtime_memory.allocated_frames;
         let remaining_frames = runtime_memory.remaining_frames;
 
-        println!("GalacticOS");
+        println!("NullStar OS");
         println!("-------------");
         println!();
         println!("Normal boot complete. Smoke tests were not run.");
@@ -1310,7 +1310,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         terminal_result.terminal_bytes_read
     );
 
-    const PIPE_TEST_BYTES: u64 = 42;
+    const PIPE_TEST_BYTES: u64 = 43;
     let pipe_before = userspace_runtime.pipe_snapshot();
     let pipeline_result =
         match userspace_runtime.pipeline("/pipe-producer", &[], "/pipe-consumer", &[]) {
@@ -1421,7 +1421,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
     let shell_variable_expansion_verified = shell_variable_output.bytes.as_slice()
-        == b"Hello from a GalacticOS userspace file descriptor.\n";
+        == b"Hello from a NullStar OS userspace file descriptor.\n";
     if !shell_variable_expansion_verified {
         serial_println!(
             "userspace shell variable expansion verification failed: output_bytes={}",
@@ -1670,15 +1670,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && fat::verify_file_fat_copies("/UFATUP.TXT").unwrap_or(false);
 
     let mut expected_message = Vec::new();
-    expected_message.extend_from_slice(b"Hello through a blocking GalacticOS pipe.\n");
-    expected_message.extend_from_slice(b"Hello through a blocking GalacticOS pipe.\n");
+    expected_message.extend_from_slice(b"Hello through a blocking NullStar OS pipe.\n");
+    expected_message.extend_from_slice(b"Hello through a blocking NullStar OS pipe.\n");
     let mut expected_upper = Vec::new();
-    expected_upper.extend_from_slice(b"HELLO THROUGH A BLOCKING GALACTICOS PIPE.\n");
-    expected_upper.extend_from_slice(b"HELLO THROUGH A BLOCKING GALACTICOS PIPE.\n");
+    expected_upper.extend_from_slice(b"HELLO THROUGH A BLOCKING NULLSTAR OS PIPE.\n");
+    expected_upper.extend_from_slice(b"HELLO THROUGH A BLOCKING NULLSTAR OS PIPE.\n");
     let tmpfs_snapshot = vfs::tmpfs_info().expect("mounted tmpfs disappeared");
     let userspace_redirection_verified = tmpfs_message.bytes == expected_message
         && tmpfs_upper.bytes == expected_upper
-        && tmpfs_pipeline.bytes == b"HELLO FROM A GALACTICOS USERSPACE FILE DESCRIPTOR.\n"
+        && tmpfs_pipeline.bytes == b"HELLO FROM A NULLSTAR OS USERSPACE FILE DESCRIPTOR.\n"
         && tmpfs_errors.bytes == b"stderr probe line\n"
         && tmpfs_all.bytes == b"stdout probe line\nstderr probe line\n"
         && fat_message.bytes == expected_message
@@ -2289,7 +2289,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         shell_child.bytes_read
     );
 
-    println!("GalacticOS");
+    println!("NullStar OS");
     println!("-------------");
     println!();
     println!("The x86-64 kernel has booted successfully.");
