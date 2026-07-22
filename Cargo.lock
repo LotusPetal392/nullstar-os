@@ -175,15 +175,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "galactic-os"
-version = "0.1.0"
-dependencies = [
- "bootloader",
- "kernel",
- "userspace",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -303,6 +294,15 @@ name = "noto-sans-mono-bitmap"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a27daf9557165efe1d09b52f97393bf6283cadb0a76fbe64a1061e15553a994a"
+
+[[package]]
+name = "nullstar-os"
+version = "0.1.0"
+dependencies = [
+ "bootloader",
+ "kernel",
+ "userspace",
+]
 
 [[package]]
 name = "once_cell"

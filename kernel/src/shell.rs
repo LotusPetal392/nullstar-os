@@ -6,7 +6,7 @@ use crate::{
     acpi, ahci, allocator, console, elf, fat, interrupts, memory, partition, pci, userspace, vfs,
 };
 
-const PROMPT: &str = "galactic> ";
+const PROMPT: &str = "nullstar> ";
 const DEFAULT_CONSOLE_COLUMNS: usize = 80;
 const MAX_COMMAND_LENGTH: usize = 128;
 const MAX_PCI_SHELL_FUNCTIONS: usize = 64;
@@ -260,10 +260,10 @@ impl Shell {
                 self.wait_process(process_id);
             }
             "about" => {
-                shell_println!("GalacticOS: an experimental x86-64 kernel written in Rust.");
+                shell_println!("NullStar OS: an experimental x86-64 kernel written in Rust.");
             }
             "halt" => {
-                shell_println!("Halting GalacticOS.");
+                shell_println!("Halting NullStar OS.");
                 return ShellAction::Halt;
             }
             _ => {
@@ -1382,6 +1382,6 @@ fn print_help() {
     shell_println!("  spawn <path> [args...]  launch a userspace process");
     shell_println!("  wait <pid>       wait for and reap a userspace process");
     shell_println!("  run <path> [args...]    run in the foreground with stdin");
-    shell_println!("  about            describe GalacticOS");
+    shell_println!("  about            describe NullStar OS");
     shell_println!("  halt             halt the CPU");
 }

@@ -1,14 +1,14 @@
-// Shared GalacticOS ring-3 ABI constants. This file is included by both the
+// Shared NullStar OS ring-3 ABI constants. This file is included by both the
 // kernel process manager and the userspace runtime so numeric definitions stay
 // in one place without introducing a runtime dependency.
 
-/// Software interrupt vector used by the GalacticOS userspace ABI.
+/// Software interrupt vector used by the NullStar OS userspace ABI.
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
 /// Process identifier reserved for the first userspace process.
 pub const INIT_PROCESS_ID: u64 = 1;
 
-/// First documented version of the GalacticOS userspace ABI.
+/// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
 pub const ABI_VERSION_MINOR: u64 = 0;
 
@@ -192,7 +192,7 @@ pub mod signal_action {
     pub const IGNORE: u64 = 1;
     pub const RESET_HANDLER: u64 = 1 << 0;
     pub const ALLOWED_FLAGS: u64 = RESET_HANDLER;
-    pub const FRAME_MAGIC: u64 = 0x4741_4c41_4354_5347;
+    pub const FRAME_MAGIC: u64 = 0x4e55_4c4c_5354_4152;
 
     #[repr(C)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
