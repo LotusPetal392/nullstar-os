@@ -71,8 +71,17 @@ fn platform_probe(argument: &[u8]) -> bool {
     if info.abi_major != userspace::abi::ABI_VERSION_MAJOR
         || info.abi_minor != userspace::abi::ABI_VERSION_MINOR
         || info.capabilities & capability::PLATFORM_V1 != capability::PLATFORM_V1
+        || info.capabilities & capability::PROCESS_GROUP_CONTROL == 0
         || info.page_size != 4096
         || info.maximum_open_files < 3
+    {
+        return false;
+    }
+    let Ok(process_group) = platform::get_process_group(0) else {
+        return false;
+    };
+    if process_group == 0
+        || platform::set_process_group(0, process_group).ok() != Some(process_group)
     {
         return false;
     }
@@ -154,7 +163,7 @@ fn relative_open_probe() -> bool {
 fn relative_spawn_probe() -> bool {
     let Ok(process_id) = syscall::spawn_command(
         b"../pwd",
-        SpawnFlags::EMPTY,
+        SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
         None,
