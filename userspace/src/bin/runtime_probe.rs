@@ -111,6 +111,9 @@ fn platform_probe(argument: &[u8]) -> bool {
     if platform::read_directory(b".", 0, &mut directory_page).is_err() {
         return false;
     }
+    if argument != b"runtime-smoke" && !relative_open_probe() {
+        return false;
+    }
     if syscall::environment_set(b"PWD", b"/").is_ok() {
         return false;
     }
@@ -132,6 +135,20 @@ fn platform_probe(argument: &[u8]) -> bool {
         return false;
     }
     true
+}
+
+fn relative_open_probe() -> bool {
+    const CONTENTS: &[u8] = b"cwd-aware open\n";
+    let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
+    let Ok(descriptor) = syscall::open(b"cwd-open.txt", flags) else {
+        return false;
+    };
+    let written = syscall::write_all(descriptor, CONTENTS).is_ok();
+    let closed = syscall::close(descriptor).is_ok();
+    written
+        && closed
+        && platform::stat(b"/tmp/cwd-open.txt")
+            .is_ok_and(|stat| stat.is_file() && stat.size == CONTENTS.len() as u64)
 }
 
 fn root_directory_has_expected_entries() -> bool {
