@@ -24,7 +24,7 @@ grow in later ABI revisions without writing past an older caller's allocation.
 Userspace should call the typed wrappers in `userspace::syscall` and
 `userspace::platform` rather than issuing raw interrupts.
 
-## Version 1.0 platform calls
+## Version 1.1 platform calls
 
 | Number | Name | Arguments | Result |
 | ---: | --- | --- | --- |
@@ -38,10 +38,12 @@ Userspace should call the typed wrappers in `userspace::syscall` and
 | 30 | `dup2` | source descriptor, target descriptor | target descriptor |
 | 31 | `getppid` | none | parent PID, or zero for PID 1 |
 | 32 | `kill` | target PID, signal | zero |
+| 33 | `get_process_group` | target PID | process-group ID |
+| 34 | `set_process_group` | target PID, process-group ID | resulting process-group ID |
 
-`SystemInfo.capabilities` advertises the calls above. Version 1.0 reports
-4 KiB pages, the process descriptor bound, the path bound, and the maximum
-number of directory records accepted by one call.
+`SystemInfo.capabilities` advertises the calls above. Version 1.1 reports
+4 KiB pages, the process descriptor bound, the path bound, the maximum number
+of directory records accepted by one call, and process-group control support.
 
 ## Paths and working directories
 
@@ -106,6 +108,29 @@ The default terminal endpoints can be copied between standard descriptors, but
 cannot yet be represented as an ordinary descriptor numbered 3 or higher.
 `dup` on an unredirected terminal therefore returns `ENOSYS`.
 
+## Process groups and generic launch
+
+A target PID of zero means the calling process for both process-group calls. A
+process-group ID of zero in `set_process_group` means the target process's PID.
+A process may inspect or move itself, or a parent may inspect or move one of its
+direct children. Other targets return `EPERM`.
+
+A process may create a group whose ID is its own PID. Joining another group is
+allowed only when a live process with the same parent already belongs to that
+group. A process that owns or has been assigned the terminal cannot be moved to
+a different group. Repeating an already-completed group assignment succeeds.
+
+The public `userspace::syscall::spawn_command` facade now constructs simple
+new-process-group launches from `fork`, `set_process_group`, optional foreground
+transfer, and `execve`. The child waits until the parent completes the group
+assignment before claiming the terminal or replacing its image. Foreground
+transfer is idempotent so either side of the parent/child race may complete it.
+
+Descriptor-bearing launches and joined pipeline stages still use syscall 7's
+legacy atomic spawn operation. The `/exec` compatibility launcher also remains
+on that path so its existing transactional-exec accounting is unchanged. The
+raw syscall remains available during this migration.
+
 ## Direct signals
 
 `kill` uses the focused NullStar OS signal set. A process may target one of its
@@ -115,7 +140,8 @@ the existing group-oriented syscall.
 
 ## Compatibility rules
 
-- Existing syscall numbers 1 through 22 are unchanged.
+- Existing syscall numbers 1 through 32 are unchanged.
+- ABI 1.1 adds process-group calls 33 and 34 and a capability bit.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds are reported by `system_info` and remain part of normal
