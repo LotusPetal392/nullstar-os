@@ -1,14 +1,17 @@
 #![no_std]
 #![no_main]
 
-use userspace::syscall::{self, DescriptorFlags, Errno, OpenFlags};
+use userspace::{
+    platform,
+    syscall::{self, DescriptorFlags, Errno, OpenFlags},
+};
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const PRESERVED_PATH: &[u8] = b"/tmp/exec-preserved.txt";
 const CLOSED_PATH: &[u8] = b"/tmp/exec-closed.txt";
-const VALID_EXEC: &[u8] = b"/exec-target alpha beta";
+const VALID_EXEC: &[u8] = b"../exec-target alpha beta";
 const INVALID_EXEC: &[u8] = b"/missing-exec";
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
@@ -49,6 +52,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
 
     if syscall::set_descriptor_flags(preserved, DescriptorFlags::CLOSE_ON_EXEC).is_err()
         || syscall::set_descriptor_flags(preserved, DescriptorFlags::EMPTY).is_err()
+        || platform::chdir(b"/tmp").is_err()
     {
         syscall::exit(7);
     }
