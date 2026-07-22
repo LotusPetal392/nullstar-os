@@ -1,6 +1,6 @@
-# Developing GalacticOS
+# Developing NullStar OS
 
-GalacticOS mixes a host-side runner with bare-metal kernel and userspace
+NullStar OS mixes a host-side runner with bare-metal kernel and userspace
 artifacts. Keeping those targets separate is the most important part of a
 predictable development environment.
 
@@ -78,7 +78,7 @@ which is not a meaningful workspace build.
 
 The repository root contains two target kinds:
 
-- `galactic-os` must be analyzed for the host target because it launches QEMU.
+- `nullstar-os` must be analyzed for the host target because it launches QEMU.
 - `kernel` and userspace binaries must be analyzed for
   `x86_64-unknown-none`.
 
