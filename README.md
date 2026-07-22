@@ -1,6 +1,6 @@
-# GalacticOS
+# NullStar OS
 
-GalacticOS is an experimental x86-64 operating system written in Rust. It
+NullStar OS is an experimental x86-64 operating system written in Rust. It
 combines a freestanding `no_std` kernel with a small `no_std` ring-3 userspace
 and boots as a BIOS disk image in QEMU.
 
@@ -49,13 +49,13 @@ models are not supported targets yet.
 ## Quick start
 
 ```sh
-git clone https://github.com/LotusPetal392/galactic-os.git
-cd galactic-os
+git clone https://github.com/LotusPetal392/nullstar-os.git
+cd nullstar-os
 cargo run
 ```
 
 QEMU opens a display for the framebuffer and PS/2 keyboard. The host terminal
-shows the serial log. Focus the QEMU window and enter `help` when the GalacticOS
+shows the serial log. Focus the QEMU window and enter `help` when the NullStar OS
 prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 
 ### Run modes
