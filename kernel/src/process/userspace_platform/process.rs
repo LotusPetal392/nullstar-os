@@ -143,18 +143,29 @@ fn platform_foreground_process_group(process_id: u64, process_group_id: u64) -> 
             let Some(leader) = leader else {
                 return error_return(ERR_NO_CHILD);
             };
-            let parent = leader.parent_process_id;
+            let Some(parent) = leader.parent_process_id else {
+                return error_return(ERR_IO);
+            };
+            let launch_claim = manager.processes.iter().any(|process| {
+                process.process_id == parent
+                    && process.is_live()
+                    && leader.exec_count == 0
+                    && leader.path == process.path
+            });
+            if !launch_claim {
+                return error_return(ERR_IO);
+            }
             let members = manager
                 .processes
                 .iter()
                 .filter(|process| {
-                    process.parent_process_id == parent
+                    process.parent_process_id == Some(parent)
                         && process.process_group_id == process_group_id
                         && process.is_live()
                 })
                 .map(|process| process.process_id)
                 .collect::<Vec<_>>();
-            (members, parent, false, true)
+            (members, Some(parent), false, true)
         }
     };
 
