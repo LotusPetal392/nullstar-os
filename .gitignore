@@ -1,4 +1,30 @@
-target
+# Rust build output
+/target/
+**/target/
 
-Thumbs.db
-.DS_Store
+# NullStar build and runtime output
+*.img
+*.iso
+*.log
+*.qcow2
+*.raw
+*.bin
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local tools and test output
+coverage/
+tmp/
+.cache/
