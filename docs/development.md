@@ -29,13 +29,12 @@ rustc --version
 All three should identify `nightly-2026-02-01` when invoked here. An explicit
 `+nightly-2026-02-01` override is useful in scripts and diagnostics.
 
-## Local checks
+## Local and automated checks
 
-GitHub Actions are temporarily disabled. The preserved workflow is parked at
-`.github/workflows-disabled/kernel-qemu.yml`; move it back to
-`.github/workflows/kernel-qemu.yml` to restore automatic pull-request and
-`main`-branch checks. While it is disabled, the complete local check below is
-the required pre-push verification path.
+GitHub Actions runs `.github/workflows/kernel-qemu.yml` for pull requests and
+pushes to `main`. The workflow checks formatting, builds the bootable image, and
+runs the QEMU smoke test. Treat the automated result as a required integration
+check, not as a replacement for local verification.
 
 Use the checked-in wrapper rather than maintaining a separate command list:
 
