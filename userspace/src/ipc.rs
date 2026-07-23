@@ -223,9 +223,7 @@ pub fn wait_for_handle(handle: CapabilityHandle) -> Result<CapabilityInfo> {
     loop {
         match info(handle) {
             Ok(info) => return Ok(info),
-            Err(error)
-                if error == Error::BAD_FILE_DESCRIPTOR || error == Error::TRY_AGAIN =>
-            {
+            Err(error) if error == Error::BAD_FILE_DESCRIPTOR || error == Error::TRY_AGAIN => {
                 if crate::syscall::yield_now().is_err() {
                     return Err(Error::IO);
                 }
@@ -243,11 +241,7 @@ pub fn endpoint_create() -> Result<CapabilityHandle> {
     decode(result)
 }
 
-pub fn send(
-    endpoint: CapabilityHandle,
-    bytes: &[u8],
-    transfer: Option<Transfer>,
-) -> Result<()> {
+pub fn send(endpoint: CapabilityHandle, bytes: &[u8], transfer: Option<Transfer>) -> Result<()> {
     let transfer_handle = transfer
         .map(|transfer| transfer.handle)
         .unwrap_or(abi_capability::INVALID_HANDLE);
@@ -394,11 +388,7 @@ pub fn shared_memory_read(
     decode(result).map(|count| count as usize)
 }
 
-pub fn shared_memory_write(
-    handle: CapabilityHandle,
-    offset: usize,
-    bytes: &[u8],
-) -> Result<usize> {
+pub fn shared_memory_write(handle: CapabilityHandle, offset: usize, bytes: &[u8]) -> Result<usize> {
     let mut result = syscall::SHARED_MEMORY_WRITE;
     unsafe {
         asm!(
