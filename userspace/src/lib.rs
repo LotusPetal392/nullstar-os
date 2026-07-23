@@ -6,10 +6,10 @@ pub mod environment;
 pub mod heap;
 pub mod platform;
 pub mod supervisor;
-#[path = "syscall.rs"]
-mod syscall_legacy;
 #[path = "syscall_facade.rs"]
 pub mod syscall;
+#[path = "syscall.rs"]
+mod syscall_legacy;
 
 pub mod abi {
     include!(concat!(

@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     heap::BumpHeap,
     platform::{self, DirectoryEntry},
-    syscall::{self, OpenFlags, SpawnFlags, STDERR, STDIN, STDOUT},
+    syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SpawnFlags},
 };
 
 userspace::entry!(rust_main);
