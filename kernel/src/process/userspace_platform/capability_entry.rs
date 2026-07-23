@@ -245,7 +245,7 @@ impl CapabilityRegistry {
         }
 
         self.objects
-            .retain(|record| reachable.iter().any(|object| *object == record.reference));
+            .retain(|record| reachable.contains(&record.reference));
     }
 }
 
