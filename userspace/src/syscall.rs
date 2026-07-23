@@ -13,19 +13,6 @@ global_asm!(
     r#"
     .section .text
     .p2align 4
-    .global galactic_userspace_spawn_command
-    .type galactic_userspace_spawn_command,@function
-galactic_userspace_spawn_command:
-    push rbx
-    mov r10, rcx
-    mov rbx, qword ptr [rsp + 16]
-    mov rax, {spawn_command}
-    int 0x80
-    pop rbx
-    ret
-.size galactic_userspace_spawn_command, .-galactic_userspace_spawn_command
-
-    .p2align 4
     .global galactic_userspace_signal_restorer
     .type galactic_userspace_signal_restorer,@function
 galactic_userspace_signal_restorer:
@@ -34,20 +21,10 @@ galactic_userspace_signal_restorer:
     ud2
 .size galactic_userspace_signal_restorer, .-galactic_userspace_signal_restorer
 "#,
-    spawn_command = const syscall::SPAWN_COMMAND,
     signal_return = const syscall::SIGNAL_RETURN,
 );
 
 unsafe extern "C" {
-    fn galactic_userspace_spawn_command(
-        command_address: u64,
-        command_length: u64,
-        flags: u64,
-        stdin_descriptor: u64,
-        stdout_descriptor: u64,
-        stderr_descriptor: u64,
-        process_group: u64,
-    ) -> u64;
     fn galactic_userspace_signal_restorer();
 }
 
@@ -442,28 +419,6 @@ pub fn getpid() -> Result<ProcessId> {
         asm!("int 0x80", inlateout("rax") result);
     }
     decode(result)
-}
-
-pub fn spawn_command(
-    command: &[u8],
-    flags: SpawnFlags,
-    stdin_descriptor: Option<FileDescriptor>,
-    stdout_descriptor: Option<FileDescriptor>,
-    stderr_descriptor: Option<FileDescriptor>,
-    process_group: Option<ProcessGroupId>,
-) -> Result<ProcessId> {
-    let raw = unsafe {
-        galactic_userspace_spawn_command(
-            command.as_ptr() as u64,
-            command.len() as u64,
-            flags.bits(),
-            stdin_descriptor.unwrap_or(spawn::DEFAULT_DESCRIPTOR),
-            stdout_descriptor.unwrap_or(spawn::DEFAULT_DESCRIPTOR),
-            stderr_descriptor.unwrap_or(spawn::DEFAULT_DESCRIPTOR),
-            process_group.unwrap_or(spawn::DEFAULT_PROCESS_GROUP),
-        )
-    };
-    decode(raw)
 }
 
 pub fn wait_child(process_id: ProcessId) -> Result<ChildStatus> {
