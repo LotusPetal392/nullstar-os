@@ -22,4 +22,14 @@ jobs:
             --component rustfmt \
             --target x86_64-unknown-none
       - name: Run host tests, Clippy, and release build
-        run: ./scripts/check-local.sh --quick
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/check-local.sh --quick 2>&1 | tee phase1-quick-validation.log
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase1-quick-validation-log
+          path: phase1-quick-validation.log
+          if-no-files-found: warn
