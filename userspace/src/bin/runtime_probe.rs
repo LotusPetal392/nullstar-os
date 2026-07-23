@@ -120,8 +120,7 @@ fn platform_probe(argument: &[u8]) -> bool {
     if platform::read_directory(b".", 0, &mut directory_page).is_err() {
         return false;
     }
-    if supplementary_probes_enabled(argument)
-        && (!relative_open_probe() || !relative_spawn_probe())
+    if supplementary_probes_enabled(argument) && (!relative_open_probe() || !relative_spawn_probe())
     {
         return false;
     }
