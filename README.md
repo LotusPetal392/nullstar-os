@@ -100,8 +100,10 @@ diagnostic shell. That shell exposes hardware and kernel-state commands such as
 
 ## Testing locally
 
-GitHub Actions are temporarily disabled. Until the workflow is restored, these
-local checks are the required verification path for every change.
+GitHub Actions automatically run the kernel QEMU smoke workflow for pull
+requests and pushes to `main`. Local checks remain the required pre-push
+verification path because they exercise the complete development suite before a
+change reaches GitHub.
 
 Run the fast checks while iterating:
 
