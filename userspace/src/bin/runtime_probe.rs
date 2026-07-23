@@ -56,16 +56,20 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if heap.used() != 0 || heap.remaining() != heap.capacity() {
         syscall::exit(1);
     }
-    if !platform_probe(argument) {
+    let process_id = match syscall::getpid() {
+        Ok(process_id) => process_id,
+        Err(_) => syscall::exit(1),
+    };
+    if !platform_probe(argument, process_id) {
         syscall::exit(1);
     }
-    if syscall::getpid().is_err() || syscall::write_all(STDOUT, SUCCESS).is_err() {
+    if syscall::write_all(STDOUT, SUCCESS).is_err() {
         syscall::exit(1);
     }
     syscall::exit(0)
 }
 
-fn platform_probe(argument: &[u8]) -> bool {
+fn platform_probe(argument: &[u8], process_id: u64) -> bool {
     let Ok(info) = platform::system_info() else {
         return false;
     };
@@ -79,7 +83,7 @@ fn platform_probe(argument: &[u8]) -> bool {
     {
         return false;
     }
-    if !capability_probe() {
+    if !capability_probe(process_id) {
         return false;
     }
     let Ok(process_group) = platform::get_process_group(0) else {
@@ -156,7 +160,7 @@ fn supplementary_probes_enabled(argument: &[u8]) -> bool {
     argument != b"runtime-smoke" && argument != b"manual-argv"
 }
 
-fn capability_probe() -> bool {
+fn capability_probe(current_process: u64) -> bool {
     const MESSAGE: &[u8] = b"phase-one-ipc";
     const SHARED_BYTES: &[u8] = b"shared capability memory";
     const SHARED_OFFSET: usize = 7;
@@ -226,9 +230,6 @@ fn capability_probe() -> bool {
 
     let mut message_buffer = [0_u8; 32];
     let Ok(message) = ipc::try_receive(endpoint, &mut message_buffer) else {
-        return false;
-    };
-    let Ok(current_process) = syscall::getpid() else {
         return false;
     };
     let Some(received_capability) = message.capability else {
