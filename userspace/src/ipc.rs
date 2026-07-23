@@ -1,8 +1,8 @@
 //! Capability handles and bounded phase-one IPC primitives.
 //!
-//! Kernel operations are non-blocking. `receive` and `notification_wait` add a
-//! cooperative blocking facade by yielding whenever the kernel reports
-//! `TRY_AGAIN`.
+//! Kernel operations are non-blocking. `receive`, `notification_wait`, and
+//! `wait_for_handle` add cooperative blocking facades by yielding whenever the
+//! requested state is not ready.
 
 use core::{
     arch::asm,
@@ -11,6 +11,13 @@ use core::{
 };
 
 use crate::abi::{capability as abi_capability, errno as abi_errno, syscall};
+
+mod phase1_protection_abi {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/protection_abi.rs"
+    ));
+}
 
 pub type CapabilityHandle = u64;
 
@@ -22,6 +29,7 @@ impl Error {
     pub const NO_PROCESS: Self = Self((-abi_errno::NO_PROCESS) as i32);
     pub const IO: Self = Self((-abi_errno::IO) as i32);
     pub const BAD_FILE_DESCRIPTOR: Self = Self((-abi_errno::BAD_FILE_DESCRIPTOR) as i32);
+    pub const NO_CHILD: Self = Self((-abi_errno::NO_CHILD) as i32);
     pub const TRY_AGAIN: Self = Self((-abi_errno::TRY_AGAIN) as i32);
     pub const PERMISSION: Self = Self((-abi_errno::PERMISSION) as i32);
     pub const BAD_ADDRESS: Self = Self((-abi_errno::BAD_ADDRESS) as i32);
@@ -156,6 +164,26 @@ pub fn duplicate(handle: CapabilityHandle, rights: Rights) -> Result<CapabilityH
     decode(result)
 }
 
+pub fn grant_child(
+    child_process_id: u64,
+    source_handle: CapabilityHandle,
+    rights: Rights,
+    requested_child_handle: CapabilityHandle,
+) -> Result<CapabilityHandle> {
+    let mut result = phase1_protection_abi::syscall::GRANT_CHILD;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") child_process_id,
+            in("rsi") source_handle,
+            in("rdx") rights.bits(),
+            in("r10") requested_child_handle,
+        );
+    }
+    decode(result)
+}
+
 pub fn close(handle: CapabilityHandle) -> Result<()> {
     let mut result = syscall::CAPABILITY_CLOSE;
     unsafe {
@@ -189,6 +217,22 @@ pub fn info(handle: CapabilityHandle) -> Result<CapabilityInfo> {
         rights,
         size: raw.size,
     })
+}
+
+pub fn wait_for_handle(handle: CapabilityHandle) -> Result<CapabilityInfo> {
+    loop {
+        match info(handle) {
+            Ok(info) => return Ok(info),
+            Err(error)
+                if error == Error::BAD_FILE_DESCRIPTOR || error == Error::TRY_AGAIN =>
+            {
+                if crate::syscall::yield_now().is_err() {
+                    return Err(Error::IO);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub fn endpoint_create() -> Result<CapabilityHandle> {
