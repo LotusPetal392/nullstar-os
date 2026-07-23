@@ -1,0 +1,25 @@
+name: Phase 1 quick validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quick-validation:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component clippy \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt \
+            --target x86_64-unknown-none
+      - name: Run host tests, Clippy, and release build
+        run: ./scripts/check-local.sh --quick
