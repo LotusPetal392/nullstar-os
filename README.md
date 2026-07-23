@@ -152,9 +152,11 @@ images, and launches QEMU.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`
   operations accept explicit relative paths. Bare executable names still use
   the root-directory command namespace rather than a configurable search path.
-- Descriptor-free new-process-group launches use `fork`, process-group control,
-  and `execve`. Descriptor-bearing launches, joined pipeline stages, and the
-  `/exec` compatibility launcher still use the legacy atomic spawn syscall.
+- Generic userspace launches use `fork`, descriptor duplication, process-group
+  control, and `execve`. Pipeline stages wait on a close-on-exec launch barrier
+  until the shell has finalized inherited pipe endpoints and group membership.
+  The `/exec` compatibility launcher alone retains the legacy atomic spawn
+  syscall outside pipelines so its transactional accounting remains stable.
 - Process, descriptor, pipe, environment, job, and filesystem resources have
   fixed bounds. These keep failure behavior deterministic while the kernel is
   still evolving.

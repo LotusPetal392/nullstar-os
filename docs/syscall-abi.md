@@ -120,16 +120,24 @@ allowed only when a live process with the same parent already belongs to that
 group. A process that owns or has been assigned the terminal cannot be moved to
 a different group. Repeating an already-completed group assignment succeeds.
 
-The public `userspace::syscall::spawn_command` facade now constructs simple
-new-process-group launches from `fork`, `set_process_group`, optional foreground
-transfer, and `execve`. The child waits until the parent completes the group
-assignment before claiming the terminal or replacing its image. Foreground
-transfer is idempotent so either side of the parent/child race may complete it.
+The public `userspace::syscall::spawn_command` facade constructs ordinary
+launches from `fork`, descriptor duplication, `set_process_group`, optional
+foreground transfer, and `execve`. A child waits until the parent completes its
+group assignment before claiming the terminal or replacing its image.
+Foreground transfer is idempotent so either side of the parent/child race may
+complete it.
 
-Descriptor-bearing launches and joined pipeline stages still use syscall 7's
-legacy atomic spawn operation. The `/exec` compatibility launcher also remains
-on that path so its existing transactional-exec accounting is unchanged. The
-raw syscall remains available during this migration.
+Pipelines add a close-on-exec pipe barrier before the first stage is forked.
+Each child closes its inherited writer, installs standard-stream descriptors,
+and blocks on the barrier reader. After every stage has joined the process
+group, the shell establishes foreground ownership when needed, closes its data
+pipe endpoints, and closes the barrier writer. The resulting end-of-file event
+releases all stages together; `execve` then closes every unrelated inherited
+endpoint.
+
+The `/exec` compatibility launcher alone remains on syscall 7's legacy atomic
+spawn path outside pipelines so its existing transactional-exec accounting is
+unchanged. The raw syscall remains available during this migration.
 
 ## Direct signals
 
