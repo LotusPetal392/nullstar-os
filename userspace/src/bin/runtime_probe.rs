@@ -120,7 +120,9 @@ fn platform_probe(argument: &[u8]) -> bool {
     if platform::read_directory(b".", 0, &mut directory_page).is_err() {
         return false;
     }
-    if argument != b"runtime-smoke" && (!relative_open_probe() || !relative_spawn_probe()) {
+    if supplementary_probes_enabled(argument)
+        && (!relative_open_probe() || !relative_spawn_probe())
+    {
         return false;
     }
     if syscall::environment_set(b"PWD", b"/").is_ok() {
@@ -137,13 +139,17 @@ fn platform_probe(argument: &[u8]) -> bool {
     }
 
     if !descriptor_probe()
-        || (argument != b"runtime-smoke" && !ordinary_descriptor_probe())
+        || (supplementary_probes_enabled(argument) && !ordinary_descriptor_probe())
         || platform::getppid().is_err()
         || platform::kill(u64::MAX, signal::TERMINATE).err() != Some(platform::Errno::NO_PROCESS)
     {
         return false;
     }
     true
+}
+
+fn supplementary_probes_enabled(argument: &[u8]) -> bool {
+    !matches!(argument, b"runtime-smoke" | b"manual-argv")
 }
 
 fn relative_open_probe() -> bool {
