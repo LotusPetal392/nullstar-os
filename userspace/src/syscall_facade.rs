@@ -1,11 +1,10 @@
 //! Public userspace syscall facade.
 //!
-//! Ordinary launches are constructed from generic process and descriptor
+//! Supported launches are constructed from generic process and descriptor
 //! primitives. Pipelines use a close-on-exec pipe as a launch barrier so every
 //! child remains blocked until the parent has finished descriptor and
-//! process-group setup. The `/exec` compatibility launcher retains the legacy
-//! atomic spawn path outside a barrier so its transactional accounting remains
-//! unchanged during the migration.
+//! process-group setup. Bundled userspace no longer calls the legacy atomic
+//! spawn syscall; syscall 7 remains a kernel ABI compatibility entry point.
 
 use crate::{abi::signal, platform};
 
@@ -120,17 +119,7 @@ fn spawn_command_inner(
         process_group,
         barrier.is_some(),
     ) {
-        if barrier.is_some() {
-            return Err(Errno::INVALID_ARGUMENT);
-        }
-        return crate::syscall_legacy::spawn_command(
-            command,
-            flags,
-            descriptors.stdin,
-            descriptors.stdout,
-            descriptors.stderr,
-            process_group,
-        );
+        return Err(Errno::INVALID_ARGUMENT);
     }
 
     let foreground = flags.contains(SpawnFlags::FOREGROUND);
@@ -169,17 +158,7 @@ fn generic_spawn_supported(
         && group_request_valid
         && (!flags.contains(SpawnFlags::FOREGROUND) || new_group)
         && (!join_group || barrier)
-        && descriptors_requested == !descriptors.is_empty()
-        && (barrier || !compatibility_launcher(command))
-}
-
-fn compatibility_launcher(command: &[u8]) -> bool {
-    let token_end = command
-        .iter()
-        .position(|byte| byte.is_ascii_whitespace())
-        .unwrap_or(command.len());
-    let program = &command[..token_end];
-    program == b"exec" || program.ends_with(b"/exec")
+        && descriptors_requested != descriptors.is_empty()
 }
 
 fn launch_child(
@@ -288,5 +267,60 @@ fn terminate_and_reap(process_id: ProcessId) {
             Err(error) if error == Errno::INTERRUPTED => {}
             _ => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaunchDescriptors, generic_spawn_supported};
+    use crate::syscall_legacy::{STDOUT, SpawnFlags};
+
+    #[test]
+    fn exec_launcher_uses_generic_new_group_path() {
+        assert!(generic_spawn_supported(
+            b"exec runtime-probe manual-argv",
+            SpawnFlags::FOREGROUND | SpawnFlags::USE_DESCRIPTORS | SpawnFlags::NEW_PROCESS_GROUP,
+            LaunchDescriptors::new(None, Some(STDOUT), None),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn joined_group_requires_a_barrier() {
+        let flags = SpawnFlags::USE_DESCRIPTORS | SpawnFlags::JOIN_PROCESS_GROUP;
+        let descriptors = LaunchDescriptors::new(None, Some(STDOUT), None);
+        assert!(!generic_spawn_supported(
+            b"cat",
+            flags,
+            descriptors,
+            Some(7),
+            false,
+        ));
+        assert!(generic_spawn_supported(
+            b"cat",
+            flags,
+            descriptors,
+            Some(7),
+            true,
+        ));
+    }
+
+    #[test]
+    fn descriptor_flag_must_match_descriptor_arguments() {
+        assert!(!generic_spawn_supported(
+            b"cat",
+            SpawnFlags::NEW_PROCESS_GROUP,
+            LaunchDescriptors::new(None, Some(STDOUT), None),
+            None,
+            false,
+        ));
+        assert!(!generic_spawn_supported(
+            b"cat",
+            SpawnFlags::USE_DESCRIPTORS | SpawnFlags::NEW_PROCESS_GROUP,
+            LaunchDescriptors::new(None, None, None),
+            None,
+            false,
+        ));
     }
 }

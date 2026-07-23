@@ -1513,7 +1513,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         == Some(userspace_shell.process_id)
         && shell_exec_child.path == "/runtime-probe"
         && shell_exec_child.exit_code() == Some(0)
-        && shell_exec_child.exec_count == 1
+        && shell_exec_child.exec_count == 2
         && shell_exec_child.exec_failure_count == 0
         && shell_exec_child.close_on_exec_count == 0
         && shell_exec_child.file_write_count == 1
@@ -2224,7 +2224,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
         && userspace_shell_result.child_spawn_count == 22
-        && userspace_shell_result.fork_count == 21
+        && userspace_shell_result.fork_count == userspace_shell_result.child_spawn_count
         && userspace_shell_result.child_wait_count
             == userspace_shell_result
                 .child_spawn_count
@@ -2235,7 +2235,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             < userspace_shell_result.child_poll_count
         && userspace_shell_result.signal_sent_count == 4
         && userspace_shell_result.open_count == 13
-        && userspace_shell_result.file_descriptor_inherit_count == 1
+        && userspace_shell_result.file_descriptor_inherit_count == 0
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1

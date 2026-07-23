@@ -19,6 +19,8 @@ pub mod syscall {
     pub const OPEN: u64 = 4;
     pub const READ: u64 = 5;
     pub const CLOSE: u64 = 6;
+    // Retained for version-1 ABI compatibility. Bundled userspace builds
+    // launches from fork, descriptor, process-group, and exec primitives.
     pub const SPAWN_COMMAND: u64 = 7;
     pub const WAIT_CHILD: u64 = 8;
     pub const GETPID: u64 = 9;

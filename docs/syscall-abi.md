@@ -135,9 +135,11 @@ pipe endpoints, and closes the barrier writer. The resulting end-of-file event
 releases all stages together; `execve` then closes every unrelated inherited
 endpoint.
 
-The `/exec` compatibility launcher alone remains on syscall 7's legacy atomic
-spawn path outside pipelines so its existing transactional-exec accounting is
-unchanged. The raw syscall remains available during this migration.
+The typed facade rejects unsupported flag, descriptor, and process-group
+combinations with `EINVAL`; joined-group launches require the barrier form.
+The `/exec` helper now follows the same generic path as other bundled programs.
+No bundled userspace code calls syscall 7's legacy atomic spawn operation; the
+kernel retains that entry point only for version-1 ABI compatibility.
 
 ## Direct signals
 
