@@ -157,3 +157,25 @@ images, and launches QEMU.
   fixed bounds. These keep failure behavior deterministic while the kernel is
   still evolving.
 - Security hardening and broad hardware compatibility are incomplete.
+
+## AI-assisted development
+
+NullStar OS is developed and maintained by Natalie Rockot with substantial
+assistance from OpenAI's ChatGPT for design discussion, implementation,
+debugging, testing guidance, review, and documentation.
+
+AI-assisted changes are reviewed and accepted by the project maintainer, who
+remains responsible for the project's direction and published contents.
+
+## License
+
+NullStar OS is free software licensed under the GNU General Public License,
+version 3 or (at your option) any later version (`GPL-3.0-or-later`). See
+[`LICENSE`](LICENSE) for the complete license text.
+
+Cargo dependencies and any other third-party components retain their respective
+licenses. See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the
+project's third-party licensing record.
+
+Contributions are accepted under the same `GPL-3.0-or-later` terms. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting material.

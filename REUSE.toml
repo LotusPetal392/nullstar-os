@@ -1,0 +1,24 @@
+version = 1
+SPDX-PackageName = "NullStar OS"
+SPDX-PackageSupplier = "Natalie Rockot"
+SPDX-PackageDownloadLocation = "https://github.com/LotusPetal392/nullstar-os"
+
+[[annotations]]
+path = [
+    "*.rs",
+    "src/**/*.rs",
+    "kernel/**/*.rs",
+    "userspace/**/*.rs",
+    "shared/**/*.rs",
+    "scripts/**/*.sh",
+    "Cargo.toml",
+    "kernel/Cargo.toml",
+    "userspace/Cargo.toml",
+    "rust-toolchain.toml",
+    "README.md",
+    "CONTRIBUTING.md",
+    "docs/**/*.md",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Natalie Rockot"
+SPDX-License-Identifier = "GPL-3.0-or-later"
