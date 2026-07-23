@@ -1992,13 +1992,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && shell_consumer.pipe_read_count >= 2
         && shell_consumer.pipe_bytes_read == PIPE_TEST_BYTES
         && shell_consumer.blocked_pipe_read_count >= 1
-        && userspace_shell_result.pipe_pair_count == 5
-        && userspace_shell_result.pipe_descriptor_close_count == 10
-        && userspace_shell_result.pipe_descriptor_inherit_count == 10
-        && created_pipe_delta == 2
-        && destroyed_pipe_delta == 2
-        && reader_retain_delta == 2
-        && writer_retain_delta == 2
+        && userspace_shell_result.pipe_pair_count == 8
+        && userspace_shell_result.pipe_descriptor_close_count == 16
+        && userspace_shell_result.pipe_descriptor_inherit_count == 0
+        && created_pipe_delta == 3
+        && destroyed_pipe_delta == 3
+        && reader_retain_delta == 11
+        && writer_retain_delta == 11
         && pipe_bytes_read_delta == PIPE_TEST_BYTES.saturating_mul(2)
         && pipe_bytes_written_delta == PIPE_TEST_BYTES.saturating_mul(2)
         && userspace_pipeline_after.active_pipes == 0;
@@ -2155,8 +2155,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .any(|result| result.path == "/pipe-consumer")
         && terminal_after_interrupt.interrupts
             == terminal_before_interrupt.interrupts.saturating_add(1)
-        && signal_pipe_created == 2
-        && signal_pipe_destroyed == 2
+        && signal_pipe_created == 3
+        && signal_pipe_destroyed == 3
         && userspace_signal_pipe_after.active_pipes == 0;
     let background_signal_verified = background_signal_group.process_ids.len() == 1
         && background_signal_results.len() == 1
@@ -2224,6 +2224,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let userspace_shell_verified = userspace_shell_result.exit_code() == Some(0)
         && userspace_shell_result.child_spawn_count == 22
+        && userspace_shell_result.fork_count == 21
         && userspace_shell_result.child_wait_count
             == userspace_shell_result
                 .child_spawn_count
@@ -2234,7 +2235,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             < userspace_shell_result.child_poll_count
         && userspace_shell_result.signal_sent_count == 4
         && userspace_shell_result.open_count == 13
-        && userspace_shell_result.file_descriptor_inherit_count == 14
+        && userspace_shell_result.file_descriptor_inherit_count == 1
         && shell_child.parent_process_id == Some(userspace_shell.process_id)
         && shell_child.exit_code() == Some(0)
         && shell_child.open_count == 1
@@ -2254,9 +2255,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .is_none();
     if !userspace_shell_verified {
         serial_println!(
-            "userspace shell verification failed: shell_exit={:?}, spawns={}, waits={}, polls={}, pending_polls={}, zombies={}, signals={}, opens={}, inherited_files={}, environment={}/{}, stopped_jobs={}, exec_child={}, environment_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
+            "userspace shell verification failed: shell_exit={:?}, spawns={}, forks={}, waits={}, polls={}, pending_polls={}, zombies={}, signals={}, opens={}, inherited_files={}, environment={}/{}, stopped_jobs={}, exec_child={}, environment_child={}, child_parent={:?}, child_exit={:?}, child_opens={}, child_bytes={}, foreground={:?}",
             userspace_shell_result.exit_code(),
             userspace_shell_result.child_spawn_count,
+            userspace_shell_result.fork_count,
             userspace_shell_result.child_wait_count,
             userspace_shell_result.child_poll_count,
             userspace_shell_result.child_poll_pending_count,
@@ -2278,10 +2280,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hlt_loop();
     }
     serial_println!(
-        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, waits={}, polls={}, pending_polls={}, signals={}, environment_changes=2, stopped_jobs=1, exec_jobs=1, child_exit=0, child_bytes={}",
+        "userspace shell verified: shell_pid={}, child_pid={}, spawns={}, forks={}, waits={}, polls={}, pending_polls={}, signals={}, environment_changes=2, stopped_jobs=1, exec_jobs=1, child_exit=0, child_bytes={}",
         userspace_shell_result.process_id,
         shell_child.process_id,
         userspace_shell_result.child_spawn_count,
+        userspace_shell_result.fork_count,
         userspace_shell_result.child_wait_count,
         userspace_shell_result.child_poll_count,
         userspace_shell_result.child_poll_pending_count,

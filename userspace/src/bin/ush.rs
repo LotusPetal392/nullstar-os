@@ -6,8 +6,8 @@ use userspace::{
     environment::Environment,
     platform,
     syscall::{
-        self, ChildStatus, FileDescriptor, OpenFlags, PipePair, ProcessGroupId, ProcessId, STDERR,
-        STDIN, STDOUT, SpawnFlags,
+        self, ChildStatus, DescriptorFlags, FileDescriptor, LaunchBarrier, OpenFlags, PipePair,
+        ProcessGroupId, ProcessId, STDERR, STDIN, STDOUT, SpawnFlags,
     },
 };
 
@@ -739,6 +739,19 @@ impl Shell {
                 }
             }
         }
+        if !self.prepare_pipeline_pipes(pipe_count) {
+            self.close_pipes(pipe_count);
+            self.error(PIPE_FAILURE);
+            return;
+        }
+        let barrier = match LaunchBarrier::new() {
+            Ok(barrier) => barrier,
+            Err(_) => {
+                self.close_pipes(pipe_count);
+                self.error(PIPE_FAILURE);
+                return;
+            }
+        };
         let mut leader = None;
         let mut stage_index = parsed.count;
         while stage_index > 0 {
@@ -757,10 +770,7 @@ impl Shell {
             let d = match self.open_stage(&stage, default_stdin, default_stdout) {
                 Ok(v) => v,
                 Err(()) => {
-                    self.close_pipes(pipe_count);
-                    for i in stage_index + 1..parsed.count {
-                        let _ = Self::wait_final(self.children[i]);
-                    }
+                    self.abort_pipeline(pipe_count, barrier, stage_index + 1, parsed.count);
                     self.error(REDIRECTION_OPEN_FAILURE);
                     return;
                 }
@@ -779,13 +789,14 @@ impl Shell {
                 flags |= SpawnFlags::JOIN_PROCESS_GROUP;
                 leader
             };
-            let spawned = syscall::spawn_command(
+            let spawned = syscall::spawn_command_with_barrier(
                 stage.command.as_slice(),
                 flags,
                 d.stdin,
                 d.stdout,
                 d.stderr,
                 group,
+                &barrier,
             );
             self.close_stage_descriptors(&d);
             match spawned {
@@ -796,17 +807,25 @@ impl Shell {
                     }
                 }
                 Err(_) => {
-                    self.close_pipes(pipe_count);
-                    for i in stage_index + 1..parsed.count {
-                        let _ = Self::wait_final(self.children[i]);
-                    }
+                    self.abort_pipeline(pipe_count, barrier, stage_index + 1, parsed.count);
                     self.error(SPAWN_FAILURE);
                     return;
                 }
             }
         }
-        self.close_pipes(pipe_count);
         let group = leader.unwrap_or(0);
+        if !parsed.background && syscall::foreground_process_group(group).is_err() {
+            self.abort_pipeline(pipe_count, barrier, 0, parsed.count);
+            self.error(JOB_CONTROL_FAILURE);
+            return;
+        }
+        self.close_pipes(pipe_count);
+        if barrier.release().is_err() {
+            self.terminate_children(0, parsed.count);
+            Self::collect_children(&self.children, parsed.count);
+            self.error(PIPE_FAILURE);
+            return;
+        }
         if let Some(slot) = job_slot {
             self.store_job(slot, parsed.count, group, JobState::Started);
             self.print_job(slot);
@@ -1127,6 +1146,39 @@ impl Shell {
         }
     }
 
+    fn prepare_pipeline_pipes(&self, count: usize) -> bool {
+        for pair in &self.pipes[..count] {
+            if syscall::set_descriptor_flags(pair.reader, DescriptorFlags::CLOSE_ON_EXEC).is_err()
+                || syscall::set_descriptor_flags(pair.writer, DescriptorFlags::CLOSE_ON_EXEC)
+                    .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn abort_pipeline(
+        &self,
+        pipe_count: usize,
+        barrier: LaunchBarrier,
+        child_start: usize,
+        child_end: usize,
+    ) {
+        self.close_pipes(pipe_count);
+        self.terminate_children(child_start, child_end);
+        let _ = barrier.release();
+        for process_id in &self.children[child_start..child_end] {
+            let _ = Self::wait_final(*process_id);
+        }
+    }
+
+    fn terminate_children(&self, start: usize, end: usize) {
+        for process_id in &self.children[start..end] {
+            let _ = platform::kill(*process_id, signal::TERMINATE);
+        }
+    }
+
     fn close_pipes(&self, count: usize) {
         for pair in &self.pipes[..count] {
             let _ = syscall::close(pair.reader);
@@ -1426,7 +1478,7 @@ fn open_redirect(r: FileRedirect) -> Result<FileDescriptor, ()> {
         RedirectMode::Truncate => OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
         RedirectMode::Append => OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND,
     };
-    syscall::open(r.path.as_slice(), flags).map_err(|_| ())
+    syscall::open(r.path.as_slice(), flags | OpenFlags::CLOSE_ON_EXEC).map_err(|_| ())
 }
 
 fn detect_builtin(command: &[u8]) -> Option<Builtin> {

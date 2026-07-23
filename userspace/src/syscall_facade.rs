@@ -1,8 +1,11 @@
 //! Public userspace syscall facade.
 //!
-//! Simple new-process-group launches are constructed from generic process and
-//! descriptor primitives. Descriptor-bearing and joined pipeline stages retain
-//! the legacy atomic spawn call until the shell gains a launch barrier.
+//! Ordinary launches are constructed from generic process and descriptor
+//! primitives. Pipelines use a close-on-exec pipe as a launch barrier so every
+//! child remains blocked until the parent has finished descriptor and
+//! process-group setup. The `/exec` compatibility launcher retains the legacy
+//! atomic spawn path outside a barrier so its transactional accounting remains
+//! unchanged during the migration.
 
 use crate::{abi::signal, platform};
 
@@ -18,6 +21,56 @@ pub use crate::syscall_legacy::{
 const GROUP_SETUP_YIELDS: usize = 256;
 const CHILD_LAUNCH_FAILURE: &[u8] = b"userspace launch failed\n";
 
+#[derive(Debug)]
+pub struct LaunchBarrier {
+    pair: PipePair,
+}
+
+impl LaunchBarrier {
+    pub fn new() -> Result<Self> {
+        let pair = pipe_pair()?;
+        if set_descriptor_flags(pair.reader, DescriptorFlags::CLOSE_ON_EXEC).is_err()
+            || set_descriptor_flags(pair.writer, DescriptorFlags::CLOSE_ON_EXEC).is_err()
+        {
+            let _ = close(pair.writer);
+            let _ = close(pair.reader);
+            return Err(Errno::IO);
+        }
+        Ok(Self { pair })
+    }
+
+    pub fn release(self) -> Result<()> {
+        let writer_result = close(self.pair.writer);
+        let reader_result = close(self.pair.reader);
+        writer_result.and(reader_result)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LaunchDescriptors {
+    stdin: Option<FileDescriptor>,
+    stdout: Option<FileDescriptor>,
+    stderr: Option<FileDescriptor>,
+}
+
+impl LaunchDescriptors {
+    const fn new(
+        stdin: Option<FileDescriptor>,
+        stdout: Option<FileDescriptor>,
+        stderr: Option<FileDescriptor>,
+    ) -> Self {
+        Self {
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.stdin.is_none() && self.stdout.is_none() && self.stderr.is_none()
+    }
+}
+
 pub fn spawn_command(
     command: &[u8],
     flags: SpawnFlags,
@@ -26,20 +79,56 @@ pub fn spawn_command(
     stderr_descriptor: Option<FileDescriptor>,
     process_group: Option<ProcessGroupId>,
 ) -> Result<ProcessId> {
+    spawn_command_inner(
+        command,
+        flags,
+        LaunchDescriptors::new(stdin_descriptor, stdout_descriptor, stderr_descriptor),
+        process_group,
+        None,
+    )
+}
+
+pub fn spawn_command_with_barrier(
+    command: &[u8],
+    flags: SpawnFlags,
+    stdin_descriptor: Option<FileDescriptor>,
+    stdout_descriptor: Option<FileDescriptor>,
+    stderr_descriptor: Option<FileDescriptor>,
+    process_group: Option<ProcessGroupId>,
+    barrier: &LaunchBarrier,
+) -> Result<ProcessId> {
+    spawn_command_inner(
+        command,
+        flags,
+        LaunchDescriptors::new(stdin_descriptor, stdout_descriptor, stderr_descriptor),
+        process_group,
+        Some(barrier.pair),
+    )
+}
+
+fn spawn_command_inner(
+    command: &[u8],
+    flags: SpawnFlags,
+    descriptors: LaunchDescriptors,
+    process_group: Option<ProcessGroupId>,
+    barrier: Option<PipePair>,
+) -> Result<ProcessId> {
     if !generic_spawn_supported(
         command,
         flags,
-        stdin_descriptor,
-        stdout_descriptor,
-        stderr_descriptor,
+        descriptors,
         process_group,
+        barrier.is_some(),
     ) {
+        if barrier.is_some() {
+            return Err(Errno::INVALID_ARGUMENT);
+        }
         return crate::syscall_legacy::spawn_command(
             command,
             flags,
-            stdin_descriptor,
-            stdout_descriptor,
-            stderr_descriptor,
+            descriptors.stdin,
+            descriptors.stdout,
+            descriptors.stderr,
             process_group,
         );
     }
@@ -47,10 +136,11 @@ pub fn spawn_command(
     let foreground = flags.contains(SpawnFlags::FOREGROUND);
     let child_process_id = fork()?;
     if child_process_id == 0 {
-        launch_child(command, foreground)
+        launch_child(command, foreground, descriptors, process_group, barrier)
     }
 
-    if platform::set_process_group(child_process_id, child_process_id).is_err() {
+    let target_group = process_group.unwrap_or(child_process_id);
+    if platform::set_process_group(child_process_id, target_group).is_err() {
         terminate_and_reap(child_process_id);
         return Err(Errno::IO);
     }
@@ -60,20 +150,27 @@ pub fn spawn_command(
 fn generic_spawn_supported(
     command: &[u8],
     flags: SpawnFlags,
-    stdin_descriptor: Option<FileDescriptor>,
-    stdout_descriptor: Option<FileDescriptor>,
-    stderr_descriptor: Option<FileDescriptor>,
+    descriptors: LaunchDescriptors,
     process_group: Option<ProcessGroupId>,
+    barrier: bool,
 ) -> bool {
+    let new_group = flags.contains(SpawnFlags::NEW_PROCESS_GROUP);
+    let join_group = flags.contains(SpawnFlags::JOIN_PROCESS_GROUP);
+    let descriptors_requested = flags.contains(SpawnFlags::USE_DESCRIPTORS);
+    let group_request_valid = if new_group == join_group {
+        false
+    } else if new_group {
+        process_group.is_none()
+    } else {
+        process_group.is_some_and(|group| group != 0)
+    };
+
     !command.is_empty()
-        && flags.contains(SpawnFlags::NEW_PROCESS_GROUP)
-        && !flags.contains(SpawnFlags::USE_DESCRIPTORS)
-        && !flags.contains(SpawnFlags::JOIN_PROCESS_GROUP)
-        && stdin_descriptor.is_none()
-        && stdout_descriptor.is_none()
-        && stderr_descriptor.is_none()
-        && process_group.is_none()
-        && !compatibility_launcher(command)
+        && group_request_valid
+        && (!flags.contains(SpawnFlags::FOREGROUND) || new_group)
+        && (!join_group || barrier)
+        && descriptors_requested == !descriptors.is_empty()
+        && (barrier || !compatibility_launcher(command))
 }
 
 fn compatibility_launcher(command: &[u8]) -> bool {
@@ -85,32 +182,97 @@ fn compatibility_launcher(command: &[u8]) -> bool {
     program == b"exec" || program.ends_with(b"/exec")
 }
 
-fn launch_child(command: &[u8], foreground: bool) -> ! {
+fn launch_child(
+    command: &[u8],
+    foreground: bool,
+    descriptors: LaunchDescriptors,
+    process_group: Option<ProcessGroupId>,
+    barrier: Option<PipePair>,
+) -> ! {
     let process_id = match getpid() {
         Ok(process_id) => process_id,
         Err(_) => launch_failure(),
     };
+    let expected_group = process_group.unwrap_or(process_id);
 
-    let mut grouped = false;
-    for _ in 0..GROUP_SETUP_YIELDS {
-        if platform::get_process_group(0).ok() == Some(process_id) {
-            grouped = true;
-            break;
-        }
-        if yield_now().is_err() {
-            break;
-        }
-    }
-    if !grouped {
+    if let Some(pair) = barrier
+        && close(pair.writer).is_err()
+    {
         launch_failure();
     }
-    if foreground && foreground_process_group(process_id).is_err() {
+    if !install_descriptors(descriptors) {
+        launch_failure();
+    }
+    close_descriptor_sources(descriptors);
+
+    if let Some(pair) = barrier {
+        wait_for_barrier(pair.reader);
+        if platform::get_process_group(0).ok() != Some(expected_group) {
+            launch_failure();
+        }
+    } else if !wait_for_group(expected_group) {
+        launch_failure();
+    }
+
+    if foreground && foreground_process_group(expected_group).is_err() {
         launch_failure();
     }
     if execve(command).is_err() {
         launch_failure();
     }
     exit(127)
+}
+
+fn install_descriptors(descriptors: LaunchDescriptors) -> bool {
+    install_descriptor(descriptors.stdin, STDIN)
+        && install_descriptor(descriptors.stdout, STDOUT)
+        && install_descriptor(descriptors.stderr, STDERR)
+}
+
+fn install_descriptor(source: Option<FileDescriptor>, target: FileDescriptor) -> bool {
+    source.is_none_or(|source| platform::dup2(source, target).is_ok())
+}
+
+fn close_descriptor_sources(descriptors: LaunchDescriptors) {
+    let sources = [descriptors.stdin, descriptors.stdout, descriptors.stderr];
+    for (index, source) in sources.iter().enumerate() {
+        let Some(source) = *source else {
+            continue;
+        };
+        if source < 3 || sources[..index].contains(&Some(source)) {
+            continue;
+        }
+        if close(source).is_err() {
+            launch_failure();
+        }
+    }
+}
+
+fn wait_for_group(expected_group: ProcessGroupId) -> bool {
+    for _ in 0..GROUP_SETUP_YIELDS {
+        if platform::get_process_group(0).ok() == Some(expected_group) {
+            return true;
+        }
+        if yield_now().is_err() {
+            break;
+        }
+    }
+    false
+}
+
+fn wait_for_barrier(reader: FileDescriptor) {
+    let mut byte = [0_u8; 1];
+    loop {
+        match read(reader, &mut byte) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error == Errno::INTERRUPTED => {}
+            Err(_) => launch_failure(),
+        }
+    }
+    if close(reader).is_err() {
+        launch_failure();
+    }
 }
 
 fn launch_failure() -> ! {
