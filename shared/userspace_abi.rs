@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 1;
+pub const ABI_VERSION_MINOR: u64 = 2;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -51,6 +51,22 @@ pub mod syscall {
     pub const KILL: u64 = 32;
     pub const GET_PROCESS_GROUP: u64 = 33;
     pub const SET_PROCESS_GROUP: u64 = 34;
+
+    // Capability and IPC ABI v1. Kernel operations are deliberately bounded
+    // and non-blocking; the userspace facade provides cooperative blocking
+    // helpers by yielding on TRY_AGAIN.
+    pub const CAPABILITY_DUPLICATE: u64 = 35;
+    pub const CAPABILITY_CLOSE: u64 = 36;
+    pub const CAPABILITY_INFO: u64 = 37;
+    pub const ENDPOINT_CREATE: u64 = 38;
+    pub const ENDPOINT_SEND: u64 = 39;
+    pub const ENDPOINT_RECEIVE: u64 = 40;
+    pub const NOTIFICATION_CREATE: u64 = 41;
+    pub const NOTIFICATION_SIGNAL: u64 = 42;
+    pub const NOTIFICATION_TRY_WAIT: u64 = 43;
+    pub const SHARED_MEMORY_CREATE: u64 = 44;
+    pub const SHARED_MEMORY_READ: u64 = 45;
+    pub const SHARED_MEMORY_WRITE: u64 = 46;
 }
 
 pub mod capability {
@@ -61,6 +77,10 @@ pub mod capability {
     pub const PARENT_PROCESS: u64 = 1 << 4;
     pub const DIRECT_SIGNALS: u64 = 1 << 5;
     pub const PROCESS_GROUP_CONTROL: u64 = 1 << 6;
+    pub const HANDLE_TABLE: u64 = 1 << 7;
+    pub const IPC_ENDPOINTS: u64 = 1 << 8;
+    pub const NOTIFICATIONS: u64 = 1 << 9;
+    pub const SHARED_MEMORY_OBJECTS: u64 = 1 << 10;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -69,6 +89,68 @@ pub mod capability {
         | PARENT_PROCESS
         | DIRECT_SIGNALS
         | PROCESS_GROUP_CONTROL;
+
+    pub const PROTECTION_V1: u64 =
+        HANDLE_TABLE | IPC_ENDPOINTS | NOTIFICATIONS | SHARED_MEMORY_OBJECTS;
+
+    pub const INVALID_HANDLE: u64 = 0;
+
+    pub const KIND_ENDPOINT: u64 = 1;
+    pub const KIND_NOTIFICATION: u64 = 2;
+    pub const KIND_SHARED_MEMORY: u64 = 3;
+
+    pub const RIGHT_DUPLICATE: u64 = 1 << 0;
+    pub const RIGHT_TRANSFER: u64 = 1 << 1;
+    pub const RIGHT_SEND: u64 = 1 << 2;
+    pub const RIGHT_RECEIVE: u64 = 1 << 3;
+    pub const RIGHT_SIGNAL: u64 = 1 << 4;
+    pub const RIGHT_WAIT: u64 = 1 << 5;
+    pub const RIGHT_READ: u64 = 1 << 6;
+    pub const RIGHT_WRITE: u64 = 1 << 7;
+
+    pub const ENDPOINT_RIGHTS: u64 = RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SEND | RIGHT_RECEIVE;
+    pub const NOTIFICATION_RIGHTS: u64 =
+        RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SIGNAL | RIGHT_WAIT;
+    pub const SHARED_MEMORY_RIGHTS: u64 =
+        RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_READ | RIGHT_WRITE;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Info {
+        pub object_id: u64,
+        pub kind: u64,
+        pub rights: u64,
+        /// Object-specific bounded state: queued endpoint messages, pending
+        /// notification count, or shared-memory byte length.
+        pub size: u64,
+    }
+
+    impl Info {
+        pub const EMPTY: Self = Self {
+            object_id: 0,
+            kind: 0,
+            rights: 0,
+            size: 0,
+        };
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MessageInfo {
+        pub sender_process_id: u64,
+        pub byte_count: u64,
+        pub transferred_handle: u64,
+        pub transferred_rights: u64,
+    }
+
+    impl MessageInfo {
+        pub const EMPTY: Self = Self {
+            sender_process_id: 0,
+            byte_count: 0,
+            transferred_handle: INVALID_HANDLE,
+            transferred_rights: 0,
+        };
+    }
 }
 
 #[repr(C)]
@@ -293,6 +375,15 @@ pub mod limits {
     pub const MAX_COMMAND_BYTES: usize = 512;
     pub const MAX_PATH_BYTES: usize = 4096;
     pub const MAX_DIRECTORY_ENTRIES_PER_CALL: usize = 32;
+
+    pub const MAX_CAPABILITIES_PER_PROCESS: usize = 64;
+    pub const MAX_ENDPOINT_OBJECTS: usize = 32;
+    pub const MAX_NOTIFICATION_OBJECTS: usize = 32;
+    pub const MAX_SHARED_MEMORY_OBJECTS: usize = 16;
+    pub const MAX_ENDPOINT_MESSAGES: usize = 8;
+    pub const MAX_IPC_MESSAGE_BYTES: usize = 256;
+    pub const MAX_SHARED_MEMORY_BYTES: usize = 16 * 1024;
+    pub const MAX_SHARED_MEMORY_TOTAL_BYTES: usize = 256 * 1024;
 }
 
 pub mod errno {
