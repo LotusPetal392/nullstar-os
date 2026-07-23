@@ -19,6 +19,9 @@ experimentation, not production use or untrusted workloads.
 - ELF64 ring-3 processes, file descriptors, pipes, `fork` with copy-on-write,
   transactional `exec`, parent/child waiting, environments, process groups,
   terminal ownership, and a focused signal implementation
+- bounded per-process capability tables with rights-reduced duplication and
+  delegation, message endpoints, counted notifications, shared byte-memory
+  objects, and explicit direct-child bootstrap grants
 - a documented userspace platform ABI with system discovery, file metadata,
   paged directory reads, per-process working directories, descriptor
   duplication, parent-process lookup, direct child signaling, and controlled
@@ -30,9 +33,10 @@ experimentation, not production use or untrusted workloads.
   tests and a local pre-push check script
 
 See [Architecture](docs/architecture.md) for how these pieces fit together,
-[Userspace ABI](docs/syscall-abi.md) for the ring-3 contract, and
-[Development](docs/development.md) for the toolchain, test workflow, and common
-build issues.
+[Userspace ABI](docs/syscall-abi.md) for the ring-3 contract,
+[Protection model](docs/protection-model.md) for the capability and IPC
+foundation, and [Development](docs/development.md) for the toolchain, test
+workflow, and common build issues.
 
 ## Requirements
 
@@ -158,9 +162,13 @@ images, and launches QEMU.
   The `/exec` helper follows the same path, so no bundled program calls syscall
   7's legacy atomic spawn operation. The kernel retains that entry point only
   to preserve the version-1 ABI contract.
-- Process, descriptor, pipe, environment, job, and filesystem resources have
-  fixed bounds. These keep failure behavior deterministic while the kernel is
-  still evolving.
+- The capability and IPC layer is a migration foundation: existing drivers,
+  filesystems, VFS routing, terminals, and pipes remain kernel-resident. Shared
+  memory currently uses bounded copy operations rather than mapped pages, and
+  there are no MMIO, IRQ, DMA, revocation, or service-discovery capabilities.
+- Process, descriptor, pipe, capability, environment, job, and filesystem
+  resources have fixed bounds. These keep failure behavior deterministic while
+  the kernel is still evolving.
 - Security hardening and broad hardware compatibility are incomplete.
 
 ## AI-assisted development
