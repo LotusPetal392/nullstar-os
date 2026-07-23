@@ -1,0 +1,26 @@
+name: Export rustfmt patch
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rustfmt-export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Install pinned rustfmt
+        run: rustup toolchain install nightly-2026-02-01 --profile minimal --component rustfmt
+      - name: Format Rust sources
+        run: cargo +nightly-2026-02-01 fmt --all
+      - name: Capture formatting patch
+        run: git diff --binary > rustfmt.patch
+      - name: Upload formatting patch
+        uses: actions/upload-artifact@v6
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
+          if-no-files-found: error
