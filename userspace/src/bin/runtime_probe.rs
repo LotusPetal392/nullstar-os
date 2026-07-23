@@ -149,7 +149,7 @@ fn platform_probe(argument: &[u8]) -> bool {
 }
 
 fn supplementary_probes_enabled(argument: &[u8]) -> bool {
-    !matches!(argument, b"runtime-smoke" | b"manual-argv")
+    argument != b"runtime-smoke" && argument != b"manual-argv"
 }
 
 fn relative_open_probe() -> bool {
