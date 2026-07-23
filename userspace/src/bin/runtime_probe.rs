@@ -168,7 +168,9 @@ fn capability_probe() -> bool {
         return false;
     };
     if endpoint_info.kind != ObjectKind::Endpoint
-        || !endpoint_info.rights.contains(Rights::SEND | Rights::RECEIVE)
+        || !endpoint_info
+            .rights
+            .contains(Rights::SEND | Rights::RECEIVE)
         || endpoint_info.size != 0
     {
         return false;
@@ -204,7 +206,7 @@ fn capability_probe() -> bool {
     let mut shared_readback = [0_u8; SHARED_BYTES.len()];
     if ipc::shared_memory_read(read_only_memory, SHARED_OFFSET, &mut shared_readback).ok()
         != Some(SHARED_BYTES.len())
-        || shared_readback != *SHARED_BYTES
+        || shared_readback.as_slice() != SHARED_BYTES
     {
         return false;
     }
