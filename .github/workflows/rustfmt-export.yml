@@ -18,9 +18,12 @@ jobs:
         run: cargo +nightly-2026-02-01 fmt --all
       - name: Capture formatting patch
         run: git diff --binary > rustfmt.patch
-      - name: Upload formatting patch
+      - name: Upload formatting output
         uses: actions/upload-artifact@v6
         with:
-          name: rustfmt-patch
-          path: rustfmt.patch
+          name: rustfmt-output
+          path: |
+            rustfmt.patch
+            userspace/src/bin/runtime_probe.rs
+            userspace/src/ipc.rs
           if-no-files-found: error
