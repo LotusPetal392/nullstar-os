@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod args;
+pub mod blocking_ipc;
 pub mod environment;
 pub mod heap;
 pub mod ipc;
