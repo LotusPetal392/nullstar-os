@@ -15,14 +15,17 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const INIT_READY: &[u8] = b"userspace init ready: pid=1\n";
-const SERVICE_COMMAND: &[u8] = b"/service-probe";
-const SERVICE_READY_MESSAGE: &[u8] = b"service-ready: probe";
-const SERVICE_STARTING: &[u8] = b"userspace init: starting probe service\n";
-const SERVICE_RESTARTING: &[u8] = b"userspace init: probe service exited; restarting\n";
-const SERVICE_READY: &[u8] = b"userspace init: probe service ready\n";
-const SERVICE_FAILED: &[u8] = b"userspace init: probe service exhausted restart budget\n";
-const SERVICE_BOOTSTRAP_FAILED: &[u8] = b"userspace init: failed to grant service endpoint\n";
-const SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid service readiness message\n";
+const SERVICE_COMMAND: &[u8] = b"/tmpfs-service";
+const SERVICE_READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
+const SERVICE_STARTING: &[u8] = b"userspace init: starting tmpfs service\n";
+const SERVICE_RESTARTING: &[u8] = b"userspace init: tmpfs service exited; restarting\n";
+const SERVICE_READY: &[u8] = b"userspace init: tmpfs service ready\n";
+const SERVICE_FAILED: &[u8] = b"userspace init: tmpfs service exhausted restart budget\n";
+const SERVICE_BOOTSTRAP_FAILED: &[u8] = b"userspace init: failed to grant tmpfs capabilities\n";
+const SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid tmpfs readiness message\n";
+const TMPFS_PROBE_COMMAND: &[u8] = b"/tmpfs-probe";
+const TMPFS_PROBE_FAILED: &[u8] = b"userspace init: userspace tmpfs probe failed\n";
+const TMPFS_PROBE_PASSED: &[u8] = b"userspace init: userspace tmpfs probe passed\n";
 const SHELL_COMMAND: &[u8] = b"/ush";
 const SHELL_LAUNCHED: &[u8] = b"userspace init launched /ush\n";
 const SHELL_RESTARTING: &[u8] = b"userspace init: /ush exited; restarting\n";
@@ -32,11 +35,14 @@ const SHELL_WAIT_FAILED: &[u8] = b"userspace init: failed while waiting for /ush
 const SHELL_FOREGROUND_FAILED: &[u8] =
     b"userspace init: failed to restore /ush to the foreground\n";
 
-const PROBE_SERVICE: ServiceSpec = ServiceSpec {
-    name: b"probe",
+const READY_HANDLE: u64 = 1;
+const REQUEST_HANDLE: u64 = 2;
+
+const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
+    name: b"tmpfs",
     command: SERVICE_COMMAND,
     ready_message: SERVICE_READY_MESSAGE,
-    bootstrap_handle: 1,
+    bootstrap_handle: READY_HANDLE,
     restart_limit: 3,
     restart_backoff_yields: 32,
 };
@@ -49,12 +55,13 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(1);
     }
 
-    let readiness_endpoint = match ipc::endpoint_create() {
-        Ok(endpoint) => endpoint,
-        Err(_) => fail(SERVICE_BOOTSTRAP_FAILED),
-    };
-    let mut service = ServiceRuntime::new(PROBE_SERVICE);
-    start_service(&mut service, readiness_endpoint);
+    let readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
+    let request_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
+    let mut service = ServiceRuntime::new(TMPFS_SERVICE);
+    start_service(&mut service, readiness_endpoint, request_endpoint);
+    run_tmpfs_probe(request_endpoint);
     let mut shell_process_id = spawn_shell();
 
     loop {
@@ -65,7 +72,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, SERVICE_RESTARTING);
                         backoff(backoff_yields);
-                        start_service(&mut service, readiness_endpoint);
+                        start_service(&mut service, readiness_endpoint, request_endpoint);
                     }
                     ServiceStatusDisposition::Failed => fail(SERVICE_FAILED),
                 },
@@ -99,30 +106,34 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     }
 }
 
-fn start_service(service: &mut ServiceRuntime, readiness_endpoint: CapabilityHandle) {
+fn start_service(
+    service: &mut ServiceRuntime,
+    readiness_endpoint: CapabilityHandle,
+    request_endpoint: CapabilityHandle,
+) {
     loop {
         let spec = service.spec();
         let _ = syscall::write_all(STDOUT, SERVICE_STARTING);
-        let process_id = match syscall::spawn_command(
+        let process_id = syscall::spawn_command(
             spec.command,
             SpawnFlags::NEW_PROCESS_GROUP,
             None,
             None,
             None,
             None,
-        ) {
-            Ok(process_id) => process_id,
-            Err(_) => fail(SERVICE_FAILED),
-        };
-        service.note_spawned(process_id);
-        if ipc::grant_child(
-            process_id,
-            readiness_endpoint,
-            Rights::SEND,
-            spec.bootstrap_handle,
         )
-        .ok()
-            != Some(spec.bootstrap_handle)
+        .unwrap_or_else(|_| fail(SERVICE_FAILED));
+        service.note_spawned(process_id);
+        if ipc::grant_child(process_id, readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
+            != Some(READY_HANDLE)
+            || ipc::grant_child(
+                process_id,
+                request_endpoint,
+                Rights::RECEIVE,
+                REQUEST_HANDLE,
+            )
+            .ok()
+                != Some(REQUEST_HANDLE)
         {
             fail(SERVICE_BOOTSTRAP_FAILED);
         }
@@ -160,28 +171,48 @@ fn start_service(service: &mut ServiceRuntime, readiness_endpoint: CapabilityHan
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
                 Err(_) => fail(SERVICE_FAILED),
             }
-
-            if syscall::yield_now().is_err() {
-                fail(SERVICE_FAILED);
-            }
+            let _ = syscall::yield_now();
         }
     }
 }
 
+fn run_tmpfs_probe(request_endpoint: CapabilityHandle) {
+    let process_id = syscall::spawn_command(
+        TMPFS_PROBE_COMMAND,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap_or_else(|_| fail(TMPFS_PROBE_FAILED));
+    if ipc::grant_child(process_id, request_endpoint, Rights::SEND, 1).ok() != Some(1) {
+        fail(TMPFS_PROBE_FAILED);
+    }
+    loop {
+        match syscall::wait_child(process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(status) if status.success() => break,
+            Ok(_) => fail(TMPFS_PROBE_FAILED),
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(TMPFS_PROBE_FAILED),
+        }
+    }
+    let _ = syscall::write_all(STDOUT, TMPFS_PROBE_PASSED);
+}
+
 fn spawn_shell() -> ProcessId {
-    let shell_process_id = match syscall::spawn_command(
+    let process_id = syscall::spawn_command(
         SHELL_COMMAND,
         SpawnFlags::FOREGROUND | SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
         None,
         None,
-    ) {
-        Ok(process_id) => process_id,
-        Err(_) => fail(SHELL_SPAWN_FAILED),
-    };
+    )
+    .unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
     let _ = syscall::write_all(STDOUT, SHELL_LAUNCHED);
-    shell_process_id
+    process_id
 }
 
 fn backoff(yields: u32) {

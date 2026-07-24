@@ -13,6 +13,18 @@ test = false
 bench = false
 
 [[bin]]
+name = "tmpfs_service"
+path = "src/bin/tmpfs_service.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "tmpfs_probe"
+path = "src/bin/tmpfs_probe.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "service_probe"
 path = "src/bin/service_probe.rs"
 test = false

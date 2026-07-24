@@ -16,6 +16,14 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_init")
             .expect("userspace init artifact path was not set"),
     );
+    let userspace_tmpfs_service = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_tmpfs_service")
+            .expect("userspace tmpfs-service artifact path was not set"),
+    );
+    let userspace_tmpfs_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_tmpfs_probe")
+            .expect("userspace tmpfs-probe artifact path was not set"),
+    );
     let userspace_service_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_service_probe")
             .expect("userspace service-probe artifact path was not set"),
@@ -87,7 +95,6 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_exec_target")
             .expect("userspace exec-target artifact path was not set"),
     );
-
     let userspace_fork_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_fork_probe")
             .expect("userspace fork-probe artifact path was not set"),
@@ -127,6 +134,11 @@ fn main() {
         let mut image = bootloader::DiskImageBuilder::new(kernel_binary.clone());
         image.set_file_contents(String::from("BOOTMODE"), boot_mode.to_vec());
         image.set_file(String::from("init"), userspace_init.clone());
+        image.set_file(
+            String::from("tmpfs-service"),
+            userspace_tmpfs_service.clone(),
+        );
+        image.set_file(String::from("tmpfs-probe"), userspace_tmpfs_probe.clone());
         image.set_file(
             String::from("service-probe"),
             userspace_service_probe.clone(),
