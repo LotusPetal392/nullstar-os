@@ -114,13 +114,15 @@ fn start_service(
     loop {
         let spec = service.spec();
         let _ = syscall::write_all(STDOUT, SERVICE_STARTING);
-        let process_id = syscall::spawn_command(
+        let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(SERVICE_FAILED));
+        let process_id = syscall::spawn_command_with_barrier(
             spec.command,
             SpawnFlags::NEW_PROCESS_GROUP,
             None,
             None,
             None,
             None,
+            &barrier,
         )
         .unwrap_or_else(|_| fail(SERVICE_FAILED));
         service.note_spawned(process_id);
@@ -137,6 +139,9 @@ fn start_service(
         {
             fail(SERVICE_BOOTSTRAP_FAILED);
         }
+        barrier
+            .release()
+            .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
 
         let mut ready_buffer = [0_u8; 64];
         loop {
@@ -177,18 +182,23 @@ fn start_service(
 }
 
 fn run_tmpfs_probe(request_endpoint: CapabilityHandle) {
-    let process_id = syscall::spawn_command(
+    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(TMPFS_PROBE_FAILED));
+    let process_id = syscall::spawn_command_with_barrier(
         TMPFS_PROBE_COMMAND,
         SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
         None,
         None,
+        &barrier,
     )
     .unwrap_or_else(|_| fail(TMPFS_PROBE_FAILED));
     if ipc::grant_child(process_id, request_endpoint, Rights::SEND, 1).ok() != Some(1) {
         fail(TMPFS_PROBE_FAILED);
     }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(TMPFS_PROBE_FAILED));
     loop {
         match syscall::wait_child(process_id) {
             Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
