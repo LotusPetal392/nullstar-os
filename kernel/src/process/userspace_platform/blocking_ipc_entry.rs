@@ -1,6 +1,13 @@
 // Scheduler-integrated endpoint readiness waits layered over the bounded
 // capability data-movement syscalls.
 
+mod phase5_blocking_ipc_abi {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/blocking_ipc_abi.rs"
+    ));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EndpointWaiter {
     object: CapabilityObjectRef,
@@ -73,14 +80,32 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
     let registers_pointer = current_stack_pointer as *mut SavedRegisters;
     let syscall_number = unsafe { (*registers_pointer).rax };
 
-    if syscall_number == abi::syscall::ENDPOINT_WAIT {
+    if syscall_number == abi::syscall::SYSTEM_INFO {
+        let Some(process_id) = scheduler::current_process_id() else {
+            unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
+            return current_stack_pointer;
+        };
+        let address = unsafe { (*registers_pointer).rdi };
+        let length = unsafe { (*registers_pointer).rsi };
+        unsafe {
+            (*registers_pointer).rax = blocking_ipc_system_info(process_id, address, length)
+        };
+        return current_stack_pointer;
+    }
+
+    if syscall_number == phase5_blocking_ipc_abi::syscall::ENDPOINT_WAIT {
         return blocking_endpoint_wait(current_stack_pointer, registers_pointer);
     }
 
     if syscall_number == abi::syscall::ENDPOINT_SEND {
         let endpoint_object = scheduler::current_process_id().and_then(|process_id| {
             let endpoint_handle = unsafe { (*registers_pointer).rdi };
-            endpoint_object_for_handle(process_id, endpoint_handle).ok()
+            endpoint_object_for_handle(
+                process_id,
+                endpoint_handle,
+                abi::capability::RIGHT_SEND,
+            )
+            .ok()
         });
         let next_stack_pointer =
             nullstar_capability_grant_syscall_dispatch(current_stack_pointer);
@@ -97,15 +122,32 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
     nullstar_capability_grant_syscall_dispatch(current_stack_pointer)
 }
 
+fn blocking_ipc_system_info(process_id: u64, address: u64, length: u64) -> u64 {
+    let info = abi::SystemInfo {
+        abi_major: abi::ABI_VERSION_MAJOR,
+        abi_minor: phase5_blocking_ipc_abi::ABI_VERSION_MINOR,
+        capabilities: abi::capability::PLATFORM_V1
+            | abi::capability::PROTECTION_V1
+            | phase5_blocking_ipc_abi::FEATURE_ENDPOINT_WAIT,
+        page_size: PLATFORM_PAGE_SIZE,
+        maximum_open_files: MAX_OPEN_FILES as u64,
+        maximum_path_bytes: abi::limits::MAX_PATH_BYTES as u64,
+        maximum_directory_entries: abi::limits::MAX_DIRECTORY_ENTRIES_PER_CALL as u64,
+        init_process_id: INIT_PROCESS_ID,
+    };
+    platform_write_value(process_id, address, length, info)
+}
+
 fn endpoint_object_for_handle(
     process_id: u64,
     endpoint_handle: u64,
+    required_right: u64,
 ) -> Result<CapabilityObjectRef, i64> {
     let registry = CAPABILITY_REGISTRY.lock();
     let entry = registry
         .entry(process_id, endpoint_handle)
         .ok_or(abi::errno::BAD_FILE_DESCRIPTOR)?;
-    capability_has_right(entry, abi::capability::RIGHT_RECEIVE)?;
+    capability_has_right(entry, required_right)?;
     if entry.object.kind != abi::capability::KIND_ENDPOINT {
         return Err(abi::errno::INVALID_ARGUMENT);
     }
@@ -146,7 +188,11 @@ fn blocking_endpoint_wait(
     let mut waiters = ENDPOINT_WAITERS.lock();
     waiters.retain(|waiter| waiter.process_id != process_id);
 
-    let endpoint_object = match endpoint_object_for_handle(process_id, endpoint_handle) {
+    let endpoint_object = match endpoint_object_for_handle(
+        process_id,
+        endpoint_handle,
+        abi::capability::RIGHT_RECEIVE,
+    ) {
         Ok(object) => object,
         Err(error) => {
             unsafe { (*registers_pointer).rax = error_return(error) };
