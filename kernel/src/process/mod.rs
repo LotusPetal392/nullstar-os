@@ -11,6 +11,7 @@ mod userspace_legacy {
     include!("userspace_platform/process_group_entry.rs");
     include!("userspace_platform/capability_entry.rs");
     include!("userspace_platform/capability_grant_entry.rs");
+    include!("userspace_platform/blocking_ipc_entry.rs");
 }
 
 pub(crate) mod userspace {
@@ -25,6 +26,8 @@ pub(crate) mod userspace {
             super::userspace_legacy::process_group_syscall_interrupt_entry_address;
         let _capability_entry: fn() -> x86_64::VirtAddr =
             super::userspace_legacy::capability_syscall_interrupt_entry_address;
-        super::userspace_legacy::capability_grant_syscall_interrupt_entry_address()
+        let _capability_grant_entry: fn() -> x86_64::VirtAddr =
+            super::userspace_legacy::capability_grant_syscall_interrupt_entry_address;
+        super::userspace_legacy::blocking_ipc_syscall_interrupt_entry_address()
     }
 }
