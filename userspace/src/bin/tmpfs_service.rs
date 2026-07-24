@@ -47,6 +47,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(2);
     }
 
+    let generation = syscall::getpid().unwrap_or(1) as u32;
     let mut files = [File::EMPTY; protocol::MAX_FILES];
     let mut request_bytes = [0_u8; size_of::<protocol::Request>()];
     loop {
@@ -65,7 +66,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         let request = unsafe {
             core::ptr::read_unaligned(request_bytes.as_ptr() as *const protocol::Request)
         };
-        let reply = dispatch(&mut files, &request);
+        let reply = dispatch(&mut files, generation, &request);
         let reply_bytes = unsafe {
             slice::from_raw_parts(
                 &reply as *const protocol::Reply as *const u8,
@@ -83,12 +84,21 @@ fn valid_bootstrap(handle: u64, kind: ObjectKind, rights: Rights) -> bool {
 
 fn dispatch(
     files: &mut [File; protocol::MAX_FILES],
+    generation: u32,
     request: &protocol::Request,
 ) -> protocol::Reply {
     let mut reply = protocol::Reply::EMPTY;
     reply.operation = request.operation;
+    reply.generation = generation;
     if request.version != protocol::VERSION {
         reply.status = protocol::status::INVALID;
+        return reply;
+    }
+    if request.operation == protocol::operation::MOUNT {
+        return reply;
+    }
+    if request.generation != generation {
+        reply.status = protocol::status::STALE_MOUNT;
         return reply;
     }
     let name_length = request.name_length as usize;

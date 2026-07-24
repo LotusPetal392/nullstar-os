@@ -18,6 +18,85 @@ pub enum Error {
     NotFound,
     NoSpace,
     Range,
+    StaleMount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mount {
+    service: CapabilityHandle,
+    generation: u32,
+}
+
+impl Mount {
+    pub fn connect(service: CapabilityHandle) -> Result<Self, Error> {
+        let mut request_value = protocol::Request::EMPTY;
+        request_value.operation = protocol::operation::MOUNT;
+        let reply = request(service, &request_value)?;
+        if reply.generation == 0 {
+            return Err(Error::Transport);
+        }
+        Ok(Self {
+            service,
+            generation: reply.generation,
+        })
+    }
+
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+
+    pub fn write(self, name: &[u8], bytes: &[u8]) -> Result<usize, Error> {
+        if bytes.len() > protocol::MAX_DATA_BYTES {
+            return Err(Error::Range);
+        }
+        let mut request_value = named(protocol::operation::WRITE, self.generation, name)?;
+        request_value.data_length = bytes.len() as u16;
+        request_value.data[..bytes.len()].copy_from_slice(bytes);
+        request(self.service, &request_value).map(|reply| reply.value as usize)
+    }
+
+    pub fn read(self, name: &[u8], offset: usize, buffer: &mut [u8]) -> Result<usize, Error> {
+        if buffer.len() > protocol::MAX_DATA_BYTES {
+            return Err(Error::Range);
+        }
+        let mut request_value = named(protocol::operation::READ, self.generation, name)?;
+        request_value.offset = u32::try_from(offset).map_err(|_| Error::Range)?;
+        request_value.data_length = buffer.len() as u16;
+        let reply = request(self.service, &request_value)?;
+        let count = reply.data_length as usize;
+        if count > buffer.len() || count > reply.data.len() {
+            return Err(Error::Transport);
+        }
+        buffer[..count].copy_from_slice(&reply.data[..count]);
+        Ok(count)
+    }
+
+    pub fn stat(self, name: &[u8]) -> Result<usize, Error> {
+        let request_value = named(protocol::operation::STAT, self.generation, name)?;
+        request(self.service, &request_value).map(|reply| reply.value as usize)
+    }
+
+    pub fn remove(self, name: &[u8]) -> Result<(), Error> {
+        let request_value = named(protocol::operation::REMOVE, self.generation, name)?;
+        request(self.service, &request_value).map(|_| ())
+    }
+
+    pub fn list(self, buffer: &mut [u8]) -> Result<usize, Error> {
+        if buffer.len() > protocol::MAX_DATA_BYTES {
+            return Err(Error::Range);
+        }
+        let mut request_value = protocol::Request::EMPTY;
+        request_value.operation = protocol::operation::LIST;
+        request_value.generation = self.generation;
+        request_value.data_length = buffer.len() as u16;
+        let reply = request(self.service, &request_value)?;
+        let count = reply.data_length as usize;
+        if count > buffer.len() || count > reply.data.len() {
+            return Err(Error::Transport);
+        }
+        buffer[..count].copy_from_slice(&reply.data[..count]);
+        Ok(count)
+    }
 }
 
 fn bytes_of<T>(value: &T) -> &[u8] {
@@ -58,74 +137,40 @@ fn request(
         protocol::status::NOT_FOUND => Err(Error::NotFound),
         protocol::status::NO_SPACE => Err(Error::NoSpace),
         protocol::status::RANGE => Err(Error::Range),
+        protocol::status::STALE_MOUNT => Err(Error::StaleMount),
         _ => Err(Error::Transport),
     }
 }
 
-fn named(operation: u16, name: &[u8]) -> Result<protocol::Request, Error> {
+fn named(operation: u16, generation: u32, name: &[u8]) -> Result<protocol::Request, Error> {
     if name.is_empty() || name.len() > protocol::MAX_NAME_BYTES || name.contains(&b'/') {
         return Err(Error::Invalid);
     }
     let mut request = protocol::Request::EMPTY;
     request.operation = operation;
+    request.generation = generation;
     request.name_length = name.len() as u16;
     request.name[..name.len()].copy_from_slice(name);
     Ok(request)
 }
 
-pub fn write(service: CapabilityHandle, name: &[u8], bytes: &[u8]) -> Result<usize, Error> {
-    if bytes.len() > protocol::MAX_DATA_BYTES {
-        return Err(Error::Range);
-    }
-    let mut request_value = named(protocol::operation::WRITE, name)?;
-    request_value.data_length = bytes.len() as u16;
-    request_value.data[..bytes.len()].copy_from_slice(bytes);
-    request(service, &request_value).map(|reply| reply.value as usize)
-}
+#[cfg(test)]
+mod tests {
+    use core::mem::size_of;
 
-pub fn read(
-    service: CapabilityHandle,
-    name: &[u8],
-    offset: usize,
-    buffer: &mut [u8],
-) -> Result<usize, Error> {
-    if buffer.len() > protocol::MAX_DATA_BYTES {
-        return Err(Error::Range);
-    }
-    let mut request_value = named(protocol::operation::READ, name)?;
-    request_value.offset = u32::try_from(offset).map_err(|_| Error::Range)?;
-    request_value.data_length = buffer.len() as u16;
-    let reply = request(service, &request_value)?;
-    let count = reply.data_length as usize;
-    if count > buffer.len() || count > reply.data.len() {
-        return Err(Error::Transport);
-    }
-    buffer[..count].copy_from_slice(&reply.data[..count]);
-    Ok(count)
-}
+    use super::{named, protocol};
 
-pub fn stat(service: CapabilityHandle, name: &[u8]) -> Result<usize, Error> {
-    let request_value = named(protocol::operation::STAT, name)?;
-    request(service, &request_value).map(|reply| reply.value as usize)
-}
-
-pub fn remove(service: CapabilityHandle, name: &[u8]) -> Result<(), Error> {
-    let request_value = named(protocol::operation::REMOVE, name)?;
-    request(service, &request_value).map(|_| ())
-}
-
-pub fn list(service: CapabilityHandle, buffer: &mut [u8]) -> Result<usize, Error> {
-    if buffer.len() > protocol::MAX_DATA_BYTES {
-        return Err(Error::Range);
+    #[test]
+    fn protocol_records_fit_endpoint_messages() {
+        assert!(size_of::<protocol::Request>() <= 256);
+        assert!(size_of::<protocol::Reply>() <= 256);
     }
-    let mut request_value = protocol::Request::EMPTY;
-    request_value.operation = protocol::operation::LIST;
-    request_value.data_length = buffer.len() as u16;
-    let reply = request(service, &request_value)?;
-    let count = reply.data_length as usize;
-    if count > buffer.len() || count > reply.data.len() {
-        return Err(Error::Transport);
+
+    #[test]
+    fn named_requests_preserve_mount_generation() {
+        let request = named(protocol::operation::STAT, 41, b"state").expect("valid request");
+        assert_eq!(request.version, protocol::VERSION);
+        assert_eq!(request.generation, 41);
+        assert_eq!(&request.name[..request.name_length as usize], b"state");
     }
-    buffer[..count].copy_from_slice(&reply.data[..count]);
-    Ok(count)
 }
