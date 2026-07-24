@@ -31,6 +31,7 @@ jobs:
           service = Path("userspace/src/bin/tmpfs_service.rs")
           text = service.read_text()
           text = text.replace("usize::from(cursor != 0)", "if cursor != 0 { 1 } else { 0 }")
+          text = text.replace("name.iter().any(|byte| *byte == b'/')", "name.contains(&b'/')")
           service.write_text(text)
 
           client = Path("userspace/src/tmpfs.rs")
@@ -39,6 +40,7 @@ jobs:
               "let mut request = named(protocol::operation::WRITE, name)?;\n    request.data_length = bytes.len() as u16;\n    request.data[..bytes.len()].copy_from_slice(bytes);\n    request(service, &request)",
               "let mut request_value = named(protocol::operation::WRITE, name)?;\n    request_value.data_length = bytes.len() as u16;\n    request_value.data[..bytes.len()].copy_from_slice(bytes);\n    request(service, &request_value)",
           )
+          text = text.replace("name.iter().any(|byte| *byte == b'/')", "name.contains(&b'/')")
           client.write_text(text)
           PY
           cargo +nightly-2026-02-01 fmt --all
