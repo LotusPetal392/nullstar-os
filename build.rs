@@ -16,6 +16,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_init")
             .expect("userspace init artifact path was not set"),
     );
+    let userspace_service_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_service_probe")
+            .expect("userspace service-probe artifact path was not set"),
+    );
     let userspace_process_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_process_probe")
             .expect("userspace process-probe artifact path was not set"),
@@ -123,6 +127,10 @@ fn main() {
         let mut image = bootloader::DiskImageBuilder::new(kernel_binary.clone());
         image.set_file_contents(String::from("BOOTMODE"), boot_mode.to_vec());
         image.set_file(String::from("init"), userspace_init.clone());
+        image.set_file(
+            String::from("service-probe"),
+            userspace_service_probe.clone(),
+        );
         image.set_file(
             String::from("process-probe"),
             userspace_process_probe.clone(),
