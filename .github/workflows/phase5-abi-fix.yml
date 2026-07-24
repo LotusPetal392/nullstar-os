@@ -1,0 +1,72 @@
+name: Phase 5 ABI fix
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/phase5-blocking-ipc
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-02-01 \
+            --profile minimal \
+            --component clippy \
+            --component llvm-tools-preview \
+            --component rust-src \
+            --component rustfmt \
+            --target x86_64-unknown-none
+      - name: Consolidate Phase 5 ABI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              file = Path(path)
+              text = file.read_text()
+              if old not in text:
+                  raise SystemExit(f"missing anchor in {path}: {old!r}")
+              file.write_text(text.replace(old, new, 1))
+
+          replace("shared/userspace_abi.rs", "pub const ABI_VERSION_MINOR: u64 = 2;", "pub const ABI_VERSION_MINOR: u64 = 3;")
+          replace("shared/userspace_abi.rs", "    pub const SHARED_MEMORY_WRITE: u64 = 46;\n", "    pub const SHARED_MEMORY_WRITE: u64 = 46;\n    pub const ENDPOINT_WAIT: u64 = 47;\n")
+          replace("shared/userspace_abi.rs", "    pub const SHARED_MEMORY_OBJECTS: u64 = 1 << 10;\n", "    pub const SHARED_MEMORY_OBJECTS: u64 = 1 << 10;\n    pub const BLOCKING_ENDPOINT_WAIT: u64 = 1 << 11;\n")
+          replace("shared/userspace_abi.rs", "    pub const PROTECTION_V1: u64 =\n        HANDLE_TABLE | IPC_ENDPOINTS | NOTIFICATIONS | SHARED_MEMORY_OBJECTS;", "    pub const PROTECTION_V1: u64 = HANDLE_TABLE\n        | IPC_ENDPOINTS\n        | NOTIFICATIONS\n        | SHARED_MEMORY_OBJECTS\n        | BLOCKING_ENDPOINT_WAIT;")
+
+          kernel = Path("kernel/src/process/userspace_platform/blocking_ipc_entry.rs")
+          text = kernel.read_text()
+          start = text.index("mod phase5_blocking_ipc_abi {")
+          end = text.index("\n\n#[derive", start)
+          text = text[:start] + text[end + 2:]
+          text = text.replace("phase5_blocking_ipc_abi::syscall::ENDPOINT_WAIT", "abi::syscall::ENDPOINT_WAIT")
+          text = text.replace("phase5_blocking_ipc_abi::ABI_VERSION_MINOR", "abi::ABI_VERSION_MINOR")
+          text = text.replace("phase5_blocking_ipc_abi::FEATURE_ENDPOINT_WAIT", "abi::capability::BLOCKING_ENDPOINT_WAIT")
+          kernel.write_text(text)
+
+          user = Path("userspace/src/blocking_ipc.rs")
+          text = user.read_text()
+          start = text.index("mod phase5_blocking_ipc_abi {")
+          end = text.index("\n\npub fn", start)
+          text = text[:start] + text[end + 2:]
+          text = text.replace("phase5_blocking_ipc_abi::syscall::ENDPOINT_WAIT", "crate::abi::syscall::ENDPOINT_WAIT")
+          user.write_text(text)
+          PY
+          rm shared/blocking_ipc_abi.rs
+          cargo +nightly-2026-02-01 fmt --all
+      - name: Run quick validation
+        run: ./scripts/check-local.sh --quick
+      - name: Commit fixes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add --all
+          git commit -m "Synchronize Phase 5 blocking IPC ABI"
+          git push origin HEAD:agent/phase5-blocking-ipc
