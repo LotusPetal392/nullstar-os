@@ -78,11 +78,13 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
 }
 
 fn valid_bootstrap(handle: u64, kind: ObjectKind, rights: Rights) -> bool {
-    ipc::wait_for_handle(handle)
-        .is_ok_and(|info| info.kind == kind && info.rights == rights)
+    ipc::wait_for_handle(handle).is_ok_and(|info| info.kind == kind && info.rights == rights)
 }
 
-fn dispatch(files: &mut [File; protocol::MAX_FILES], request: &protocol::Request) -> protocol::Reply {
+fn dispatch(
+    files: &mut [File; protocol::MAX_FILES],
+    request: &protocol::Request,
+) -> protocol::Reply {
     let mut reply = protocol::Reply::EMPTY;
     reply.operation = request.operation;
     if request.version != protocol::VERSION {
@@ -188,11 +190,7 @@ fn remove_file(files: &mut [File; protocol::MAX_FILES], name: &[u8], reply: &mut
     files[index] = File::EMPTY;
 }
 
-fn list_files(
-    files: &[File; protocol::MAX_FILES],
-    capacity: usize,
-    reply: &mut protocol::Reply,
-) {
+fn list_files(files: &[File; protocol::MAX_FILES], capacity: usize, reply: &mut protocol::Reply) {
     let capacity = capacity.min(reply.data.len());
     let mut cursor = 0usize;
     for file in files.iter().filter(|file| file.used) {

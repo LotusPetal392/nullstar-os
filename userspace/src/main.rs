@@ -55,8 +55,10 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(1);
     }
 
-    let readiness_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
-    let request_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
+    let readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
+    let request_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let mut service = ServiceRuntime::new(TMPFS_SERVICE);
     start_service(&mut service, readiness_endpoint, request_endpoint);
     run_tmpfs_probe(request_endpoint);
@@ -124,7 +126,13 @@ fn start_service(
         service.note_spawned(process_id);
         if ipc::grant_child(process_id, readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
             != Some(READY_HANDLE)
-            || ipc::grant_child(process_id, request_endpoint, Rights::RECEIVE, REQUEST_HANDLE).ok()
+            || ipc::grant_child(
+                process_id,
+                request_endpoint,
+                Rights::RECEIVE,
+                REQUEST_HANDLE,
+            )
+            .ok()
                 != Some(REQUEST_HANDLE)
         {
             fail(SERVICE_BOOTSTRAP_FAILED);
