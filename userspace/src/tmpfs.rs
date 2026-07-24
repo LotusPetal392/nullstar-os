@@ -2,7 +2,10 @@
 
 use core::{mem::size_of, slice};
 
-use crate::ipc::{self, CapabilityHandle, Rights, Transfer};
+use crate::{
+    blocking_ipc,
+    ipc::{self, CapabilityHandle, Rights, Transfer},
+};
 
 pub mod protocol {
     include!(concat!(
@@ -122,7 +125,7 @@ fn request(
     }
 
     let mut bytes = [0_u8; size_of::<protocol::Reply>()];
-    let message = ipc::receive(reply_endpoint, &mut bytes).map_err(|_| Error::Transport)?;
+    let message = blocking_ipc::receive(reply_endpoint, &mut bytes).map_err(|_| Error::Transport)?;
     let _ = ipc::close(reply_endpoint);
     if message.capability.is_some() || message.bytes != bytes.len() {
         return Err(Error::Transport);
