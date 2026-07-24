@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - agent/phase5-blocking-ipc
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -98,7 +101,30 @@ jobs:
           )
 
           docs = Path("docs/blocking-ipc.md")
-          docs.write_text("""# Blocking endpoint waits\n\nPhase 5 adds a scheduler-integrated readiness wait for capability endpoints.\n\n## Contract\n\n`ENDPOINT_WAIT` validates that the caller holds `RECEIVE` authority. If the endpoint already contains a message, it returns immediately. Otherwise the kernel registers the process as a waiter and marks its scheduler task blocked.\n\n`ENDPOINT_SEND` queues the bounded message, removes one waiter in FIFO order, releases the capability-registry lock, and wakes that process. Userspace then retries the non-blocking receive syscall.\n\nThe wait is intentionally readiness-based rather than a combined receive operation. A wake may be spurious, or another receiver may consume the message first, so callers must always retry receive in a loop. This also makes signal-induced wakeups safe without committing partially copied output or transferred capabilities.\n\n## Lost-wakeup avoidance\n\nWaiter registration and scheduler blocking happen while the endpoint registry remains locked. A sender cannot enqueue and attempt a wake between those two actions. The sender releases the registry before acquiring scheduler state to wake a process.\n\n## Cancellation and cleanup\n\nA process is removed from any previous endpoint wait queue before registering a new wait. Dead-process capability cleanup also removes stale waiter records. Signals or other scheduler events may wake a blocked process; the userspace receive facade simply rechecks the endpoint and waits again when it remains empty.\n\n## Current boundary\n\nThis primitive removes cooperative polling from endpoint receive and is the blocking foundation for the future kernel-to-userspace VFS proxy. It does not yet provide transaction identifiers, kernel-owned reply slots, request cancellation messages, timeout deadlines, or restart-aware kernel file descriptors.\n""")
+          docs.write_text("""# Blocking endpoint waits
+
+Phase 5 adds a scheduler-integrated readiness wait for capability endpoints.
+
+## Contract
+
+`ENDPOINT_WAIT` validates that the caller holds `RECEIVE` authority. If the endpoint already contains a message, it returns immediately. Otherwise the kernel registers the process as a waiter and marks its scheduler task blocked.
+
+`ENDPOINT_SEND` queues the bounded message, removes one waiter in FIFO order, releases the capability-registry lock, and wakes that process. Userspace then retries the non-blocking receive syscall.
+
+The wait is intentionally readiness-based rather than a combined receive operation. A wake may be spurious, or another receiver may consume the message first, so callers must always retry receive in a loop. This also makes signal-induced wakeups safe without committing partially copied output or transferred capabilities.
+
+## Lost-wakeup avoidance
+
+Waiter registration and scheduler blocking happen while the endpoint registry remains locked. A sender cannot enqueue and attempt a wake between those two actions. The sender releases the registry before acquiring scheduler state to wake a process.
+
+## Cancellation and cleanup
+
+A process is removed from any previous endpoint wait queue before registering a new wait. Dead-process capability cleanup also removes stale waiter records. Signals or other scheduler events may wake a blocked process; the userspace receive facade simply rechecks the endpoint and waits again when it remains empty.
+
+## Current boundary
+
+This primitive removes cooperative polling from endpoint receive and is the blocking foundation for the future kernel-to-userspace VFS proxy. It does not yet provide transaction identifiers, kernel-owned reply slots, request cancellation messages, timeout deadlines, or restart-aware kernel file descriptors.
+""")
           PY
           cargo +nightly-2026-02-01 fmt --all
       - name: Run quick validation
