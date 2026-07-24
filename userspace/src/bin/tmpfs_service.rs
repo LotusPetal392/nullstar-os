@@ -98,9 +98,7 @@ fn dispatch(
         return reply;
     }
     let name = &request.name[..name_length];
-    if request.operation != protocol::operation::LIST
-        && (name.is_empty() || name.iter().any(|byte| *byte == b'/'))
-    {
+    if request.operation != protocol::operation::LIST && (name.is_empty() || name.contains(&b'/')) {
         reply.status = protocol::status::INVALID;
         return reply;
     }

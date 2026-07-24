@@ -63,10 +63,7 @@ fn request(
 }
 
 fn named(operation: u16, name: &[u8]) -> Result<protocol::Request, Error> {
-    if name.is_empty()
-        || name.len() > protocol::MAX_NAME_BYTES
-        || name.iter().any(|byte| *byte == b'/')
-    {
+    if name.is_empty() || name.len() > protocol::MAX_NAME_BYTES || name.contains(&b'/') {
         return Err(Error::Invalid);
     }
     let mut request = protocol::Request::EMPTY;
