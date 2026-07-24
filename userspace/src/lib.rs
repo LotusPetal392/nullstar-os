@@ -7,6 +7,7 @@ pub mod heap;
 pub mod ipc;
 pub mod platform;
 pub mod supervisor;
+pub mod tmpfs;
 #[path = "syscall_facade.rs"]
 pub mod syscall;
 #[path = "syscall.rs"]
