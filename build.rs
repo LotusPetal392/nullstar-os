@@ -16,6 +16,14 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_init")
             .expect("userspace init artifact path was not set"),
     );
+    let userspace_tmpfs_service = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_tmpfs_service")
+            .expect("userspace tmpfs-service artifact path was not set"),
+    );
+    let userspace_tmpfs_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_tmpfs_probe")
+            .expect("userspace tmpfs-probe artifact path was not set"),
+    );
     let userspace_service_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_service_probe")
             .expect("userspace service-probe artifact path was not set"),
@@ -87,7 +95,6 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_exec_target")
             .expect("userspace exec-target artifact path was not set"),
     );
-
     let userspace_fork_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_fork_probe")
             .expect("userspace fork-probe artifact path was not set"),
@@ -127,61 +134,33 @@ fn main() {
         let mut image = bootloader::DiskImageBuilder::new(kernel_binary.clone());
         image.set_file_contents(String::from("BOOTMODE"), boot_mode.to_vec());
         image.set_file(String::from("init"), userspace_init.clone());
-        image.set_file(
-            String::from("service-probe"),
-            userspace_service_probe.clone(),
-        );
-        image.set_file(
-            String::from("process-probe"),
-            userspace_process_probe.clone(),
-        );
+        image.set_file(String::from("tmpfs-service"), userspace_tmpfs_service.clone());
+        image.set_file(String::from("tmpfs-probe"), userspace_tmpfs_probe.clone());
+        image.set_file(String::from("service-probe"), userspace_service_probe.clone());
+        image.set_file(String::from("process-probe"), userspace_process_probe.clone());
         image.set_file(String::from("fault-probe"), userspace_fault_probe.clone());
         image.set_file(String::from("cat"), userspace_cat.clone());
         image.set_file(String::from("ls"), userspace_ls.clone());
         image.set_file(String::from("pwd"), userspace_pwd.clone());
         image.set_file(String::from("stat"), userspace_stat.clone());
         image.set_file(String::from("readline"), userspace_readline.clone());
-        image.set_file(
-            String::from("pipe-producer"),
-            userspace_pipe_producer.clone(),
-        );
-        image.set_file(
-            String::from("pipe-consumer"),
-            userspace_pipe_consumer.clone(),
-        );
+        image.set_file(String::from("pipe-producer"), userspace_pipe_producer.clone());
+        image.set_file(String::from("pipe-consumer"), userspace_pipe_consumer.clone());
         image.set_file(String::from("upper"), userspace_upper.clone());
         image.set_file(String::from("delay"), userspace_delay.clone());
         image.set_file(String::from("signal-probe"), userspace_signal_probe.clone());
-        image.set_file(
-            String::from("runtime-probe"),
-            userspace_runtime_probe.clone(),
-        );
+        image.set_file(String::from("runtime-probe"), userspace_runtime_probe.clone());
         image.set_file(String::from("stderr-probe"), userspace_stderr_probe.clone());
         image.set_file(String::from("exec"), userspace_exec.clone());
         image.set_file(String::from("exec-source"), userspace_exec_source.clone());
         image.set_file(String::from("exec-target"), userspace_exec_target.clone());
         image.set_file(String::from("fork-probe"), userspace_fork_probe.clone());
         image.set_file(String::from("fork-target"), userspace_fork_target.clone());
-        image.set_file(
-            String::from("signal-handler-probe"),
-            userspace_signal_handler_probe.clone(),
-        );
-        image.set_file(
-            String::from("signal-lifecycle-probe"),
-            userspace_signal_lifecycle_probe.clone(),
-        );
-        image.set_file(
-            String::from("signal-lifecycle-target"),
-            userspace_signal_lifecycle_target.clone(),
-        );
-        image.set_file(
-            String::from("environment-probe"),
-            userspace_environment_probe.clone(),
-        );
-        image.set_file(
-            String::from("environment-target"),
-            userspace_environment_target.clone(),
-        );
+        image.set_file(String::from("signal-handler-probe"), userspace_signal_handler_probe.clone());
+        image.set_file(String::from("signal-lifecycle-probe"), userspace_signal_lifecycle_probe.clone());
+        image.set_file(String::from("signal-lifecycle-target"), userspace_signal_lifecycle_target.clone());
+        image.set_file(String::from("environment-probe"), userspace_environment_probe.clone());
+        image.set_file(String::from("environment-target"), userspace_environment_target.clone());
         image.set_file(String::from("ush"), userspace_shell.clone());
         image.set_file(String::from("hello.txt"), hello_text.clone());
         image
