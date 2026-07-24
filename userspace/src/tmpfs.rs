@@ -55,12 +55,7 @@ impl Mount {
         request(self.service, &request_value).map(|reply| reply.value as usize)
     }
 
-    pub fn read(
-        self,
-        name: &[u8],
-        offset: usize,
-        buffer: &mut [u8],
-    ) -> Result<usize, Error> {
+    pub fn read(self, name: &[u8], offset: usize, buffer: &mut [u8]) -> Result<usize, Error> {
         if buffer.len() > protocol::MAX_DATA_BYTES {
             return Err(Error::Range);
         }
