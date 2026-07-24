@@ -4,15 +4,8 @@ use core::arch::asm;
 
 use crate::ipc::{self, CapabilityHandle, ReceivedMessage};
 
-mod phase5_blocking_ipc_abi {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../shared/blocking_ipc_abi.rs"
-    ));
-}
-
 pub fn endpoint_wait(endpoint: CapabilityHandle) -> ipc::Result<()> {
-    let mut result = phase5_blocking_ipc_abi::syscall::ENDPOINT_WAIT;
+    let mut result = crate::abi::syscall::ENDPOINT_WAIT;
     unsafe {
         asm!(
             "int 0x80",

@@ -1,13 +1,6 @@
 // Scheduler-integrated endpoint readiness waits layered over the bounded
 // capability data-movement syscalls.
 
-mod phase5_blocking_ipc_abi {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../shared/blocking_ipc_abi.rs"
-    ));
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EndpointWaiter {
     object: CapabilityObjectRef,
@@ -93,7 +86,7 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
         return current_stack_pointer;
     }
 
-    if syscall_number == phase5_blocking_ipc_abi::syscall::ENDPOINT_WAIT {
+    if syscall_number == abi::syscall::ENDPOINT_WAIT {
         return blocking_endpoint_wait(current_stack_pointer, registers_pointer);
     }
 
@@ -111,10 +104,9 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
             nullstar_capability_grant_syscall_dispatch(current_stack_pointer);
         if next_stack_pointer == current_stack_pointer
             && unsafe { ((*registers_pointer).rax as i64) >= 0 }
+            && let Some(endpoint_object) = endpoint_object
         {
-            if let Some(endpoint_object) = endpoint_object {
-                wake_endpoint_waiter(endpoint_object);
-            }
+            wake_endpoint_waiter(endpoint_object);
         }
         return next_stack_pointer;
     }
@@ -125,10 +117,10 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
 fn blocking_ipc_system_info(process_id: u64, address: u64, length: u64) -> u64 {
     let info = abi::SystemInfo {
         abi_major: abi::ABI_VERSION_MAJOR,
-        abi_minor: phase5_blocking_ipc_abi::ABI_VERSION_MINOR,
+        abi_minor: abi::ABI_VERSION_MINOR,
         capabilities: abi::capability::PLATFORM_V1
             | abi::capability::PROTECTION_V1
-            | phase5_blocking_ipc_abi::FEATURE_ENDPOINT_WAIT,
+            | abi::capability::BLOCKING_ENDPOINT_WAIT,
         page_size: PLATFORM_PAGE_SIZE,
         maximum_open_files: MAX_OPEN_FILES as u64,
         maximum_path_bytes: abi::limits::MAX_PATH_BYTES as u64,
