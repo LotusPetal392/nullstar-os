@@ -158,3 +158,24 @@ fn named(operation: u16, generation: u32, name: &[u8]) -> Result<protocol::Reque
     request.name[..name.len()].copy_from_slice(name);
     Ok(request)
 }
+
+#[cfg(test)]
+mod tests {
+    use core::mem::size_of;
+
+    use super::{named, protocol};
+
+    #[test]
+    fn protocol_records_fit_endpoint_messages() {
+        assert!(size_of::<protocol::Request>() <= 256);
+        assert!(size_of::<protocol::Reply>() <= 256);
+    }
+
+    #[test]
+    fn named_requests_preserve_mount_generation() {
+        let request = named(protocol::operation::STAT, 41, b"state").expect("valid request");
+        assert_eq!(request.version, protocol::VERSION);
+        assert_eq!(request.generation, 41);
+        assert_eq!(&request.name[..request.name_length as usize], b"state");
+    }
+}
