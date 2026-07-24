@@ -194,7 +194,7 @@ fn list_files(files: &[File; protocol::MAX_FILES], capacity: usize, reply: &mut 
     let capacity = capacity.min(reply.data.len());
     let mut cursor = 0usize;
     for file in files.iter().filter(|file| file.used) {
-        let needed = file.name_length + usize::from(cursor != 0);
+        let needed = file.name_length + if cursor != 0 { 1 } else { 0 };
         if cursor + needed > capacity {
             break;
         }
