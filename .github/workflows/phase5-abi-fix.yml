@@ -49,6 +49,10 @@ jobs:
           text = text.replace("phase5_blocking_ipc_abi::syscall::ENDPOINT_WAIT", "abi::syscall::ENDPOINT_WAIT")
           text = text.replace("phase5_blocking_ipc_abi::ABI_VERSION_MINOR", "abi::ABI_VERSION_MINOR")
           text = text.replace("phase5_blocking_ipc_abi::FEATURE_ENDPOINT_WAIT", "abi::capability::BLOCKING_ENDPOINT_WAIT")
+          text = text.replace(
+              "        if next_stack_pointer == current_stack_pointer\n            && unsafe { ((*registers_pointer).rax as i64) >= 0 }\n        {\n            if let Some(endpoint_object) = endpoint_object {\n                wake_endpoint_waiter(endpoint_object);\n            }\n        }",
+              "        if next_stack_pointer == current_stack_pointer\n            && unsafe { ((*registers_pointer).rax as i64) >= 0 }\n            && let Some(endpoint_object) = endpoint_object\n        {\n            wake_endpoint_waiter(endpoint_object);\n        }",
+          )
           kernel.write_text(text)
 
           user = Path("userspace/src/blocking_ipc.rs")
