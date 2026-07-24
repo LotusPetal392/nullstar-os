@@ -35,4 +35,14 @@ jobs:
             git push origin HEAD:${{ github.head_ref }}
           fi
       - name: Run quick validation
-        run: ./scripts/check-local.sh --quick
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/check-local.sh --quick 2>&1 | tee phase2-validation.log
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase2-validation-log
+          path: phase2-validation.log
+          if-no-files-found: warn
