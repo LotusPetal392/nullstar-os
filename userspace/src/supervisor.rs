@@ -94,7 +94,7 @@ impl ServiceRuntime {
 
     pub fn observe_status(&mut self, status: u64) -> ServiceStatusDisposition {
         if status == child_status::CONTINUED
-            || (status >= child_status::STOPPED_BASE && status < child_status::CONTINUED)
+            || (child_status::STOPPED_BASE..child_status::CONTINUED).contains(&status)
         {
             return ServiceStatusDisposition::WaitForNextEvent;
         }
