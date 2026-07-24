@@ -41,10 +41,7 @@ pub fn endpoint_wait(endpoint: CapabilityHandle) -> ipc::Result<()> {
     }
 }
 
-pub fn receive(
-    endpoint: CapabilityHandle,
-    buffer: &mut [u8],
-) -> ipc::Result<ReceivedMessage> {
+pub fn receive(endpoint: CapabilityHandle, buffer: &mut [u8]) -> ipc::Result<ReceivedMessage> {
     loop {
         match ipc::try_receive(endpoint, buffer) {
             Ok(message) => return Ok(message),
