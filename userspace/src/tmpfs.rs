@@ -80,10 +80,10 @@ pub fn write(service: CapabilityHandle, name: &[u8], bytes: &[u8]) -> Result<usi
     if bytes.len() > protocol::MAX_DATA_BYTES {
         return Err(Error::Range);
     }
-    let mut request = named(protocol::operation::WRITE, name)?;
-    request.data_length = bytes.len() as u16;
-    request.data[..bytes.len()].copy_from_slice(bytes);
-    request(service, &request).map(|reply| reply.value as usize)
+    let mut request_value = named(protocol::operation::WRITE, name)?;
+    request_value.data_length = bytes.len() as u16;
+    request_value.data[..bytes.len()].copy_from_slice(bytes);
+    request(service, &request_value).map(|reply| reply.value as usize)
 }
 
 pub fn read(
