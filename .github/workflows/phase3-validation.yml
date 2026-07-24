@@ -23,16 +23,34 @@ jobs:
             --component rust-src \
             --component rustfmt \
             --target x86_64-unknown-none
-      - name: Apply rustfmt
-        run: cargo +nightly-2026-02-01 fmt --all
-      - name: Commit formatting
+      - name: Apply mechanical fixes and rustfmt
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("userspace/src/bin/tmpfs_service.rs")
+          text = path.read_text()
+          text = text.replace("usize::from(cursor != 0)", "if cursor != 0 { 1 } else { 0 }")
+          path.write_text(text)
+          PY
+          cargo +nightly-2026-02-01 fmt --all
+      - name: Commit fixes
         run: |
           if ! git diff --quiet; then
             git config user.name github-actions[bot]
             git config user.email 41898282+github-actions[bot]@users.noreply.github.com
             git add --all
-            git commit -m "Format Phase 3 tmpfs changes"
+            git commit -m "Fix and format Phase 3 tmpfs changes"
             git push origin HEAD:${{ github.head_ref }}
           fi
       - name: Run quick validation
-        run: ./scripts/check-local.sh --quick
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/check-local.sh --quick 2>&1 | tee phase3-validation.log
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase3-validation-log
+          path: phase3-validation.log
+          if-no-files-found: warn
