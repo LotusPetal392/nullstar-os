@@ -4,6 +4,7 @@
 pub mod args;
 pub mod environment;
 pub mod heap;
+pub mod ipc;
 pub mod platform;
 pub mod supervisor;
 #[path = "syscall_facade.rs"]

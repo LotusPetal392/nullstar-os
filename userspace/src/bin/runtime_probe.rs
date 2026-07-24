@@ -5,6 +5,7 @@ use userspace::{
     abi::{capability, file, signal},
     args::Args,
     heap::BumpHeap,
+    ipc::{self, ObjectKind, Rights, Transfer},
     platform::{self, DirectoryEntry},
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SpawnFlags},
 };
@@ -55,26 +56,34 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if heap.used() != 0 || heap.remaining() != heap.capacity() {
         syscall::exit(1);
     }
-    if !platform_probe(argument) {
+    let process_id = match syscall::getpid() {
+        Ok(process_id) => process_id,
+        Err(_) => syscall::exit(1),
+    };
+    if !platform_probe(argument, process_id) {
         syscall::exit(1);
     }
-    if syscall::getpid().is_err() || syscall::write_all(STDOUT, SUCCESS).is_err() {
+    if syscall::write_all(STDOUT, SUCCESS).is_err() {
         syscall::exit(1);
     }
     syscall::exit(0)
 }
 
-fn platform_probe(argument: &[u8]) -> bool {
+fn platform_probe(argument: &[u8], process_id: u64) -> bool {
     let Ok(info) = platform::system_info() else {
         return false;
     };
     if info.abi_major != userspace::abi::ABI_VERSION_MAJOR
         || info.abi_minor != userspace::abi::ABI_VERSION_MINOR
         || info.capabilities & capability::PLATFORM_V1 != capability::PLATFORM_V1
+        || info.capabilities & capability::PROTECTION_V1 != capability::PROTECTION_V1
         || info.capabilities & capability::PROCESS_GROUP_CONTROL == 0
         || info.page_size != 4096
         || info.maximum_open_files < 3
     {
+        return false;
+    }
+    if !capability_probe(process_id) {
         return false;
     }
     let Ok(process_group) = platform::get_process_group(0) else {
@@ -149,6 +158,116 @@ fn platform_probe(argument: &[u8]) -> bool {
 
 fn supplementary_probes_enabled(argument: &[u8]) -> bool {
     argument != b"runtime-smoke" && argument != b"manual-argv"
+}
+
+fn capability_probe(current_process: u64) -> bool {
+    const MESSAGE: &[u8] = b"phase-one-ipc";
+    const SHARED_BYTES: &[u8] = b"shared capability memory";
+    const SHARED_OFFSET: usize = 7;
+
+    let Ok(endpoint) = ipc::endpoint_create() else {
+        return false;
+    };
+    let Ok(endpoint_info) = ipc::info(endpoint) else {
+        return false;
+    };
+    if endpoint_info.kind != ObjectKind::Endpoint
+        || !endpoint_info
+            .rights
+            .contains(Rights::SEND | Rights::RECEIVE)
+        || endpoint_info.size != 0
+    {
+        return false;
+    }
+
+    let Ok(send_only) = ipc::duplicate(endpoint, Rights::SEND) else {
+        return false;
+    };
+    let mut denied_buffer = [0_u8; 1];
+    if ipc::try_receive(send_only, &mut denied_buffer).err() != Some(ipc::Error::PERMISSION) {
+        return false;
+    }
+
+    let Ok(notification) = ipc::notification_create() else {
+        return false;
+    };
+    let Ok(shared_memory) = ipc::shared_memory_create(64) else {
+        return false;
+    };
+    let Ok(read_only_memory) = ipc::duplicate(shared_memory, Rights::READ) else {
+        return false;
+    };
+    if ipc::shared_memory_write(read_only_memory, 0, b"denied").err()
+        != Some(ipc::Error::PERMISSION)
+    {
+        return false;
+    }
+    if ipc::shared_memory_write(shared_memory, SHARED_OFFSET, SHARED_BYTES).ok()
+        != Some(SHARED_BYTES.len())
+    {
+        return false;
+    }
+    let mut shared_readback = [0_u8; SHARED_BYTES.len()];
+    if ipc::shared_memory_read(read_only_memory, SHARED_OFFSET, &mut shared_readback).ok()
+        != Some(SHARED_BYTES.len())
+        || shared_readback.as_slice() != SHARED_BYTES
+    {
+        return false;
+    }
+
+    if ipc::send(
+        endpoint,
+        MESSAGE,
+        Some(Transfer {
+            handle: notification,
+            rights: Rights::WAIT,
+        }),
+    )
+    .is_err()
+    {
+        return false;
+    }
+
+    let mut message_buffer = [0_u8; 32];
+    let Ok(message) = ipc::try_receive(endpoint, &mut message_buffer) else {
+        return false;
+    };
+    let Some(received_capability) = message.capability else {
+        return false;
+    };
+    if message.sender_process_id != current_process
+        || message.bytes != MESSAGE.len()
+        || &message_buffer[..message.bytes] != MESSAGE
+        || received_capability.rights != Rights::WAIT
+    {
+        return false;
+    }
+    let Ok(received_info) = ipc::info(received_capability.handle) else {
+        return false;
+    };
+    if received_info.kind != ObjectKind::Notification
+        || received_info.rights != Rights::WAIT
+        || ipc::notification_signal(received_capability.handle, 1).err()
+            != Some(ipc::Error::PERMISSION)
+    {
+        return false;
+    }
+
+    if ipc::notification_signal(notification, 2).ok() != Some(2)
+        || ipc::notification_try_wait(received_capability.handle).ok() != Some(1)
+        || ipc::notification_try_wait(received_capability.handle).ok() != Some(0)
+        || ipc::notification_try_wait(received_capability.handle).err()
+            != Some(ipc::Error::TRY_AGAIN)
+    {
+        return false;
+    }
+
+    ipc::close(received_capability.handle).is_ok()
+        && ipc::close(read_only_memory).is_ok()
+        && ipc::close(shared_memory).is_ok()
+        && ipc::close(notification).is_ok()
+        && ipc::close(send_only).is_ok()
+        && ipc::close(endpoint).is_ok()
 }
 
 fn relative_open_probe() -> bool {

@@ -2,10 +2,11 @@
 
 NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 `0x80`. The shared numeric and structure definitions live in
-`shared/userspace_abi.rs`; kernel and userspace include that file directly so
-they cannot silently disagree about call numbers or layouts.
+`shared/userspace_abi.rs`; the direct-child capability bootstrap extension lives
+in `shared/protection_abi.rs`. Kernel and userspace include these files directly
+so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can now query a documented version and
+The ABI is experimental, but callers can query a documented version and
 capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -21,8 +22,8 @@ numbers. Calls that copy a structure to userspace take both an address and a
 byte length. Supplying a shorter buffer returns `ERANGE`, allowing structures to
 grow in later ABI revisions without writing past an older caller's allocation.
 
-Userspace should call the typed wrappers in `userspace::syscall` and
-`userspace::platform` rather than issuing raw interrupts.
+Userspace should call the typed wrappers in `userspace::syscall`,
+`userspace::platform`, and `userspace::ipc` rather than issuing raw interrupts.
 
 ## Version 1.1 platform calls
 
@@ -44,6 +45,54 @@ Userspace should call the typed wrappers in `userspace::syscall` and
 `SystemInfo.capabilities` advertises the calls above. Version 1.1 reports
 4 KiB pages, the process descriptor bound, the path bound, the maximum number
 of directory records accepted by one call, and process-group control support.
+
+## Version 1.2 protection calls
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 35 | `capability_duplicate` | source handle, reduced rights | new handle |
+| 36 | `capability_close` | handle | zero |
+| 37 | `capability_info` | handle, output address, output bytes | fills `capability::Info` |
+| 38 | `endpoint_create` | none | endpoint handle |
+| 39 | `endpoint_send` | endpoint, byte address, byte count, transfer handle, transfer rights | zero |
+| 40 | `endpoint_receive` | endpoint, buffer address, capacity, message-info address | received byte count |
+| 41 | `notification_create` | none | notification handle |
+| 42 | `notification_signal` | handle, nonzero amount | pending count |
+| 43 | `notification_try_wait` | handle | pending count after consuming one |
+| 44 | `shared_memory_create` | byte length | shared-memory handle |
+| 45 | `shared_memory_read` | handle, offset, buffer address, byte count | copied byte count |
+| 46 | `shared_memory_write` | handle, offset, byte address, byte count | copied byte count |
+| 47 | `capability_grant_child` | child PID, source handle, reduced rights, requested child handle | child handle |
+
+`SystemInfo.capabilities` reports `capability::PROTECTION_V1` when the handle
+table, endpoints, notifications, and shared-memory objects are available.
+
+Capability handles occupy a namespace separate from file descriptors. Handles
+are process local, begin at one, and refer to an object plus an explicit rights
+mask. Duplication and delegation require the corresponding authority and accept
+only a nonempty subset of the source rights.
+
+Endpoint send and receive are non-blocking kernel calls. A full send queue or an
+empty receive queue returns `EAGAIN`. Receiving into a buffer smaller than the
+front message returns `ERANGE` without consuming the message. One message may
+carry one rights-reduced capability. The `userspace::ipc::receive` helper yields
+and retries on `EAGAIN`.
+
+Notifications are counted. Signaling checks for overflow; try-wait consumes one
+pending event or returns `EAGAIN`. Shared-memory calls currently copy bytes
+between userspace and bounded kernel storage rather than creating direct virtual
+memory mappings.
+
+`capability_grant_child` is a narrow bootstrap operation. The target must be a
+live direct child, the source handle must carry `TRANSFER`, and the granted
+rights must be a subset of the source rights. A requested child handle of zero
+allocates the lowest free slot; a nonzero value requests that exact slot. This
+allows recently forked processes to agree on a bootstrap endpoint without a
+global service namespace. Capability tables are not implicitly cloned by
+`fork`, but they remain attached to a process across `exec`.
+
+See [Capability and IPC protection model](protection-model.md) for lifetime,
+security-boundary, testing, and migration details.
 
 ## Paths and working directories
 
@@ -150,12 +199,12 @@ the existing group-oriented syscall.
 
 ## Compatibility rules
 
-- Existing syscall numbers 1 through 32 are unchanged.
-- ABI 1.1 adds process-group calls 33 and 34 and a capability bit.
+- Existing syscall numbers 1 through 34 are unchanged.
+- ABI 1.2 adds protection calls 35 through 47 and capability feature bits.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
-- Resource bounds are reported by `system_info` and remain part of normal
-  failure behavior.
+- Resource bounds remain part of normal failure behavior; protection bounds are
+  fixed in the shared ABI definitions.
 - ABI changes that alter an existing structure or semantic contract must bump
   the reported version and update this document, the shared definitions, and
   the runtime probe together.
