@@ -134,6 +134,21 @@ bounded buffers and wake blocked readers or writers as state changes. The
 terminal tracks a foreground process group so keyboard-generated interrupt and
 stop events reach the correct pipeline.
 
+The next filesystem boundary is defined by the versioned userspace
+[filesystem service protocol](filesystem-service-protocol.md). It introduces
+session-scoped node IDs, directory-relative lookup, request IDs, cancellation,
+and registered shared-memory windows. The existing tmpfs v2 route remains the
+active boot path while a compatibility adapter and service-side node table are
+implemented.
+
+The intended rooted namespace includes service-backed `/dev` and `/tmp` mounts,
+a system hierarchy under `/System` (`config`, `var/log`, `bin`, `services`,
+`drivers`, `lib`, and `Applications`), user homes under `/Users`, and globally
+installed applications under `/Applications`. Additional local, removable, and
+network filesystems appear as named children of `/Volumes`. The future VFS
+service will hide mount crossings from clients while preserving node and volume
+identity.
+
 ## Shells
 
 The kernel shell in `kernel/src/shell.rs` is a diagnostic and control surface.

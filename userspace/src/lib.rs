@@ -4,6 +4,8 @@
 pub mod args;
 pub mod blocking_ipc;
 pub mod environment;
+pub mod filesystem;
+pub mod filesystem_service;
 pub mod heap;
 pub mod ipc;
 pub mod platform;
