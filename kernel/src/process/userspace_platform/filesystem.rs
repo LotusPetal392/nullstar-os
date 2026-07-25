@@ -6,21 +6,37 @@ fn platform_stat(
     path_length: u64,
     stat_address: u64,
     stat_length: u64,
-) -> u64 {
+    current_stack_pointer: usize,
+) -> ControlOutcome {
     let path = match platform_user_path(process_id, path_address, path_length) {
         Ok(path) => path,
-        Err(error) => return error_return(error),
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
+    if tmpfs_proxy_state().is_some() {
+        match tmpfs_proxy_path(&path) {
+            Ok(Some(_)) => {
+                return tmpfs_proxy_stat(
+                    process_id,
+                    &path,
+                    stat_address,
+                    stat_length,
+                    current_stack_pointer,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return ControlOutcome::Ready(error_return(error)),
+        }
+    }
     let metadata = match vfs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) => return error_return(platform_vfs_errno(&error)),
+        Err(error) => return ControlOutcome::Ready(error_return(platform_vfs_errno(&error))),
     };
-    platform_write_value(
+    ControlOutcome::Ready(platform_write_value(
         process_id,
         stat_address,
         stat_length,
         platform_stat_from_metadata(&metadata),
-    )
+    ))
 }
 
 fn platform_read_directory(
@@ -30,45 +46,65 @@ fn platform_read_directory(
     start_index: u64,
     records_address: u64,
     capacity: u64,
-) -> u64 {
+    current_stack_pointer: usize,
+) -> ControlOutcome {
     let capacity = match usize::try_from(capacity) {
         Ok(capacity) if capacity <= abi::limits::MAX_DIRECTORY_ENTRIES_PER_CALL => capacity,
-        _ => return error_return(ERR_INVALID_ARGUMENT),
+        _ => return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT)),
     };
     if capacity == 0 {
-        return 0;
+        return ControlOutcome::Ready(0);
     }
     let byte_length = match capacity.checked_mul(size_of::<abi::file::DirectoryEntry>()) {
         Some(length) => length,
-        None => return error_return(ERR_ARGUMENT_TOO_LARGE),
+        None => return ControlOutcome::Ready(error_return(ERR_ARGUMENT_TOO_LARGE)),
     };
     if !user_range_allows(process_id, records_address, byte_length, true) {
-        return error_return(ERR_BAD_ADDRESS);
+        return ControlOutcome::Ready(error_return(ERR_BAD_ADDRESS));
     }
     let start_index = match usize::try_from(start_index) {
         Ok(index) => index,
-        Err(_) => return error_return(ERR_INVALID_ARGUMENT),
+        Err(_) => return ControlOutcome::Ready(error_return(ERR_INVALID_ARGUMENT)),
     };
     let path = match platform_user_path(process_id, path_address, path_length) {
         Ok(path) => path,
-        Err(error) => return error_return(error),
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
+    if tmpfs_proxy_state().is_some() {
+        match tmpfs_proxy_path(&path) {
+            Ok(Some(TmpfsProxyPath::Directory)) => {
+                return tmpfs_proxy_read_directory(
+                    process_id,
+                    &path,
+                    start_index,
+                    records_address,
+                    capacity,
+                    current_stack_pointer,
+                );
+            }
+            Ok(Some(TmpfsProxyPath::File(_))) => {
+                return ControlOutcome::Ready(error_return(abi::errno::NOT_DIRECTORY));
+            }
+            Ok(None) => {}
+            Err(error) => return ControlOutcome::Ready(error_return(error)),
+        }
+    }
     let entries = match vfs::read_directory(&path) {
         Ok(entries) => entries,
-        Err(error) => return error_return(platform_vfs_errno(&error)),
+        Err(error) => return ControlOutcome::Ready(error_return(platform_vfs_errno(&error))),
     };
 
     let mut written = 0usize;
     for entry in entries.iter().skip(start_index).take(capacity) {
         let record = match platform_directory_record(entry) {
             Ok(record) => record,
-            Err(error) => return error_return(error),
+            Err(error) => return ControlOutcome::Ready(error_return(error)),
         };
         let destination = (records_address as *mut abi::file::DirectoryEntry).wrapping_add(written);
         unsafe { ptr::write_unaligned(destination, record) };
         written = written.saturating_add(1);
     }
-    written as u64
+    ControlOutcome::Ready(written as u64)
 }
 
 fn platform_chdir(process_id: u64, path_address: u64, path_length: u64) -> u64 {
