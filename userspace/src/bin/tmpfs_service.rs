@@ -40,12 +40,24 @@ impl File {
 }
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
-    if !valid_bootstrap(READY_HANDLE, ObjectKind::Endpoint, Rights::SEND)
-        || !valid_bootstrap(REQUEST_HANDLE, ObjectKind::Endpoint, Rights::RECEIVE)
-        || ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err()
-    {
+    let _ = syscall::write_all(syscall::STDERR, b"tmpfs: validating readiness handle\n");
+    if !valid_bootstrap(READY_HANDLE, ObjectKind::Endpoint, Rights::SEND) {
+        let _ = syscall::write_all(syscall::STDERR, b"tmpfs: invalid readiness handle\n");
         syscall::exit(2);
     }
+
+    let _ = syscall::write_all(syscall::STDERR, b"tmpfs: validating request handle\n");
+    if !valid_bootstrap(REQUEST_HANDLE, ObjectKind::Endpoint, Rights::RECEIVE) {
+        let _ = syscall::write_all(syscall::STDERR, b"tmpfs: invalid request handle\n");
+        syscall::exit(3);
+    }
+
+    let _ = syscall::write_all(syscall::STDERR, b"tmpfs: sending readiness message\n");
+    if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err() {
+        let _ = syscall::write_all(syscall::STDERR, b"tmpfs: readiness send failed\n");
+        syscall::exit(4);
+    }
+    let _ = syscall::write_all(syscall::STDERR, b"tmpfs: ready\n");
 
     let generation = syscall::getpid().unwrap_or(1) as u32;
     let mut files = [File::EMPTY; protocol::MAX_FILES];
@@ -53,7 +65,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     loop {
         let message = match ipc::receive(REQUEST_HANDLE, &mut request_bytes) {
             Ok(message) => message,
-            Err(_) => syscall::exit(3),
+            Err(_) => syscall::exit(5),
         };
         let Some(reply_capability) = message.capability else {
             continue;

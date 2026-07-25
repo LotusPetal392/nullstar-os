@@ -121,6 +121,8 @@ fn request(
         return Err(Error::Transport);
     }
 
+    // Keep the boot-critical tmpfs path on the proven cooperative receive loop
+    // until ENDPOINT_WAIT has an isolated runtime wake/cancellation probe.
     let mut bytes = [0_u8; size_of::<protocol::Reply>()];
     let message = ipc::receive(reply_endpoint, &mut bytes).map_err(|_| Error::Transport)?;
     let _ = ipc::close(reply_endpoint);

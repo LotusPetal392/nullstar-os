@@ -8,5 +8,5 @@ pub mod syscall {
     ///
     /// Arguments: target PID, source handle, rights mask, requested child
     /// handle. A requested handle of zero asks the kernel to allocate a slot.
-    pub const GRANT_CHILD: u64 = 47;
+    pub const GRANT_CHILD: u64 = 48;
 }

@@ -405,8 +405,8 @@ pub fn shared_memory_write(handle: CapabilityHandle, offset: usize, bytes: &[u8]
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectKind, Rights};
-    use crate::abi::capability;
+    use super::{ObjectKind, Rights, phase1_protection_abi};
+    use crate::abi::{capability, syscall};
 
     #[test]
     fn rights_reject_unknown_bits() {
@@ -428,5 +428,13 @@ mod tests {
             Some(ObjectKind::Endpoint)
         );
         assert_eq!(ObjectKind::from_raw(99), None);
+    }
+
+    #[test]
+    fn protection_bootstrap_syscall_does_not_overlap_endpoint_wait() {
+        assert_ne!(
+            phase1_protection_abi::syscall::GRANT_CHILD,
+            syscall::ENDPOINT_WAIT
+        );
     }
 }
