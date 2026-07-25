@@ -361,18 +361,8 @@ fn platform_register_tmpfs_service(process_id: u64, handle: u64, generation: u64
         return error_return(ERR_BAD_FILE_DESCRIPTOR);
     };
 
-    let previous = {
-        let mut state = TMPFS_PROXY.lock();
-        let previous = state.request_endpoint;
-        state.request_endpoint = Some(endpoint);
-        state.generation = generation;
-        previous
-    };
-    if previous != Some(endpoint) {
-        if let Some(previous) = previous {
-            kernel_capability_root_remove(previous);
-        }
-        kernel_capability_root_add(endpoint);
+    if let Err(error) = tmpfs_proxy_begin_connect(endpoint, generation) {
+        return error_return(error);
     }
     0
 }

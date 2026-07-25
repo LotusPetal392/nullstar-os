@@ -51,6 +51,14 @@ mod tmpfs_protocol {
     ));
 }
 
+#[allow(dead_code)]
+mod filesystem_protocol {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/filesystem_protocol.rs"
+    ));
+}
+
 pub const SYSCALL_VECTOR: u8 = abi::SYSCALL_VECTOR;
 pub const INIT_PROCESS_ID: u64 = abi::INIT_PROCESS_ID;
 
@@ -889,6 +897,12 @@ enum PendingTmpfsProxyOperation {
 struct TmpfsProxyState {
     request_endpoint: Option<CapabilityObjectRef>,
     generation: u32,
+    connect_reply_endpoint: Option<CapabilityObjectRef>,
+    session_reply_endpoint: Option<CapabilityObjectRef>,
+    session_id: u64,
+    session_generation: u64,
+    bulk_buffer: Option<CapabilityObjectRef>,
+    bulk_buffer_attached: bool,
 }
 
 impl TmpfsProxyState {
@@ -896,6 +910,12 @@ impl TmpfsProxyState {
         Self {
             request_endpoint: None,
             generation: 0,
+            connect_reply_endpoint: None,
+            session_reply_endpoint: None,
+            session_id: filesystem_protocol::INVALID_ID,
+            session_generation: 0,
+            bulk_buffer: None,
+            bulk_buffer_attached: false,
         }
     }
 }
@@ -3541,6 +3561,7 @@ impl Runtime {
     }
 
     fn service_tmpfs_proxy_requests(&mut self) -> Result<usize, Error> {
+        let mut completed = usize::from(tmpfs_proxy_service_connect());
         let pending_requests: Vec<(u64, PendingTmpfsProxyRequest)> =
             cpu_interrupts::without_interrupts(|| {
                 PROCESS_MANAGER
@@ -3555,7 +3576,6 @@ impl Runtime {
                     })
                     .collect()
             });
-        let mut completed = 0usize;
         for (process_id, pending) in pending_requests {
             let Some(reply) =
                 tmpfs_proxy_take_reply(
@@ -5874,6 +5894,292 @@ fn tmpfs_proxy_state() -> Option<TmpfsProxyState> {
     } else {
         None
     }
+}
+
+fn tmpfs_proxy_begin_connect(
+    request_endpoint: CapabilityObjectRef,
+    legacy_generation: u32,
+) -> Result<(), i64> {
+    let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
+    let mut request = filesystem_protocol::Request::EMPTY;
+    request.operation = filesystem_protocol::operation::CONNECT;
+    request.request_id = 1;
+    let bytes = tmpfs_proxy_value_bytes(&request).to_vec();
+    let push_result = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        match registry.object_index(request_endpoint) {
+            Some(object_index) => match &mut registry.objects[object_index].data {
+                CapabilityObjectData::Endpoint(endpoint)
+                    if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES =>
+                {
+                    endpoint.queue.push_back(EndpointMessage {
+                        sender_process_id: 0,
+                        bytes,
+                        capability: Some(TransferredCapability {
+                            object: reply_endpoint,
+                            rights: abi::capability::RIGHT_SEND,
+                        }),
+                    });
+                    Ok(())
+                }
+                CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
+                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
+                    Err(ERR_IO)
+                }
+            },
+            None => Err(ERR_IO),
+        }
+    };
+    if let Err(error) = push_result {
+        tmpfs_proxy_release_reply_endpoint(reply_endpoint);
+        return Err(error);
+    }
+
+    let previous = {
+        let mut state = TMPFS_PROXY.lock();
+        let previous = (
+            state.request_endpoint,
+            state.connect_reply_endpoint,
+            state.session_reply_endpoint,
+            state.bulk_buffer,
+        );
+        state.request_endpoint = Some(request_endpoint);
+        state.generation = legacy_generation;
+        state.connect_reply_endpoint = Some(reply_endpoint);
+        state.session_reply_endpoint = None;
+        state.session_id = filesystem_protocol::INVALID_ID;
+        state.session_generation = 0;
+        state.bulk_buffer = None;
+        state.bulk_buffer_attached = false;
+        previous
+    };
+    if previous.0 != Some(request_endpoint) {
+        if let Some(endpoint) = previous.0 {
+            kernel_capability_root_remove(endpoint);
+        }
+        kernel_capability_root_add(request_endpoint);
+    }
+    if let Some(endpoint) = previous.1 {
+        tmpfs_proxy_release_reply_endpoint(endpoint);
+    }
+    if let Some(endpoint) = previous.2 {
+        tmpfs_proxy_release_reply_endpoint(endpoint);
+    }
+    if let Some(buffer) = previous.3 {
+        kernel_capability_root_remove(buffer);
+    }
+    wake_endpoint_waiter(request_endpoint);
+    Ok(())
+}
+
+fn tmpfs_proxy_service_connect() -> bool {
+    let state = *TMPFS_PROXY.lock();
+    if state.connect_reply_endpoint.is_none()
+        && state.bulk_buffer.is_some()
+        && !state.bulk_buffer_attached
+    {
+        return tmpfs_proxy_service_attach(state);
+    };
+    let Some(reply_endpoint) = state.connect_reply_endpoint else {
+        return false;
+    };
+    let message = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        let Some(index) = registry.object_index(reply_endpoint) else {
+            return false;
+        };
+        let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[index].data else {
+            return false;
+        };
+        endpoint.queue.pop_front()
+    };
+    let Some(message) = message else {
+        return false;
+    };
+    let valid = if message.capability.is_none()
+        && message.bytes.len() == size_of::<filesystem_protocol::Reply>()
+    {
+        let reply = unsafe {
+            ptr::read_unaligned(message.bytes.as_ptr() as *const filesystem_protocol::Reply)
+        };
+        reply.version == filesystem_protocol::VERSION
+            && reply.operation == filesystem_protocol::operation::CONNECT
+            && reply.status == filesystem_protocol::status::OK
+            && reply.flags == 0
+            && reply.request_id == 1
+            && reply.session_id != filesystem_protocol::INVALID_ID
+            && reply.generation == u64::from(state.generation)
+            && reply.node_id == filesystem_protocol::ROOT_NODE_ID
+            && reply.node_kind == filesystem_protocol::node_kind::DIRECTORY
+            && reply.data_length == 0
+            && reply.reserved == [0; 2]
+            && {
+                let mut proxy = TMPFS_PROXY.lock();
+                if proxy.connect_reply_endpoint == Some(reply_endpoint) {
+                    proxy.connect_reply_endpoint = None;
+                    proxy.session_reply_endpoint = Some(reply_endpoint);
+                    proxy.session_id = reply.session_id;
+                    proxy.session_generation = reply.generation;
+                    true
+                } else {
+                    false
+                }
+            }
+    } else {
+        false
+    };
+    if !valid {
+        let mut proxy = TMPFS_PROXY.lock();
+        if proxy.connect_reply_endpoint == Some(reply_endpoint) {
+            proxy.connect_reply_endpoint = None;
+            proxy.session_id = filesystem_protocol::INVALID_ID;
+            proxy.session_generation = 0;
+        }
+    }
+    if !valid {
+        tmpfs_proxy_release_reply_endpoint(reply_endpoint);
+    } else if tmpfs_proxy_begin_attach().is_err() {
+        let mut proxy = TMPFS_PROXY.lock();
+        proxy.bulk_buffer = None;
+        proxy.bulk_buffer_attached = false;
+    }
+    true
+}
+
+fn tmpfs_proxy_begin_attach() -> Result<(), i64> {
+    const BULK_BUFFER_ID: u64 = 1;
+    const BULK_BUFFER_BYTES: usize = 4096;
+    let state = *TMPFS_PROXY.lock();
+    let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
+    if state.session_id == filesystem_protocol::INVALID_ID || state.session_generation == 0 {
+        return Err(ERR_IO);
+    }
+    let buffer = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        registry.collect_garbage();
+        if registry
+            .shared_memory_bytes()
+            .saturating_add(BULK_BUFFER_BYTES)
+            > abi::limits::MAX_SHARED_MEMORY_TOTAL_BYTES
+        {
+            return Err(ERR_NO_SPACE);
+        }
+        registry.create_object(
+            abi::capability::KIND_SHARED_MEMORY,
+            CapabilityObjectData::SharedMemory(SharedMemoryObject {
+                bytes: vec![0_u8; BULK_BUFFER_BYTES],
+            }),
+        )?
+    };
+    kernel_capability_root_add(buffer);
+    let mut request = filesystem_protocol::Request::EMPTY;
+    request.operation = filesystem_protocol::operation::ATTACH_BUFFER;
+    request.request_id = 2;
+    request.session_id = state.session_id;
+    request.generation = state.session_generation;
+    request.bulk = filesystem_protocol::BulkBuffer {
+        buffer_id: BULK_BUFFER_ID,
+        offset: 0,
+        length: BULK_BUFFER_BYTES as u64,
+    };
+    let bytes = tmpfs_proxy_value_bytes(&request).to_vec();
+    let pushed = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        match registry.object_index(request_endpoint) {
+            Some(index) => match &mut registry.objects[index].data {
+                CapabilityObjectData::Endpoint(endpoint)
+                    if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES =>
+                {
+                    endpoint.queue.push_back(EndpointMessage {
+                        sender_process_id: 0,
+                        bytes,
+                        capability: Some(TransferredCapability {
+                            object: buffer,
+                            rights: abi::capability::RIGHT_READ | abi::capability::RIGHT_WRITE,
+                        }),
+                    });
+                    Ok(())
+                }
+                CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
+                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
+                    Err(ERR_IO)
+                }
+            },
+            None => Err(ERR_IO),
+        }
+    };
+    if let Err(error) = pushed {
+        kernel_capability_root_remove(buffer);
+        CAPABILITY_REGISTRY.lock().collect_garbage();
+        return Err(error);
+    }
+    let mut proxy = TMPFS_PROXY.lock();
+    if proxy.session_id != state.session_id
+        || proxy.session_generation != state.session_generation
+        || proxy.request_endpoint != Some(request_endpoint)
+    {
+        drop(proxy);
+        kernel_capability_root_remove(buffer);
+        return Err(ERR_IO);
+    }
+    proxy.bulk_buffer = Some(buffer);
+    proxy.bulk_buffer_attached = false;
+    drop(proxy);
+    wake_endpoint_waiter(request_endpoint);
+    Ok(())
+}
+
+fn tmpfs_proxy_service_attach(state: TmpfsProxyState) -> bool {
+    let Some(reply_endpoint) = state.session_reply_endpoint else {
+        return false;
+    };
+    let message = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        let Some(index) = registry.object_index(reply_endpoint) else {
+            return false;
+        };
+        let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[index].data else {
+            return false;
+        };
+        endpoint.queue.pop_front()
+    };
+    let Some(message) = message else {
+        return false;
+    };
+    let valid = if message.capability.is_none()
+        && message.bytes.len() == size_of::<filesystem_protocol::Reply>()
+    {
+        let reply = unsafe {
+            ptr::read_unaligned(message.bytes.as_ptr() as *const filesystem_protocol::Reply)
+        };
+        reply.version == filesystem_protocol::VERSION
+            && reply.operation == filesystem_protocol::operation::ATTACH_BUFFER
+            && reply.status == filesystem_protocol::status::OK
+            && reply.flags == 0
+            && reply.request_id == 2
+            && reply.session_id == state.session_id
+            && reply.generation == state.session_generation
+            && reply.data_length == 0
+            && reply.reserved == [0; 2]
+    } else {
+        false
+    };
+    let mut proxy = TMPFS_PROXY.lock();
+    if proxy.session_id == state.session_id
+        && proxy.session_generation == state.session_generation
+        && proxy.bulk_buffer == state.bulk_buffer
+    {
+        proxy.bulk_buffer_attached = valid;
+        if !valid {
+            let buffer = proxy.bulk_buffer.take();
+            drop(proxy);
+            if let Some(buffer) = buffer {
+                kernel_capability_root_remove(buffer);
+            }
+            return true;
+        }
+    }
+    true
 }
 
 fn tmpfs_proxy_request(operation: u16, generation: u32, name: &str) -> tmpfs_protocol::Request {
