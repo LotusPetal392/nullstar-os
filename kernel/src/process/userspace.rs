@@ -848,6 +848,7 @@ struct OpenFile {
 struct PendingTmpfsProxyRequest {
     reply_endpoint: CapabilityObjectRef,
     request_operation: u16,
+    request_generation: u32,
     operation: PendingTmpfsProxyOperation,
     stack_pointer: usize,
 }
@@ -3557,7 +3558,11 @@ impl Runtime {
         let mut completed = 0usize;
         for (process_id, pending) in pending_requests {
             let Some(reply) =
-                tmpfs_proxy_take_reply(pending.reply_endpoint, pending.request_operation)
+                tmpfs_proxy_take_reply(
+                    pending.reply_endpoint,
+                    pending.request_operation,
+                    pending.request_generation,
+                )
             else {
                 continue;
             };
@@ -5904,6 +5909,7 @@ fn tmpfs_proxy_release_reply_endpoint(reply_endpoint: CapabilityObjectRef) {
 fn tmpfs_proxy_take_reply(
     reply_endpoint: CapabilityObjectRef,
     expected_operation: u16,
+    expected_generation: u32,
 ) -> Option<Result<tmpfs_protocol::Reply, i64>> {
     let message = {
         let mut registry = CAPABILITY_REGISTRY.lock();
@@ -5917,22 +5923,37 @@ fn tmpfs_proxy_take_reply(
             }
         }
     }?;
-    Some(tmpfs_proxy_decode_reply(message, expected_operation))
+    Some(tmpfs_proxy_decode_reply(
+        message,
+        expected_operation,
+        expected_generation,
+    ))
 }
 
 fn tmpfs_proxy_decode_reply(
     message: EndpointMessage,
     expected_operation: u16,
+    expected_generation: u32,
 ) -> Result<tmpfs_protocol::Reply, i64> {
-    if message.bytes.len() != size_of::<tmpfs_protocol::Reply>() || message.capability.is_some() {
+    if message.bytes.len() != size_of::<tmpfs_protocol::Reply>() {
         return Err(ERR_IO);
     }
     let reply =
         unsafe { ptr::read_unaligned(message.bytes.as_ptr() as *const tmpfs_protocol::Reply) };
-    if reply.version != tmpfs_protocol::VERSION
-        || reply.operation != expected_operation
-        || usize::from(reply.data_length) > tmpfs_protocol::MAX_DATA_BYTES
-    {
+    if !crate::tmpfs_abi::valid_reply_envelope(crate::tmpfs_abi::ReplyEnvelope {
+        byte_length: message.bytes.len(),
+        expected_byte_length: size_of::<tmpfs_protocol::Reply>(),
+        has_capability: message.capability.is_some(),
+        version: reply.version,
+        expected_version: tmpfs_protocol::VERSION,
+        operation: reply.operation,
+        expected_operation,
+        generation: reply.generation,
+        expected_generation,
+        data_length: usize::from(reply.data_length),
+        maximum_data_length: tmpfs_protocol::MAX_DATA_BYTES,
+        reserved: reply.reserved,
+    }) {
         return Err(ERR_IO);
     }
     Ok(reply)
@@ -5999,6 +6020,7 @@ fn tmpfs_proxy_begin_request(
     let pending = PendingTmpfsProxyRequest {
         reply_endpoint,
         request_operation: request.operation,
+        request_generation: request.generation,
         operation,
         stack_pointer,
     };
