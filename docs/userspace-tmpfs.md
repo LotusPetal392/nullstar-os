@@ -1,9 +1,9 @@
 # Userspace tmpfs service
 
-Phase 3 introduces NullStar OS's first real stateful userspace service. The
-service is not yet mounted into the kernel VFS; it is reached through the typed
-`userspace::tmpfs` client facade while the existing kernel `/tmp` remains the
-compatibility path for ordinary file syscalls.
+Phase 3 introduced NullStar OS's first real stateful userspace service. The
+service is now also registered with the kernel by PID 1, so ordinary `/tmp/<name>`
+file syscalls are routed through `/tmpfs-service` rather than the kernel-resident
+tmpfs implementation.
 
 ## Process and capability layout
 
@@ -13,12 +13,17 @@ PID 1 creates two endpoint objects before starting `/tmpfs-service`:
 - a request endpoint, granted to the service with `RECEIVE` only.
 
 The service receives those capabilities at deterministic handles 1 and 2. It
-validates the object types and exact rights before announcing readiness.
+validates the object types and exact rights before announcing readiness. After
+the readiness handshake, PID 1 performs a mount handshake, learns the service
+generation, and registers the request endpoint with the kernel.
 
-A client receives only `SEND` authority to the request endpoint. For each
-request it creates a fresh reply endpoint and transfers a `SEND`-only copy to
-the service. The client retains `RECEIVE`, so replies cannot be consumed by the
-service or another request sender.
+A userspace client receives only `SEND` authority to the request endpoint. For
+each direct protocol request it creates a fresh reply endpoint and transfers a
+`SEND`-only copy to the service. The client retains `RECEIVE`, so replies cannot
+be consumed by the service or another request sender. Kernel-proxied ordinary
+file syscalls use the same request/reply shape: the kernel creates the private
+reply endpoint, transfers a send-only reply capability to the service, blocks the
+calling process, and completes the saved syscall frame when the reply arrives.
 
 ```text
 client                     tmpfs service
@@ -39,6 +44,7 @@ supports:
 
 - write at an offset;
 - bounded reads;
+- open/create/truncate;
 - file-size lookup;
 - removal;
 - newline-separated root listing.
@@ -77,18 +83,24 @@ and grants it request `SEND` authority. The probe verifies:
 The shell is launched only after the probe exits successfully. The service then
 continues under the Phase 2 restart policy.
 
-## Compatibility boundary
+## Syscall routing boundary
 
-Ordinary `open`, `read`, `write`, `stat`, directory, and descriptor operations
-still use the kernel VFS and kernel tmpfs for `/tmp`. Redirecting those calls to
-a userspace server safely requires additional kernel machinery:
+After PID 1 registers the service, ordinary `open`, `read`, `write`, `stat`,
+`fstat`, `read_directory`, descriptor duplication, redirection, and seek offset
+bookkeeping for `/tmp/<name>` operate on proxy-backed file descriptions. The
+kernel still owns descriptor tables and scheduling, but file contents and file
+sizes come from `/tmpfs-service`.
 
-- a kernel-to-userspace request path that can block without cooperative polling;
-- cancellation when callers exit or receive signals;
-- restart-aware request and descriptor identities;
-- protection against priority inversion and server deadlock;
-- deterministic handling of in-flight operations when the service fails;
-- a mount/service registration contract.
+The current proxy intentionally keeps several boundaries small:
 
-Until those pieces exist, keeping kernel `/tmp` available avoids weakening the
-working shell and smoke suite while the userspace service protocol matures.
+- names are single `/tmp/<name>` components, with no subdirectories;
+- payloads are limited to 128 bytes per protocol request/reply, so larger reads
+  and writes complete as ordinary short file syscalls;
+- directory listings are synthesized from the service's newline-separated file
+  list, so entry sizes are reported as zero in directory records;
+- service restart generation is validated by the protocol, but in-flight syscall
+  replay across a service restart remains future work.
+
+The kernel tmpfs is still mounted for kernel-internal compatibility and smoke
+fixtures, but userspace programs using normal file APIs no longer write their
+`/tmp` data there.

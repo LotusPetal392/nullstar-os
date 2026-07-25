@@ -129,32 +129,65 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
             ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
         };
     }
-
-    registers.rax = match syscall_number {
-        abi::syscall::OPEN => {
-            platform_open(process_id, registers.rdi, registers.rsi, registers.rdx)
-        }
-        abi::syscall::SYSTEM_INFO => platform_system_info(process_id, registers.rdi, registers.rsi),
-        abi::syscall::STAT => platform_stat(
+    if syscall_number == abi::syscall::OPEN {
+        return match platform_open(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        };
+    }
+    if syscall_number == abi::syscall::STAT {
+        return match platform_stat(
             process_id,
             registers.rdi,
             registers.rsi,
             registers.rdx,
             registers.r10,
-        ),
-        abi::syscall::FSTAT => {
-            platform_fstat(process_id, registers.rdi, registers.rsi, registers.rdx)
-        }
-        abi::syscall::READ_DIRECTORY => platform_read_directory(
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        };
+    }
+    if syscall_number == abi::syscall::READ_DIRECTORY {
+        return match platform_read_directory(
             process_id,
             registers.rdi,
             registers.rsi,
             registers.rdx,
             registers.r10,
             registers.r8,
-        ),
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        };
+    }
+
+    registers.rax = match syscall_number {
+        abi::syscall::SYSTEM_INFO => platform_system_info(process_id, registers.rdi, registers.rsi),
+        abi::syscall::FSTAT => {
+            platform_fstat(process_id, registers.rdi, registers.rsi, registers.rdx)
+        }
         abi::syscall::CHDIR => platform_chdir(process_id, registers.rdi, registers.rsi),
         abi::syscall::GETCWD => platform_getcwd(process_id, registers.rdi, registers.rsi),
+        abi::syscall::REGISTER_TMPFS_SERVICE => {
+            platform_register_tmpfs_service(process_id, registers.rdi, registers.rsi)
+        }
         abi::syscall::DUP => platform_dup(process_id, registers.rdi),
         abi::syscall::DUP2 => platform_dup2(process_id, registers.rdi, registers.rsi),
         abi::syscall::GETPPID => platform_getppid(process_id),
@@ -183,6 +216,7 @@ fn platform_syscall_number(number: u64) -> bool {
             | abi::syscall::READ_DIRECTORY
             | abi::syscall::CHDIR
             | abi::syscall::GETCWD
+            | abi::syscall::REGISTER_TMPFS_SERVICE
             | abi::syscall::DUP
             | abi::syscall::DUP2
             | abi::syscall::GETPPID
@@ -213,14 +247,20 @@ fn platform_reserved_environment_call(
     .is_ok_and(|name| name == PLATFORM_WORKING_DIRECTORY_NAME)
 }
 
-fn platform_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
+fn platform_open(
+    process_id: u64,
+    address: u64,
+    length: u64,
+    flags: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
     let (options, close_on_exec) = match decode_open_options(flags) {
         Ok(decoded) => decoded,
-        Err(error) => return error_return(error),
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
     let path = match platform_user_path(process_id, address, length) {
         Ok(path) => path,
-        Err(error) => return error_return(error),
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
     let descriptor = {
         let manager = PROCESS_MANAGER.lock();
@@ -229,19 +269,38 @@ fn platform_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 
             .iter()
             .find(|process| process.process_id == process_id)
         else {
-            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+            return ControlOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
         };
         if descriptor_count(process) >= MAX_OPEN_FILES {
-            return error_return(ERR_TOO_MANY_OPEN_FILES);
+            return ControlOutcome::Ready(error_return(ERR_TOO_MANY_OPEN_FILES));
         }
         let Some(descriptor) = allocate_descriptor(process) else {
-            return error_return(ERR_TOO_MANY_OPEN_FILES);
+            return ControlOutcome::Ready(error_return(ERR_TOO_MANY_OPEN_FILES));
         };
         descriptor
     };
+    if tmpfs_proxy_state().is_some() {
+        match tmpfs_proxy_path(&path) {
+            Ok(Some(TmpfsProxyPath::Directory)) => {
+                return ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY));
+            }
+            Ok(Some(TmpfsProxyPath::File(_))) => {
+                return tmpfs_proxy_open(
+                    process_id,
+                    &path,
+                    options,
+                    close_on_exec,
+                    descriptor,
+                    current_stack_pointer,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return ControlOutcome::Ready(error_return(error)),
+        }
+    }
     let metadata = match vfs::open(&path, options) {
         Ok(metadata) => metadata,
-        Err(error) => return error_return(vfs_errno(&error)),
+        Err(error) => return ControlOutcome::Ready(error_return(vfs_errno(&error))),
     };
     let offset = if options.append { metadata.size } else { 0 };
     let handle = Arc::new(Mutex::new(OpenFileState {
@@ -250,13 +309,15 @@ fn platform_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 
         readable: options.read,
         writable: options.write,
         append: options.append,
+        size: metadata.size,
+        backend: OpenFileBackend::Vfs,
     }));
     let mut manager = PROCESS_MANAGER.lock();
     let Some(process) = manager.process_mut(process_id) else {
-        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        return ControlOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
     };
     if descriptor_in_use(process, descriptor) {
-        return error_return(ERR_TOO_MANY_OPEN_FILES);
+        return ControlOutcome::Ready(error_return(ERR_TOO_MANY_OPEN_FILES));
     }
     process.open_files.push(OpenFile {
         descriptor,
@@ -264,7 +325,47 @@ fn platform_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 
         close_on_exec,
     });
     process.open_count = process.open_count.saturating_add(1);
-    descriptor
+    ControlOutcome::Ready(descriptor)
+}
+
+fn platform_register_tmpfs_service(process_id: u64, handle: u64, generation: u64) -> u64 {
+    if process_id != INIT_PROCESS_ID {
+        return error_return(abi::errno::PERMISSION);
+    }
+    let Ok(generation) = u32::try_from(generation) else {
+        return error_return(ERR_INVALID_ARGUMENT);
+    };
+    if generation == 0 {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    let endpoint = {
+        let registry = CAPABILITY_REGISTRY.lock();
+        let Some(entry) = registry.entry(process_id, handle) else {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        };
+        if entry.object.kind != abi::capability::KIND_ENDPOINT {
+            return error_return(ERR_INVALID_ARGUMENT);
+        }
+        if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_SEND) {
+            return error_return(error);
+        }
+        entry.object
+    };
+
+    let previous = {
+        let mut state = TMPFS_PROXY.lock();
+        let previous = state.request_endpoint;
+        state.request_endpoint = Some(endpoint);
+        state.generation = generation;
+        previous
+    };
+    if previous != Some(endpoint) {
+        if let Some(previous) = previous {
+            kernel_capability_root_remove(previous);
+        }
+        kernel_capability_root_add(endpoint);
+    }
+    0
 }
 
 fn platform_spawn_command(
@@ -327,6 +428,7 @@ fn platform_spawn_command(
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
         || process.pending_fork.is_some()
+        || process.pending_tmpfs_proxy.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -367,6 +469,7 @@ fn platform_execve(
     if process.pending_terminal_read.is_some()
         || process.pending_pipe_read.is_some()
         || process.pending_pipe_write.is_some()
+        || process.pending_tmpfs_proxy.is_some()
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()

@@ -209,7 +209,8 @@ impl CapabilityRegistry {
             id: object_id,
             kind,
         };
-        self.objects.push(CapabilityObjectRecord { reference, data });
+        self.objects
+            .push(CapabilityObjectRecord { reference, data });
         Ok(reference)
     }
 
@@ -219,6 +220,9 @@ impl CapabilityRegistry {
             for entry in &table.entries {
                 push_unique_object(&mut reachable, entry.object);
             }
+        }
+        for object in kernel_capability_roots_snapshot() {
+            push_unique_object(&mut reachable, object);
         }
 
         let mut cursor = 0usize;
@@ -231,7 +235,9 @@ impl CapabilityRegistry {
                         endpoint
                             .queue
                             .iter()
-                            .filter_map(|message| message.capability.map(|capability| capability.object))
+                            .filter_map(|message| {
+                                message.capability.map(|capability| capability.object)
+                            })
                             .collect::<Vec<_>>(),
                     ),
                     CapabilityObjectData::Notification(_)
@@ -302,11 +308,7 @@ fn capability_user_range(process_id: u64, address: u64, length: usize, writable:
     length == 0 || user_range_allows(process_id, address, length, writable)
 }
 
-fn capability_read_message(
-    process_id: u64,
-    address: u64,
-    length: u64,
-) -> Result<Vec<u8>, i64> {
+fn capability_read_message(process_id: u64, address: u64, length: u64) -> Result<Vec<u8>, i64> {
     let length = capability_user_length(length, abi::limits::MAX_IPC_MESSAGE_BYTES)?;
     if !capability_user_range(process_id, address, length, false) {
         return Err(abi::errno::BAD_ADDRESS);
@@ -419,7 +421,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
 
     let registers = unsafe { &mut *registers_pointer };
     registers.rax = match syscall_number {
-        abi::syscall::SYSTEM_INFO => capability_system_info(process_id, registers.rdi, registers.rsi),
+        abi::syscall::SYSTEM_INFO => {
+            capability_system_info(process_id, registers.rdi, registers.rsi)
+        }
         abi::syscall::CAPABILITY_DUPLICATE => {
             capability_duplicate(process_id, registers.rdi, registers.rsi)
         }
@@ -539,9 +543,7 @@ fn endpoint_create(process_id: u64) -> u64 {
     let object = match registry.create_object(
         abi::capability::KIND_ENDPOINT,
         CapabilityObjectData::Endpoint(EndpointObject {
-            queue: alloc::collections::VecDeque::with_capacity(
-                abi::limits::MAX_ENDPOINT_MESSAGES,
-            ),
+            queue: alloc::collections::VecDeque::with_capacity(abi::limits::MAX_ENDPOINT_MESSAGES),
         }),
     ) {
         Ok(object) => object,
@@ -627,13 +629,11 @@ fn endpoint_receive(
     buffer_length: u64,
     info_address: u64,
 ) -> u64 {
-    let buffer_length = match capability_user_length(
-        buffer_length,
-        abi::limits::MAX_IPC_MESSAGE_BYTES,
-    ) {
-        Ok(length) => length,
-        Err(error) => return error_return(error),
-    };
+    let buffer_length =
+        match capability_user_length(buffer_length, abi::limits::MAX_IPC_MESSAGE_BYTES) {
+            Ok(length) => length,
+            Err(error) => return error_return(error),
+        };
     if !capability_user_range(process_id, buffer_address, buffer_length, true)
         || !user_range_allows(
             process_id,
@@ -673,14 +673,12 @@ fn endpoint_receive(
     }
 
     let transferred_handle = match transfer {
-        Some(capability) => match registry.insert_entry(
-            process_id,
-            capability.object,
-            capability.rights,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => return error_return(error),
-        },
+        Some(capability) => {
+            match registry.insert_entry(process_id, capability.object, capability.rights) {
+                Ok(handle) => handle,
+                Err(error) => return error_return(error),
+            }
+        }
         None => abi::capability::INVALID_HANDLE,
     };
 
@@ -706,14 +704,12 @@ fn endpoint_receive(
         sender_process_id: message.sender_process_id,
         byte_count: message.bytes.len() as u64,
         transferred_handle,
-        transferred_rights: message.capability.map(|capability| capability.rights).unwrap_or(0),
+        transferred_rights: message
+            .capability
+            .map(|capability| capability.rights)
+            .unwrap_or(0),
     };
-    unsafe {
-        ptr::write_unaligned(
-            info_address as *mut abi::capability::MessageInfo,
-            info,
-        )
-    };
+    unsafe { ptr::write_unaligned(info_address as *mut abi::capability::MessageInfo, info) };
     registry.collect_garbage();
     message.bytes.len() as u64
 }
@@ -818,13 +814,7 @@ fn shared_memory_create(process_id: u64, length: u64) -> u64 {
     }
 }
 
-fn shared_memory_read(
-    process_id: u64,
-    handle: u64,
-    offset: u64,
-    address: u64,
-    length: u64,
-) -> u64 {
+fn shared_memory_read(process_id: u64, handle: u64, offset: u64, address: u64, length: u64) -> u64 {
     let length = match capability_user_length(length, abi::limits::MAX_SHARED_MEMORY_BYTES) {
         Ok(length) => length,
         Err(error) => return error_return(error),

@@ -30,12 +30,21 @@ fn platform_fstat(process_id: u64, descriptor: u64, stat_address: u64, stat_leng
             flags: 0,
         },
         PlatformDescriptorSource::File(handle) => {
-            let path = handle.lock().path.clone();
-            let metadata = match vfs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) => return error_return(platform_vfs_errno(&error)),
-            };
-            platform_stat_from_metadata(&metadata)
+            let file = handle.lock();
+            match file.backend {
+                OpenFileBackend::TmpfsProxy { .. } => abi::file::Stat {
+                    kind: abi::file::KIND_FILE,
+                    size: file.size,
+                    flags: 0,
+                },
+                OpenFileBackend::Vfs => {
+                    let metadata = match vfs::metadata(&file.path) {
+                        Ok(metadata) => metadata,
+                        Err(error) => return error_return(platform_vfs_errno(&error)),
+                    };
+                    platform_stat_from_metadata(&metadata)
+                }
+            }
         }
     };
     platform_write_value(process_id, stat_address, stat_length, stat)

@@ -213,3 +213,16 @@ pub fn set_process_group(
     }
     decode(result)
 }
+
+pub fn register_tmpfs_service(service: FileDescriptor, generation: u32) -> Result<()> {
+    let mut result = syscall::REGISTER_TMPFS_SERVICE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") service,
+            in("rsi") generation as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
