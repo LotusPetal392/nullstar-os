@@ -2,6 +2,7 @@
 #![no_main]
 
 use userspace::{
+    filesystem::{Node, connect_service},
     ipc::{self, ObjectKind, Rights},
     syscall,
     tmpfs::{Error, Mount},
@@ -48,8 +49,29 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if &listing[..listed] != NAME {
         syscall::exit(9);
     }
+    let session = match connect_service(SERVICE_HANDLE, 1) {
+        Ok(session) => session,
+        Err(_) => syscall::exit(10),
+    };
+    let node = match session.lookup_node(2, Node::root(session), NAME) {
+        Ok(node) => node,
+        Err(_) => syscall::exit(11),
+    };
+    let attributes = match session.attributes(3, node) {
+        Ok(attributes) => attributes,
+        Err(_) => syscall::exit(12),
+    };
+    if attributes.node_id != node.id()
+        || attributes.kind != userspace::filesystem::protocol::node_kind::FILE
+        || attributes.size != PAYLOAD.len() as u64
+    {
+        syscall::exit(13);
+    }
+    if session.disconnect(4).is_err() {
+        syscall::exit(14);
+    }
     if mount.remove(NAME).is_err() || mount.stat(NAME) != Err(Error::NotFound) {
-        syscall::exit(10);
+        syscall::exit(15);
     }
     syscall::exit(0)
 }
