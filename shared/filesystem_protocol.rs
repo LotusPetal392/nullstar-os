@@ -60,6 +60,12 @@ pub mod request_flags {
     pub const ALL: u32 = CREATE | EXCLUSIVE | TRUNCATE | APPEND | READ | WRITE;
 }
 
+pub mod reply_flags {
+    pub const END_OF_DIRECTORY: u32 = 1 << 0;
+
+    pub const ALL: u32 = END_OF_DIRECTORY;
+}
+
 pub mod node_kind {
     pub const UNKNOWN: u16 = 0;
     pub const FILE: u16 = 1;
@@ -85,6 +91,28 @@ impl BulkBuffer {
     pub const fn end(self) -> Option<u64> {
         self.offset.checked_add(self.length)
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub node_id: u64,
+    pub next_cookie: u64,
+    pub kind: u16,
+    pub name_length: u16,
+    pub reserved: u32,
+    pub name: [u8; MAX_NAME_BYTES],
+}
+
+impl DirectoryEntry {
+    pub const EMPTY: Self = Self {
+        node_id: INVALID_ID,
+        next_cookie: 0,
+        kind: node_kind::UNKNOWN,
+        name_length: 0,
+        reserved: 0,
+        name: [0; MAX_NAME_BYTES],
+    };
 }
 
 #[repr(C)]

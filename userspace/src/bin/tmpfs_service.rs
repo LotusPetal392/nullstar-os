@@ -83,7 +83,8 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             );
         } else if message.bytes == size_of::<filesystem_protocol::Request>() {
             dispatch_filesystem_message(
-                &files,
+                &mut files,
+                &mut next_node_id,
                 generation,
                 &mut sessions,
                 &request_bytes,
@@ -117,7 +118,8 @@ fn dispatch_legacy_message(
 }
 
 fn dispatch_filesystem_message(
-    files: &[File; protocol::MAX_FILES],
+    files: &mut [File; protocol::MAX_FILES],
+    next_node_id: &mut u64,
     generation: u64,
     sessions: &mut SessionTable,
     request_bytes: &[u8],
@@ -205,6 +207,42 @@ fn dispatch_filesystem_message(
             reject_unexpected_capability(capability, &mut reply);
             if reply.status == filesystem_protocol::status::OK {
                 get_node_attributes(files, &request, &mut reply);
+            }
+        }
+        filesystem_protocol::operation::READ => {
+            reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK {
+                read_node_to_buffer(files, sessions, &request, &mut reply);
+            }
+        }
+        filesystem_protocol::operation::WRITE => {
+            reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK {
+                write_node_from_buffer(files, sessions, &request, &mut reply);
+            }
+        }
+        filesystem_protocol::operation::CREATE_FILE => {
+            reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK {
+                create_filesystem_file(files, next_node_id, &request, &mut reply);
+            }
+        }
+        filesystem_protocol::operation::OPEN => {
+            reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK {
+                open_filesystem_node(files, &request, &mut reply);
+            }
+        }
+        filesystem_protocol::operation::READ_DIRECTORY => {
+            reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK {
+                read_directory_to_buffer(files, sessions, &request, &mut reply);
+            }
+        }
+        filesystem_protocol::operation::UNLINK => {
+            reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK {
+                unlink_filesystem_node(files, &request, &mut reply);
             }
         }
         _ => {
@@ -302,22 +340,176 @@ fn lookup_node(
         reply.status = filesystem_protocol::status::NOT_DIRECTORY;
         return;
     }
-    let name_length = usize::from(request.name_length);
-    if name_length == 0
-        || name_length > filesystem_protocol::MAX_NAME_BYTES
-        || request.name[..name_length].contains(&b'/')
-        || request.name[..name_length].contains(&0)
-    {
+    let Some(name) = request_name(request) else {
         reply.status = filesystem_protocol::status::INVALID;
         return;
-    }
-    let name = &request.name[..name_length];
+    };
     let Some(file) = files.iter().find(|file| file.named(name)) else {
         reply.status = filesystem_protocol::status::NOT_FOUND;
         return;
     };
     reply.node_id = file.node_id;
     reply.node_kind = filesystem_protocol::node_kind::FILE;
+}
+
+fn create_filesystem_file(
+    files: &mut [File; protocol::MAX_FILES],
+    next_node_id: &mut u64,
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) {
+    let allowed = filesystem_protocol::request_flags::EXCLUSIVE
+        | filesystem_protocol::request_flags::TRUNCATE;
+    if request.node_id != filesystem_protocol::ROOT_NODE_ID || request.flags & !allowed != 0 {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    let Some(name) = request_name(request) else {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    };
+    if let Some(index) = find_file(files, name) {
+        if request.flags & filesystem_protocol::request_flags::EXCLUSIVE != 0 {
+            reply.status = filesystem_protocol::status::EXISTS;
+            return;
+        }
+        if request.flags & filesystem_protocol::request_flags::TRUNCATE != 0 {
+            files[index].length = 0;
+        }
+        reply.node_id = files[index].node_id;
+        reply.node_kind = filesystem_protocol::node_kind::FILE;
+        reply.value = files[index].length as u64;
+        return;
+    }
+    let Some(index) = files.iter().position(|file| !file.used) else {
+        reply.status = filesystem_protocol::status::NO_SPACE;
+        return;
+    };
+    initialize_file(&mut files[index], next_node_id, name);
+    reply.node_id = files[index].node_id;
+    reply.node_kind = filesystem_protocol::node_kind::FILE;
+}
+
+fn open_filesystem_node(
+    files: &mut [File; protocol::MAX_FILES],
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) {
+    let allowed = filesystem_protocol::request_flags::READ
+        | filesystem_protocol::request_flags::WRITE
+        | filesystem_protocol::request_flags::APPEND
+        | filesystem_protocol::request_flags::TRUNCATE;
+    if request.flags & !allowed != 0
+        || request.flags & filesystem_protocol::request_flags::APPEND != 0
+            && request.flags & filesystem_protocol::request_flags::WRITE == 0
+        || request.flags & filesystem_protocol::request_flags::TRUNCATE != 0
+            && request.flags & filesystem_protocol::request_flags::WRITE == 0
+    {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    let Some(index) = files
+        .iter()
+        .position(|file| file.used && file.node_id == request.node_id)
+    else {
+        reply.status = if request.node_id == filesystem_protocol::ROOT_NODE_ID {
+            filesystem_protocol::status::IS_DIRECTORY
+        } else {
+            filesystem_protocol::status::STALE_NODE
+        };
+        return;
+    };
+    if request.flags & filesystem_protocol::request_flags::TRUNCATE != 0 {
+        files[index].length = 0;
+    }
+    reply.node_id = files[index].node_id;
+    reply.node_kind = filesystem_protocol::node_kind::FILE;
+    reply.value = files[index].length as u64;
+}
+
+fn read_directory_to_buffer(
+    files: &[File; protocol::MAX_FILES],
+    sessions: &SessionTable,
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) {
+    if request.node_id != filesystem_protocol::ROOT_NODE_ID {
+        reply.status = filesystem_protocol::status::NOT_DIRECTORY;
+        return;
+    }
+    if request.flags != 0 {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    let Some((buffer, buffer_offset, requested)) = checked_bulk_range(sessions, request, reply)
+    else {
+        return;
+    };
+    let record_size = size_of::<filesystem_protocol::DirectoryEntry>();
+    let capacity = requested / record_size;
+    if capacity == 0 {
+        reply.status = filesystem_protocol::status::RANGE;
+        return;
+    }
+    let mut count = 0usize;
+    let mut cookie = request.file_offset;
+    while count < capacity {
+        let Some(file) = files
+            .iter()
+            .filter(|file| file.used && file.node_id > cookie)
+            .min_by_key(|file| file.node_id)
+        else {
+            break;
+        };
+        let mut entry = filesystem_protocol::DirectoryEntry::EMPTY;
+        entry.node_id = file.node_id;
+        entry.next_cookie = file.node_id;
+        entry.kind = filesystem_protocol::node_kind::FILE;
+        entry.name_length = file.name_length as u16;
+        entry.name[..file.name_length].copy_from_slice(&file.name[..file.name_length]);
+        let offset = buffer_offset + count * record_size;
+        match ipc::shared_memory_write(buffer.handle, offset, value_bytes(&entry)) {
+            Ok(written) if written == record_size => count += 1,
+            _ => {
+                reply.status = filesystem_protocol::status::IO;
+                return;
+            }
+        }
+        cookie = file.node_id;
+    }
+    reply.value = count as u64;
+    if !files.iter().any(|file| file.used && file.node_id > cookie) {
+        reply.flags |= filesystem_protocol::reply_flags::END_OF_DIRECTORY;
+    }
+}
+
+fn request_name(request: &filesystem_protocol::Request) -> Option<&[u8]> {
+    let name_length = usize::from(request.name_length);
+    (name_length != 0
+        && name_length <= filesystem_protocol::MAX_NAME_BYTES
+        && !request.name[..name_length].contains(&b'/')
+        && !request.name[..name_length].contains(&0))
+    .then_some(&request.name[..name_length])
+}
+
+fn unlink_filesystem_node(
+    files: &mut [File; protocol::MAX_FILES],
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) {
+    if request.node_id != filesystem_protocol::ROOT_NODE_ID || request.flags != 0 {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    let Some(name) = request_name(request) else {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    };
+    let Some(index) = find_file(files, name) else {
+        reply.status = filesystem_protocol::status::NOT_FOUND;
+        return;
+    };
+    files[index] = File::EMPTY;
 }
 
 fn get_node_attributes(
@@ -352,6 +544,135 @@ fn get_node_attributes(
     reply.data_length = bytes.len() as u16;
     reply.node_id = attributes.node_id;
     reply.node_kind = attributes.kind;
+}
+
+fn read_node_to_buffer(
+    files: &[File; protocol::MAX_FILES],
+    sessions: &SessionTable,
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) {
+    if request.flags != 0 {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    let Some(file) = files
+        .iter()
+        .find(|file| file.used && file.node_id == request.node_id)
+    else {
+        reply.status = filesystem_protocol::status::STALE_NODE;
+        return;
+    };
+    let Some((buffer, buffer_offset, requested)) = checked_bulk_range(sessions, request, reply)
+    else {
+        return;
+    };
+    let Ok(file_offset) = usize::try_from(request.file_offset) else {
+        reply.status = filesystem_protocol::status::RANGE;
+        return;
+    };
+    if file_offset > file.length {
+        reply.status = filesystem_protocol::status::RANGE;
+        return;
+    }
+    let count = requested.min(file.length - file_offset);
+    match ipc::shared_memory_write(
+        buffer.handle,
+        buffer_offset,
+        &file.data[file_offset..file_offset + count],
+    ) {
+        Ok(written) if written == count => reply.value = written as u64,
+        _ => reply.status = filesystem_protocol::status::IO,
+    }
+}
+
+fn write_node_from_buffer(
+    files: &mut [File; protocol::MAX_FILES],
+    sessions: &SessionTable,
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) {
+    if request.flags & !filesystem_protocol::request_flags::APPEND != 0 {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    let Some(index) = files
+        .iter()
+        .position(|file| file.used && file.node_id == request.node_id)
+    else {
+        reply.status = filesystem_protocol::status::STALE_NODE;
+        return;
+    };
+    let Some((buffer, buffer_offset, requested)) = checked_bulk_range(sessions, request, reply)
+    else {
+        return;
+    };
+    if requested > protocol::MAX_FILE_BYTES {
+        reply.status = filesystem_protocol::status::RANGE;
+        return;
+    }
+    let file_offset = if request.flags & filesystem_protocol::request_flags::APPEND != 0 {
+        files[index].length
+    } else {
+        let Ok(offset) = usize::try_from(request.file_offset) else {
+            reply.status = filesystem_protocol::status::RANGE;
+            return;
+        };
+        offset
+    };
+    let Some(end) = file_offset.checked_add(requested) else {
+        reply.status = filesystem_protocol::status::RANGE;
+        return;
+    };
+    if end > protocol::MAX_FILE_BYTES {
+        reply.status = filesystem_protocol::status::NO_SPACE;
+        return;
+    }
+    let mut bytes = [0_u8; protocol::MAX_FILE_BYTES];
+    match ipc::shared_memory_read(buffer.handle, buffer_offset, &mut bytes[..requested]) {
+        Ok(read) if read == requested => {
+            let file = &mut files[index];
+            file.data[file_offset..end].copy_from_slice(&bytes[..requested]);
+            file.length = file.length.max(end);
+            reply.value = requested as u64;
+        }
+        _ => reply.status = filesystem_protocol::status::IO,
+    }
+}
+
+fn checked_bulk_range(
+    sessions: &SessionTable,
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) -> Option<(userspace::filesystem_service::BufferSlot, usize, usize)> {
+    let buffer = match sessions.buffer(
+        request.session_id,
+        request.generation,
+        request.bulk.buffer_id,
+    ) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            reply.status = session_status(error);
+            return None;
+        }
+    };
+    let Some(end) = request.bulk.end() else {
+        reply.status = filesystem_protocol::status::RANGE;
+        return None;
+    };
+    if request.bulk.length == 0 || end > buffer.length {
+        reply.status = filesystem_protocol::status::RANGE;
+        return None;
+    }
+    let Ok(offset) = usize::try_from(request.bulk.offset) else {
+        reply.status = filesystem_protocol::status::RANGE;
+        return None;
+    };
+    let Ok(length) = usize::try_from(request.bulk.length) else {
+        reply.status = filesystem_protocol::status::RANGE;
+        return None;
+    };
+    Some((buffer, offset, length))
 }
 
 fn reject_unexpected_capability(

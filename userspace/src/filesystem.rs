@@ -38,6 +38,12 @@ pub struct Session {
     generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryBatch {
+    pub count: usize,
+    pub end: bool,
+}
+
 impl Session {
     pub const fn from_reply(reply: &protocol::Reply) -> Option<Self> {
         if reply.status == protocol::status::OK
@@ -101,6 +107,113 @@ impl Session {
             }),
         )
         .map(|_| ())
+    }
+
+    pub fn detach_shared_buffer(self, request_id: u64, buffer_id: u64) -> Result<(), Error> {
+        if buffer_id == protocol::INVALID_ID {
+            return Err(Error::InvalidBuffer);
+        }
+        let mut request = self.request(protocol::operation::DETACH_BUFFER, request_id)?;
+        request.bulk.buffer_id = buffer_id;
+        self.exchange(&request, None).map(|_| ())
+    }
+
+    pub fn read_to_shared_buffer(
+        self,
+        request_id: u64,
+        node: Node,
+        file_offset: u64,
+        bulk: protocol::BulkBuffer,
+    ) -> Result<usize, Error> {
+        let request = self.read(request_id, node, file_offset, bulk)?;
+        let reply = self.exchange(&request, None)?;
+        usize::try_from(reply.value).map_err(|_| Error::Range)
+    }
+
+    pub fn write_from_shared_buffer(
+        self,
+        request_id: u64,
+        node: Node,
+        file_offset: u64,
+        bulk: protocol::BulkBuffer,
+        append: bool,
+    ) -> Result<usize, Error> {
+        let flags = if append {
+            protocol::request_flags::APPEND
+        } else {
+            0
+        };
+        let request = self.write(request_id, node, file_offset, bulk, flags)?;
+        let reply = self.exchange(&request, None)?;
+        usize::try_from(reply.value).map_err(|_| Error::Range)
+    }
+
+    pub fn create_file(
+        self,
+        request_id: u64,
+        directory: Node,
+        name: &[u8],
+        exclusive: bool,
+        truncate: bool,
+    ) -> Result<Node, Error> {
+        let mut request = self.request(protocol::operation::CREATE_FILE, request_id)?;
+        request.node_id = directory.id_for(self)?;
+        request.flags = if exclusive {
+            protocol::request_flags::EXCLUSIVE
+        } else {
+            0
+        } | if truncate {
+            protocol::request_flags::TRUNCATE
+        } else {
+            0
+        };
+        set_name(&mut request, name)?;
+        let reply = self.exchange(&request, None)?;
+        Node::from_reply(self, &reply).ok_or(Error::Transport)
+    }
+
+    pub fn open_node(self, request_id: u64, node: Node, flags: u32) -> Result<Node, Error> {
+        let allowed = protocol::request_flags::READ
+            | protocol::request_flags::WRITE
+            | protocol::request_flags::APPEND
+            | protocol::request_flags::TRUNCATE;
+        if flags & !allowed != 0
+            || flags & (protocol::request_flags::APPEND | protocol::request_flags::TRUNCATE) != 0
+                && flags & protocol::request_flags::WRITE == 0
+        {
+            return Err(Error::InvalidFlags);
+        }
+        let mut request = self.request(protocol::operation::OPEN, request_id)?;
+        request.node_id = node.id_for(self)?;
+        request.flags = flags;
+        let reply = self.exchange(&request, None)?;
+        Node::from_reply(self, &reply).ok_or(Error::Transport)
+    }
+
+    pub fn read_directory_to_shared_buffer(
+        self,
+        request_id: u64,
+        directory: Node,
+        cookie: u64,
+        bulk: protocol::BulkBuffer,
+    ) -> Result<DirectoryBatch, Error> {
+        validate_bulk(bulk)?;
+        let mut request = self.request(protocol::operation::READ_DIRECTORY, request_id)?;
+        request.node_id = directory.id_for(self)?;
+        request.file_offset = cookie;
+        request.bulk = bulk;
+        let reply = self.exchange(&request, None)?;
+        Ok(DirectoryBatch {
+            count: usize::try_from(reply.value).map_err(|_| Error::Range)?,
+            end: reply.flags & protocol::reply_flags::END_OF_DIRECTORY != 0,
+        })
+    }
+
+    pub fn unlink(self, request_id: u64, directory: Node, name: &[u8]) -> Result<(), Error> {
+        let mut request = self.request(protocol::operation::UNLINK, request_id)?;
+        request.node_id = directory.id_for(self)?;
+        set_name(&mut request, name)?;
+        self.exchange(&request, None).map(|_| ())
     }
 
     pub fn disconnect(self, request_id: u64) -> Result<(), Error> {
@@ -288,6 +401,7 @@ pub fn valid_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool
         && reply.operation == request.operation
         && reply.request_id == request.request_id
         && reply.data_length as usize <= protocol::MAX_INLINE_DATA_BYTES
+        && reply.flags & !protocol::reply_flags::ALL == 0
         && reply.reserved == [0; 2]
         && (request.operation == protocol::operation::CONNECT
             || (reply.session_id == request.session_id && reply.generation == request.generation))
@@ -361,6 +475,10 @@ mod tests {
         assert!(size_of::<protocol::Request>() <= 256);
         assert!(size_of::<protocol::Reply>() <= 256);
         assert!(size_of::<protocol::NodeAttributes>() <= protocol::MAX_INLINE_DATA_BYTES);
+        assert_eq!(
+            size_of::<protocol::DirectoryEntry>(),
+            24 + protocol::MAX_NAME_BYTES
+        );
     }
 
     #[test]
@@ -433,5 +551,44 @@ mod tests {
         assert_eq!(request.operation, protocol::operation::CONNECT);
         assert_eq!(request.session_id, protocol::INVALID_ID);
         assert_eq!(connect(0), Err(Error::InvalidRequestId));
+    }
+
+    #[test]
+    fn create_open_and_directory_requests_preserve_typed_identity() {
+        let session = session();
+        let root = Node::root(session);
+        let create = session
+            .create_file(1, root, b"notes.txt", true, false)
+            .unwrap_err();
+        assert_eq!(create, Error::Transport);
+
+        assert_eq!(
+            session.open_node(2, root, protocol::request_flags::APPEND),
+            Err(Error::InvalidFlags)
+        );
+
+        let request = session
+            .request(protocol::operation::READ_DIRECTORY, 3)
+            .expect("valid directory request");
+        assert_eq!(request.session_id, session.id());
+        assert_eq!(request.generation, session.generation());
+    }
+
+    #[test]
+    fn directory_completion_is_the_only_defined_reply_flag() {
+        let session = session();
+        let request = session
+            .request(protocol::operation::READ_DIRECTORY, 4)
+            .expect("valid request");
+        let mut reply = protocol::Reply::EMPTY;
+        reply.operation = request.operation;
+        reply.request_id = request.request_id;
+        reply.session_id = request.session_id;
+        reply.generation = request.generation;
+        reply.flags = protocol::reply_flags::END_OF_DIRECTORY;
+        assert!(valid_reply(&request, &reply));
+
+        reply.flags |= 1 << 31;
+        assert!(!valid_reply(&request, &reply));
     }
 }

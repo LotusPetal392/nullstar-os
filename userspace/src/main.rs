@@ -112,7 +112,11 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
 
 fn register_tmpfs_proxy(request_endpoint: CapabilityHandle) {
     let mount = Mount::connect(request_endpoint).unwrap_or_else(|_| fail(SERVICE_PROTOCOL_FAILED));
-    platform::register_tmpfs_service(request_endpoint, mount.generation())
+    let generation = mount.generation();
+    mount
+        .disconnect()
+        .unwrap_or_else(|_| fail(SERVICE_PROTOCOL_FAILED));
+    platform::register_tmpfs_service(request_endpoint, generation)
         .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
 }
 

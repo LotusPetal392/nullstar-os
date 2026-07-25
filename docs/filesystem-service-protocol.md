@@ -62,6 +62,19 @@ client-selected nonzero buffer ID. Read and write requests identify a checked
 kernel's bounded shared-memory copy calls; direct page mappings can replace
 those copies without changing filesystem operations.
 
+Generic tmpfs reads and writes now use these registered windows. For `READ`, the
+service copies file bytes into the selected shared-memory range; for `WRITE`, it
+copies bytes from the range into the file. Both operations validate the session,
+node ID, buffer ID, buffer bounds, file offset, file capacity, and append flags
+before accessing either object. Replies return the completed byte count.
+
+Directory iteration uses fixed-size `DirectoryEntry` records in a registered
+window. Each record carries a node ID, kind, component name, and continuation
+cookie. Cookies are monotonic node IDs rather than tmpfs storage slots, so
+deleting an earlier entry does not shift later entries or make a continuing
+client skip them. A reply marks `END_OF_DIRECTORY` only when no entry remains
+after the final returned cookie.
+
 ## Namespace operations
 
 Lookup is directory-relative:
@@ -158,8 +171,9 @@ overloading generic flags or inline data.
 
 ## Migration sequence
 
-1. Implement the session and node table in `/tmpfs-service`.
-2. Add a compatibility adapter so existing tmpfs calls use the generic client.
+1. Implement the session and node table in `/tmpfs-service`. (complete)
+2. Add a compatibility adapter so existing userspace tmpfs calls use the
+   generic client. (complete)
 3. Teach the kernel proxy to speak the generic protocol without changing the
    public file-descriptor ABI.
 4. Move path routing and open-file descriptions into a VFS service.
@@ -170,7 +184,23 @@ overloading generic flags or inline data.
 
 The current implementation completes the shared wire contract, typed request
 builders, bounded service session and buffer tables, monotonic tmpfs node IDs,
-root-relative lookup, node attributes, identity validation, and unit tests. The
-service accepts generic and legacy requests on the same endpoint. It
-deliberately does not switch the boot-critical tmpfs client path until generic
-bulk reads and writes and an integration probe are implemented.
+root-relative lookup, node attributes, shared-memory reads and writes, identity
+validation, file create/open, stable directory iteration, and unit tests. The
+service accepts generic and legacy requests on the same endpoint, and the boot
+probe verifies shared data visibility plus generic creation and enumeration.
+The userspace `tmpfs::Mount` compatibility API now translates its bounded
+write, read, stat, remove, and list calls into generic lookup, create,
+attributes, unlink, shared-buffer I/O, and directory-iteration operations. It
+also disconnects its persistent session explicitly. The kernel proxy remains
+on the legacy protocol; the next migration step is to teach that asynchronous
+proxy to maintain a generic service session and shared I/O window behind its
+existing public file-descriptor ABI.
+
+The kernel proxy registration path now starts that migration: it queues
+`CONNECT` without blocking PID 1, validates the reply from the normal kernel
+poll loop, retains the persistent session reply endpoint, creates a kernel-owned
+4 KiB shared-memory window, and registers it with `ATTACH_BUFFER`. Service
+replacement releases the previous handshake endpoint, session endpoint, and
+bulk-window root before establishing the new generation. File operations still
+use the legacy per-request transport until their asynchronous completion states
+are converted to generic replies.
