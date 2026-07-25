@@ -62,7 +62,8 @@ of directory records accepted by one call, and process-group control support.
 | 44 | `shared_memory_create` | byte length | shared-memory handle |
 | 45 | `shared_memory_read` | handle, offset, buffer address, byte count | copied byte count |
 | 46 | `shared_memory_write` | handle, offset, byte address, byte count | copied byte count |
-| 47 | `capability_grant_child` | child PID, source handle, reduced rights, requested child handle | child handle |
+| 47 | `endpoint_wait` | endpoint handle | zero once the endpoint is readable |
+| 48 | `capability_grant_child` | child PID, source handle, reduced rights, requested child handle | child handle |
 
 `SystemInfo.capabilities` reports `capability::PROTECTION_V1` when the handle
 table, endpoints, notifications, and shared-memory objects are available.
@@ -72,11 +73,12 @@ are process local, begin at one, and refer to an object plus an explicit rights
 mask. Duplication and delegation require the corresponding authority and accept
 only a nonempty subset of the source rights.
 
-Endpoint send and receive are non-blocking kernel calls. A full send queue or an
-empty receive queue returns `EAGAIN`. Receiving into a buffer smaller than the
-front message returns `ERANGE` without consuming the message. One message may
-carry one rights-reduced capability. The `userspace::ipc::receive` helper yields
-and retries on `EAGAIN`.
+Endpoint send and receive are non-blocking data-movement calls. A full send
+queue or an empty receive queue returns `EAGAIN`. Receiving into a buffer smaller
+than the front message returns `ERANGE` without consuming the message. One
+message may carry one rights-reduced capability. The `userspace::ipc::receive`
+helper yields and retries on `EAGAIN`. `endpoint_wait` is the scheduler-integrated
+readiness wait for code that wants to block until an endpoint receives a message.
 
 Notifications are counted. Signaling checks for overflow; try-wait consumes one
 pending event or returns `EAGAIN`. Shared-memory calls currently copy bytes
@@ -93,6 +95,25 @@ global service namespace. Capability tables are not implicitly cloned by
 
 See [Capability and IPC protection model](protection-model.md) for lifetime,
 security-boundary, testing, and migration details.
+
+## Version 1.4 tmpfs registration
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 49 | `register_tmpfs_service` | request endpoint handle, generation | zero |
+
+Only PID 1 may register the supervised tmpfs service. The handle must refer to
+an endpoint with `SEND` authority, and the generation must be nonzero. After
+registration, ordinary `/tmp/<name>` file syscalls are proxied to the registered
+service endpoint. The kernel creates a private reply endpoint per syscall,
+blocks the caller, and completes the saved syscall frame when the service
+replies. `/tmp` itself remains a directory mount point.
+
+The reply endpoint is an untrusted ABI boundary. The kernel rejects replies with
+the wrong fixed-record size, protocol version, operation, mount generation, or
+data bound; nonzero reserved fields and attached capabilities are also rejected.
+These checks prevent stale service instances and malformed replies from
+completing a blocked filesystem syscall.
 
 ## Paths and working directories
 
@@ -200,7 +221,8 @@ the existing group-oriented syscall.
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
-- ABI 1.2 adds protection calls 35 through 47 and capability feature bits.
+- ABI 1.2 adds protection calls 35 through 48 and capability feature bits.
+- ABI 1.4 adds PID-1 tmpfs service registration at syscall 49.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

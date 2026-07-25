@@ -43,6 +43,14 @@ mod abi {
     ));
 }
 
+#[allow(dead_code)]
+mod tmpfs_protocol {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/tmpfs_protocol.rs"
+    ));
+}
+
 pub const SYSCALL_VECTOR: u8 = abi::SYSCALL_VECTOR;
 pub const INIT_PROCESS_ID: u64 = abi::INIT_PROCESS_ID;
 
@@ -811,12 +819,20 @@ struct ActiveSignalFrame {
     restorer: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenFileBackend {
+    Vfs,
+    TmpfsProxy { generation: u32 },
+}
+
 struct OpenFileState {
     path: String,
     offset: u64,
     readable: bool,
     writable: bool,
     append: bool,
+    size: u64,
+    backend: OpenFileBackend,
 }
 
 type OpenFileHandle = Arc<Mutex<OpenFileState>>;
@@ -826,6 +842,82 @@ struct OpenFile {
     descriptor: u64,
     handle: OpenFileHandle,
     close_on_exec: bool,
+}
+
+#[derive(Clone)]
+struct PendingTmpfsProxyRequest {
+    reply_endpoint: CapabilityObjectRef,
+    request_operation: u16,
+    request_generation: u32,
+    operation: PendingTmpfsProxyOperation,
+    stack_pointer: usize,
+}
+
+#[derive(Clone)]
+enum PendingTmpfsProxyOperation {
+    Open {
+        path: String,
+        descriptor: u64,
+        readable: bool,
+        writable: bool,
+        append: bool,
+        close_on_exec: bool,
+        generation: u32,
+    },
+    Read {
+        handle: OpenFileHandle,
+        address: u64,
+        length: usize,
+    },
+    Write {
+        handle: OpenFileHandle,
+        offset: u64,
+        length: usize,
+    },
+    Stat {
+        address: u64,
+        length: u64,
+    },
+    ReadDirectory {
+        start_index: usize,
+        records_address: u64,
+        capacity: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct TmpfsProxyState {
+    request_endpoint: Option<CapabilityObjectRef>,
+    generation: u32,
+}
+
+impl TmpfsProxyState {
+    const fn new() -> Self {
+        Self {
+            request_endpoint: None,
+            generation: 0,
+        }
+    }
+}
+
+static KERNEL_CAPABILITY_ROOTS: Mutex<Vec<CapabilityObjectRef>> = Mutex::new(Vec::new());
+static TMPFS_PROXY: Mutex<TmpfsProxyState> = Mutex::new(TmpfsProxyState::new());
+
+fn kernel_capability_root_add(object: CapabilityObjectRef) {
+    let mut roots = KERNEL_CAPABILITY_ROOTS.lock();
+    if !roots.contains(&object) {
+        roots.push(object);
+    }
+}
+
+fn kernel_capability_root_remove(object: CapabilityObjectRef) {
+    KERNEL_CAPABILITY_ROOTS
+        .lock()
+        .retain(|candidate| *candidate != object);
+}
+
+fn kernel_capability_roots_snapshot() -> Vec<CapabilityObjectRef> {
+    KERNEL_CAPABILITY_ROOTS.lock().clone()
 }
 
 #[derive(Clone)]
@@ -878,6 +970,7 @@ struct Process {
     pending_terminal_read: Option<PendingTerminalRead>,
     pending_pipe_read: Option<PendingPipeRead>,
     pending_pipe_write: Option<PendingPipeWrite>,
+    pending_tmpfs_proxy: Option<PendingTmpfsProxyRequest>,
     pending_child_spawn: Option<PendingChildSpawn>,
     pending_child_wait: Option<PendingChildWait>,
     pending_exec: Option<PendingExec>,
@@ -1833,6 +1926,7 @@ fn spawn_with_mode(
         pending_terminal_read: None,
         pending_pipe_read: None,
         pending_pipe_write: None,
+        pending_tmpfs_proxy: None,
         pending_child_spawn: None,
         pending_child_wait: None,
         pending_exec: None,
@@ -2588,6 +2682,7 @@ impl Runtime {
                 pending_terminal_read: None,
                 pending_pipe_read: None,
                 pending_pipe_write: None,
+                pending_tmpfs_proxy: None,
                 pending_child_spawn: None,
                 pending_child_wait: None,
                 pending_exec: None,
@@ -2895,6 +2990,7 @@ impl Runtime {
             Terminal,
             PipeRead(PipeId),
             PipeWrite(PipeId),
+            TmpfsProxy(CapabilityObjectRef),
             Child,
         }
 
@@ -2919,6 +3015,11 @@ impl Runtime {
                         (
                             pending.stack_pointer,
                             InterruptedWait::PipeWrite(pending.pipe_id),
+                        )
+                    } else if let Some(pending) = process.pending_tmpfs_proxy.take() {
+                        (
+                            pending.stack_pointer,
+                            InterruptedWait::TmpfsProxy(pending.reply_endpoint),
                         )
                     } else if let Some(pending) = process.pending_child_wait.take() {
                         (pending.stack_pointer, InterruptedWait::Child)
@@ -2947,6 +3048,9 @@ impl Runtime {
             }
             InterruptedWait::PipeWrite(pipe_id) => {
                 let _ = pipe::note_writer_wakeup(pipe_id);
+            }
+            InterruptedWait::TmpfsProxy(reply_endpoint) => {
+                tmpfs_proxy_release_reply_endpoint(reply_endpoint);
             }
             InterruptedWait::Child => {}
         }
@@ -3428,11 +3532,91 @@ impl Runtime {
         self.service_cow_faults()?;
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;
+        self.service_tmpfs_proxy_requests()?;
         self.service_fork_requests()?;
         self.service_child_requests()?;
         self.service_exec_requests()?;
         self.service_pending_signals()?;
         Ok(reaped)
+    }
+
+    fn service_tmpfs_proxy_requests(&mut self) -> Result<usize, Error> {
+        let pending_requests: Vec<(u64, PendingTmpfsProxyRequest)> =
+            cpu_interrupts::without_interrupts(|| {
+                PROCESS_MANAGER
+                    .lock()
+                    .processes
+                    .iter()
+                    .filter_map(|process| {
+                        process
+                            .pending_tmpfs_proxy
+                            .clone()
+                            .map(|pending| (process.process_id, pending))
+                    })
+                    .collect()
+            });
+        let mut completed = 0usize;
+        for (process_id, pending) in pending_requests {
+            let Some(reply) =
+                tmpfs_proxy_take_reply(
+                    pending.reply_endpoint,
+                    pending.request_operation,
+                    pending.request_generation,
+                )
+            else {
+                continue;
+            };
+            tmpfs_proxy_release_reply_endpoint(pending.reply_endpoint);
+            self.complete_tmpfs_proxy_request(process_id, pending, reply)?;
+            completed = completed.saturating_add(1);
+        }
+        Ok(completed)
+    }
+
+    fn complete_tmpfs_proxy_request(
+        &mut self,
+        process_id: u64,
+        pending: PendingTmpfsProxyRequest,
+        reply: Result<tmpfs_protocol::Reply, i64>,
+    ) -> Result<(), Error> {
+        let physical_memory_offset = self.physical_memory_offset;
+        let reply_endpoint = pending.reply_endpoint;
+        let stack_pointer = pending.stack_pointer;
+        let operation = pending.operation;
+        cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
+            let mut manager = PROCESS_MANAGER.lock();
+            let process = manager
+                .process_mut(process_id)
+                .ok_or(Error::ProcessNotFound(process_id))?;
+            let still_pending = process
+                .pending_tmpfs_proxy
+                .as_ref()
+                .is_some_and(|current| current.reply_endpoint == reply_endpoint);
+            if !still_pending {
+                return Ok(());
+            }
+            let result = match reply {
+                Ok(reply) => match tmpfs_proxy_reply_status(reply.status) {
+                    Ok(()) => tmpfs_proxy_complete_operation(
+                        process,
+                        operation,
+                        reply,
+                        physical_memory_offset,
+                    )?,
+                    Err(error) => error_return(error),
+                },
+                Err(error) => error_return(error),
+            };
+            let registers = unsafe { &mut *(stack_pointer as *mut SavedRegisters) };
+            registers.rax = result;
+            process.pending_tmpfs_proxy = None;
+            process.make_runnable();
+            drop(manager);
+            if !scheduler::wake_process(process_id) {
+                return Err(Error::ProcessNotFound(process_id));
+            }
+            Ok(())
+        })
     }
 
     fn service_child_requests(&mut self) -> Result<usize, Error> {
@@ -3869,6 +4053,9 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
                     let _ = pipe::close_writer(descriptor.pipe_id);
                 }
             }
+        }
+        if let Some(pending) = process.pending_tmpfs_proxy.take() {
+            tmpfs_proxy_release_reply_endpoint(pending.reply_endpoint);
         }
         let frames_reclaimed = release_owned_frames(&mut process.owned_frames, frame_allocator);
         debug_assert_eq!(process.task_id, task.task_id);
@@ -4349,6 +4536,7 @@ fn syscall_spawn_command(
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
         || process.pending_fork.is_some()
+        || process.pending_tmpfs_proxy.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -4389,6 +4577,7 @@ fn syscall_execve(
     if process.pending_terminal_read.is_some()
         || process.pending_pipe_read.is_some()
         || process.pending_pipe_write.is_some()
+        || process.pending_tmpfs_proxy.is_some()
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
@@ -4413,6 +4602,7 @@ fn syscall_fork(process_id: u64, current_stack_pointer: usize) -> ControlOutcome
     if process.pending_terminal_read.is_some()
         || process.pending_pipe_read.is_some()
         || process.pending_pipe_write.is_some()
+        || process.pending_tmpfs_proxy.is_some()
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
@@ -4550,6 +4740,7 @@ fn syscall_wait_child(
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
         || process.pending_fork.is_some()
+        || process.pending_tmpfs_proxy.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -5527,6 +5718,9 @@ fn syscall_write(
     }
     if let WriteTarget::File(handle) = &target {
         let handle = handle.clone();
+        if matches!(handle.lock().backend, OpenFileBackend::TmpfsProxy { .. }) {
+            return tmpfs_proxy_write(process_id, handle, bytes, current_stack_pointer);
+        }
         let result = {
             let mut f = handle.lock();
             if !f.writable {
@@ -5535,6 +5729,7 @@ fn syscall_write(
                 match vfs::append(&f.path, bytes) {
                     Ok((offset, count)) => {
                         f.offset = offset.saturating_add(count as u64);
+                        f.size = f.size.max(f.offset);
                         Ok(count)
                     }
                     Err(e) => Err(vfs_errno(&e)),
@@ -5543,6 +5738,7 @@ fn syscall_write(
                 match vfs::write_at(&f.path, f.offset, bytes) {
                     Ok(count) => {
                         f.offset = f.offset.saturating_add(count as u64);
+                        f.size = f.size.max(f.offset);
                         Ok(count)
                     }
                     Err(e) => Err(vfs_errno(&e)),
@@ -5591,14 +5787,18 @@ fn user_range_allows(process_id: u64, address: u64, length: usize, require_write
         .processes
         .iter()
         .find(|process| process.process_id == process_id)
-        .map(|process| {
-            process.ranges.iter().any(|range| {
-                range.readable
-                    && (!require_write || range.writable)
-                    && range.contains(address, length)
-            })
-        })
-        .unwrap_or(false)
+        .is_some_and(|process| process_user_range_allows(process, address, length, require_write))
+}
+
+fn process_user_range_allows(
+    process: &Process,
+    address: u64,
+    length: usize,
+    require_write: bool,
+) -> bool {
+    process.ranges.iter().any(|range| {
+        range.readable && (!require_write || range.writable) && range.contains(address, length)
+    })
 }
 
 fn user_string(process_id: u64, address: u64, length: u64) -> Result<String, i64> {
@@ -5643,6 +5843,610 @@ fn user_text_allow_empty(
     }
     let text = str::from_utf8(bytes).map_err(|_| ERR_INVALID_ARGUMENT)?;
     Ok(String::from(text))
+}
+
+enum TmpfsProxyPath {
+    Directory,
+    File(String),
+}
+
+fn tmpfs_proxy_path(path: &str) -> Result<Option<TmpfsProxyPath>, i64> {
+    let path = vfs::normalize_path(path).map_err(|error| vfs_errno(&error))?;
+    if path == vfs::TMPFS_MOUNT_PATH {
+        return Ok(Some(TmpfsProxyPath::Directory));
+    }
+    let Some(name) = path.strip_prefix("/tmp/") else {
+        return Ok(None);
+    };
+    if name.is_empty() || name.contains('/') {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    if name.len() > tmpfs_protocol::MAX_NAME_BYTES {
+        return Err(abi::errno::NAME_TOO_LONG);
+    }
+    Ok(Some(TmpfsProxyPath::File(String::from(name))))
+}
+
+fn tmpfs_proxy_state() -> Option<TmpfsProxyState> {
+    let state = *TMPFS_PROXY.lock();
+    if state.request_endpoint.is_some() && state.generation != 0 {
+        Some(state)
+    } else {
+        None
+    }
+}
+
+fn tmpfs_proxy_request(operation: u16, generation: u32, name: &str) -> tmpfs_protocol::Request {
+    let mut request = tmpfs_protocol::Request::EMPTY;
+    request.operation = operation;
+    request.generation = generation;
+    request.name_length = name.len() as u16;
+    request.name[..name.len()].copy_from_slice(name.as_bytes());
+    request
+}
+
+fn tmpfs_proxy_create_reply_endpoint() -> Result<CapabilityObjectRef, i64> {
+    let reply_endpoint = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        registry.create_object(
+            abi::capability::KIND_ENDPOINT,
+            CapabilityObjectData::Endpoint(EndpointObject {
+                queue: alloc::collections::VecDeque::with_capacity(
+                    abi::limits::MAX_ENDPOINT_MESSAGES,
+                ),
+            }),
+        )?
+    };
+    kernel_capability_root_add(reply_endpoint);
+    Ok(reply_endpoint)
+}
+
+fn tmpfs_proxy_release_reply_endpoint(reply_endpoint: CapabilityObjectRef) {
+    kernel_capability_root_remove(reply_endpoint);
+    CAPABILITY_REGISTRY.lock().collect_garbage();
+}
+
+fn tmpfs_proxy_take_reply(
+    reply_endpoint: CapabilityObjectRef,
+    expected_operation: u16,
+    expected_generation: u32,
+) -> Option<Result<tmpfs_protocol::Reply, i64>> {
+    let message = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        let Some(object_index) = registry.object_index(reply_endpoint) else {
+            return Some(Err(ERR_IO));
+        };
+        match &mut registry.objects[object_index].data {
+            CapabilityObjectData::Endpoint(endpoint) => endpoint.queue.pop_front(),
+            CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
+                return Some(Err(ERR_IO));
+            }
+        }
+    }?;
+    Some(tmpfs_proxy_decode_reply(
+        message,
+        expected_operation,
+        expected_generation,
+    ))
+}
+
+fn tmpfs_proxy_decode_reply(
+    message: EndpointMessage,
+    expected_operation: u16,
+    expected_generation: u32,
+) -> Result<tmpfs_protocol::Reply, i64> {
+    if message.bytes.len() != size_of::<tmpfs_protocol::Reply>() {
+        return Err(ERR_IO);
+    }
+    let reply =
+        unsafe { ptr::read_unaligned(message.bytes.as_ptr() as *const tmpfs_protocol::Reply) };
+    if !crate::tmpfs_abi::valid_reply_envelope(crate::tmpfs_abi::ReplyEnvelope {
+        byte_length: message.bytes.len(),
+        expected_byte_length: size_of::<tmpfs_protocol::Reply>(),
+        has_capability: message.capability.is_some(),
+        version: reply.version,
+        expected_version: tmpfs_protocol::VERSION,
+        operation: reply.operation,
+        expected_operation,
+        generation: reply.generation,
+        expected_generation,
+        data_length: usize::from(reply.data_length),
+        maximum_data_length: tmpfs_protocol::MAX_DATA_BYTES,
+        reserved: reply.reserved,
+    }) {
+        return Err(ERR_IO);
+    }
+    Ok(reply)
+}
+
+fn tmpfs_proxy_value_bytes<T>(value: &T) -> &[u8] {
+    unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
+}
+
+fn tmpfs_proxy_request_bytes(request: &tmpfs_protocol::Request) -> Vec<u8> {
+    unsafe {
+        slice::from_raw_parts(
+            request as *const tmpfs_protocol::Request as *const u8,
+            size_of::<tmpfs_protocol::Request>(),
+        )
+    }
+    .to_vec()
+}
+
+fn tmpfs_proxy_begin_request(
+    process_id: u64,
+    mut request: tmpfs_protocol::Request,
+    operation: PendingTmpfsProxyOperation,
+    stack_pointer: usize,
+) -> Result<(), i64> {
+    let state = tmpfs_proxy_state().ok_or(ERR_IO)?;
+    request.generation = state.generation;
+    let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
+    let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
+    let bytes = tmpfs_proxy_request_bytes(&request);
+
+    let push_result = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        match registry.object_index(request_endpoint) {
+            Some(object_index) => match &mut registry.objects[object_index].data {
+                CapabilityObjectData::Endpoint(endpoint) => {
+                    if endpoint.queue.len() >= abi::limits::MAX_ENDPOINT_MESSAGES {
+                        Err(ERR_TRY_AGAIN)
+                    } else {
+                        endpoint.queue.push_back(EndpointMessage {
+                            sender_process_id: 0,
+                            bytes,
+                            capability: Some(TransferredCapability {
+                                object: reply_endpoint,
+                                rights: abi::capability::RIGHT_SEND,
+                            }),
+                        });
+                        Ok(())
+                    }
+                }
+                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
+                    Err(ERR_IO)
+                }
+            },
+            None => Err(ERR_IO),
+        }
+    };
+    if let Err(error) = push_result {
+        kernel_capability_root_remove(reply_endpoint);
+        CAPABILITY_REGISTRY.lock().collect_garbage();
+        return Err(error);
+    }
+
+    let pending = PendingTmpfsProxyRequest {
+        reply_endpoint,
+        request_operation: request.operation,
+        request_generation: request.generation,
+        operation,
+        stack_pointer,
+    };
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        kernel_capability_root_remove(reply_endpoint);
+        CAPABILITY_REGISTRY.lock().collect_garbage();
+        return Err(ERR_NO_PROCESS);
+    };
+    if process.pending_tmpfs_proxy.is_some() {
+        kernel_capability_root_remove(reply_endpoint);
+        CAPABILITY_REGISTRY.lock().collect_garbage();
+        return Err(ERR_IO);
+    }
+    process.pending_tmpfs_proxy = Some(pending);
+    process.state = ProcessState::Blocked;
+    drop(manager);
+    wake_endpoint_waiter(request_endpoint);
+    Ok(())
+}
+
+fn tmpfs_proxy_reply_status(status: i32) -> Result<(), i64> {
+    match status {
+        tmpfs_protocol::status::OK => Ok(()),
+        tmpfs_protocol::status::INVALID => Err(ERR_INVALID_ARGUMENT),
+        tmpfs_protocol::status::NOT_FOUND => Err(ERR_NO_ENTRY),
+        tmpfs_protocol::status::NO_SPACE => Err(ERR_NO_SPACE),
+        tmpfs_protocol::status::RANGE => Err(abi::errno::RANGE),
+        tmpfs_protocol::status::STALE_MOUNT => Err(ERR_IO),
+        _ => Err(ERR_IO),
+    }
+}
+
+fn tmpfs_proxy_complete_operation(
+    process: &mut Process,
+    operation: PendingTmpfsProxyOperation,
+    reply: tmpfs_protocol::Reply,
+    physical_memory_offset: VirtAddr,
+) -> Result<u64, Error> {
+    match operation {
+        PendingTmpfsProxyOperation::Open {
+            path,
+            descriptor,
+            readable,
+            writable,
+            append,
+            close_on_exec,
+            generation,
+        } => {
+            if descriptor_in_use(process, descriptor) || descriptor_count(process) >= MAX_OPEN_FILES
+            {
+                return Ok(error_return(ERR_TOO_MANY_OPEN_FILES));
+            }
+            let size = reply.value as u64;
+            let offset = if append { size } else { 0 };
+            let handle = Arc::new(Mutex::new(OpenFileState {
+                path,
+                offset,
+                readable,
+                writable,
+                append,
+                size,
+                backend: OpenFileBackend::TmpfsProxy { generation },
+            }));
+            process.open_files.push(OpenFile {
+                descriptor,
+                handle,
+                close_on_exec,
+            });
+            process.open_count = process.open_count.saturating_add(1);
+            Ok(descriptor)
+        }
+        PendingTmpfsProxyOperation::Read {
+            handle,
+            address,
+            length,
+        } => {
+            let count = usize::from(reply.data_length);
+            if count > length {
+                return Ok(error_return(ERR_IO));
+            }
+            if count != 0 {
+                write_user_bytes(
+                    address,
+                    &reply.data[..count],
+                    physical_memory_offset,
+                    &process.pages,
+                )?;
+            }
+            {
+                let mut file = handle.lock();
+                file.offset = file.offset.saturating_add(count as u64);
+                file.size = reply.value as u64;
+            }
+            process.read_count = process.read_count.saturating_add(1);
+            process.bytes_read = process.bytes_read.saturating_add(count as u64);
+            Ok(count as u64)
+        }
+        PendingTmpfsProxyOperation::Write {
+            handle,
+            offset,
+            length,
+        } => {
+            let count = reply.value as usize;
+            if count > length {
+                return Ok(error_return(ERR_IO));
+            }
+            let new_offset = offset.saturating_add(count as u64);
+            {
+                let mut file = handle.lock();
+                file.offset = new_offset;
+                file.size = file.size.max(new_offset);
+            }
+            process.write_count = process.write_count.saturating_add(1);
+            process.bytes_written = process.bytes_written.saturating_add(count as u64);
+            process.file_write_count = process.file_write_count.saturating_add(1);
+            process.file_bytes_written = process.file_bytes_written.saturating_add(count as u64);
+            Ok(count as u64)
+        }
+        PendingTmpfsProxyOperation::Stat { address, length } => {
+            let Ok(length) = usize::try_from(length) else {
+                return Ok(error_return(abi::errno::RANGE));
+            };
+            let required = size_of::<abi::file::Stat>();
+            if length < required {
+                return Ok(error_return(abi::errno::RANGE));
+            }
+            if !process_user_range_allows(process, address, required, true) {
+                return Ok(error_return(ERR_BAD_ADDRESS));
+            }
+            let stat = abi::file::Stat {
+                kind: abi::file::KIND_FILE,
+                size: reply.value as u64,
+                flags: 0,
+            };
+            write_user_bytes(
+                address,
+                tmpfs_proxy_value_bytes(&stat),
+                physical_memory_offset,
+                &process.pages,
+            )?;
+            Ok(0)
+        }
+        PendingTmpfsProxyOperation::ReadDirectory {
+            start_index,
+            records_address,
+            capacity,
+        } => tmpfs_proxy_complete_read_directory(
+            process,
+            &reply,
+            start_index,
+            records_address,
+            capacity,
+            physical_memory_offset,
+        ),
+    }
+}
+
+fn tmpfs_proxy_complete_read_directory(
+    process: &Process,
+    reply: &tmpfs_protocol::Reply,
+    start_index: usize,
+    records_address: u64,
+    capacity: usize,
+    physical_memory_offset: VirtAddr,
+) -> Result<u64, Error> {
+    let record_size = size_of::<abi::file::DirectoryEntry>();
+    let byte_length = match capacity.checked_mul(record_size) {
+        Some(length) => length,
+        None => return Ok(error_return(ERR_ARGUMENT_TOO_LARGE)),
+    };
+    if !process_user_range_allows(process, records_address, byte_length, true) {
+        return Ok(error_return(ERR_BAD_ADDRESS));
+    }
+
+    let data = &reply.data[..usize::from(reply.data_length)];
+    let mut entry_index = 0usize;
+    let mut written = 0usize;
+    let mut cursor = 0usize;
+    while cursor < data.len() {
+        let start = cursor;
+        while cursor < data.len() && data[cursor] != b'\n' {
+            cursor = cursor.saturating_add(1);
+        }
+        let name = &data[start..cursor];
+        if name.is_empty()
+            || name.len() > abi::file::MAX_DIRECTORY_ENTRY_NAME_BYTES
+            || name.contains(&b'/')
+        {
+            return Ok(error_return(ERR_IO));
+        }
+        if entry_index >= start_index && written < capacity {
+            let record = tmpfs_proxy_directory_record(name);
+            let Some(destination) = records_address.checked_add((written * record_size) as u64)
+            else {
+                return Ok(error_return(abi::errno::RANGE));
+            };
+            write_user_bytes(
+                destination,
+                tmpfs_proxy_value_bytes(&record),
+                physical_memory_offset,
+                &process.pages,
+            )?;
+            written = written.saturating_add(1);
+        }
+        entry_index = entry_index.saturating_add(1);
+        if cursor < data.len() {
+            cursor = cursor.saturating_add(1);
+        }
+    }
+    Ok(written as u64)
+}
+
+fn tmpfs_proxy_directory_record(name: &[u8]) -> abi::file::DirectoryEntry {
+    let mut record = abi::file::DirectoryEntry {
+        kind: abi::file::KIND_FILE,
+        size: 0,
+        flags: 0,
+        name_length: name.len() as u64,
+        name: [0; abi::file::DIRECTORY_ENTRY_NAME_CAPACITY],
+    };
+    record.name[..name.len()].copy_from_slice(name);
+    record
+}
+
+fn tmpfs_proxy_file_name(path: &str) -> Result<String, i64> {
+    match tmpfs_proxy_path(path)? {
+        Some(TmpfsProxyPath::File(name)) => Ok(name),
+        Some(TmpfsProxyPath::Directory) => Err(ERR_IS_DIRECTORY),
+        None => Err(ERR_INVALID_ARGUMENT),
+    }
+}
+
+fn tmpfs_proxy_open(
+    process_id: u64,
+    path: &str,
+    options: vfs::OpenOptions,
+    close_on_exec: bool,
+    descriptor: u64,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    let generation = match tmpfs_proxy_state() {
+        Some(state) => state.generation,
+        None => return ControlOutcome::Ready(error_return(ERR_IO)),
+    };
+    let name = match tmpfs_proxy_file_name(path) {
+        Ok(name) => name,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let mut request = tmpfs_proxy_request(tmpfs_protocol::operation::OPEN, generation, &name);
+    let mut flags = 0_u32;
+    if options.create {
+        flags |= tmpfs_protocol::open_flags::CREATE;
+    }
+    if options.truncate {
+        flags |= tmpfs_protocol::open_flags::TRUNCATE;
+    }
+    request.offset = flags;
+    let path = if path == vfs::TMPFS_MOUNT_PATH {
+        String::from(vfs::TMPFS_MOUNT_PATH)
+    } else {
+        let mut full_path = String::from("/tmp/");
+        full_path.push_str(&name);
+        full_path
+    };
+    let operation = PendingTmpfsProxyOperation::Open {
+        path,
+        descriptor,
+        readable: options.read,
+        writable: options.write,
+        append: options.append,
+        close_on_exec,
+        generation,
+    };
+    match tmpfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
+        Ok(()) => ControlOutcome::Blocked,
+        Err(error) => ControlOutcome::Ready(error_return(error)),
+    }
+}
+
+fn tmpfs_proxy_read(
+    process_id: u64,
+    handle: OpenFileHandle,
+    address: u64,
+    length: usize,
+    stack_pointer: usize,
+) -> ReadOutcome {
+    let (path, offset, generation) = {
+        let file = handle.lock();
+        if !file.readable {
+            return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+        }
+        let OpenFileBackend::TmpfsProxy { generation } = file.backend else {
+            return ReadOutcome::Ready(error_return(ERR_IO));
+        };
+        (file.path.clone(), file.offset, generation)
+    };
+    let name = match tmpfs_proxy_file_name(&path) {
+        Ok(name) => name,
+        Err(error) => return ReadOutcome::Ready(error_return(error)),
+    };
+    let count = length.min(tmpfs_protocol::MAX_DATA_BYTES);
+    let Ok(offset) = u32::try_from(offset) else {
+        return ReadOutcome::Ready(error_return(abi::errno::RANGE));
+    };
+    let mut request = tmpfs_proxy_request(tmpfs_protocol::operation::READ, generation, &name);
+    request.offset = offset;
+    request.data_length = count as u16;
+    let operation = PendingTmpfsProxyOperation::Read {
+        handle,
+        address,
+        length: count,
+    };
+    match tmpfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
+        Ok(()) => ReadOutcome::Blocked,
+        Err(error) => ReadOutcome::Ready(error_return(error)),
+    }
+}
+
+fn tmpfs_proxy_write(
+    process_id: u64,
+    handle: OpenFileHandle,
+    bytes: &[u8],
+    stack_pointer: usize,
+) -> WriteOutcome {
+    let (path, offset, generation) = {
+        let file = handle.lock();
+        if !file.writable {
+            return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+        }
+        let OpenFileBackend::TmpfsProxy { generation } = file.backend else {
+            return WriteOutcome::Ready(error_return(ERR_IO));
+        };
+        let offset = if file.append { file.size } else { file.offset };
+        (file.path.clone(), offset, generation)
+    };
+    let name = match tmpfs_proxy_file_name(&path) {
+        Ok(name) => name,
+        Err(error) => return WriteOutcome::Ready(error_return(error)),
+    };
+    let count = bytes.len().min(tmpfs_protocol::MAX_DATA_BYTES);
+    let Ok(request_offset) = u32::try_from(offset) else {
+        return WriteOutcome::Ready(error_return(abi::errno::RANGE));
+    };
+    let mut request = tmpfs_proxy_request(tmpfs_protocol::operation::WRITE, generation, &name);
+    request.offset = request_offset;
+    request.data_length = count as u16;
+    request.data[..count].copy_from_slice(&bytes[..count]);
+    let operation = PendingTmpfsProxyOperation::Write {
+        handle,
+        offset,
+        length: count,
+    };
+    match tmpfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
+        Ok(()) => WriteOutcome::Blocked,
+        Err(error) => WriteOutcome::Ready(error_return(error)),
+    }
+}
+
+fn tmpfs_proxy_stat(
+    process_id: u64,
+    path: &str,
+    address: u64,
+    length: u64,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    if matches!(tmpfs_proxy_path(path), Ok(Some(TmpfsProxyPath::Directory))) {
+        let metadata = vfs::Metadata {
+            path: String::from(vfs::TMPFS_MOUNT_PATH),
+            kind: vfs::NodeKind::Directory,
+            size: 0,
+            read_only: false,
+            hidden: false,
+            system: false,
+        };
+        return ControlOutcome::Ready(platform_write_value(
+            process_id,
+            address,
+            length,
+            platform_stat_from_metadata(&metadata),
+        ));
+    }
+    let generation = match tmpfs_proxy_state() {
+        Some(state) => state.generation,
+        None => return ControlOutcome::Ready(error_return(ERR_IO)),
+    };
+    let name = match tmpfs_proxy_file_name(path) {
+        Ok(name) => name,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let request = tmpfs_proxy_request(tmpfs_protocol::operation::STAT, generation, &name);
+    let operation = PendingTmpfsProxyOperation::Stat { address, length };
+    match tmpfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
+        Ok(()) => ControlOutcome::Blocked,
+        Err(error) => ControlOutcome::Ready(error_return(error)),
+    }
+}
+
+fn tmpfs_proxy_read_directory(
+    process_id: u64,
+    path: &str,
+    start_index: usize,
+    records_address: u64,
+    capacity: usize,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    if !matches!(tmpfs_proxy_path(path), Ok(Some(TmpfsProxyPath::Directory))) {
+        return ControlOutcome::Ready(error_return(abi::errno::NOT_DIRECTORY));
+    }
+    let generation = match tmpfs_proxy_state() {
+        Some(state) => state.generation,
+        None => return ControlOutcome::Ready(error_return(ERR_IO)),
+    };
+    let mut request = tmpfs_protocol::Request::EMPTY;
+    request.operation = tmpfs_protocol::operation::LIST;
+    request.generation = generation;
+    request.data_length = tmpfs_protocol::MAX_DATA_BYTES as u16;
+    let operation = PendingTmpfsProxyOperation::ReadDirectory {
+        start_index,
+        records_address,
+        capacity,
+    };
+    match tmpfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
+        Ok(()) => ControlOutcome::Blocked,
+        Err(error) => ControlOutcome::Ready(error_return(error)),
+    }
 }
 
 fn decode_open_options(mut flags: u64) -> Result<(vfs::OpenOptions, bool), i64> {
@@ -5697,6 +6501,8 @@ fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
         readable: options.read,
         writable: options.write,
         append: options.append,
+        size: metadata.size,
+        backend: OpenFileBackend::Vfs,
     }));
     let mut m = PROCESS_MANAGER.lock();
     let Some(p) = m.process_mut(process_id) else {
@@ -5777,6 +6583,15 @@ fn syscall_read(
             syscall_pipe_read(process_id, id, address, length, current_stack_pointer)
         }
         ReadTarget::File(handle) => {
+            if matches!(handle.lock().backend, OpenFileBackend::TmpfsProxy { .. }) {
+                return tmpfs_proxy_read(
+                    process_id,
+                    handle,
+                    address,
+                    length,
+                    current_stack_pointer,
+                );
+            }
             let mut buffer = vec![0_u8; length];
             let result = {
                 let mut f = handle.lock();
@@ -6130,9 +6945,12 @@ fn syscall_seek(process_id: u64, descriptor: u64, offset: u64, whence: u64) -> u
         let base = match whence {
             SEEK_SET => 0_i128,
             SEEK_CURRENT => i128::from(f.offset),
-            SEEK_END => match vfs::metadata(&f.path) {
-                Ok(md) => i128::from(md.size),
-                Err(e) => return error_return(vfs_errno(&e)),
+            SEEK_END => match f.backend {
+                OpenFileBackend::TmpfsProxy { .. } => i128::from(f.size),
+                OpenFileBackend::Vfs => match vfs::metadata(&f.path) {
+                    Ok(md) => i128::from(md.size),
+                    Err(e) => return error_return(vfs_errno(&e)),
+                },
             },
             _ => return error_return(ERR_INVALID_ARGUMENT),
         };

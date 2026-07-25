@@ -27,5 +27,14 @@ userspace = {
 [profile.dev]
 panic = "abort"
 
+# Keep bootable dev disk images below BIOS/bootloader sector-count limits. The
+# host runner can keep its default debuginfo; the no_std payloads are validated
+# primarily through serial logs and smoke tests.
+[profile.dev.package.kernel]
+debug = 0
+
+[profile.dev.package.userspace]
+debug = 0
+
 [profile.release]
 panic = "abort"

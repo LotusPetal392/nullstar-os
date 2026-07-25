@@ -20,6 +20,7 @@ mod process_completion;
 mod scheduler;
 mod shell;
 mod storage;
+mod tmpfs_abi;
 mod vfs;
 
 pub(crate) use arch::x86_64::{acpi, apic, gdt, hpet, interrupts};

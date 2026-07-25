@@ -4,11 +4,13 @@
 use userspace::{
     abi::INIT_PROCESS_ID,
     ipc::{self, CapabilityHandle, Rights},
+    platform,
     supervisor::{
         ServiceRuntime, ServiceSpec, ServiceStatusDisposition, ShellStatusDisposition,
         shell_status_disposition,
     },
     syscall::{self, ProcessId, STDERR, STDOUT, SpawnFlags},
+    tmpfs::Mount,
 };
 
 userspace::entry!(rust_main);
@@ -61,6 +63,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let mut service = ServiceRuntime::new(TMPFS_SERVICE);
     start_service(&mut service, readiness_endpoint, request_endpoint);
+    register_tmpfs_proxy(request_endpoint);
     run_tmpfs_probe(request_endpoint);
     let mut shell_process_id = spawn_shell();
 
@@ -73,6 +76,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         let _ = syscall::write_all(STDOUT, SERVICE_RESTARTING);
                         backoff(backoff_yields);
                         start_service(&mut service, readiness_endpoint, request_endpoint);
+                        register_tmpfs_proxy(request_endpoint);
                     }
                     ServiceStatusDisposition::Failed => fail(SERVICE_FAILED),
                 },
@@ -104,6 +108,12 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             fail(SHELL_WAIT_FAILED);
         }
     }
+}
+
+fn register_tmpfs_proxy(request_endpoint: CapabilityHandle) {
+    let mount = Mount::connect(request_endpoint).unwrap_or_else(|_| fail(SERVICE_PROTOCOL_FAILED));
+    platform::register_tmpfs_service(request_endpoint, mount.generation())
+        .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
 }
 
 fn start_service(

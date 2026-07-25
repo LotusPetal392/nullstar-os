@@ -131,6 +131,7 @@ fn dispatch(
         protocol::operation::STAT => stat_file(files, name, &mut reply),
         protocol::operation::REMOVE => remove_file(files, name, &mut reply),
         protocol::operation::LIST => list_files(files, data_length, &mut reply),
+        protocol::operation::OPEN => open_file(files, name, request, &mut reply),
         _ => reply.status = protocol::status::INVALID,
     }
     reply
@@ -138,6 +139,42 @@ fn dispatch(
 
 fn find_file(files: &[File; protocol::MAX_FILES], name: &[u8]) -> Option<usize> {
     files.iter().position(|file| file.named(name))
+}
+
+fn open_file(
+    files: &mut [File; protocol::MAX_FILES],
+    name: &[u8],
+    request: &protocol::Request,
+    reply: &mut protocol::Reply,
+) {
+    let flags = request.offset;
+    if flags & !(protocol::open_flags::CREATE | protocol::open_flags::TRUNCATE) != 0 {
+        reply.status = protocol::status::INVALID;
+        return;
+    }
+    let index = find_file(files, name).or_else(|| {
+        (flags & protocol::open_flags::CREATE != 0)
+            .then(|| files.iter().position(|file| !file.used))
+            .flatten()
+    });
+    let Some(index) = index else {
+        reply.status = if flags & protocol::open_flags::CREATE != 0 {
+            protocol::status::NO_SPACE
+        } else {
+            protocol::status::NOT_FOUND
+        };
+        return;
+    };
+    let file = &mut files[index];
+    if !file.used {
+        file.used = true;
+        file.name_length = name.len();
+        file.name[..name.len()].copy_from_slice(name);
+    }
+    if flags & protocol::open_flags::TRUNCATE != 0 {
+        file.length = 0;
+    }
+    reply.value = file.length as u32;
 }
 
 fn write_file(

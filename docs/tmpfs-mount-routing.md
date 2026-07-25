@@ -27,11 +27,19 @@ state. Clients must discard stale mounts and reconnect.
 
 ## Current boundary
 
-This is the restart and identity layer required by a future kernel VFS proxy. It
-does not yet redirect ordinary kernel `open`, `read`, `write`, `stat`, or directory
-syscalls for `/tmp`. The existing kernel tmpfs remains the compatibility mount.
+The kernel now uses this mount identity for ordinary `/tmp/<name>` file syscalls.
+PID 1 registers the service request endpoint and generation after the mount
+handshake. For proxied `open`, `read`, `write`, `stat`, and directory syscalls,
+the kernel queues a bounded protocol request to `/tmpfs-service`, transfers a
+private send-only reply endpoint, blocks the calling process, and completes the
+saved syscall frame from the service reply.
 
-A safe kernel proxy still needs scheduler-integrated blocking IPC, cancellation
-when callers exit or receive signals, request ownership cleanup, descriptor
-semantics across service replacement, and rules preventing the kernel from
-blocking while holding VFS or process-table locks.
+The kernel still owns descriptor tables, standard-stream redirection, offsets,
+append mode, close-on-exec state, process scheduling, signal interruption, and
+exit cleanup. The kernel tmpfs remains mounted for kernel-internal fixtures and
+legacy smoke-test compatibility, but userspace programs that use normal `/tmp`
+file APIs are routed through the supervised service.
+
+Remaining follow-up work includes richer directory records, larger file/storage
+bounds, recursive paths, and deterministic replay or cancellation semantics for
+requests that are in flight while the service is replaced.

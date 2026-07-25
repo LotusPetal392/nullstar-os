@@ -17,6 +17,12 @@ pub mod operation {
     pub const STAT: u16 = 4;
     pub const REMOVE: u16 = 5;
     pub const LIST: u16 = 6;
+    pub const OPEN: u16 = 7;
+}
+
+pub mod open_flags {
+    pub const CREATE: u32 = 1 << 0;
+    pub const TRUNCATE: u32 = 1 << 1;
 }
 
 pub mod status {
