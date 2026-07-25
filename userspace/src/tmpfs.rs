@@ -130,7 +130,7 @@ fn request(
         return Err(Error::Transport);
     }
     let reply = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const protocol::Reply) };
-    if reply.version != protocol::VERSION || reply.operation != request.operation {
+    if !valid_reply(request, &reply) {
         return Err(Error::Transport);
     }
     match reply.status {
@@ -142,6 +142,19 @@ fn request(
         protocol::status::STALE_MOUNT => Err(Error::StaleMount),
         _ => Err(Error::Transport),
     }
+}
+
+fn valid_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
+    let generation_matches = if request.operation == protocol::operation::MOUNT {
+        reply.generation != 0
+    } else {
+        reply.generation == request.generation
+    };
+    reply.version == protocol::VERSION
+        && reply.operation == request.operation
+        && generation_matches
+        && reply.reserved == 0
+        && usize::from(reply.data_length) <= protocol::MAX_DATA_BYTES
 }
 
 fn named(operation: u16, generation: u32, name: &[u8]) -> Result<protocol::Request, Error> {
@@ -160,7 +173,7 @@ fn named(operation: u16, generation: u32, name: &[u8]) -> Result<protocol::Reque
 mod tests {
     use core::mem::size_of;
 
-    use super::{named, protocol};
+    use super::{named, protocol, valid_reply};
 
     #[test]
     fn protocol_records_fit_endpoint_messages() {
@@ -174,5 +187,34 @@ mod tests {
         assert_eq!(request.version, protocol::VERSION);
         assert_eq!(request.generation, 41);
         assert_eq!(&request.name[..request.name_length as usize], b"state");
+    }
+
+    #[test]
+    fn replies_require_matching_generation_and_zero_reserved_fields() {
+        let request = named(protocol::operation::READ, 41, b"state").expect("valid request");
+        let mut reply = protocol::Reply::EMPTY;
+        reply.operation = request.operation;
+        reply.generation = request.generation;
+        assert!(valid_reply(&request, &reply));
+
+        reply.generation += 1;
+        assert!(!valid_reply(&request, &reply));
+        reply.generation = request.generation;
+        reply.reserved = 1;
+        assert!(!valid_reply(&request, &reply));
+        reply.reserved = 0;
+        reply.data_length = (protocol::MAX_DATA_BYTES + 1) as u16;
+        assert!(!valid_reply(&request, &reply));
+    }
+
+    #[test]
+    fn mount_replies_require_a_nonzero_generation() {
+        let mut request = protocol::Request::EMPTY;
+        request.operation = protocol::operation::MOUNT;
+        let mut reply = protocol::Reply::EMPTY;
+        reply.operation = protocol::operation::MOUNT;
+        assert!(!valid_reply(&request, &reply));
+        reply.generation = 1;
+        assert!(valid_reply(&request, &reply));
     }
 }

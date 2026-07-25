@@ -329,27 +329,36 @@ fn platform_open(
 }
 
 fn platform_register_tmpfs_service(process_id: u64, handle: u64, generation: u64) -> u64 {
-    if process_id != INIT_PROCESS_ID {
-        return error_return(abi::errno::PERMISSION);
-    }
-    let Ok(generation) = u32::try_from(generation) else {
-        return error_return(ERR_INVALID_ARGUMENT);
-    };
-    if generation == 0 {
-        return error_return(ERR_INVALID_ARGUMENT);
-    }
-    let endpoint = {
+    let (entry, endpoint) = {
         let registry = CAPABILITY_REGISTRY.lock();
-        let Some(entry) = registry.entry(process_id, handle) else {
+        let entry = registry.entry(process_id, handle);
+        (entry.map(|entry| (entry.object.kind, entry.rights)), entry.map(|entry| entry.object))
+    };
+    let generation = match crate::tmpfs_abi::validate_registration(
+        process_id,
+        INIT_PROCESS_ID,
+        generation,
+        entry,
+        abi::capability::KIND_ENDPOINT,
+        abi::capability::RIGHT_SEND,
+    ) {
+        Ok(generation) => generation,
+        Err(crate::tmpfs_abi::RegistrationError::Permission) => {
+            return error_return(abi::errno::PERMISSION);
+        }
+        Err(crate::tmpfs_abi::RegistrationError::BadHandle) => {
             return error_return(ERR_BAD_FILE_DESCRIPTOR);
-        };
-        if entry.object.kind != abi::capability::KIND_ENDPOINT {
-            return error_return(ERR_INVALID_ARGUMENT);
         }
-        if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_SEND) {
-            return error_return(error);
+        Err(crate::tmpfs_abi::RegistrationError::MissingSendRight) => {
+            return error_return(abi::errno::PERMISSION);
         }
-        entry.object
+        Err(
+            crate::tmpfs_abi::RegistrationError::InvalidGeneration
+            | crate::tmpfs_abi::RegistrationError::WrongObjectKind,
+        ) => return error_return(ERR_INVALID_ARGUMENT),
+    };
+    let Some(endpoint) = endpoint else {
+        return error_return(ERR_BAD_FILE_DESCRIPTOR);
     };
 
     let previous = {

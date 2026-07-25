@@ -109,6 +109,12 @@ service endpoint. The kernel creates a private reply endpoint per syscall,
 blocks the caller, and completes the saved syscall frame when the service
 replies. `/tmp` itself remains a directory mount point.
 
+The reply endpoint is an untrusted ABI boundary. The kernel rejects replies with
+the wrong fixed-record size, protocol version, operation, mount generation, or
+data bound; nonzero reserved fields and attached capabilities are also rejected.
+These checks prevent stale service instances and malformed replies from
+completing a blocked filesystem syscall.
+
 ## Paths and working directories
 
 Every process starts in `/` unless its inherited environment contains the
