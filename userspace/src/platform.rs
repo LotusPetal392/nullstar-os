@@ -226,3 +226,16 @@ pub fn register_tmpfs_service(service: FileDescriptor, generation: u32) -> Resul
     }
     decode(result).map(|_| ())
 }
+
+pub fn register_vfs_service(service: FileDescriptor, generation: u32) -> Result<()> {
+    let mut result = syscall::REGISTER_VFS_SERVICE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") service,
+            in("rsi") generation as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}

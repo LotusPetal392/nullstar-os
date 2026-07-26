@@ -137,17 +137,22 @@ stop events reach the correct pipeline.
 The next filesystem boundary is defined by the versioned userspace
 [filesystem service protocol](filesystem-service-protocol.md). It introduces
 session-scoped node IDs, directory-relative lookup, request IDs, cancellation,
-and registered shared-memory windows. The existing tmpfs v2 route remains the
-active boot path while a compatibility adapter and service-side node table are
-implemented.
+and registered shared-memory windows. The tmpfs service is the active `/tmp`
+data path through the generic protocol. A separately supervised userspace VFS
+service now owns a versioned longest-prefix namespace table and validates the
+intended mount layout during boot. `stat`, path-based `read_directory`, and
+`chdir` now cross that service boundary, including synthetic directory metadata
+and merged namespace listings for VFS-owned nodes; other kernel file syscalls
+still perform their own routing until their asynchronous proxy handoffs are
+complete.
 
 The intended rooted namespace includes service-backed `/dev` and `/tmp` mounts,
 a system hierarchy under `/System` (`config`, `var/log`, `bin`, `services`,
 `drivers`, `lib`, and `Applications`), user homes under `/Users`, and globally
 installed applications under `/Applications`. Additional local, removable, and
-network filesystems appear as named children of `/Volumes`. The future VFS
-service will hide mount crossings from clients while preserving node and volume
-identity.
+network filesystems appear as named children of `/Volumes`. The VFS service
+will hide mount crossings from clients while preserving node and volume
+identity as routing and open-file ownership move out of the kernel.
 
 ## Shells
 

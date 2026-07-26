@@ -28,6 +28,17 @@ const SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid tmpfs readiness
 const TMPFS_PROBE_COMMAND: &[u8] = b"/tmpfs-probe";
 const TMPFS_PROBE_FAILED: &[u8] = b"userspace init: userspace tmpfs probe failed\n";
 const TMPFS_PROBE_PASSED: &[u8] = b"userspace init: userspace tmpfs probe passed\n";
+const VFS_SERVICE_COMMAND: &[u8] = b"/vfs-service";
+const VFS_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: vfs";
+const VFS_SERVICE_STARTING: &[u8] = b"userspace init: starting vfs service\n";
+const VFS_SERVICE_RESTARTING: &[u8] = b"userspace init: vfs service exited; restarting\n";
+const VFS_SERVICE_READY: &[u8] = b"userspace init: vfs service ready\n";
+const VFS_SERVICE_FAILED: &[u8] = b"userspace init: vfs service exhausted restart budget\n";
+const VFS_SERVICE_BOOTSTRAP_FAILED: &[u8] = b"userspace init: failed to grant vfs capabilities\n";
+const VFS_SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid vfs readiness message\n";
+const VFS_PROBE_COMMAND: &[u8] = b"/vfs-probe";
+const VFS_PROBE_FAILED: &[u8] = b"userspace init: userspace vfs probe failed\n";
+const VFS_PROBE_PASSED: &[u8] = b"userspace init: userspace vfs probe passed\n";
 const SHELL_COMMAND: &[u8] = b"/ush";
 const SHELL_LAUNCHED: &[u8] = b"userspace init launched /ush\n";
 const SHELL_RESTARTING: &[u8] = b"userspace init: /ush exited; restarting\n";
@@ -48,6 +59,40 @@ const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
     restart_limit: 3,
     restart_backoff_yields: 32,
 };
+const VFS_SERVICE: ServiceSpec = ServiceSpec {
+    name: b"vfs",
+    command: VFS_SERVICE_COMMAND,
+    ready_message: VFS_SERVICE_READY_MESSAGE,
+    bootstrap_handle: READY_HANDLE,
+    restart_limit: 3,
+    restart_backoff_yields: 32,
+};
+
+struct ServiceMessages {
+    starting: &'static [u8],
+    restarting: &'static [u8],
+    ready: &'static [u8],
+    failed: &'static [u8],
+    bootstrap_failed: &'static [u8],
+    protocol_failed: &'static [u8],
+}
+
+const TMPFS_MESSAGES: ServiceMessages = ServiceMessages {
+    starting: SERVICE_STARTING,
+    restarting: SERVICE_RESTARTING,
+    ready: SERVICE_READY,
+    failed: SERVICE_FAILED,
+    bootstrap_failed: SERVICE_BOOTSTRAP_FAILED,
+    protocol_failed: SERVICE_PROTOCOL_FAILED,
+};
+const VFS_MESSAGES: ServiceMessages = ServiceMessages {
+    starting: VFS_SERVICE_STARTING,
+    restarting: VFS_SERVICE_RESTARTING,
+    ready: VFS_SERVICE_READY,
+    failed: VFS_SERVICE_FAILED,
+    bootstrap_failed: VFS_SERVICE_BOOTSTRAP_FAILED,
+    protocol_failed: VFS_SERVICE_PROTOCOL_FAILED,
+};
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if syscall::getpid() != Ok(INIT_PROCESS_ID) {
@@ -62,9 +107,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let mut service = ServiceRuntime::new(TMPFS_SERVICE);
-    start_service(&mut service, readiness_endpoint, request_endpoint);
+    start_service(
+        &mut service,
+        readiness_endpoint,
+        request_endpoint,
+        &TMPFS_MESSAGES,
+    );
     register_tmpfs_proxy(request_endpoint);
     run_tmpfs_probe(request_endpoint);
+    let vfs_readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
+    let vfs_request_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
+    let mut vfs_service = ServiceRuntime::new(VFS_SERVICE);
+    start_service(
+        &mut vfs_service,
+        vfs_readiness_endpoint,
+        vfs_request_endpoint,
+        &VFS_MESSAGES,
+    );
+    register_vfs_router(&vfs_service, vfs_request_endpoint);
+    run_probe(
+        VFS_PROBE_COMMAND,
+        vfs_request_endpoint,
+        VFS_PROBE_FAILED,
+        VFS_PROBE_PASSED,
+    );
     let mut shell_process_id = spawn_shell();
 
     loop {
@@ -75,7 +143,12 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, SERVICE_RESTARTING);
                         backoff(backoff_yields);
-                        start_service(&mut service, readiness_endpoint, request_endpoint);
+                        start_service(
+                            &mut service,
+                            readiness_endpoint,
+                            request_endpoint,
+                            &TMPFS_MESSAGES,
+                        );
                         register_tmpfs_proxy(request_endpoint);
                     }
                     ServiceStatusDisposition::Failed => fail(SERVICE_FAILED),
@@ -83,6 +156,29 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
                 Err(_) => fail(SERVICE_FAILED),
+            }
+        }
+
+        if let Some(service_process_id) = vfs_service.process_id() {
+            match syscall::try_wait_child(service_process_id) {
+                Ok(status) => match vfs_service.observe_status(status.raw()) {
+                    ServiceStatusDisposition::WaitForNextEvent => {}
+                    ServiceStatusDisposition::Restart { backoff_yields } => {
+                        let _ = syscall::write_all(STDOUT, VFS_SERVICE_RESTARTING);
+                        backoff(backoff_yields);
+                        start_service(
+                            &mut vfs_service,
+                            vfs_readiness_endpoint,
+                            vfs_request_endpoint,
+                            &VFS_MESSAGES,
+                        );
+                        register_vfs_router(&vfs_service, vfs_request_endpoint);
+                    }
+                    ServiceStatusDisposition::Failed => fail(VFS_SERVICE_FAILED),
+                },
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+                Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                Err(_) => fail(VFS_SERVICE_FAILED),
             }
         }
 
@@ -120,15 +216,26 @@ fn register_tmpfs_proxy(request_endpoint: CapabilityHandle) {
         .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
 }
 
+fn register_vfs_router(service: &ServiceRuntime, request_endpoint: CapabilityHandle) {
+    let generation = service
+        .process_id()
+        .and_then(|process_id| u32::try_from(process_id).ok())
+        .filter(|generation| *generation != 0)
+        .unwrap_or_else(|| fail(VFS_SERVICE_PROTOCOL_FAILED));
+    platform::register_vfs_service(request_endpoint, generation)
+        .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
+}
+
 fn start_service(
     service: &mut ServiceRuntime,
     readiness_endpoint: CapabilityHandle,
     request_endpoint: CapabilityHandle,
+    messages: &ServiceMessages,
 ) {
     loop {
         let spec = service.spec();
-        let _ = syscall::write_all(STDOUT, SERVICE_STARTING);
-        let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(SERVICE_FAILED));
+        let _ = syscall::write_all(STDOUT, messages.starting);
+        let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(messages.failed));
         let process_id = syscall::spawn_command_with_barrier(
             spec.command,
             SpawnFlags::NEW_PROCESS_GROUP,
@@ -138,7 +245,7 @@ fn start_service(
             None,
             &barrier,
         )
-        .unwrap_or_else(|_| fail(SERVICE_FAILED));
+        .unwrap_or_else(|_| fail(messages.failed));
         service.note_spawned(process_id);
         if ipc::grant_child(process_id, readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
             != Some(READY_HANDLE)
@@ -151,11 +258,11 @@ fn start_service(
             .ok()
                 != Some(REQUEST_HANDLE)
         {
-            fail(SERVICE_BOOTSTRAP_FAILED);
+            fail(messages.bootstrap_failed);
         }
         barrier
             .release()
-            .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
+            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
 
         let mut ready_buffer = [0_u8; 64];
         loop {
@@ -166,29 +273,29 @@ fn start_service(
                         || message.bytes != spec.ready_message.len()
                         || &ready_buffer[..message.bytes] != spec.ready_message
                     {
-                        fail(SERVICE_PROTOCOL_FAILED);
+                        fail(messages.protocol_failed);
                     }
                     service.note_ready();
-                    let _ = syscall::write_all(STDOUT, SERVICE_READY);
+                    let _ = syscall::write_all(STDOUT, messages.ready);
                     return;
                 }
                 Err(error) if error == ipc::Error::TRY_AGAIN => {}
-                Err(_) => fail(SERVICE_PROTOCOL_FAILED),
+                Err(_) => fail(messages.protocol_failed),
             }
 
             match syscall::try_wait_child(process_id) {
                 Ok(status) => match service.observe_status(status.raw()) {
                     ServiceStatusDisposition::WaitForNextEvent => {}
                     ServiceStatusDisposition::Restart { backoff_yields } => {
-                        let _ = syscall::write_all(STDOUT, SERVICE_RESTARTING);
+                        let _ = syscall::write_all(STDOUT, messages.restarting);
                         backoff(backoff_yields);
                         break;
                     }
-                    ServiceStatusDisposition::Failed => fail(SERVICE_FAILED),
+                    ServiceStatusDisposition::Failed => fail(messages.failed),
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
-                Err(_) => fail(SERVICE_FAILED),
+                Err(_) => fail(messages.failed),
             }
             let _ = syscall::yield_now();
         }
@@ -196,9 +303,23 @@ fn start_service(
 }
 
 fn run_tmpfs_probe(request_endpoint: CapabilityHandle) {
-    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(TMPFS_PROBE_FAILED));
-    let process_id = syscall::spawn_command_with_barrier(
+    run_probe(
         TMPFS_PROBE_COMMAND,
+        request_endpoint,
+        TMPFS_PROBE_FAILED,
+        TMPFS_PROBE_PASSED,
+    );
+}
+
+fn run_probe(
+    command: &[u8],
+    request_endpoint: CapabilityHandle,
+    failed_message: &[u8],
+    passed_message: &[u8],
+) {
+    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(failed_message));
+    let process_id = syscall::spawn_command_with_barrier(
+        command,
         SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
@@ -206,23 +327,21 @@ fn run_tmpfs_probe(request_endpoint: CapabilityHandle) {
         None,
         &barrier,
     )
-    .unwrap_or_else(|_| fail(TMPFS_PROBE_FAILED));
+    .unwrap_or_else(|_| fail(failed_message));
     if ipc::grant_child(process_id, request_endpoint, Rights::SEND, 1).ok() != Some(1) {
-        fail(TMPFS_PROBE_FAILED);
+        fail(failed_message);
     }
-    barrier
-        .release()
-        .unwrap_or_else(|_| fail(TMPFS_PROBE_FAILED));
+    barrier.release().unwrap_or_else(|_| fail(failed_message));
     loop {
         match syscall::wait_child(process_id) {
             Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
             Ok(status) if status.success() => break,
-            Ok(_) => fail(TMPFS_PROBE_FAILED),
+            Ok(_) => fail(failed_message),
             Err(error) if error == syscall::Errno::INTERRUPTED => {}
-            Err(_) => fail(TMPFS_PROBE_FAILED),
+            Err(_) => fail(failed_message),
         }
     }
-    let _ = syscall::write_all(STDOUT, TMPFS_PROBE_PASSED);
+    let _ = syscall::write_all(STDOUT, passed_message);
 }
 
 fn spawn_shell() -> ProcessId {

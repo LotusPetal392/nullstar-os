@@ -223,6 +223,9 @@ the existing group-oriented syscall.
 - Existing syscall numbers 1 through 34 are unchanged.
 - ABI 1.2 adds protection calls 35 through 48 and capability feature bits.
 - ABI 1.4 adds PID-1 tmpfs service registration at syscall 49.
+- ABI 1.5 adds PID-1 VFS routing service registration at syscall 50. The
+  kernel retains the send endpoint and completes a versioned root-route
+  handshake asynchronously before treating the service as ready.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

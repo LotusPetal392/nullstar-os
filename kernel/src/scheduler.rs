@@ -582,6 +582,35 @@ impl Scheduler {
             .filter(|stack_pointer| *stack_pointer != 0)
     }
 
+    fn with_process_address_space<T>(
+        &mut self,
+        process_id: u64,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let target_address_space = self
+            .tasks
+            .iter()
+            .find(|task| {
+                task.kind == TaskKind::UserProcess
+                    && task.state != TaskState::Zombie
+                    && task.process_id == Some(process_id)
+            })
+            .map(|task| task.address_space)?;
+        let current_address_space = AddressSpace::current();
+        if current_address_space != target_address_space {
+            unsafe {
+                Cr3::write(target_address_space.frame, target_address_space.flags);
+            }
+        }
+        let result = operation();
+        if current_address_space != target_address_space {
+            unsafe {
+                Cr3::write(current_address_space.frame, current_address_space.flags);
+            }
+        }
+        Some(result)
+    }
+
     fn replace_process_image(
         &mut self,
         process_id: u64,
@@ -956,6 +985,18 @@ pub fn wake_process(process_id: u64) -> bool {
 
 pub fn process_stack_pointer(process_id: u64) -> Option<usize> {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().process_stack_pointer(process_id))
+}
+
+/// Executes a bounded, non-blocking operation while the target process's page
+/// table is active, then restores the caller's address space.
+///
+/// The callback must not block, schedule, or acquire the scheduler lock.
+pub fn with_process_address_space<T>(process_id: u64, operation: impl FnOnce() -> T) -> Option<T> {
+    cpu_interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .with_process_address_space(process_id, operation)
+    })
 }
 
 pub fn replace_process_image(

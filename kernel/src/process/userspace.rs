@@ -59,6 +59,14 @@ mod filesystem_protocol {
     ));
 }
 
+#[allow(dead_code)]
+mod vfs_protocol {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/vfs_protocol.rs"
+    ));
+}
+
 pub const SYSCALL_VECTOR: u8 = abi::SYSCALL_VECTOR;
 pub const INIT_PROCESS_ID: u64 = abi::INIT_PROCESS_ID;
 
@@ -928,6 +936,55 @@ impl TmpfsProxyState {
 static KERNEL_CAPABILITY_ROOTS: Mutex<Vec<CapabilityObjectRef>> = Mutex::new(Vec::new());
 static TMPFS_PROXY: Mutex<TmpfsProxyState> = Mutex::new(TmpfsProxyState::new());
 
+#[derive(Clone, Copy)]
+struct VfsRouteState {
+    request_endpoint: Option<CapabilityObjectRef>,
+    reply_endpoint: Option<CapabilityObjectRef>,
+    generation: u32,
+    ready: bool,
+    next_request_id: u32,
+    active_request_id: u32,
+}
+
+impl VfsRouteState {
+    const fn new() -> Self {
+        Self {
+            request_endpoint: None,
+            reply_endpoint: None,
+            generation: 0,
+            ready: false,
+            next_request_id: 1,
+            active_request_id: 0,
+        }
+    }
+}
+
+static VFS_ROUTE: Mutex<VfsRouteState> = Mutex::new(VfsRouteState::new());
+
+#[derive(Clone)]
+enum PendingVfsOperation {
+    Stat {
+        stat_address: u64,
+        stat_length: u64,
+    },
+    ReadDirectory {
+        start_index: usize,
+        records_address: u64,
+        capacity: usize,
+    },
+    Chdir,
+}
+
+#[derive(Clone)]
+struct PendingVfsRequest {
+    reply_endpoint: CapabilityObjectRef,
+    request_id: u32,
+    generation: u32,
+    path: String,
+    operation: PendingVfsOperation,
+    stack_pointer: usize,
+}
+
 fn kernel_capability_root_add(object: CapabilityObjectRef) {
     let mut roots = KERNEL_CAPABILITY_ROOTS.lock();
     if !roots.contains(&object) {
@@ -996,6 +1053,7 @@ struct Process {
     pending_pipe_read: Option<PendingPipeRead>,
     pending_pipe_write: Option<PendingPipeWrite>,
     pending_tmpfs_proxy: Option<PendingTmpfsProxyRequest>,
+    pending_vfs_request: Option<PendingVfsRequest>,
     pending_child_spawn: Option<PendingChildSpawn>,
     pending_child_wait: Option<PendingChildWait>,
     pending_exec: Option<PendingExec>,
@@ -1952,6 +2010,7 @@ fn spawn_with_mode(
         pending_pipe_read: None,
         pending_pipe_write: None,
         pending_tmpfs_proxy: None,
+        pending_vfs_request: None,
         pending_child_spawn: None,
         pending_child_wait: None,
         pending_exec: None,
@@ -2708,6 +2767,7 @@ impl Runtime {
                 pending_pipe_read: None,
                 pending_pipe_write: None,
                 pending_tmpfs_proxy: None,
+                pending_vfs_request: None,
                 pending_child_spawn: None,
                 pending_child_wait: None,
                 pending_exec: None,
@@ -3016,6 +3076,7 @@ impl Runtime {
             PipeRead(PipeId),
             PipeWrite(PipeId),
             TmpfsProxy(PendingTmpfsProxyRequest),
+            VfsRequest(PendingVfsRequest),
             Child,
         }
 
@@ -3046,13 +3107,17 @@ impl Runtime {
                             pending.stack_pointer,
                             InterruptedWait::TmpfsProxy(pending),
                         )
+                    } else if let Some(pending) = process.pending_vfs_request.take() {
+                        (pending.stack_pointer, InterruptedWait::VfsRequest(pending))
                     } else if let Some(pending) = process.pending_child_wait.take() {
                         (pending.stack_pointer, InterruptedWait::Child)
                     } else {
                         return Ok(None);
                     };
-                let registers = unsafe { &mut *(stack_pointer as *mut SavedRegisters) };
-                registers.rax = error_return(ERR_INTERRUPTED);
+                if !matches!(&kind, InterruptedWait::VfsRequest(_)) {
+                    let registers = unsafe { &mut *(stack_pointer as *mut SavedRegisters) };
+                    registers.rax = error_return(ERR_INTERRUPTED);
+                }
                 process.make_runnable();
                 process.signal_interrupted_syscall_count =
                     process.signal_interrupted_syscall_count.saturating_add(1);
@@ -3063,6 +3128,13 @@ impl Runtime {
         let Some(interrupted) = interrupted else {
             return Ok(false);
         };
+        if let InterruptedWait::VfsRequest(pending) = &interrupted {
+            scheduler::with_process_address_space(process_id, || {
+                let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+                registers.rax = error_return(ERR_INTERRUPTED);
+            })
+            .ok_or(Error::ProcessNotFound(process_id))?;
+        }
         if !scheduler::wake_process(process_id) {
             return Err(Error::ProcessNotFound(process_id));
         }
@@ -3077,6 +3149,7 @@ impl Runtime {
             InterruptedWait::TmpfsProxy(pending) => {
                 tmpfs_proxy_release_pending(&pending);
             }
+            InterruptedWait::VfsRequest(pending) => vfs_request_release(&pending),
             InterruptedWait::Child => {}
         }
         Ok(true)
@@ -3558,6 +3631,8 @@ impl Runtime {
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;
         self.service_tmpfs_proxy_requests()?;
+        vfs_route_service_registration();
+        self.service_vfs_requests()?;
         self.service_fork_requests()?;
         self.service_child_requests()?;
         self.service_exec_requests()?;
@@ -3588,6 +3663,248 @@ impl Runtime {
             tmpfs_proxy_release_pending(&pending);
             self.complete_tmpfs_proxy_request(process_id, pending, reply)?;
             completed = completed.saturating_add(1);
+        }
+        Ok(completed)
+    }
+
+    fn service_vfs_requests(&mut self) -> Result<usize, Error> {
+        let requests: Vec<(u64, PendingVfsRequest)> = PROCESS_MANAGER
+            .lock()
+            .processes
+            .iter()
+            .filter_map(|process| {
+                process
+                    .pending_vfs_request
+                    .clone()
+                    .map(|pending| (process.process_id, pending))
+            })
+            .collect();
+        let mut completed = 0;
+        for (process_id, pending) in requests {
+            let Some(reply) = vfs_request_take_reply(&pending) else {
+                continue;
+            };
+            vfs_request_release(&pending);
+            {
+                let mut manager = PROCESS_MANAGER.lock();
+                let Some(process) = manager.process_mut(process_id) else {
+                    continue;
+                };
+                if process
+                    .pending_vfs_request
+                    .as_ref()
+                    .is_none_or(|current| current.reply_endpoint != pending.reply_endpoint)
+                {
+                    continue;
+                }
+                process.pending_vfs_request = None;
+            }
+            let outcome = scheduler::with_process_address_space(process_id, || {
+                match (&pending.operation, reply) {
+                    (
+                        PendingVfsOperation::Stat {
+                            stat_address,
+                            stat_length,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::TMPFS =>
+                    {
+                        tmpfs_proxy_stat(
+                            process_id,
+                            &pending.path,
+                            *stat_address,
+                            *stat_length,
+                            pending.stack_pointer,
+                        )
+                    }
+                    (
+                        PendingVfsOperation::Stat {
+                            stat_address,
+                            stat_length,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                    {
+                        let result = match vfs::metadata(&pending.path) {
+                            Ok(metadata) => platform_write_value(
+                                process_id,
+                                *stat_address,
+                                *stat_length,
+                                platform_stat_from_metadata(&metadata),
+                            ),
+                            Err(error) => error_return(platform_vfs_errno(&error)),
+                        };
+                        ControlOutcome::Ready(result)
+                    }
+                    (
+                        PendingVfsOperation::Stat {
+                            stat_address,
+                            stat_length,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::NAMESPACE
+                        && usize::from(reply.prefix_length) == pending.path.len() =>
+                    {
+                        ControlOutcome::Ready(platform_write_value(
+                            process_id,
+                            *stat_address,
+                            *stat_length,
+                            abi::file::Stat {
+                                kind: abi::file::KIND_DIRECTORY,
+                                size: 0,
+                                flags: if pending.path == "/System"
+                                    || pending.path.starts_with("/System/")
+                                {
+                                    abi::file::FLAG_SYSTEM
+                                } else {
+                                    0
+                                },
+                            },
+                        ))
+                    }
+                    (PendingVfsOperation::Stat { .. }, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                    {
+                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                    }
+                    (
+                        PendingVfsOperation::ReadDirectory {
+                            start_index,
+                            records_address,
+                            capacity,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::TMPFS =>
+                    {
+                        tmpfs_proxy_read_directory(
+                            process_id,
+                            &pending.path,
+                            *start_index,
+                            *records_address,
+                            *capacity,
+                            pending.stack_pointer,
+                        )
+                    }
+                    (
+                        PendingVfsOperation::ReadDirectory {
+                            start_index,
+                            records_address,
+                            capacity,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                    {
+                        vfs_routed_boot_directory(
+                            &pending.path,
+                            *start_index,
+                            *records_address,
+                            *capacity,
+                        )
+                    }
+                    (
+                        PendingVfsOperation::ReadDirectory {
+                            start_index,
+                            records_address,
+                            capacity,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::NAMESPACE
+                        && usize::from(reply.prefix_length) == pending.path.len() =>
+                    {
+                        vfs_routed_namespace_directory(
+                            &pending.path,
+                            *start_index,
+                            *records_address,
+                            *capacity,
+                        )
+                    }
+                    (PendingVfsOperation::ReadDirectory { .. }, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                    {
+                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                    }
+                    (PendingVfsOperation::Chdir, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::TMPFS
+                            && pending.path == "/tmp" =>
+                    {
+                        ControlOutcome::Ready(match platform_set_working_directory(
+                            process_id,
+                            &pending.path,
+                        ) {
+                            Ok(()) => 0,
+                            Err(error) => error_return(error),
+                        })
+                    }
+                    (PendingVfsOperation::Chdir, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                    {
+                        let result = match vfs::metadata(&pending.path) {
+                            Ok(metadata) if metadata.is_directory() => {
+                                platform_set_working_directory(process_id, &metadata.path)
+                            }
+                            Ok(_) => Err(abi::errno::NOT_DIRECTORY),
+                            Err(error) => Err(platform_vfs_errno(&error)),
+                        };
+                        ControlOutcome::Ready(match result {
+                            Ok(()) => 0,
+                            Err(error) => error_return(error),
+                        })
+                    }
+                    (PendingVfsOperation::Chdir, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::NAMESPACE
+                            && usize::from(reply.prefix_length) == pending.path.len() =>
+                    {
+                        ControlOutcome::Ready(match platform_set_working_directory(
+                            process_id,
+                            &pending.path,
+                        ) {
+                            Ok(()) => 0,
+                            Err(error) => error_return(error),
+                        })
+                    }
+                    (PendingVfsOperation::Chdir, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && (reply.backend == vfs_protocol::backend::NAMESPACE
+                                || reply.backend == vfs_protocol::backend::TMPFS) =>
+                    {
+                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                    }
+                    (_, Ok(reply)) if reply.status == vfs_protocol::status::NOT_FOUND => {
+                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                    }
+                    _ => ControlOutcome::Ready(error_return(ERR_IO)),
+                }
+            })
+            .ok_or(Error::ProcessNotFound(process_id))?;
+            if let ControlOutcome::Ready(result) = outcome {
+                scheduler::with_process_address_space(process_id, || {
+                    let registers =
+                        unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+                    registers.rax = result;
+                })
+                .ok_or(Error::ProcessNotFound(process_id))?;
+                let mut manager = PROCESS_MANAGER.lock();
+                let process = manager
+                    .process_mut(process_id)
+                    .ok_or(Error::ProcessNotFound(process_id))?;
+                process.make_runnable();
+                drop(manager);
+                if !scheduler::wake_process(process_id) {
+                    return Err(Error::ProcessNotFound(process_id));
+                }
+            }
+            completed += 1;
         }
         Ok(completed)
     }
@@ -3626,8 +3943,14 @@ impl Runtime {
                 },
                 Err(error) => error_return(error),
             };
-            let registers = unsafe { &mut *(stack_pointer as *mut SavedRegisters) };
-            registers.rax = result;
+            if scheduler::with_process_address_space(process_id, || {
+                let registers = unsafe { &mut *(stack_pointer as *mut SavedRegisters) };
+                registers.rax = result;
+            })
+            .is_none()
+            {
+                return Err(Error::ProcessNotFound(process_id));
+            }
             process.pending_tmpfs_proxy = None;
             process.make_runnable();
             drop(manager);
@@ -4020,6 +4343,577 @@ impl Runtime {
     }
 }
 
+fn vfs_route_begin_registration(
+    request_endpoint: CapabilityObjectRef,
+    generation: u32,
+) -> Result<(), i64> {
+    let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
+    let mut request = vfs_protocol::Request::EMPTY;
+    request.operation = vfs_protocol::operation::RESOLVE;
+    request.request_id = generation;
+    request.path_length = 1;
+    request.path[0] = b'/';
+    let bytes = tmpfs_proxy_value_bytes(&request).to_vec();
+    let push_result = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        match registry.object_index(request_endpoint) {
+            Some(object_index) => match &mut registry.objects[object_index].data {
+                CapabilityObjectData::Endpoint(endpoint)
+                    if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES =>
+                {
+                    endpoint.queue.push_back(EndpointMessage {
+                        sender_process_id: 0,
+                        bytes,
+                        capability: Some(TransferredCapability {
+                            object: reply_endpoint,
+                            rights: abi::capability::RIGHT_SEND,
+                        }),
+                    });
+                    Ok(())
+                }
+                CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
+                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
+                    Err(ERR_IO)
+                }
+            },
+            None => Err(ERR_IO),
+        }
+    };
+    if let Err(error) = push_result {
+        tmpfs_proxy_release_reply_endpoint(reply_endpoint);
+        return Err(error);
+    }
+
+    let previous = {
+        let mut state = VFS_ROUTE.lock();
+        let previous = (state.request_endpoint, state.reply_endpoint);
+        state.request_endpoint = Some(request_endpoint);
+        state.reply_endpoint = Some(reply_endpoint);
+        state.generation = generation;
+        state.ready = false;
+        state.active_request_id = 0;
+        previous
+    };
+    if previous.0 != Some(request_endpoint) {
+        if let Some(endpoint) = previous.0 {
+            kernel_capability_root_remove(endpoint);
+        }
+        kernel_capability_root_add(request_endpoint);
+    }
+    if let Some(endpoint) = previous.1 {
+        tmpfs_proxy_release_reply_endpoint(endpoint);
+    }
+    vfs_route_cancel_stale_requests(generation);
+    wake_endpoint_waiter(request_endpoint);
+    Ok(())
+}
+
+fn vfs_route_cancel_stale_requests(generation: u32) {
+    let pending: Vec<(u64, PendingVfsRequest)> = {
+        let mut manager = PROCESS_MANAGER.lock();
+        manager
+            .processes
+            .iter_mut()
+            .filter_map(|process| {
+                let request = process.pending_vfs_request.as_ref()?;
+                if request.generation == generation {
+                    return None;
+                }
+                process
+                    .pending_vfs_request
+                    .take()
+                    .map(|pending| (process.process_id, pending))
+            })
+            .collect()
+    };
+    for (process_id, pending) in pending {
+        tmpfs_proxy_release_reply_endpoint(pending.reply_endpoint);
+        if scheduler::with_process_address_space(process_id, || {
+            let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+            registers.rax = error_return(ERR_IO);
+        })
+        .is_none()
+        {
+            continue;
+        }
+        let made_runnable = {
+            let mut manager = PROCESS_MANAGER.lock();
+            let Some(process) = manager.process_mut(process_id) else {
+                continue;
+            };
+            process.make_runnable();
+            true
+        };
+        if made_runnable {
+            let _ = scheduler::wake_process(process_id);
+        }
+    }
+}
+
+fn vfs_route_service_registration() -> bool {
+    let state = *VFS_ROUTE.lock();
+    let Some(reply_endpoint) = state.reply_endpoint else {
+        return false;
+    };
+    let message = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        let Some(index) = registry.object_index(reply_endpoint) else {
+            return false;
+        };
+        let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[index].data else {
+            return false;
+        };
+        endpoint.queue.pop_front()
+    };
+    let Some(message) = message else {
+        return false;
+    };
+    let valid = if message.capability.is_none()
+        && message.bytes.len() == size_of::<vfs_protocol::Reply>()
+    {
+        let reply =
+            unsafe { ptr::read_unaligned(message.bytes.as_ptr() as *const vfs_protocol::Reply) };
+        reply.version == vfs_protocol::VERSION
+            && reply.operation == vfs_protocol::operation::RESOLVE
+            && reply.request_id == state.generation
+            && reply.status == vfs_protocol::status::OK
+            && reply.route_id == vfs_protocol::route::ROOT
+            && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM
+            && reply.prefix_length == 1
+            && reply.reserved == [0; 8]
+    } else {
+        false
+    };
+    {
+        let mut route = VFS_ROUTE.lock();
+        if route.reply_endpoint == Some(reply_endpoint) {
+            route.reply_endpoint = None;
+            route.ready = valid;
+        }
+    }
+    tmpfs_proxy_release_reply_endpoint(reply_endpoint);
+    true
+}
+
+fn vfs_route_ready() -> bool {
+    let state = *VFS_ROUTE.lock();
+    state.request_endpoint.is_some() && state.generation != 0 && state.ready
+}
+
+fn vfs_is_declared_namespace_directory(path: &str) -> bool {
+    matches!(
+        path,
+        "/dev"
+            | "/System"
+            | "/System/config"
+            | "/System/var"
+            | "/System/var/log"
+            | "/System/bin"
+            | "/System/services"
+            | "/System/drivers"
+            | "/System/lib"
+            | "/System/Applications"
+            | "/Users"
+            | "/Applications"
+            | "/Volumes"
+    )
+}
+
+fn vfs_routed_boot_directory(
+    path: &str,
+    start_index: usize,
+    records_address: u64,
+    capacity: usize,
+) -> ControlOutcome {
+    let entries = match vfs::read_directory(path) {
+        Ok(entries) => entries,
+        Err(error) => return ControlOutcome::Ready(error_return(platform_vfs_errno(&error))),
+    };
+    let mut records = Vec::new();
+    if path == "/" {
+        for name in [
+            "dev",
+            "tmp",
+            "System",
+            "Users",
+            "Applications",
+            "Volumes",
+        ] {
+            records.push(vfs_namespace_directory_record(name, name == "System"));
+        }
+    }
+    for entry in &entries {
+        if path == "/"
+            && matches!(
+                entry.name.as_str(),
+                "dev" | "tmp" | "System" | "Users" | "Applications" | "Volumes"
+            )
+        {
+            continue;
+        }
+        let record = match platform_directory_record(entry) {
+            Ok(record) => record,
+            Err(error) => return ControlOutcome::Ready(error_return(error)),
+        };
+        records.push(record);
+    }
+    vfs_write_directory_records(&records, start_index, records_address, capacity)
+}
+
+fn vfs_routed_namespace_directory(
+    path: &str,
+    start_index: usize,
+    records_address: u64,
+    capacity: usize,
+) -> ControlOutcome {
+    let names: &[&str] = match path {
+        "/System" => &[
+            "config",
+            "var",
+            "bin",
+            "services",
+            "drivers",
+            "lib",
+            "Applications",
+        ],
+        "/System/var" => &["log"],
+        "/dev"
+        | "/System/config"
+        | "/System/var/log"
+        | "/System/bin"
+        | "/System/services"
+        | "/System/drivers"
+        | "/System/lib"
+        | "/System/Applications"
+        | "/Users"
+        | "/Applications"
+        | "/Volumes" => &[],
+        _ => return ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY)),
+    };
+    let records: Vec<_> = names
+        .iter()
+        .map(|name| vfs_namespace_directory_record(name, path.starts_with("/System")))
+        .collect();
+    vfs_write_directory_records(&records, start_index, records_address, capacity)
+}
+
+fn vfs_namespace_directory_record(name: &str, system: bool) -> abi::file::DirectoryEntry {
+    let bytes = name.as_bytes();
+    let mut record = abi::file::DirectoryEntry {
+        kind: abi::file::KIND_DIRECTORY,
+        size: 0,
+        flags: if system { abi::file::FLAG_SYSTEM } else { 0 },
+        name_length: bytes.len() as u64,
+        name: [0; abi::file::DIRECTORY_ENTRY_NAME_CAPACITY],
+    };
+    record.name[..bytes.len()].copy_from_slice(bytes);
+    record
+}
+
+fn vfs_write_directory_records(
+    records: &[abi::file::DirectoryEntry],
+    start_index: usize,
+    records_address: u64,
+    capacity: usize,
+) -> ControlOutcome {
+    let mut written = 0usize;
+    for record in records.iter().skip(start_index).take(capacity) {
+        let destination =
+            (records_address as *mut abi::file::DirectoryEntry).wrapping_add(written);
+        unsafe { ptr::write_unaligned(destination, *record) };
+        written = written.saturating_add(1);
+    }
+    ControlOutcome::Ready(written as u64)
+}
+
+fn vfs_route_stat(
+    process_id: u64,
+    path: &str,
+    stat_address: u64,
+    stat_length: u64,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    vfs_route_request(
+        process_id,
+        path,
+        PendingVfsOperation::Stat {
+            stat_address,
+            stat_length,
+        },
+        stack_pointer,
+    )
+}
+
+fn vfs_route_read_directory(
+    process_id: u64,
+    path: &str,
+    start_index: usize,
+    records_address: u64,
+    capacity: usize,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    vfs_route_request(
+        process_id,
+        path,
+        PendingVfsOperation::ReadDirectory {
+            start_index,
+            records_address,
+            capacity,
+        },
+        stack_pointer,
+    )
+}
+
+fn vfs_route_chdir(
+    process_id: u64,
+    path: &str,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    vfs_route_request(
+        process_id,
+        path,
+        PendingVfsOperation::Chdir,
+        stack_pointer,
+    )
+}
+
+fn vfs_route_request(
+    process_id: u64,
+    path: &str,
+    operation: PendingVfsOperation,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    if path.len() > vfs_protocol::MAX_PATH_BYTES {
+        return ControlOutcome::Ready(error_return(abi::errno::NAME_TOO_LONG));
+    }
+    let (endpoint, generation, request_id) = {
+        let mut state = VFS_ROUTE.lock();
+        let Some(endpoint) = state.request_endpoint.filter(|_| state.ready) else {
+            return ControlOutcome::Ready(error_return(ERR_IO));
+        };
+        if state.active_request_id != 0 {
+            return ControlOutcome::Ready(error_return(ERR_TRY_AGAIN));
+        }
+        let request_id = state.next_request_id.max(1);
+        state.next_request_id = request_id.wrapping_add(1).max(1);
+        state.active_request_id = request_id;
+        (endpoint, state.generation, request_id)
+    };
+    let reply_endpoint = match tmpfs_proxy_create_reply_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            let mut state = VFS_ROUTE.lock();
+            if state.generation == generation && state.active_request_id == request_id {
+                state.active_request_id = 0;
+            }
+            return ControlOutcome::Ready(error_return(error));
+        }
+    };
+    let mut request = vfs_protocol::Request::EMPTY;
+    request.operation = vfs_protocol::operation::RESOLVE;
+    request.request_id = request_id;
+    request.path_length = path.len() as u16;
+    request.path[..path.len()].copy_from_slice(path.as_bytes());
+    let pushed = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        match registry.object_index(endpoint) {
+            Some(index) => match &mut registry.objects[index].data {
+                CapabilityObjectData::Endpoint(target)
+                    if target.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES =>
+                {
+                    target.queue.push_back(EndpointMessage {
+                        sender_process_id: 0,
+                        bytes: tmpfs_proxy_value_bytes(&request).to_vec(),
+                        capability: Some(TransferredCapability {
+                            object: reply_endpoint,
+                            rights: abi::capability::RIGHT_SEND,
+                        }),
+                    });
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        }
+    };
+    let pending = PendingVfsRequest {
+        reply_endpoint,
+        request_id,
+        generation,
+        path: String::from(path),
+        operation,
+        stack_pointer,
+    };
+    if !pushed {
+        vfs_request_release(&pending);
+        return ControlOutcome::Ready(error_return(ERR_TRY_AGAIN));
+    }
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        drop(manager);
+        vfs_request_release(&pending);
+        return ControlOutcome::Ready(error_return(ERR_NO_PROCESS));
+    };
+    if process.pending_vfs_request.is_some() || process.pending_tmpfs_proxy.is_some() {
+        drop(manager);
+        vfs_request_release(&pending);
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
+    process.pending_vfs_request = Some(pending);
+    process.state = ProcessState::Blocked;
+    drop(manager);
+    wake_endpoint_waiter(endpoint);
+    ControlOutcome::Blocked
+}
+
+fn vfs_request_take_reply(
+    pending: &PendingVfsRequest,
+) -> Option<Result<vfs_protocol::Reply, i64>> {
+    let message = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        let index = registry.object_index(pending.reply_endpoint)?;
+        let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[index].data else {
+            return Some(Err(ERR_IO));
+        };
+        endpoint.queue.pop_front()
+    }?;
+    if message.capability.is_some() || message.bytes.len() != size_of::<vfs_protocol::Reply>() {
+        return Some(Err(ERR_IO));
+    }
+    let reply =
+        unsafe { ptr::read_unaligned(message.bytes.as_ptr() as *const vfs_protocol::Reply) };
+    let state = *VFS_ROUTE.lock();
+    if reply.version != vfs_protocol::VERSION
+        || reply.operation != vfs_protocol::operation::RESOLVE
+        || reply.request_id != pending.request_id
+        || reply.reserved != [0; 8]
+        || state.generation != pending.generation
+        || state.active_request_id != pending.request_id
+        || !vfs_stat_route_is_valid(&reply, &pending.path)
+    {
+        Some(Err(ERR_IO))
+    } else {
+        Some(Ok(reply))
+    }
+}
+
+fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
+    if reply.status == vfs_protocol::status::NOT_FOUND {
+        return reply.route_id == 0 && reply.backend == 0 && reply.prefix_length == 0;
+    }
+    if reply.status != vfs_protocol::status::OK {
+        return true;
+    }
+    let expected = if vfs_path_has_prefix(path, "/System/Applications") {
+        (
+            "/System/Applications",
+            vfs_protocol::route::SYSTEM_APPLICATIONS,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System/services") {
+        (
+            "/System/services",
+            vfs_protocol::route::SYSTEM_SERVICES,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System/drivers") {
+        (
+            "/System/drivers",
+            vfs_protocol::route::SYSTEM_DRIVERS,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System/var/log") {
+        (
+            "/System/var/log",
+            vfs_protocol::route::SYSTEM_VAR_LOG,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System/config") {
+        (
+            "/System/config",
+            vfs_protocol::route::SYSTEM_CONFIG,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System/bin") {
+        (
+            "/System/bin",
+            vfs_protocol::route::SYSTEM_BIN,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System/lib") {
+        (
+            "/System/lib",
+            vfs_protocol::route::SYSTEM_LIB,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/Applications") {
+        (
+            "/Applications",
+            vfs_protocol::route::APPLICATIONS,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/Volumes") {
+        (
+            "/Volumes",
+            vfs_protocol::route::VOLUMES,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System/var") {
+        (
+            "/System/var",
+            vfs_protocol::route::SYSTEM_VAR,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/System") {
+        (
+            "/System",
+            vfs_protocol::route::SYSTEM,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/Users") {
+        (
+            "/Users",
+            vfs_protocol::route::USERS,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else if vfs_path_has_prefix(path, "/tmp") {
+        (
+            "/tmp",
+            vfs_protocol::route::TMP,
+            vfs_protocol::backend::TMPFS,
+        )
+    } else if vfs_path_has_prefix(path, "/dev") {
+        (
+            "/dev",
+            vfs_protocol::route::DEV,
+            vfs_protocol::backend::NAMESPACE,
+        )
+    } else {
+        (
+            "/",
+            vfs_protocol::route::ROOT,
+            vfs_protocol::backend::BOOT_FILESYSTEM,
+        )
+    };
+    reply.route_id == expected.1
+        && reply.backend == expected.2
+        && usize::from(reply.prefix_length) == expected.0.len()
+}
+
+fn vfs_path_has_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+}
+
+fn vfs_request_release(pending: &PendingVfsRequest) {
+    let mut state = VFS_ROUTE.lock();
+    if state.active_request_id == pending.request_id {
+        state.active_request_id = 0;
+    }
+    drop(state);
+    tmpfs_proxy_release_reply_endpoint(pending.reply_endpoint);
+}
+
 pub fn wait_for_processes(
     frame_allocator: &mut BootInfoFrameAllocator,
     process_ids: &[u64],
@@ -4075,6 +4969,9 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
         }
         if let Some(pending) = process.pending_tmpfs_proxy.take() {
             tmpfs_proxy_release_pending(&pending);
+        }
+        if let Some(pending) = process.pending_vfs_request.take() {
+            vfs_request_release(&pending);
         }
         let frames_reclaimed = release_owned_frames(&mut process.owned_frames, frame_allocator);
         debug_assert_eq!(process.task_id, task.task_id);
@@ -4556,6 +5453,7 @@ fn syscall_spawn_command(
         || process.pending_exec.is_some()
         || process.pending_fork.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_vfs_request.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -4597,6 +5495,7 @@ fn syscall_execve(
         || process.pending_pipe_read.is_some()
         || process.pending_pipe_write.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_vfs_request.is_some()
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
@@ -4622,6 +5521,7 @@ fn syscall_fork(process_id: u64, current_stack_pointer: usize) -> ControlOutcome
         || process.pending_pipe_read.is_some()
         || process.pending_pipe_write.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_vfs_request.is_some()
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
@@ -4760,6 +5660,7 @@ fn syscall_wait_child(
         || process.pending_exec.is_some()
         || process.pending_fork.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_vfs_request.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
