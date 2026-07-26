@@ -183,7 +183,8 @@ overloading generic flags or inline data.
    generic client. (complete)
 3. Teach the kernel proxy to speak the generic protocol without changing the
    public file-descriptor ABI. (complete)
-4. Move path routing and open-file descriptions into a VFS service.
+4. Move path routing and open-file descriptions into a VFS service. (routing
+   service and boot namespace contract started)
 5. Put FAT behind the same protocol.
 6. Introduce the native metadata-rich filesystem as another service.
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
@@ -198,10 +199,7 @@ probe verifies shared data visibility plus generic creation and enumeration.
 The userspace `tmpfs::Mount` compatibility API now translates its bounded
 write, read, stat, remove, and list calls into generic lookup, create,
 attributes, unlink, shared-buffer I/O, and directory-iteration operations. It
-also disconnects its persistent session explicitly. The kernel proxy remains
-on the legacy protocol; the next migration step is to teach that asynchronous
-proxy to maintain a generic service session and shared I/O window behind its
-existing public file-descriptor ABI.
+also disconnects its persistent session explicitly.
 
 The kernel proxy registration path now starts that migration: it queues
 `CONNECT` without blocking PID 1, validates the reply from the normal kernel
@@ -221,3 +219,25 @@ validates fixed records, monotonic cookies, names, and end-of-directory state
 before producing the existing syscall records. The obsolete per-request legacy
 kernel transport has been removed. The initial kernel generic path deliberately
 allows one outstanding request at a time.
+
+The first part of migration step 4 is now present as a separately supervised
+`/vfs-service`. Its versioned protocol accepts canonical absolute paths and
+returns the longest matching namespace prefix, a stable route ID, and a backend
+class. PID 1 starts and monitors the service independently of tmpfs, and
+`/vfs-probe` verifies the complete target namespace plus `/tmp` backend
+selection during normal boot. PID 1 now registers each VFS service generation
+with the kernel, which retains the endpoint and asynchronously validates a
+versioned root-route handshake. `stat` is the first syscall to use
+per-operation routing: the kernel blocks on a generation-bound route reply,
+then completes against the boot filesystem or chains directly into the tmpfs
+proxy. Both metadata output and saved-register publication occur while the
+caller's address space is temporarily active. The boot probe validates public
+`stat`, `read_directory`, and `chdir` calls across both backends and every
+declared namespace directory. Exact VFS-owned route prefixes, including the
+intermediate `/System/var` node, return synthetic directory metadata and stable
+paginated listings and can become a process's working directory. The root
+listing merges boot-filesystem entries with `/dev`, `/tmp`, `/System`, `/Users`,
+`/Applications`, and `/Volumes`, suppressing backing-store name collisions.
+Unresolved descendants remain absent until a filesystem or service is mounted
+there. Route replies are checked against the kernel's expected longest-prefix
+result before backend dispatch.

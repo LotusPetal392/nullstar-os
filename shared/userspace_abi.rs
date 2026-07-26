@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 4;
+pub const ABI_VERSION_MINOR: u64 = 5;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -69,6 +69,7 @@ pub mod syscall {
     pub const SHARED_MEMORY_WRITE: u64 = 46;
     pub const ENDPOINT_WAIT: u64 = 47;
     pub const REGISTER_TMPFS_SERVICE: u64 = 49;
+    pub const REGISTER_VFS_SERVICE: u64 = 50;
 }
 
 pub mod capability {

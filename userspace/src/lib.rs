@@ -15,6 +15,7 @@ pub mod syscall;
 #[path = "syscall.rs"]
 mod syscall_legacy;
 pub mod tmpfs;
+pub mod vfs;
 
 pub mod abi {
     include!(concat!(

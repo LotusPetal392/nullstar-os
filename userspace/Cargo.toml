@@ -25,6 +25,18 @@ test = false
 bench = false
 
 [[bin]]
+name = "vfs_service"
+path = "src/bin/vfs_service.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vfs_probe"
+path = "src/bin/vfs_probe.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "service_probe"
 path = "src/bin/service_probe.rs"
 test = false

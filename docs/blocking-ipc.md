@@ -27,3 +27,13 @@ System information reports ABI minor version 3 and advertises the endpoint-wait 
 ## Current boundary
 
 This primitive removes cooperative polling from request/reply clients and is the blocking foundation for a future kernel-to-userspace VFS proxy. It does not yet provide transaction identifiers, kernel-owned reply slots, cancellation messages, timeout deadlines, or restart-aware kernel file descriptors.
+
+Kernel service completions may arrive while a different userspace address
+space is active. The scheduler therefore provides a bounded
+`with_process_address_space` operation for updating a blocked process's syscall
+frame: interrupts remain disabled, the target CR3 is installed temporarily,
+and the original address space is restored before the scheduler lock is
+released. Callbacks may not block, schedule, or recursively acquire the
+scheduler. The tmpfs proxy and generation-bound VFS `stat`/`read_directory`
+continuations use this path for backend dispatch, signal interruption, and
+saved-register publication.

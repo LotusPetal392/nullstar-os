@@ -177,16 +177,32 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
             ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
         };
     }
+    if syscall_number == abi::syscall::CHDIR {
+        return match platform_chdir(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        };
+    }
 
     registers.rax = match syscall_number {
         abi::syscall::SYSTEM_INFO => platform_system_info(process_id, registers.rdi, registers.rsi),
         abi::syscall::FSTAT => {
             platform_fstat(process_id, registers.rdi, registers.rsi, registers.rdx)
         }
-        abi::syscall::CHDIR => platform_chdir(process_id, registers.rdi, registers.rsi),
         abi::syscall::GETCWD => platform_getcwd(process_id, registers.rdi, registers.rsi),
         abi::syscall::REGISTER_TMPFS_SERVICE => {
             platform_register_tmpfs_service(process_id, registers.rdi, registers.rsi)
+        }
+        abi::syscall::REGISTER_VFS_SERVICE => {
+            platform_register_vfs_service(process_id, registers.rdi, registers.rsi)
         }
         abi::syscall::DUP => platform_dup(process_id, registers.rdi),
         abi::syscall::DUP2 => platform_dup2(process_id, registers.rdi, registers.rsi),
@@ -217,6 +233,7 @@ fn platform_syscall_number(number: u64) -> bool {
             | abi::syscall::CHDIR
             | abi::syscall::GETCWD
             | abi::syscall::REGISTER_TMPFS_SERVICE
+            | abi::syscall::REGISTER_VFS_SERVICE
             | abi::syscall::DUP
             | abi::syscall::DUP2
             | abi::syscall::GETPPID
@@ -367,6 +384,47 @@ fn platform_register_tmpfs_service(process_id: u64, handle: u64, generation: u64
     0
 }
 
+fn platform_register_vfs_service(process_id: u64, handle: u64, generation: u64) -> u64 {
+    let (entry, endpoint) = {
+        let registry = CAPABILITY_REGISTRY.lock();
+        let entry = registry.entry(process_id, handle);
+        (
+            entry.map(|entry| (entry.object.kind, entry.rights)),
+            entry.map(|entry| entry.object),
+        )
+    };
+    let generation = match crate::tmpfs_abi::validate_registration(
+        process_id,
+        INIT_PROCESS_ID,
+        generation,
+        entry,
+        abi::capability::KIND_ENDPOINT,
+        abi::capability::RIGHT_SEND,
+    ) {
+        Ok(generation) => generation,
+        Err(crate::tmpfs_abi::RegistrationError::Permission) => {
+            return error_return(abi::errno::PERMISSION);
+        }
+        Err(crate::tmpfs_abi::RegistrationError::BadHandle) => {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        }
+        Err(crate::tmpfs_abi::RegistrationError::MissingSendRight) => {
+            return error_return(abi::errno::PERMISSION);
+        }
+        Err(
+            crate::tmpfs_abi::RegistrationError::InvalidGeneration
+            | crate::tmpfs_abi::RegistrationError::WrongObjectKind,
+        ) => return error_return(ERR_INVALID_ARGUMENT),
+    };
+    let Some(endpoint) = endpoint else {
+        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+    };
+    match vfs_route_begin_registration(endpoint, generation) {
+        Ok(()) => 0,
+        Err(error) => error_return(error),
+    }
+}
+
 fn platform_spawn_command(
     process_id: u64,
     arguments: SpawnSyscallArgs,
@@ -428,6 +486,7 @@ fn platform_spawn_command(
         || process.pending_exec.is_some()
         || process.pending_fork.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_vfs_request.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
@@ -469,6 +528,7 @@ fn platform_execve(
         || process.pending_pipe_read.is_some()
         || process.pending_pipe_write.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_vfs_request.is_some()
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
