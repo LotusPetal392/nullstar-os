@@ -35,6 +35,7 @@ pub fn validate_registration(
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ReplyEnvelope {
     pub byte_length: usize,
     pub expected_byte_length: usize,
@@ -50,6 +51,7 @@ pub struct ReplyEnvelope {
     pub reserved: u16,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn valid_reply_envelope(envelope: ReplyEnvelope) -> bool {
     envelope.byte_length == envelope.expected_byte_length
         && !envelope.has_capability

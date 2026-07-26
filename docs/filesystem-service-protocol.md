@@ -95,6 +95,13 @@ Names are single components. They may not be empty or contain `/` or NUL.
 Unicode normalization and case-comparison policy belong to each mounted
 filesystem and must eventually be reported as volume capabilities.
 
+`LOOKUP` replies include the current logical size as well as the node ID and
+kind. `OPEN` accepts either an existing node ID or a parent-directory node plus
+a component name. The named form applies create, truncate, append, read, and
+write flags in one service round trip; this lets syscall proxies preserve one
+blocked operation without embedding path-resolution continuations in the
+kernel.
+
 ## Target system namespace
 
 The initial system namespace is:
@@ -175,7 +182,7 @@ overloading generic flags or inline data.
 2. Add a compatibility adapter so existing userspace tmpfs calls use the
    generic client. (complete)
 3. Teach the kernel proxy to speak the generic protocol without changing the
-   public file-descriptor ABI.
+   public file-descriptor ABI. (complete)
 4. Move path routing and open-file descriptions into a VFS service.
 5. Put FAT behind the same protocol.
 6. Introduce the native metadata-rich filesystem as another service.
@@ -201,6 +208,16 @@ The kernel proxy registration path now starts that migration: it queues
 poll loop, retains the persistent session reply endpoint, creates a kernel-owned
 4 KiB shared-memory window, and registers it with `ATTACH_BUFFER`. Service
 replacement releases the previous handshake endpoint, session endpoint, and
-bulk-window root before establishing the new generation. File operations still
-use the legacy per-request transport until their asynchronous completion states
-are converted to generic replies.
+bulk-window root before establishing the new generation.
+
+Kernel `/tmp` open, stat, read, write, and directory iteration now use the
+generic protocol. Open
+stores the returned node ID in the kernel open-file description; later I/O
+addresses that node directly and moves bytes through the registered 4 KiB
+window. The proxy preserves append behavior, rejects nodes from replaced
+service generations, validates completed byte counts, and translates results
+back into the unchanged file-descriptor syscall ABI. Directory iteration
+validates fixed records, monotonic cookies, names, and end-of-directory state
+before producing the existing syscall records. The obsolete per-request legacy
+kernel transport has been removed. The initial kernel generic path deliberately
+allows one outstanding request at a time.

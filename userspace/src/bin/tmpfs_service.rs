@@ -230,7 +230,7 @@ fn dispatch_filesystem_message(
         filesystem_protocol::operation::OPEN => {
             reject_unexpected_capability(capability, &mut reply);
             if reply.status == filesystem_protocol::status::OK {
-                open_filesystem_node(files, &request, &mut reply);
+                open_filesystem_node(files, next_node_id, &request, &mut reply);
             }
         }
         filesystem_protocol::operation::READ_DIRECTORY => {
@@ -350,6 +350,7 @@ fn lookup_node(
     };
     reply.node_id = file.node_id;
     reply.node_kind = filesystem_protocol::node_kind::FILE;
+    reply.value = file.length as u64;
 }
 
 fn create_filesystem_file(
@@ -392,20 +393,59 @@ fn create_filesystem_file(
 
 fn open_filesystem_node(
     files: &mut [File; protocol::MAX_FILES],
+    next_node_id: &mut u64,
     request: &filesystem_protocol::Request,
     reply: &mut filesystem_protocol::Reply,
 ) {
     let allowed = filesystem_protocol::request_flags::READ
         | filesystem_protocol::request_flags::WRITE
         | filesystem_protocol::request_flags::APPEND
-        | filesystem_protocol::request_flags::TRUNCATE;
+        | filesystem_protocol::request_flags::TRUNCATE
+        | filesystem_protocol::request_flags::CREATE
+        | filesystem_protocol::request_flags::EXCLUSIVE;
     if request.flags & !allowed != 0
+        || request.flags & filesystem_protocol::request_flags::EXCLUSIVE != 0
+            && request.flags & filesystem_protocol::request_flags::CREATE == 0
         || request.flags & filesystem_protocol::request_flags::APPEND != 0
             && request.flags & filesystem_protocol::request_flags::WRITE == 0
         || request.flags & filesystem_protocol::request_flags::TRUNCATE != 0
             && request.flags & filesystem_protocol::request_flags::WRITE == 0
     {
         reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    if request.name_length != 0 {
+        if request.node_id != filesystem_protocol::ROOT_NODE_ID {
+            reply.status = filesystem_protocol::status::NOT_DIRECTORY;
+            return;
+        }
+        let Some(name) = request_name(request) else {
+            reply.status = filesystem_protocol::status::INVALID;
+            return;
+        };
+        let index = if let Some(index) = find_file(files, name) {
+            if request.flags & filesystem_protocol::request_flags::EXCLUSIVE != 0 {
+                reply.status = filesystem_protocol::status::EXISTS;
+                return;
+            }
+            index
+        } else if request.flags & filesystem_protocol::request_flags::CREATE != 0 {
+            let Some(index) = files.iter().position(|file| !file.used) else {
+                reply.status = filesystem_protocol::status::NO_SPACE;
+                return;
+            };
+            initialize_file(&mut files[index], next_node_id, name);
+            index
+        } else {
+            reply.status = filesystem_protocol::status::NOT_FOUND;
+            return;
+        };
+        if request.flags & filesystem_protocol::request_flags::TRUNCATE != 0 {
+            files[index].length = 0;
+        }
+        reply.node_id = files[index].node_id;
+        reply.node_kind = filesystem_protocol::node_kind::FILE;
+        reply.value = files[index].length as u64;
         return;
     }
     let Some(index) = files
