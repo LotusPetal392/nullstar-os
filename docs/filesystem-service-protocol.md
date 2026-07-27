@@ -232,12 +232,24 @@ per-operation routing: the kernel blocks on a generation-bound route reply,
 then completes against the boot filesystem or chains directly into the tmpfs
 proxy. Both metadata output and saved-register publication occur while the
 caller's address space is temporarily active. The boot probe validates public
-`stat`, `read_directory`, and `chdir` calls across both backends and every
-declared namespace directory. Exact VFS-owned route prefixes, including the
-intermediate `/System/var` node, return synthetic directory metadata and stable
-paginated listings and can become a process's working directory. The root
+`stat`, `read_directory`, `chdir`, `open`, and `unlink` calls across both
+backends and every declared namespace directory. `open` resolves ownership
+before allocating backend state, and `unlink` resolves ownership before
+mutation: boot files retain kernel compatibility descriptors, while `/tmp`
+operations chain directly into the generic filesystem service without waking
+the caller between stages. Boot-FAT deletion remains unsupported until that
+filesystem moves behind the protocol. Exact VFS-owned route prefixes,
+including the intermediate `/System/var` node, return synthetic directory
+metadata and stable paginated listings and can become a process's working
+directory. The root
 listing merges boot-filesystem entries with `/dev`, `/tmp`, `/System`, `/Users`,
 `/Applications`, and `/Volumes`, suppressing backing-store name collisions.
 Unresolved descendants remain absent until a filesystem or service is mounted
 there. Route replies are checked against the kernel's expected longest-prefix
 result before backend dispatch.
+
+Tmpfs now separates namespace linkage from node lifetime: unlink removes the
+name immediately while existing node-ID descriptors remain readable and
+writable. Unlinked nodes are deliberately retained for the bounded service
+generation. Completing `CLOSE_NODE` accounting is the next descriptor-lifetime
+step needed to reclaim those tombstones before restart.

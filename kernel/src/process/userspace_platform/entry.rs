@@ -191,6 +191,20 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
             ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
         };
     }
+    if syscall_number == abi::syscall::UNLINK {
+        return match platform_unlink(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            current_stack_pointer,
+        ) {
+            ControlOutcome::Ready(result) => {
+                registers.rax = result;
+                current_stack_pointer
+            }
+            ControlOutcome::Blocked => scheduler::block_current(current_stack_pointer),
+        };
+    }
 
     registers.rax = match syscall_number {
         abi::syscall::SYSTEM_INFO => platform_system_info(process_id, registers.rdi, registers.rsi),
@@ -234,6 +248,7 @@ fn platform_syscall_number(number: u64) -> bool {
             | abi::syscall::GETCWD
             | abi::syscall::REGISTER_TMPFS_SERVICE
             | abi::syscall::REGISTER_VFS_SERVICE
+            | abi::syscall::UNLINK
             | abi::syscall::DUP
             | abi::syscall::DUP2
             | abi::syscall::GETPPID
@@ -296,6 +311,16 @@ fn platform_open(
         };
         descriptor
     };
+    if vfs_route_ready() {
+        return vfs_route_open(
+            process_id,
+            &path,
+            options,
+            close_on_exec,
+            descriptor,
+            current_stack_pointer,
+        );
+    }
     if tmpfs_proxy_state().is_some() {
         match tmpfs_proxy_path(&path) {
             Ok(Some(TmpfsProxyPath::Directory)) => {
@@ -315,34 +340,13 @@ fn platform_open(
             Err(error) => return ControlOutcome::Ready(error_return(error)),
         }
     }
-    let metadata = match vfs::open(&path, options) {
-        Ok(metadata) => metadata,
-        Err(error) => return ControlOutcome::Ready(error_return(vfs_errno(&error))),
-    };
-    let offset = if options.append { metadata.size } else { 0 };
-    let handle = Arc::new(Mutex::new(OpenFileState {
-        path: metadata.path,
-        offset,
-        readable: options.read,
-        writable: options.write,
-        append: options.append,
-        size: metadata.size,
-        backend: OpenFileBackend::Vfs,
-    }));
-    let mut manager = PROCESS_MANAGER.lock();
-    let Some(process) = manager.process_mut(process_id) else {
-        return ControlOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
-    };
-    if descriptor_in_use(process, descriptor) {
-        return ControlOutcome::Ready(error_return(ERR_TOO_MANY_OPEN_FILES));
-    }
-    process.open_files.push(OpenFile {
-        descriptor,
-        handle,
+    ControlOutcome::Ready(vfs_complete_boot_open(
+        process_id,
+        &path,
+        options,
         close_on_exec,
-    });
-    process.open_count = process.open_count.saturating_add(1);
-    ControlOutcome::Ready(descriptor)
+        descriptor,
+    ))
 }
 
 fn platform_register_tmpfs_service(process_id: u64, handle: u64, generation: u64) -> u64 {

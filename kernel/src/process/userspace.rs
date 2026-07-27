@@ -900,6 +900,7 @@ enum PendingTmpfsProxyOperation {
         records_address: u64,
         capacity: usize,
     },
+    Unlink,
 }
 
 #[derive(Clone, Copy)]
@@ -973,6 +974,12 @@ enum PendingVfsOperation {
         capacity: usize,
     },
     Chdir,
+    Open {
+        options: vfs::OpenOptions,
+        close_on_exec: bool,
+        descriptor: u64,
+    },
+    Unlink,
 }
 
 #[derive(Clone)]
@@ -3880,6 +3887,97 @@ impl Runtime {
                     {
                         ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
                     }
+                    (
+                        PendingVfsOperation::Open { .. },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                    {
+                        ControlOutcome::Ready(if usize::from(reply.prefix_length)
+                            == pending.path.len()
+                        {
+                            error_return(ERR_IS_DIRECTORY)
+                        } else {
+                            error_return(abi::errno::NO_ENTRY)
+                        })
+                    }
+                    (
+                        PendingVfsOperation::Open { .. },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::TMPFS
+                        && pending.path == "/tmp" =>
+                    {
+                        ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
+                    }
+                    (
+                        PendingVfsOperation::Open {
+                            options,
+                            close_on_exec,
+                            descriptor,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::TMPFS =>
+                    {
+                        tmpfs_proxy_open(
+                            process_id,
+                            &pending.path,
+                            *options,
+                            *close_on_exec,
+                            *descriptor,
+                            pending.stack_pointer,
+                        )
+                    }
+                    (
+                        PendingVfsOperation::Open {
+                            options,
+                            close_on_exec,
+                            descriptor,
+                        },
+                        Ok(reply),
+                    ) if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                    {
+                        ControlOutcome::Ready(vfs_complete_boot_open(
+                            process_id,
+                            &pending.path,
+                            *options,
+                            *close_on_exec,
+                            *descriptor,
+                        ))
+                    }
+                    (PendingVfsOperation::Unlink, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::TMPFS
+                            && pending.path == "/tmp" =>
+                    {
+                        ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
+                    }
+                    (PendingVfsOperation::Unlink, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::TMPFS =>
+                    {
+                        tmpfs_proxy_unlink(process_id, &pending.path, pending.stack_pointer)
+                    }
+                    (PendingVfsOperation::Unlink, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                    {
+                        ControlOutcome::Ready(if usize::from(reply.prefix_length)
+                            == pending.path.len()
+                        {
+                            error_return(ERR_IS_DIRECTORY)
+                        } else {
+                            error_return(abi::errno::NO_ENTRY)
+                        })
+                    }
+                    (PendingVfsOperation::Unlink, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                    {
+                        ControlOutcome::Ready(error_return(ERR_NOT_IMPLEMENTED))
+                    }
                     (_, Ok(reply)) if reply.status == vfs_protocol::status::NOT_FOUND => {
                         ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
                     }
@@ -4675,6 +4773,76 @@ fn vfs_route_chdir(
         PendingVfsOperation::Chdir,
         stack_pointer,
     )
+}
+
+fn vfs_route_open(
+    process_id: u64,
+    path: &str,
+    options: vfs::OpenOptions,
+    close_on_exec: bool,
+    descriptor: u64,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    vfs_route_request(
+        process_id,
+        path,
+        PendingVfsOperation::Open {
+            options,
+            close_on_exec,
+            descriptor,
+        },
+        stack_pointer,
+    )
+}
+
+fn vfs_route_unlink(
+    process_id: u64,
+    path: &str,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    vfs_route_request(
+        process_id,
+        path,
+        PendingVfsOperation::Unlink,
+        stack_pointer,
+    )
+}
+
+fn vfs_complete_boot_open(
+    process_id: u64,
+    path: &str,
+    options: vfs::OpenOptions,
+    close_on_exec: bool,
+    descriptor: u64,
+) -> u64 {
+    let metadata = match vfs::open(path, options) {
+        Ok(metadata) => metadata,
+        Err(error) => return error_return(vfs_errno(&error)),
+    };
+    let offset = if options.append { metadata.size } else { 0 };
+    let handle = Arc::new(Mutex::new(OpenFileState {
+        path: metadata.path,
+        offset,
+        readable: options.read,
+        writable: options.write,
+        append: options.append,
+        size: metadata.size,
+        backend: OpenFileBackend::Vfs,
+    }));
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+    };
+    if descriptor_in_use(process, descriptor) {
+        return error_return(ERR_TOO_MANY_OPEN_FILES);
+    }
+    process.open_files.push(OpenFile {
+        descriptor,
+        handle,
+        close_on_exec,
+    });
+    process.open_count = process.open_count.saturating_add(1);
+    descriptor
 }
 
 fn vfs_route_request(
@@ -7162,6 +7330,7 @@ fn tmpfs_proxy_decode_filesystem_reply(
         PendingTmpfsProxyOperation::Write { .. } => tmpfs_protocol::operation::WRITE,
         PendingTmpfsProxyOperation::Stat { .. } => tmpfs_protocol::operation::STAT,
         PendingTmpfsProxyOperation::ReadDirectory { .. } => tmpfs_protocol::operation::LIST,
+        PendingTmpfsProxyOperation::Unlink => tmpfs_protocol::operation::REMOVE,
     };
     compatibility.generation = pending.request_generation;
     compatibility.status = match reply.status {
@@ -7203,6 +7372,7 @@ fn tmpfs_proxy_decode_filesystem_reply(
                 &mut compatibility,
             )?;
         }
+        PendingTmpfsProxyOperation::Unlink => {}
         _ => {}
     }
     Ok(compatibility)
@@ -7547,6 +7717,7 @@ fn tmpfs_proxy_complete_operation(
             capacity,
             physical_memory_offset,
         ),
+        PendingTmpfsProxyOperation::Unlink => Ok(0),
     }
 }
 
@@ -7834,6 +8005,31 @@ fn tmpfs_proxy_stat(
     request.name[..name.len()].copy_from_slice(name.as_bytes());
     let operation = PendingTmpfsProxyOperation::Stat { address, length };
     match tmpfs_proxy_begin_filesystem_request(process_id, request, operation, stack_pointer) {
+        Ok(()) => ControlOutcome::Blocked,
+        Err(error) => ControlOutcome::Ready(error_return(error)),
+    }
+}
+
+fn tmpfs_proxy_unlink(
+    process_id: u64,
+    path: &str,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    let name = match tmpfs_proxy_file_name(path) {
+        Ok(name) => name,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    let mut request = filesystem_protocol::Request::EMPTY;
+    request.operation = filesystem_protocol::operation::UNLINK;
+    request.node_id = filesystem_protocol::ROOT_NODE_ID;
+    request.name_length = name.len() as u16;
+    request.name[..name.len()].copy_from_slice(name.as_bytes());
+    match tmpfs_proxy_begin_filesystem_request(
+        process_id,
+        request,
+        PendingTmpfsProxyOperation::Unlink,
+        stack_pointer,
+    ) {
         Ok(()) => ControlOutcome::Blocked,
         Err(error) => ControlOutcome::Ready(error_return(error)),
     }
