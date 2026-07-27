@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "userspace"]
+members = [
+    "crates/nullfs-blockdev",
+    "crates/nullfs-format",
+    "kernel",
+    "userspace",
+]
 
 [package]
 name = "nullstar-os"
