@@ -165,9 +165,14 @@ authoritative allocation maps, bounded data-journaling redo transactions,
 persistent orphan recovery, and deterministic crash testing. A capability-based
 [block-device service protocol](block-device-service-protocol.md) now gives
 init-authorized filesystem services checked, partition-relative, registered-
-buffer reads. The initial endpoint is intentionally read-only; writable NullFS
-service integration requires a dedicated partition and durability validation as
-described in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
+buffer reads. Boot images now include a deterministic, 4096-byte-aligned NullFS
+partition that is identified explicitly in the MBR and validated through the real
+userspace endpoint during normal boot. The adapter aggregates the endpoint's
+512-byte device logical blocks into the 4096-byte blocks required by the shared
+NullFS core. The endpoint
+remains intentionally read-only; writable NullFS service integration still
+requires an explicit grant policy and durability validation as described in the
+[NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
 

@@ -12,8 +12,11 @@ mountable Phase 2 output from `mkfs-nullfs`; inspection through `nullfs-info`;
 deterministic source-tree population through `nullfs-image`; and an optional
 Linux read-only `nullfs-fuse` adapter. Writable core operation and checking are
 implemented; offline repair policy and the NullStar filesystem service remain
-future work. The service now has a read-only capability-based partition boundary
-and a `nullfs_blockdev::BlockDevice` adapter as its storage foundation.
+future work. Boot images now contain a deterministic dedicated NullFS partition,
+and normal boot validates its checksummed superblock through the read-only
+capability boundary. The `nullfs_blockdev::BlockDevice` adapter exposes the
+4096-byte logical geometry required by the shared core over the endpoint's device
+logical blocks.
 
 ## Architectural position
 
@@ -230,10 +233,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ## Phase 4: NullStar filesystem service
 
 Add the NullFS userspace service as another backend behind the common protocol;
-do not route clients directly to a NullFS-specific endpoint. The read-only
-partition endpoint, typed session client, and `nullfs_blockdev::BlockDevice`
-adapter are complete prerequisites; the next service milestone should mount a
-NullFS image through that adapter and expose read-only filesystem operations.
+do not route clients directly to a NullFS-specific endpoint. The build now
+appends a deterministic 4 MiB `NULLSTAR_DATA` volume as MBR partition 3, the
+kernel identifies it as NullFS, and an init-delegated boot probe validates its
+superblock through the read-only endpoint. The typed session client and adapter
+translate the endpoint's device logical-block geometry into 4096-byte core blocks.
+service milestone is therefore to mount this volume through that adapter and
+expose read-only filesystem operations.
 
 The service adapter must:
 

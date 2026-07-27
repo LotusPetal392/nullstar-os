@@ -167,6 +167,7 @@ pub enum PartitionKind {
     Fat12,
     Fat16,
     Fat32,
+    NullFs,
     EfiSystem,
     MicrosoftBasicData,
     BiosBoot,
@@ -192,6 +193,7 @@ impl fmt::Display for PartitionKind {
             Self::Fat12 => formatter.write_str("FAT12"),
             Self::Fat16 => formatter.write_str("FAT16"),
             Self::Fat32 => formatter.write_str("FAT32"),
+            Self::NullFs => formatter.write_str("NullFS"),
             Self::EfiSystem => formatter.write_str("EFI system"),
             Self::MicrosoftBasicData => formatter.write_str("Microsoft basic data"),
             Self::BiosBoot => formatter.write_str("BIOS boot"),
@@ -570,6 +572,7 @@ fn mbr_partition_kind(value: u8) -> PartitionKind {
         0x05 | 0x0f | 0x85 => PartitionKind::Extended,
         0x07 => PartitionKind::MicrosoftBasicData,
         0x20 => PartitionKind::BootloaderStage,
+        0x7f => PartitionKind::NullFs,
         0xee => PartitionKind::ProtectiveMbr,
         0xef => PartitionKind::EfiSystem,
         other => PartitionKind::UnknownMbr(other),
@@ -582,6 +585,7 @@ fn mbr_partition_name(kind: PartitionKind) -> String {
         PartitionKind::Fat12 | PartitionKind::Fat16 | PartitionKind::Fat32 => {
             String::from("FAT volume")
         }
+        PartitionKind::NullFs => String::from("NullFS volume"),
         PartitionKind::EfiSystem => String::from("EFI system partition"),
         PartitionKind::MicrosoftBasicData => String::from("basic data partition"),
         PartitionKind::Extended => String::from("extended partition"),

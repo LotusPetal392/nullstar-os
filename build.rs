@@ -1,10 +1,25 @@
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use nullfs_blockdev::MemoryBlockDevice;
+use nullfs_format::BLOCK_SIZE;
+use nullfs_testkit::ImageBuilder;
 
 const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n";
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
+const NULLFS_BLOCK_COUNT: u64 = 1024;
+const NULLFS_LABEL: &str = "NULLSTAR_DATA";
+const NULLFS_UUID: [u8; 16] = [
+    0x4e, 0x75, 0x6c, 0x6c, 0x53, 0x74, 0x61, 0x72, 0x2d, 0x4e, 0x75, 0x6c, 0x6c, 0x46, 0x53, 0x01,
+];
+const NULLFS_MBR_TYPE: u8 = 0x7f;
+const MBR_BYTES: usize = 512;
+const MBR_PARTITION_TABLE_OFFSET: usize = 446;
+const MBR_PARTITION_ENTRY_BYTES: usize = 16;
+const NULLFS_MBR_SLOT: usize = 2;
 
 fn main() {
     let output_directory = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR was not set"));
@@ -217,18 +232,105 @@ fn main() {
         image
     };
 
+    let nullfs_fixture = build_nullfs_fixture();
     let bios_image = output_directory.join("nullstar-os-bios.img");
     build_image(NORMAL_BOOT_MODE)
         .create_bios_image(&bios_image)
         .expect("failed to create BIOS disk image");
+    append_nullfs_partition(&bios_image, &nullfs_fixture)
+        .expect("failed to append NullFS partition to BIOS disk image");
     let smoke_test_bios_image = output_directory.join("nullstar-os-smoke-test-bios.img");
     build_image(SMOKE_TEST_BOOT_MODE)
         .create_bios_image(&smoke_test_bios_image)
         .expect("failed to create smoke-test BIOS disk image");
+    append_nullfs_partition(&smoke_test_bios_image, &nullfs_fixture)
+        .expect("failed to append NullFS partition to smoke-test BIOS disk image");
 
     println!("cargo:rustc-env=BIOS_IMAGE={}", bios_image.display());
     println!(
         "cargo:rustc-env=SMOKE_TEST_BIOS_IMAGE={}",
         smoke_test_bios_image.display()
     );
+}
+
+fn build_nullfs_fixture() -> Vec<u8> {
+    let device = MemoryBlockDevice::new(BLOCK_SIZE, NULLFS_BLOCK_COUNT)
+        .expect("failed to allocate NullFS fixture device");
+    let mut image = ImageBuilder::new(device, NULLFS_UUID, NULLFS_LABEL)
+        .expect("failed to format NullFS fixture");
+    let docs = image
+        .create_directory(1, "docs", 0o755)
+        .expect("failed to create NullFS fixture directory");
+    image
+        .create_file(
+            1,
+            "welcome.txt",
+            b"NullStar persistent storage service fixture.\n",
+            0o644,
+        )
+        .expect("failed to create NullFS fixture root file");
+    image
+        .create_file(
+            docs,
+            "readme.txt",
+            b"This volume is prepared for read-only Phase 4 service integration.\n",
+            0o644,
+        )
+        .expect("failed to create NullFS fixture nested file");
+    image
+        .finish()
+        .expect("failed to finalize NullFS fixture")
+        .bytes()
+        .to_vec()
+}
+
+fn append_nullfs_partition(image_path: &Path, fixture: &[u8]) -> io::Result<()> {
+    if fixture.is_empty() || !fixture.len().is_multiple_of(MBR_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NullFS fixture must contain complete disk sectors",
+        ));
+    }
+
+    let mut image = OpenOptions::new().read(true).write(true).open(image_path)?;
+    let original_length = image.metadata()?.len();
+    let alignment = BLOCK_SIZE as u64;
+    let partition_offset = original_length
+        .checked_add(alignment - 1)
+        .map(|length| length / alignment * alignment)
+        .ok_or_else(|| io::Error::other("NullFS partition alignment overflowed"))?;
+    let start_lba = u32::try_from(partition_offset / MBR_BYTES as u64)
+        .map_err(|_| io::Error::other("NullFS partition start exceeds MBR limits"))?;
+    let sector_count = u32::try_from(fixture.len() / MBR_BYTES)
+        .map_err(|_| io::Error::other("NullFS partition size exceeds MBR limits"))?;
+
+    let mut mbr = [0_u8; MBR_BYTES];
+    image.seek(SeekFrom::Start(0))?;
+    image.read_exact(&mut mbr)?;
+    if mbr[510..512] != [0x55, 0xaa] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "boot image is missing the MBR signature",
+        ));
+    }
+    let entry_offset = MBR_PARTITION_TABLE_OFFSET + NULLFS_MBR_SLOT * MBR_PARTITION_ENTRY_BYTES;
+    let entry = &mut mbr[entry_offset..entry_offset + MBR_PARTITION_ENTRY_BYTES];
+    if entry.iter().any(|byte| *byte != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "boot image already uses MBR partition slot 3",
+        ));
+    }
+    entry[4] = NULLFS_MBR_TYPE;
+    entry[8..12].copy_from_slice(&start_lba.to_le_bytes());
+    entry[12..16].copy_from_slice(&sector_count.to_le_bytes());
+
+    image.seek(SeekFrom::Start(original_length))?;
+    let padding = usize::try_from(partition_offset - original_length)
+        .map_err(|_| io::Error::other("NullFS partition padding exceeds host limits"))?;
+    image.write_all(&[0_u8; BLOCK_SIZE][..padding])?;
+    image.write_all(fixture)?;
+    image.seek(SeekFrom::Start(0))?;
+    image.write_all(&mbr)?;
+    image.sync_all()
 }

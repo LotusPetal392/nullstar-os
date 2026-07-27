@@ -41,6 +41,9 @@ const NORMAL_BOOT_MODE_MARKER: &str = "boot mode selected: normal";
 const NORMAL_BOOT_READY_MARKER: &str = "normal boot ready:";
 const NORMAL_BOOT_INIT_MARKER: &str = "userspace init ready: pid=1";
 const NORMAL_BOOT_BLOCK_DEVICE_MARKER: &str = "userspace init: read-only block-device probe passed";
+const NORMAL_BOOT_NULLFS_DISCOVERY_MARKER: &str = "partition: index=3, kind=NullFS";
+const NORMAL_BOOT_NULLFS_PARTITION_MARKER: &str =
+    "userspace init: read-only NullFS partition probe passed";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
 const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -51,6 +54,8 @@ struct NormalBootProgress {
     kernel_ready: bool,
     init_ready: bool,
     block_device_ready: bool,
+    nullfs_partition_discovered: bool,
+    nullfs_partition_verified: bool,
     init_launched_shell: bool,
     shell_ready: bool,
 }
@@ -61,6 +66,8 @@ impl NormalBootProgress {
         self.kernel_ready |= line.contains(NORMAL_BOOT_READY_MARKER);
         self.init_ready |= line.contains(NORMAL_BOOT_INIT_MARKER);
         self.block_device_ready |= line.contains(NORMAL_BOOT_BLOCK_DEVICE_MARKER);
+        self.nullfs_partition_discovered |= line.contains(NORMAL_BOOT_NULLFS_DISCOVERY_MARKER);
+        self.nullfs_partition_verified |= line.contains(NORMAL_BOOT_NULLFS_PARTITION_MARKER);
         self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
         self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
 
@@ -68,6 +75,8 @@ impl NormalBootProgress {
             && self.kernel_ready
             && self.init_ready
             && self.block_device_ready
+            && self.nullfs_partition_discovered
+            && self.nullfs_partition_verified
             && self.init_launched_shell
             && self.shell_ready
     }
@@ -447,7 +456,8 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
 mod tests {
     use super::{
         NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_INIT_MARKER, NORMAL_BOOT_INIT_SHELL_MARKER,
-        NORMAL_BOOT_MODE_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
+        NORMAL_BOOT_MODE_MARKER, NORMAL_BOOT_NULLFS_DISCOVERY_MARKER,
+        NORMAL_BOOT_NULLFS_PARTITION_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
         NormalBootProgress,
     };
 
@@ -459,6 +469,8 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_READY_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_BLOCK_DEVICE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_DISCOVERY_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_PARTITION_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_SHELL_MARKER));
         assert!(progress.observe(NORMAL_BOOT_SHELL_MARKER));
     }

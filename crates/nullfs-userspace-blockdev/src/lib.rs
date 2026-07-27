@@ -7,7 +7,8 @@
 
 use core::cmp;
 
-use nullfs_blockdev::{BlockDevice, BlockDeviceError, checked_block_range};
+use nullfs_blockdev::{BlockDevice, BlockDeviceError};
+use nullfs_format::BLOCK_SIZE;
 use userspace::{
     block_device::{DeviceInfo, Error as ClientError, RegisteredBuffer, Session, protocol},
     ipc,
@@ -20,7 +21,8 @@ pub struct SessionBlockDevice {
     info: DeviceInfo,
     buffer: RegisteredBuffer,
     next_request_id: Option<u64>,
-    block_size: usize,
+    block_count: u64,
+    protocol_blocks_per_block: u32,
     max_transfer_blocks: usize,
 }
 
@@ -37,15 +39,19 @@ impl SessionBlockDevice {
         let buffer = session
             .registered_buffer()
             .ok_or(ClientError::MissingBuffer)?;
-        let (block_size, max_transfer_blocks) =
-            adapter_geometry(info.logical_block_size(), buffer.length())?;
+        let geometry = adapter_geometry(
+            info.logical_block_size(),
+            info.block_count(),
+            buffer.length(),
+        )?;
         Ok(Self {
             session,
             info,
             buffer,
             next_request_id: Some(first_request_id),
-            block_size,
-            max_transfer_blocks,
+            block_count: geometry.block_count,
+            protocol_blocks_per_block: geometry.protocol_blocks_per_block,
+            max_transfer_blocks: geometry.max_transfer_blocks,
         })
     }
 
@@ -72,34 +78,31 @@ impl SessionBlockDevice {
 
 impl BlockDevice for SessionBlockDevice {
     fn block_size(&self) -> usize {
-        self.block_size
+        BLOCK_SIZE
     }
 
     fn block_count(&self) -> u64 {
-        self.info.block_count()
+        self.block_count
     }
 
     fn read_blocks(&mut self, first_block: u64, buffer: &mut [u8]) -> Result<(), BlockDeviceError> {
-        preflight_range(
-            self.block_size,
-            self.info.block_count(),
-            first_block,
-            buffer.len(),
-        )?;
+        preflight_range(BLOCK_SIZE, self.block_count, first_block, buffer.len())?;
         let max_bytes = self
             .max_transfer_blocks
-            .checked_mul(self.block_size)
+            .checked_mul(BLOCK_SIZE)
             .ok_or(BlockDeviceError::ArithmeticOverflow)?;
         let mut block_offset = first_block;
         for chunk in buffer.chunks_mut(max_bytes) {
-            let block_count = u32::try_from(chunk.len() / self.block_size)
+            let block_count = u32::try_from(chunk.len() / BLOCK_SIZE)
                 .map_err(|_| BlockDeviceError::ArithmeticOverflow)?;
+            let (protocol_offset, protocol_count) =
+                protocol_range(block_offset, block_count, self.protocol_blocks_per_block)?;
             let request_id = self.take_request_id()?;
             let transferred = self
                 .session
-                .read_to_shared_buffer(request_id, self.info, block_offset, block_count, 0)
+                .read_to_shared_buffer(request_id, self.info, protocol_offset, protocol_count, 0)
                 .map_err(map_block_device_error)?;
-            if transferred != block_count
+            if transferred != protocol_count
                 || ipc::shared_memory_read(self.buffer.handle(), 0, chunk).ok() != Some(chunk.len())
             {
                 return Err(BlockDeviceError::Io);
@@ -113,29 +116,26 @@ impl BlockDevice for SessionBlockDevice {
 
     fn write_blocks(&mut self, first_block: u64, buffer: &[u8]) -> Result<(), BlockDeviceError> {
         validate_writable(self.info)?;
-        preflight_range(
-            self.block_size,
-            self.info.block_count(),
-            first_block,
-            buffer.len(),
-        )?;
+        preflight_range(BLOCK_SIZE, self.block_count, first_block, buffer.len())?;
         let max_bytes = self
             .max_transfer_blocks
-            .checked_mul(self.block_size)
+            .checked_mul(BLOCK_SIZE)
             .ok_or(BlockDeviceError::ArithmeticOverflow)?;
         let mut block_offset = first_block;
         for chunk in buffer.chunks(max_bytes) {
             if ipc::shared_memory_write(self.buffer.handle(), 0, chunk).ok() != Some(chunk.len()) {
                 return Err(BlockDeviceError::Io);
             }
-            let block_count = u32::try_from(chunk.len() / self.block_size)
+            let block_count = u32::try_from(chunk.len() / BLOCK_SIZE)
                 .map_err(|_| BlockDeviceError::ArithmeticOverflow)?;
+            let (protocol_offset, protocol_count) =
+                protocol_range(block_offset, block_count, self.protocol_blocks_per_block)?;
             let request_id = self.take_request_id()?;
             let transferred = self
                 .session
-                .write_from_shared_buffer(request_id, self.info, block_offset, block_count, 0)
+                .write_from_shared_buffer(request_id, self.info, protocol_offset, protocol_count, 0)
                 .map_err(map_block_device_error)?;
-            if transferred != block_count {
+            if transferred != protocol_count {
                 return Err(BlockDeviceError::Io);
             }
             block_offset = block_offset
@@ -156,21 +156,57 @@ impl BlockDevice for SessionBlockDevice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdapterGeometry {
+    block_count: u64,
+    protocol_blocks_per_block: u32,
+    max_transfer_blocks: usize,
+}
+
 fn adapter_geometry(
-    logical_block_size: u32,
+    protocol_block_size: u32,
+    protocol_block_count: u64,
     buffer_length: usize,
-) -> Result<(usize, usize), ClientError> {
-    let block_size =
-        usize::try_from(logical_block_size).map_err(|_| ClientError::InvalidDeviceInfo)?;
-    if block_size == 0 {
+) -> Result<AdapterGeometry, ClientError> {
+    let protocol_block_size =
+        usize::try_from(protocol_block_size).map_err(|_| ClientError::InvalidDeviceInfo)?;
+    if protocol_block_size == 0 || !BLOCK_SIZE.is_multiple_of(protocol_block_size) {
+        return Err(ClientError::InvalidDeviceInfo);
+    }
+    let protocol_blocks_per_block = BLOCK_SIZE / protocol_block_size;
+    let protocol_blocks_per_block =
+        u32::try_from(protocol_blocks_per_block).map_err(|_| ClientError::InvalidDeviceInfo)?;
+    let block_count = protocol_block_count / u64::from(protocol_blocks_per_block);
+    if block_count == 0 {
         return Err(ClientError::InvalidDeviceInfo);
     }
     let transfer_length = cmp::min(buffer_length, protocol::MAX_TRANSFER_BYTES);
-    let max_transfer_blocks = cmp::min(transfer_length / block_size, u32::MAX as usize);
+    let max_transfer_blocks = cmp::min(
+        transfer_length / BLOCK_SIZE,
+        (u32::MAX / protocol_blocks_per_block) as usize,
+    );
     if max_transfer_blocks == 0 {
         return Err(ClientError::InvalidBuffer);
     }
-    Ok((block_size, max_transfer_blocks))
+    Ok(AdapterGeometry {
+        block_count,
+        protocol_blocks_per_block,
+        max_transfer_blocks,
+    })
+}
+
+fn protocol_range(
+    first_block: u64,
+    block_count: u32,
+    protocol_blocks_per_block: u32,
+) -> Result<(u64, u32), BlockDeviceError> {
+    let protocol_offset = first_block
+        .checked_mul(u64::from(protocol_blocks_per_block))
+        .ok_or(BlockDeviceError::ArithmeticOverflow)?;
+    let protocol_count = block_count
+        .checked_mul(protocol_blocks_per_block)
+        .ok_or(BlockDeviceError::ArithmeticOverflow)?;
+    Ok((protocol_offset, protocol_count))
 }
 
 fn preflight_range(
@@ -179,7 +215,21 @@ fn preflight_range(
     first_block: u64,
     buffer_length: usize,
 ) -> Result<(), BlockDeviceError> {
-    checked_block_range(block_size, block_count, first_block, buffer_length).map(|_| ())
+    if block_size == 0 {
+        return Err(BlockDeviceError::InvalidBlockSize);
+    }
+    if !buffer_length.is_multiple_of(block_size) {
+        return Err(BlockDeviceError::InvalidBufferLength);
+    }
+    let transfer_blocks = u64::try_from(buffer_length / block_size)
+        .map_err(|_| BlockDeviceError::ArithmeticOverflow)?;
+    let end = first_block
+        .checked_add(transfer_blocks)
+        .ok_or(BlockDeviceError::ArithmeticOverflow)?;
+    if first_block > block_count || end > block_count {
+        return Err(BlockDeviceError::OutOfBounds);
+    }
+    Ok(())
 }
 
 fn validate_writable(info: DeviceInfo) -> Result<(), BlockDeviceError> {
@@ -211,26 +261,78 @@ mod tests {
     use nullfs_blockdev::BlockDeviceError;
     use userspace::block_device::{Error as ClientError, protocol};
 
-    use super::{adapter_geometry, map_block_device_error, preflight_range, take_request_id};
+    use super::{
+        AdapterGeometry, adapter_geometry, map_block_device_error, preflight_range, protocol_range,
+        take_request_id,
+    };
 
     #[test]
-    fn adapter_geometry_requires_one_full_block() {
+    fn adapter_geometry_aggregates_protocol_blocks_into_nullfs_blocks() {
         assert_eq!(
-            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 511),
+            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 128, 4095),
             Err(ClientError::InvalidBuffer)
         );
         assert_eq!(
-            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 1024),
-            Ok((512, 2))
+            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 128, 4096),
+            Ok(AdapterGeometry {
+                block_count: 16,
+                protocol_blocks_per_block: 8,
+                max_transfer_blocks: 1,
+            })
         );
     }
 
     #[test]
-    fn adapter_geometry_caps_large_buffers_at_protocol_transfer_limit() {
+    fn adapter_geometry_rejects_incompatible_device_geometry() {
+        assert_eq!(
+            adapter_geometry(0, 128, 4096),
+            Err(ClientError::InvalidDeviceInfo)
+        );
+        assert_eq!(
+            adapter_geometry(768, 128, 4096),
+            Err(ClientError::InvalidDeviceInfo)
+        );
+        assert_eq!(
+            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 7, 4096),
+            Err(ClientError::InvalidDeviceInfo)
+        );
+    }
+
+    #[test]
+    fn adapter_geometry_ignores_incomplete_trailing_nullfs_blocks() {
+        assert_eq!(
+            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 127, 4096),
+            Ok(AdapterGeometry {
+                block_count: 15,
+                protocol_blocks_per_block: 8,
+                max_transfer_blocks: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn adapter_geometry_caps_transfers_at_one_nullfs_block() {
         assert_eq!(protocol::MAX_TRANSFER_BYTES, 4096);
         assert_eq!(
-            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 8192),
-            Ok((512, 8))
+            adapter_geometry(protocol::INITIAL_LOGICAL_BLOCK_SIZE, 128, 8192),
+            Ok(AdapterGeometry {
+                block_count: 16,
+                protocol_blocks_per_block: 8,
+                max_transfer_blocks: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn adapter_translates_nullfs_ranges_to_protocol_blocks() {
+        assert_eq!(protocol_range(3, 1, 8), Ok((24, 8)));
+        assert_eq!(
+            protocol_range(u64::MAX, 1, 8),
+            Err(BlockDeviceError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            protocol_range(0, u32::MAX, 8),
+            Err(BlockDeviceError::ArithmeticOverflow)
         );
     }
 
@@ -245,6 +347,7 @@ mod tests {
             Err(BlockDeviceError::OutOfBounds)
         );
         assert_eq!(preflight_range(512, 8, 8, 0), Ok(()));
+        assert_eq!(preflight_range(4096, u64::MAX, u64::MAX, 0), Ok(()));
     }
 
     #[test]

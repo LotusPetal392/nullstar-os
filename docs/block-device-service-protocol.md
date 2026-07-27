@@ -20,10 +20,11 @@ endpoint object. Closing one handle therefore does not invalidate another
 caller's handle. Endpoint object identity supplies a nonzero generation used to
 scope sessions and reject stale requests.
 
-The initial implementation exports partitions read-only. This deliberately
-includes the mounted FAT partition for protocol validation, but no write command
-can reach AHCI. Writable access must wait for a dedicated NullFS partition so raw
-writes cannot race the mounted boot filesystem.
+The initial implementation exports partitions read-only. This includes the
+mounted FAT partition and a dedicated NullFS fixture partition for protocol
+validation, but no write command can reach AHCI. Keeping the NullFS partition
+read-only until a separate grant policy and durability tests exist also ensures
+that raw writes can never race the mounted boot filesystem.
 
 ## Session bootstrap
 
@@ -100,20 +101,24 @@ on-disk consistency and recovery rules.
 `userspace::block_device` provides the typed no-`std` session client.
 `nullfs-userspace-blockdev` adapts that client to
 `nullfs_blockdev::BlockDevice`, owning monotonic request IDs and chunking larger
-core transfers through the registered window. Keeping the adapter in a separate
-crate prevents host `std` features from leaking into allocator-free userspace
-binaries and lets the future NullFS service remain a distinct package.
+core transfers through the registered window. It exposes 4096-byte NullFS blocks
+and translates each one into a checked run of protocol logical blocks; the
+current 512-byte logical-block device therefore uses eight protocol blocks per
+core block. Keeping the adapter
+in a separate crate prevents host `std` features from leaking into allocator-free
+userspace binaries and lets the future NullFS service remain a distinct package.
 
-The current QEMU boot probe verifies init-only endpoint acquisition, delegated
+The current QEMU boot probes verify init-only endpoint acquisition, delegated
 send-only authority, read-only device metadata, a partition-relative FAT boot
-block read, buffer transfer, range rejection, write rejection, unsupported
-flush, and disconnect cleanup.
+block read, and the checksummed superblock of the dedicated `NULLSTAR_DATA`
+NullFS fixture. They also cover buffer transfer, range rejection, write rejection,
+unsupported flush, and disconnect cleanup on the real kernel boundary.
 
 ## Next step
 
-Add a dedicated NullFS partition to the image and define the policy for granting
-writable authority. Only then should the kernel advertise `WRITE` and `FLUSH`,
-and only after crash-ordering tests prove that the userspace adapter preserves
-NullFS durability semantics. The first NullFS service integration can meanwhile
-use this boundary read-only for mount, lookup, attributes, file reads, directory
-iteration, and `CLOSE_NODE` handling.
+Mount the dedicated partition through `nullfs-userspace-blockdev` in a separately
+supervised NullFS service, then expose lookup, attributes, file reads, directory
+iteration, and `CLOSE_NODE` through the generic filesystem protocol. Writable
+authority remains a later milestone: the kernel must not advertise `WRITE` or
+`FLUSH` until an explicit grant policy and crash-ordering tests prove that the
+userspace adapter preserves NullFS durability semantics.
