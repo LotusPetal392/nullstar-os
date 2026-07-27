@@ -8,6 +8,7 @@ members = [
     "kernel",
     "tools/fsck-nullfs",
     "tools/mkfs-nullfs",
+    "tools/nullfs-fuse",
     "tools/nullfs-image",
     "tools/nullfs-info",
     "userspace",
