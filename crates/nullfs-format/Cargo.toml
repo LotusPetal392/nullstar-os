@@ -1,0 +1,9 @@
+[package]
+name = "nullfs-format"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/LotusPetal392/nullstar-os"
+
+[lib]
+path = "src/lib.rs"
