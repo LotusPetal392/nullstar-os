@@ -2,8 +2,14 @@
 resolver = "3"
 members = [
     "crates/nullfs-blockdev",
+    "crates/nullfs-core",
     "crates/nullfs-format",
+    "crates/nullfs-testkit",
     "kernel",
+    "tools/fsck-nullfs",
+    "tools/mkfs-nullfs",
+    "tools/nullfs-image",
+    "tools/nullfs-info",
     "userspace",
 ]
 
