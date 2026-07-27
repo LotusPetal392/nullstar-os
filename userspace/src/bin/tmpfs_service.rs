@@ -5,7 +5,7 @@ use core::{mem::size_of, slice};
 
 use userspace::{
     filesystem::protocol as filesystem_protocol,
-    filesystem_service::{Error as SessionError, SessionTable},
+    filesystem_service::{Error as SessionError, NodeReference, NodeReferenceError, SessionTable},
     ipc::{self, ObjectKind, ReceivedCapability, Rights},
     syscall,
     tmpfs::protocol,
@@ -23,6 +23,7 @@ struct File {
     used: bool,
     linked: bool,
     node_id: u64,
+    open_count: u32,
     name_length: usize,
     name: [u8; protocol::MAX_NAME_BYTES],
     length: usize,
@@ -34,6 +35,7 @@ impl File {
         used: false,
         linked: false,
         node_id: filesystem_protocol::INVALID_ID,
+        open_count: 0,
         name_length: 0,
         name: [0; protocol::MAX_NAME_BYTES],
         length: 0,
@@ -159,12 +161,18 @@ fn dispatch_filesystem_message(
     match request.operation {
         filesystem_protocol::operation::DISCONNECT => {
             reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK
+                && !canonical_empty_request_fields(&request)
+            {
+                reply.status = filesystem_protocol::status::INVALID;
+            }
             if reply.status != filesystem_protocol::status::OK {
                 send_value(reply_endpoint, &reply);
                 return;
             }
             match sessions.disconnect(request.session_id, request.generation) {
                 Ok(released) => {
+                    release_session_nodes(files, released.node_references);
                     send_value(released.reply_endpoint, &reply);
                     for handle in released
                         .buffer_handles
@@ -235,7 +243,13 @@ fn dispatch_filesystem_message(
         filesystem_protocol::operation::OPEN => {
             reject_unexpected_capability(capability, &mut reply);
             if reply.status == filesystem_protocol::status::OK {
-                open_filesystem_node(files, next_node_id, &request, &mut reply);
+                open_filesystem_node(files, next_node_id, sessions, &request, &mut reply);
+            }
+        }
+        filesystem_protocol::operation::CLOSE_NODE => {
+            reject_unexpected_capability(capability, &mut reply);
+            if reply.status == filesystem_protocol::status::OK {
+                close_filesystem_node(files, sessions, &request, &mut reply);
             }
         }
         filesystem_protocol::operation::READ_DIRECTORY => {
@@ -274,6 +288,15 @@ fn connect_filesystem_session(
         return;
     }
     let mut reply = filesystem_reply(request);
+    if request.session_id != filesystem_protocol::INVALID_ID
+        || request.generation != 0
+        || !canonical_empty_request_fields(request)
+    {
+        reply.status = filesystem_protocol::status::INVALID;
+        send_value(capability.handle, &reply);
+        let _ = ipc::close(capability.handle);
+        return;
+    }
     match sessions.connect(generation, capability.handle) {
         Ok(session_id) => {
             reply.session_id = session_id;
@@ -399,6 +422,7 @@ fn create_filesystem_file(
 fn open_filesystem_node(
     files: &mut [File; protocol::MAX_FILES],
     next_node_id: &mut u64,
+    sessions: &mut SessionTable,
     request: &filesystem_protocol::Request,
     reply: &mut filesystem_protocol::Reply,
 ) {
@@ -408,7 +432,13 @@ fn open_filesystem_node(
         | filesystem_protocol::request_flags::TRUNCATE
         | filesystem_protocol::request_flags::CREATE
         | filesystem_protocol::request_flags::EXCLUSIVE;
-    if request.flags & !allowed != 0
+    let name_length = usize::from(request.name_length);
+    if request.secondary_node_id != filesystem_protocol::INVALID_ID
+        || request.file_offset != 0
+        || request.bulk != filesystem_protocol::BulkBuffer::NONE
+        || name_length > filesystem_protocol::MAX_NAME_BYTES
+        || request.name[name_length..].iter().any(|byte| *byte != 0)
+        || request.flags & !allowed != 0
         || request.flags & filesystem_protocol::request_flags::EXCLUSIVE != 0
             && request.flags & filesystem_protocol::request_flags::CREATE == 0
         || request.flags & filesystem_protocol::request_flags::APPEND != 0
@@ -428,23 +458,36 @@ fn open_filesystem_node(
             reply.status = filesystem_protocol::status::INVALID;
             return;
         };
-        let index = if let Some(index) = find_file(files, name) {
+        let (index, node_id, create) = if let Some(index) = find_file(files, name) {
             if request.flags & filesystem_protocol::request_flags::EXCLUSIVE != 0 {
                 reply.status = filesystem_protocol::status::EXISTS;
                 return;
             }
-            index
+            (index, files[index].node_id, false)
         } else if request.flags & filesystem_protocol::request_flags::CREATE != 0 {
             let Some(index) = files.iter().position(|file| !file.used) else {
                 reply.status = filesystem_protocol::status::NO_SPACE;
                 return;
             };
-            initialize_file(&mut files[index], next_node_id, name);
-            index
+            (index, *next_node_id, true)
         } else {
             reply.status = filesystem_protocol::status::NOT_FOUND;
             return;
         };
+        if files[index].open_count == u32::MAX {
+            reply.status = filesystem_protocol::status::NO_SPACE;
+            return;
+        }
+        if let Err(error) =
+            sessions.record_open_node(request.session_id, request.generation, node_id)
+        {
+            reply.status = node_reference_status(error);
+            return;
+        }
+        if create {
+            initialize_file(&mut files[index], next_node_id, name);
+        }
+        files[index].open_count += 1;
         if request.flags & filesystem_protocol::request_flags::TRUNCATE != 0 {
             files[index].length = 0;
         }
@@ -464,12 +507,90 @@ fn open_filesystem_node(
         };
         return;
     };
+    if files[index].open_count == u32::MAX {
+        reply.status = filesystem_protocol::status::NO_SPACE;
+        return;
+    }
+    if let Err(error) =
+        sessions.record_open_node(request.session_id, request.generation, files[index].node_id)
+    {
+        reply.status = node_reference_status(error);
+        return;
+    }
+    files[index].open_count += 1;
     if request.flags & filesystem_protocol::request_flags::TRUNCATE != 0 {
         files[index].length = 0;
     }
     reply.node_id = files[index].node_id;
     reply.node_kind = filesystem_protocol::node_kind::FILE;
     reply.value = files[index].length as u64;
+}
+
+fn canonical_empty_request_fields(request: &filesystem_protocol::Request) -> bool {
+    request.flags == 0
+        && request.node_id == filesystem_protocol::INVALID_ID
+        && request.secondary_node_id == filesystem_protocol::INVALID_ID
+        && request.file_offset == 0
+        && request.bulk == filesystem_protocol::BulkBuffer::NONE
+        && request.name_length == 0
+        && request.name == [0; filesystem_protocol::MAX_NAME_BYTES]
+}
+
+fn close_filesystem_node(
+    files: &mut [File; protocol::MAX_FILES],
+    sessions: &mut SessionTable,
+    request: &filesystem_protocol::Request,
+    reply: &mut filesystem_protocol::Reply,
+) {
+    if request.flags != 0
+        || request.secondary_node_id != filesystem_protocol::INVALID_ID
+        || request.file_offset != 0
+        || request.bulk != filesystem_protocol::BulkBuffer::NONE
+        || request.name_length != 0
+        || request.name != [0; filesystem_protocol::MAX_NAME_BYTES]
+    {
+        reply.status = filesystem_protocol::status::INVALID;
+        return;
+    }
+    let Some(index) = files
+        .iter()
+        .position(|file| file.used && file.node_id == request.node_id && file.open_count != 0)
+    else {
+        reply.status = filesystem_protocol::status::STALE_NODE;
+        return;
+    };
+    if let Err(error) = sessions.close_node(request.session_id, request.generation, request.node_id)
+    {
+        reply.status = node_reference_status(error);
+        return;
+    }
+    files[index].open_count -= 1;
+    reclaim_if_unreferenced(&mut files[index]);
+}
+
+fn release_session_nodes(
+    files: &mut [File; protocol::MAX_FILES],
+    references: [NodeReference; userspace::filesystem_service::MAX_NODE_REFERENCES_PER_SESSION],
+) {
+    for reference in references
+        .into_iter()
+        .filter(|reference| reference.node_id != filesystem_protocol::INVALID_ID)
+    {
+        let Some(file) = files
+            .iter_mut()
+            .find(|file| file.used && file.node_id == reference.node_id)
+        else {
+            continue;
+        };
+        file.open_count = file.open_count.saturating_sub(reference.references);
+        reclaim_if_unreferenced(file);
+    }
+}
+
+fn reclaim_if_unreferenced(file: &mut File) {
+    if file.used && !file.linked && file.open_count == 0 {
+        *file = File::EMPTY;
+    }
 }
 
 fn read_directory_to_buffer(
@@ -558,6 +679,7 @@ fn unlink_filesystem_node(
         return;
     };
     files[index].linked = false;
+    reclaim_if_unreferenced(&mut files[index]);
 }
 
 fn get_node_attributes(
@@ -584,7 +706,7 @@ fn get_node_attributes(
         attributes.size = file.length as u64;
         attributes.allocated_size = protocol::MAX_FILE_BYTES as u64;
         attributes.kind = filesystem_protocol::node_kind::FILE;
-        attributes.link_count = 1;
+        attributes.link_count = u32::from(file.linked);
         attributes
     };
     let bytes = value_bytes(&attributes);
@@ -747,6 +869,14 @@ fn session_status(error: SessionError) -> i32 {
         SessionError::NoSpace => filesystem_protocol::status::NO_SPACE,
         SessionError::StaleSession => filesystem_protocol::status::STALE_SESSION,
         SessionError::InvalidBuffer => filesystem_protocol::status::STALE_BUFFER,
+    }
+}
+
+fn node_reference_status(error: NodeReferenceError) -> i32 {
+    match error {
+        NodeReferenceError::NoSpace => filesystem_protocol::status::NO_SPACE,
+        NodeReferenceError::StaleSession => filesystem_protocol::status::STALE_SESSION,
+        NodeReferenceError::UnknownNode => filesystem_protocol::status::STALE_NODE,
     }
 }
 
@@ -921,6 +1051,7 @@ fn remove_file(files: &mut [File; protocol::MAX_FILES], name: &[u8], reply: &mut
         return;
     };
     files[index].linked = false;
+    reclaim_if_unreferenced(&mut files[index]);
 }
 
 fn list_files(files: &[File; protocol::MAX_FILES], capacity: usize, reply: &mut protocol::Reply) {

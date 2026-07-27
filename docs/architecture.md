@@ -143,9 +143,11 @@ service now owns a versioned longest-prefix namespace table and validates the
 intended mount layout during boot. `stat`, path-based `read_directory`,
 `chdir`, descriptor-producing `open`, and `unlink` now cross that service
 boundary, including synthetic directory metadata and merged namespace listings
-for VFS-owned nodes; other kernel file operations still use the backend
-recorded by the resulting descriptor while their service-owned open-file state
-is being developed.
+for VFS-owned nodes; other kernel file operations use the backend recorded by
+the resulting open-file description. Service-backed descriptions now release
+one generation- and session-bound node reference when their final descriptor,
+stream, or inherited owner disappears, allowing tmpfs to reclaim unlinked
+nodes without closing duplicated or fork-inherited descriptors early.
 
 The intended rooted namespace includes service-backed `/dev` and `/tmp` mounts,
 a system hierarchy under `/System` (`config`, `var/log`, `bin`, `services`,

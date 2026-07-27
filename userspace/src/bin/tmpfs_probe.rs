@@ -186,19 +186,35 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     {
         syscall::exit(28);
     }
-    if session.detach_shared_buffer(11, GENERIC_BUFFER_ID).is_err()
-        || ipc::close(shared_memory).is_err()
+    if session
+        .unlink(11, Node::root(session), CREATED_NAME)
+        .is_err()
     {
         syscall::exit(29);
     }
-    if session.disconnect(12).is_err() {
-        syscall::exit(30);
-    }
-    if mount.remove(NAME).is_err() || mount.stat(NAME) != Err(Error::NotFound) {
+    let unlinked = match session.attributes(12, opened) {
+        Ok(attributes) => attributes,
+        Err(_) => syscall::exit(30),
+    };
+    if unlinked.link_count != 0 || session.close_node(13, opened).is_err() {
         syscall::exit(31);
     }
-    if mount.disconnect().is_err() {
+    if session.attributes(14, opened) != Err(userspace::filesystem::Error::StaleNode) {
         syscall::exit(32);
+    }
+    if session.detach_shared_buffer(15, GENERIC_BUFFER_ID).is_err()
+        || ipc::close(shared_memory).is_err()
+    {
+        syscall::exit(33);
+    }
+    if session.disconnect(16).is_err() {
+        syscall::exit(34);
+    }
+    if mount.remove(NAME).is_err() || mount.stat(NAME) != Err(Error::NotFound) {
+        syscall::exit(35);
+    }
+    if mount.disconnect().is_err() {
+        syscall::exit(36);
     }
     syscall::exit(0)
 }

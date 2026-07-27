@@ -4,12 +4,33 @@ use crate::ipc::CapabilityHandle;
 
 pub const MAX_SESSIONS: usize = 4;
 pub const MAX_BUFFERS_PER_SESSION: usize = 4;
+pub const MAX_NODE_REFERENCES_PER_SESSION: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     NoSpace,
     StaleSession,
     InvalidBuffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeReferenceError {
+    NoSpace,
+    StaleSession,
+    UnknownNode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeReference {
+    pub node_id: u64,
+    pub references: u32,
+}
+
+impl NodeReference {
+    pub const EMPTY: Self = Self {
+        node_id: 0,
+        references: 0,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +54,7 @@ struct SessionSlot {
     generation: u64,
     reply_endpoint: CapabilityHandle,
     buffers: [BufferSlot; MAX_BUFFERS_PER_SESSION],
+    node_references: [NodeReference; MAX_NODE_REFERENCES_PER_SESSION],
 }
 
 impl SessionSlot {
@@ -41,6 +63,7 @@ impl SessionSlot {
         generation: 0,
         reply_endpoint: 0,
         buffers: [BufferSlot::EMPTY; MAX_BUFFERS_PER_SESSION],
+        node_references: [NodeReference::EMPTY; MAX_NODE_REFERENCES_PER_SESSION],
     };
 }
 
@@ -52,6 +75,7 @@ pub struct SessionTable {
 pub struct ReleasedSession {
     pub reply_endpoint: CapabilityHandle,
     pub buffer_handles: [CapabilityHandle; MAX_BUFFERS_PER_SESSION],
+    pub node_references: [NodeReference; MAX_NODE_REFERENCES_PER_SESSION],
 }
 
 impl SessionTable {
@@ -81,6 +105,7 @@ impl SessionTable {
             generation,
             reply_endpoint,
             buffers: [BufferSlot::EMPTY; MAX_BUFFERS_PER_SESSION],
+            node_references: [NodeReference::EMPTY; MAX_NODE_REFERENCES_PER_SESSION],
         };
         Ok(slot.id)
     }
@@ -154,6 +179,70 @@ impl SessionTable {
             .ok_or(Error::InvalidBuffer)
     }
 
+    pub fn record_open_node(
+        &mut self,
+        id: u64,
+        generation: u64,
+        node_id: u64,
+    ) -> Result<(), NodeReferenceError> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id && session.generation == generation && id != 0)
+            .ok_or(NodeReferenceError::StaleSession)?;
+        if node_id == 0 {
+            return Err(NodeReferenceError::UnknownNode);
+        }
+        if let Some(node) = session
+            .node_references
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+        {
+            node.references = node
+                .references
+                .checked_add(1)
+                .ok_or(NodeReferenceError::NoSpace)?;
+            return Ok(());
+        }
+        let Some(node) = session
+            .node_references
+            .iter_mut()
+            .find(|node| node.node_id == 0)
+        else {
+            return Err(NodeReferenceError::NoSpace);
+        };
+        *node = NodeReference {
+            node_id,
+            references: 1,
+        };
+        Ok(())
+    }
+
+    pub fn close_node(
+        &mut self,
+        id: u64,
+        generation: u64,
+        node_id: u64,
+    ) -> Result<(), NodeReferenceError> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id && session.generation == generation && id != 0)
+            .ok_or(NodeReferenceError::StaleSession)?;
+        let Some(node) = session
+            .node_references
+            .iter_mut()
+            .find(|node| node.node_id == node_id && node.node_id != 0)
+        else {
+            return Err(NodeReferenceError::UnknownNode);
+        };
+        node.references -= 1;
+        if node.references == 0 {
+            *node = NodeReference::EMPTY;
+        }
+        Ok(())
+    }
+
     pub fn disconnect(&mut self, id: u64, generation: u64) -> Result<ReleasedSession, Error> {
         let session = self.session_mut(id, generation)?;
         let mut buffer_handles = [0; MAX_BUFFERS_PER_SESSION];
@@ -163,6 +252,7 @@ impl SessionTable {
         let released = ReleasedSession {
             reply_endpoint: session.reply_endpoint,
             buffer_handles,
+            node_references: session.node_references,
         };
         *session = SessionSlot::EMPTY;
         Ok(released)
@@ -191,7 +281,10 @@ impl Default for SessionTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, MAX_BUFFERS_PER_SESSION, MAX_SESSIONS, SessionTable};
+    use super::{
+        Error, MAX_BUFFERS_PER_SESSION, MAX_NODE_REFERENCES_PER_SESSION, MAX_SESSIONS,
+        NodeReference, NodeReferenceError, SessionTable,
+    };
 
     #[test]
     fn sessions_are_generation_scoped_and_bounded() {
@@ -235,7 +328,67 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_releases_reply_and_buffer_handles() {
+    fn duplicate_opens_are_closed_one_reference_at_a_time() {
+        let mut table = SessionTable::new();
+        let session = table.connect(6, 10).expect("session");
+        table.record_open_node(session, 6, 42).expect("first open");
+        table
+            .record_open_node(session, 6, 42)
+            .expect("duplicate open");
+
+        assert_eq!(table.close_node(session, 6, 42), Ok(()));
+        assert_eq!(table.close_node(session, 6, 42), Ok(()));
+        assert_eq!(
+            table.close_node(session, 6, 42),
+            Err(NodeReferenceError::UnknownNode)
+        );
+    }
+
+    #[test]
+    fn node_references_validate_session_generation_and_node_identity() {
+        let mut table = SessionTable::new();
+        let session = table.connect(7, 10).expect("session");
+        assert_eq!(
+            table.record_open_node(session, 8, 42),
+            Err(NodeReferenceError::StaleSession)
+        );
+        assert_eq!(
+            table.record_open_node(session, 7, 0),
+            Err(NodeReferenceError::UnknownNode)
+        );
+        assert_eq!(
+            table.close_node(session, 7, 42),
+            Err(NodeReferenceError::UnknownNode)
+        );
+
+        table.record_open_node(session, 7, 42).expect("open");
+        assert_eq!(
+            table.close_node(session, 8, 42),
+            Err(NodeReferenceError::StaleSession)
+        );
+        assert_eq!(table.close_node(session, 7, 42), Ok(()));
+    }
+
+    #[test]
+    fn node_reference_tables_are_bounded() {
+        let mut table = SessionTable::new();
+        let session = table.connect(8, 10).expect("session");
+        for index in 0..MAX_NODE_REFERENCES_PER_SESSION {
+            table
+                .record_open_node(session, 8, index as u64 + 1)
+                .expect("bounded node reference");
+        }
+        assert_eq!(
+            table.record_open_node(session, 8, 100),
+            Err(NodeReferenceError::NoSpace)
+        );
+        assert_eq!(table.record_open_node(session, 8, 1), Ok(()));
+        assert_eq!(table.close_node(session, 8, 1), Ok(()));
+        assert_eq!(table.close_node(session, 8, 1), Ok(()));
+    }
+
+    #[test]
+    fn disconnect_releases_reply_buffers_and_outstanding_node_references() {
         let mut table = SessionTable::new();
         let session = table.connect(4, 10).expect("session");
         table
@@ -244,9 +397,28 @@ mod tests {
         table
             .attach_buffer(session, 4, 2, 21, 64)
             .expect("second buffer");
+        table.record_open_node(session, 4, 30).expect("first open");
+        table
+            .record_open_node(session, 4, 30)
+            .expect("duplicate open");
+        table.record_open_node(session, 4, 31).expect("second node");
+        table.close_node(session, 4, 31).expect("close node");
+
         let released = table.disconnect(session, 4).expect("disconnect");
         assert_eq!(released.reply_endpoint, 10);
         assert_eq!(&released.buffer_handles[..2], &[20, 21]);
+        assert_eq!(
+            released.node_references[0],
+            NodeReference {
+                node_id: 30,
+                references: 2,
+            }
+        );
+        assert!(
+            released.node_references[1..]
+                .iter()
+                .all(|node| *node == NodeReference::EMPTY)
+        );
         assert_eq!(table.reply_endpoint(session, 4), Err(Error::StaleSession));
         assert!(table.connect(4, 11).is_ok());
     }

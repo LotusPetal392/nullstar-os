@@ -200,9 +200,10 @@ and staged path to a NullStar backend service are in the
 [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 The current implementation completes the shared wire contract, typed request
-builders, bounded service session and buffer tables, monotonic tmpfs node IDs,
-root-relative lookup, node attributes, shared-memory reads and writes, identity
-validation, file create/open, stable directory iteration, and unit tests. The
+builders, bounded service session, buffer, and open-node reference tables,
+monotonic tmpfs node IDs, root-relative lookup, node attributes, shared-memory
+reads and writes, identity validation, file create/open/close, stable directory
+iteration, and unit tests. The
 service accepts generic and legacy requests on the same endpoint, and the boot
 probe verifies shared data visibility plus generic creation and enumeration.
 The userspace `tmpfs::Mount` compatibility API now translates its bounded
@@ -227,7 +228,10 @@ back into the unchanged file-descriptor syscall ABI. Directory iteration
 validates fixed records, monotonic cookies, names, and end-of-directory state
 before producing the existing syscall records. The obsolete per-request legacy
 kernel transport has been removed. The initial kernel generic path deliberately
-allows one outstanding request at a time.
+allows one outstanding request at a time. Final node releases use that same
+serialized channel through a bounded kernel cleanup queue; interrupted requests
+remain owned until their late reply is drained so they cannot be mistaken for a
+later close reply.
 
 The first part of migration step 4 is now present as a separately supervised
 `/vfs-service`. Its versioned protocol accepts canonical absolute paths and
@@ -257,8 +261,22 @@ Unresolved descendants remain absent until a filesystem or service is mounted
 there. Route replies are checked against the kernel's expected longest-prefix
 result before backend dispatch.
 
-Tmpfs now separates namespace linkage from node lifetime: unlink removes the
-name immediately while existing node-ID descriptors remain readable and
-writable. Unlinked nodes are deliberately retained for the bounded service
-generation. Completing `CLOSE_NODE` accounting is the next descriptor-lifetime
-step needed to reclaim those tombstones before restart.
+Tmpfs separates namespace linkage from node lifetime: unlink removes the name
+immediately while existing open node-ID descriptions remain readable and
+writable. `LOOKUP` and `CREATE_FILE` return identity without acquiring an open
+reference; each successful `OPEN` records exactly one session-owned reference.
+`CLOSE_NODE` releases one such reference, and `DISCONNECT` releases every
+reference still owned by that session. An unlinked node is reclaimed only after
+its global open count reaches zero, and reclaimed storage slots receive a new
+monotonic node ID when reused.
+
+The kernel maps that contract to open-file descriptions rather than descriptor
+numbers. `dup`, `dup2`, fork inheritance, and file-backed standard streams share
+the same description, so closing one alias cannot close the service node early.
+The description's final destruction—through explicit close, close-on-exec, or
+process reap—queues one generation- and session-bound `CLOSE_NODE`. Old tickets
+are never sent to a replacement service session. Accepted close requests are not
+blindly replayed because a lost or malformed reply cannot prove whether the
+service already decremented the reference; explicit `TRY_AGAIN` is the only
+retryable close status, while malformed replies leave the proxy fail-stopped
+until service replacement rather than risking a double close.

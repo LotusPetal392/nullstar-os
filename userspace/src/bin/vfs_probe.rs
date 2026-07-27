@@ -164,6 +164,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     ) else {
         syscall::exit(6);
     };
+    let Ok(duplicate) = platform::dup(tmp_file) else {
+        syscall::exit(6);
+    };
     let mut unlinked_bytes = [0_u8; 11];
     if syscall::write_all(tmp_file, b"routed open").is_err()
         || platform::stat(b"/tmp/vfs-open-probe")
@@ -172,12 +175,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             != Some(file::KIND_FILE)
         || platform::unlink(b"/tmp/vfs-open-probe").is_err()
         || platform::stat(b"/tmp/vfs-open-probe").err() != Some(platform::Errno::NO_ENTRY)
-        || syscall::seek(tmp_file, syscall::SeekFrom::Start(0)).ok() != Some(0)
-        || syscall::read(tmp_file, &mut unlinked_bytes).ok() != Some(unlinked_bytes.len())
-        || unlinked_bytes != *b"routed open"
         || syscall::close(tmp_file).is_err()
+        || syscall::yield_now().is_err()
+        || syscall::yield_now().is_err()
+        || syscall::seek(duplicate, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || syscall::read(duplicate, &mut unlinked_bytes).ok() != Some(unlinked_bytes.len())
+        || unlinked_bytes != *b"routed open"
+        || syscall::close(duplicate).is_err()
     {
         syscall::exit(6);
+    }
+    for _ in 0..33 {
+        let Some(file) = open_with_retry(
+            b"/tmp/vfs-close-reuse-probe",
+            syscall::OpenFlags::READ
+                | syscall::OpenFlags::WRITE
+                | syscall::OpenFlags::CREATE
+                | syscall::OpenFlags::TRUNCATE,
+        ) else {
+            syscall::exit(6);
+        };
+        if platform::unlink(b"/tmp/vfs-close-reuse-probe").is_err()
+            || syscall::close(file).is_err()
+            || syscall::yield_now().is_err()
+        {
+            syscall::exit(6);
+        }
     }
     if !directory_contains(
         b"/",
@@ -224,6 +247,19 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(13);
     }
     syscall::exit(0)
+}
+
+fn open_with_retry(path: &[u8], flags: syscall::OpenFlags) -> Option<syscall::FileDescriptor> {
+    for _ in 0..8 {
+        match syscall::open(path, flags) {
+            Ok(descriptor) => return Some(descriptor),
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                syscall::yield_now().ok()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn directory_contains(path: &[u8], names: &[&[u8]]) -> bool {
