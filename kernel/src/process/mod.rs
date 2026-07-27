@@ -10,6 +10,7 @@ mod userspace_legacy {
     include!("userspace_platform/process.rs");
     include!("userspace_platform/process_group_entry.rs");
     include!("userspace_platform/capability_entry.rs");
+    include!("userspace_platform/block_device_endpoint.rs");
     include!("userspace_platform/capability_grant_entry.rs");
     include!("userspace_platform/blocking_ipc_entry.rs");
 }

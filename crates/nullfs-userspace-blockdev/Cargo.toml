@@ -1,5 +1,5 @@
 [package]
-name = "nullfs-core"
+name = "nullfs-userspace-blockdev"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
@@ -7,8 +7,7 @@ repository = "https://github.com/LotusPetal392/nullstar-os"
 
 [dependencies]
 nullfs-blockdev = { path = "../nullfs-blockdev", default-features = false }
-nullfs-format = { path = "../nullfs-format" }
+userspace = { path = "../../userspace" }
 
-[dev-dependencies]
-nullfs-blockdev = { path = "../nullfs-blockdev", features = ["memory"] }
-nullfs-testkit = { path = "../nullfs-testkit" }
+[lib]
+path = "src/lib.rs"

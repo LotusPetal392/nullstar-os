@@ -2,10 +2,11 @@
 
 //! Checked block-device interfaces shared by NullFS core code and host tools.
 
+#[cfg(any(feature = "memory", test))]
 extern crate alloc;
 
-use alloc::vec;
-use alloc::vec::Vec;
+#[cfg(any(feature = "memory", test))]
+use alloc::{vec, vec::Vec};
 use core::fmt;
 
 #[cfg(feature = "std")]
@@ -74,6 +75,7 @@ pub fn checked_block_range(
     Ok(start..end)
 }
 
+#[cfg(any(feature = "memory", test))]
 #[derive(Debug, Clone)]
 pub struct MemoryBlockDevice {
     block_size: usize,
@@ -81,6 +83,7 @@ pub struct MemoryBlockDevice {
     bytes: Vec<u8>,
 }
 
+#[cfg(any(feature = "memory", test))]
 impl MemoryBlockDevice {
     pub fn new(block_size: usize, block_count: u64) -> Result<Self, BlockDeviceError> {
         if block_size == 0 {
@@ -102,6 +105,7 @@ impl MemoryBlockDevice {
     }
 }
 
+#[cfg(any(feature = "memory", test))]
 impl BlockDevice for MemoryBlockDevice {
     fn block_size(&self) -> usize {
         self.block_size

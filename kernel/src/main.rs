@@ -265,6 +265,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         None
     };
 
+    if let Some(partitions) = partition_inventory.as_ref() {
+        let configured = userspace::configure_block_device_endpoints(partitions);
+        serial_println!("read-only block-device endpoints configured: partitions={configured}");
+    }
+
     let mut filesystem_info = match partition_inventory.as_ref() {
         Some(partitions) => match fat::init(partitions) {
             Ok(info) => {

@@ -10,8 +10,10 @@ This roadmap describes intended work. Phases 1 and 2 now include the
 `nullfs-format`, `nullfs-blockdev`, `nullfs-core`, and `nullfs-testkit` crates;
 mountable Phase 2 output from `mkfs-nullfs`; inspection through `nullfs-info`;
 deterministic source-tree population through `nullfs-image`; and an optional
-Linux read-only `nullfs-fuse` adapter. Writable operation, repair tooling, and
-the NullStar filesystem service remain future work.
+Linux read-only `nullfs-fuse` adapter. Writable core operation and checking are
+implemented; offline repair policy and the NullStar filesystem service remain
+future work. The service now has a read-only capability-based partition boundary
+and a `nullfs_blockdev::BlockDevice` adapter as its storage foundation.
 
 ## Architectural position
 
@@ -54,8 +56,9 @@ point inward:
 - **core crate**: allocation, namespace, metadata, file I/O, transactions, and
   recovery over narrow storage and clock traits; independent of FUSE and
   NullStar IPC;
-- **storage adapters**: checked access to files, memory images, and eventually a
-  NullStar block-device service or capability;
+- **storage adapters**: checked access to files, memory images, and the
+  capability-based NullStar block-device endpoint described in
+  [`../block-device-service-protocol.md`](../block-device-service-protocol.md);
 - **service adapter**: maps the common filesystem-service protocol to core
   operations and maintains sessions, generation-bound node handles, registered
   buffers, and error translation;
@@ -227,7 +230,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ## Phase 4: NullStar filesystem service
 
 Add the NullFS userspace service as another backend behind the common protocol;
-do not route clients directly to a NullFS-specific endpoint.
+do not route clients directly to a NullFS-specific endpoint. The read-only
+partition endpoint, typed session client, and `nullfs_blockdev::BlockDevice`
+adapter are complete prerequisites; the next service milestone should mount a
+NullFS image through that adapter and expose read-only filesystem operations.
 
 The service adapter must:
 

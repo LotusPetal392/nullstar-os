@@ -6,5 +6,5 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/LotusPetal392/nullstar-os"
 
 [dependencies]
-nullfs-blockdev = { path = "../../crates/nullfs-blockdev" }
+nullfs-blockdev = { path = "../../crates/nullfs-blockdev", features = ["std"] }
 nullfs-format = { path = "../../crates/nullfs-format" }
