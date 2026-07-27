@@ -1,0 +1,13 @@
+[package]
+name = "nullfs-core"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/LotusPetal392/nullstar-os"
+
+[dependencies]
+nullfs-blockdev = { path = "../nullfs-blockdev", default-features = false }
+nullfs-format = { path = "../nullfs-format" }
+
+[dev-dependencies]
+nullfs-testkit = { path = "../nullfs-testkit" }
