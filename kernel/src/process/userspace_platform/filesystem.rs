@@ -12,6 +12,15 @@ fn platform_stat(
         Ok(path) => path,
         Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
+    if vfs_route_ready() {
+        return vfs_route_stat(
+            process_id,
+            &path,
+            stat_address,
+            stat_length,
+            current_stack_pointer,
+        );
+    }
     if tmpfs_proxy_state().is_some() {
         match tmpfs_proxy_path(&path) {
             Ok(Some(_)) => {
@@ -70,6 +79,16 @@ fn platform_read_directory(
         Ok(path) => path,
         Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
+    if vfs_route_ready() {
+        return vfs_route_read_directory(
+            process_id,
+            &path,
+            start_index,
+            records_address,
+            capacity,
+            current_stack_pointer,
+        );
+    }
     if tmpfs_proxy_state().is_some() {
         match tmpfs_proxy_path(&path) {
             Ok(Some(TmpfsProxyPath::Directory)) => {
@@ -107,22 +126,60 @@ fn platform_read_directory(
     ControlOutcome::Ready(written as u64)
 }
 
-fn platform_chdir(process_id: u64, path_address: u64, path_length: u64) -> u64 {
+fn platform_chdir(
+    process_id: u64,
+    path_address: u64,
+    path_length: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
     let path = match platform_user_path(process_id, path_address, path_length) {
         Ok(path) => path,
-        Err(error) => return error_return(error),
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
+    if vfs_route_ready() {
+        return vfs_route_chdir(process_id, &path, current_stack_pointer);
+    }
     let metadata = match vfs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) => return error_return(platform_vfs_errno(&error)),
+        Err(error) => {
+            return ControlOutcome::Ready(error_return(platform_vfs_errno(&error)));
+        }
     };
     if !metadata.is_directory() {
-        return error_return(abi::errno::NOT_DIRECTORY);
+        return ControlOutcome::Ready(error_return(abi::errno::NOT_DIRECTORY));
     }
-    match platform_set_working_directory(process_id, &metadata.path) {
+    ControlOutcome::Ready(match platform_set_working_directory(process_id, &metadata.path) {
         Ok(()) => 0,
         Err(error) => error_return(error),
+    })
+}
+
+fn platform_unlink(
+    process_id: u64,
+    path_address: u64,
+    path_length: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
+    let path = match platform_user_path(process_id, path_address, path_length) {
+        Ok(path) => path,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    if vfs_route_ready() {
+        return vfs_route_unlink(process_id, &path, current_stack_pointer);
     }
+    if tmpfs_proxy_state().is_some() {
+        return match tmpfs_proxy_path(&path) {
+            Ok(Some(TmpfsProxyPath::Directory)) => {
+                ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
+            }
+            Ok(Some(TmpfsProxyPath::File(_))) => {
+                tmpfs_proxy_unlink(process_id, &path, current_stack_pointer)
+            }
+            Ok(None) => ControlOutcome::Ready(error_return(ERR_NOT_IMPLEMENTED)),
+            Err(error) => ControlOutcome::Ready(error_return(error)),
+        };
+    }
+    ControlOutcome::Ready(error_return(ERR_NOT_IMPLEMENTED))
 }
 
 fn platform_getcwd(process_id: u64, address: u64, capacity: u64) -> u64 {
@@ -231,6 +288,9 @@ fn platform_working_directory(process_id: u64) -> String {
     };
     if !candidate.starts_with('/') {
         return String::from("/");
+    }
+    if vfs_route_ready() && vfs_is_declared_namespace_directory(&candidate) {
+        return candidate;
     }
     match vfs::metadata(&candidate) {
         Ok(metadata) if metadata.is_directory() => metadata.path,

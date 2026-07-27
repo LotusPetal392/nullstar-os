@@ -218,11 +218,26 @@ direct children. Other targets return `EPERM`; missing or completed targets
 return `ESRCH`. Process-group signaling and shell job control continue to use
 the existing group-oriented syscall.
 
+## Version 1.6 pathname mutation
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 51 | `unlink` | path address, path bytes | zero |
+
+`capability::PATH_MUTATION` advertises this operation. The initial
+service-backed implementation removes flat files beneath `/tmp`; namespace
+directory nodes return `EISDIR`, and boot-FAT deletion remains unavailable
+until FAT is behind the generic filesystem protocol.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
 - ABI 1.2 adds protection calls 35 through 48 and capability feature bits.
 - ABI 1.4 adds PID-1 tmpfs service registration at syscall 49.
+- ABI 1.5 adds PID-1 VFS routing service registration at syscall 50. The
+  kernel retains the send endpoint and completes a versioned root-route
+  handshake asynchronously before treating the service as ready.
+- ABI 1.6 adds VFS-routed pathname deletion at syscall 51.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

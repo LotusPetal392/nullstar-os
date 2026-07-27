@@ -134,6 +134,35 @@ bounded buffers and wake blocked readers or writers as state changes. The
 terminal tracks a foreground process group so keyboard-generated interrupt and
 stop events reach the correct pipeline.
 
+The next filesystem boundary is defined by the versioned userspace
+[filesystem service protocol](filesystem-service-protocol.md). It introduces
+session-scoped node IDs, directory-relative lookup, request IDs, cancellation,
+and registered shared-memory windows. The tmpfs service is the active `/tmp`
+data path through the generic protocol. A separately supervised userspace VFS
+service now owns a versioned longest-prefix namespace table and validates the
+intended mount layout during boot. `stat`, path-based `read_directory`,
+`chdir`, descriptor-producing `open`, and `unlink` now cross that service
+boundary, including synthetic directory metadata and merged namespace listings
+for VFS-owned nodes; other kernel file operations still use the backend
+recorded by the resulting descriptor while their service-owned open-file state
+is being developed.
+
+The intended rooted namespace includes service-backed `/dev` and `/tmp` mounts,
+a system hierarchy under `/System` (`config`, `var/log`, `bin`, `services`,
+`drivers`, `lib`, and `Applications`), user homes under `/Users`, and globally
+installed applications under `/Applications`. Additional local, removable, and
+network filesystems appear as named children of `/Volumes`. The VFS service
+will hide mount crossings from clients while preserving node and volume
+identity as routing and open-file ownership move out of the kernel.
+
+NullFS is the planned native persistent backend for that service architecture,
+not a new kernel-specific filesystem path. Its shared `no_std` format/core code
+is reused by host formatter, image, inspector, checker, and Linux FUSE tooling.
+The host implementation supports the version 1.2 inode/directory format,
+authoritative allocation maps, bounded data-journaling redo transactions,
+persistent orphan recovery, and deterministic crash testing. NullStar service
+integration remains a later stage in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
+
 ## Shells
 
 The kernel shell in `kernel/src/shell.rs` is a diagnostic and control surface.

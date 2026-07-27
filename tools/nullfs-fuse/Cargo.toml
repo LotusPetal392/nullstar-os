@@ -1,0 +1,24 @@
+[package]
+name = "nullfs-fuse"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/LotusPetal392/nullstar-os"
+
+
+[features]
+default = []
+fuse = ["dep:fuser"]
+
+[[bin]]
+name = "nullfs-fuse"
+path = "src/main.rs"
+required-features = ["fuse"]
+
+[dependencies]
+nullfs-blockdev = { path = "../../crates/nullfs-blockdev" }
+nullfs-core = { path = "../../crates/nullfs-core" }
+nullfs-format = { path = "../../crates/nullfs-format" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "=0.18.0", default-features = false, optional = true }

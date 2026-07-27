@@ -123,6 +123,19 @@ pub fn chdir(path: &[u8]) -> Result<()> {
     decode(result).map(|_| ())
 }
 
+pub fn unlink(path: &[u8]) -> Result<()> {
+    let mut result = syscall::UNLINK;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") path.as_ptr() as u64,
+            in("rsi") path.len() as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
 pub fn getcwd(buffer: &mut [u8]) -> Result<&[u8]> {
     let mut result = syscall::GETCWD;
     unsafe {
@@ -216,6 +229,19 @@ pub fn set_process_group(
 
 pub fn register_tmpfs_service(service: FileDescriptor, generation: u32) -> Result<()> {
     let mut result = syscall::REGISTER_TMPFS_SERVICE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") service,
+            in("rsi") generation as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn register_vfs_service(service: FileDescriptor, generation: u32) -> Result<()> {
+    let mut result = syscall::REGISTER_VFS_SERVICE;
     unsafe {
         asm!(
             "int 0x80",

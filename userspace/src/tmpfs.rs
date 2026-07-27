@@ -1,8 +1,14 @@
-//! Client helpers for the supervised userspace tmpfs service.
+//! Compatibility helpers for the supervised userspace tmpfs service.
+//!
+//! The public `Mount` API retains the original bounded tmpfs interface while
+//! translating every operation to the generic filesystem-service protocol.
 
-use core::{mem::size_of, slice};
+use core::mem::size_of;
 
-use crate::ipc::{self, CapabilityHandle, Rights, Transfer};
+use crate::{
+    filesystem::{self, Node},
+    ipc::{self, CapabilityHandle},
+};
 
 pub mod protocol {
     include!(concat!(
@@ -23,21 +29,17 @@ pub enum Error {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mount {
-    service: CapabilityHandle,
+    session: filesystem::Session,
     generation: u32,
 }
 
 impl Mount {
     pub fn connect(service: CapabilityHandle) -> Result<Self, Error> {
-        let mut request_value = protocol::Request::EMPTY;
-        request_value.operation = protocol::operation::MOUNT;
-        let reply = request(service, &request_value)?;
-        if reply.generation == 0 {
-            return Err(Error::Transport);
-        }
+        let session = filesystem::connect_service(service, 1).map_err(map_error)?;
+        let generation = u32::try_from(session.generation()).map_err(|_| Error::Transport)?;
         Ok(Self {
-            service,
-            generation: reply.generation,
+            session,
+            generation,
         })
     }
 
@@ -49,172 +51,201 @@ impl Mount {
         if bytes.len() > protocol::MAX_DATA_BYTES {
             return Err(Error::Range);
         }
-        let mut request_value = named(protocol::operation::WRITE, self.generation, name)?;
-        request_value.data_length = bytes.len() as u16;
-        request_value.data[..bytes.len()].copy_from_slice(bytes);
-        request(self.service, &request_value).map(|reply| reply.value as usize)
+        validate_name(name)?;
+        let node = match self.session.lookup_node(2, Node::root(self.session), name) {
+            Ok(node) => node,
+            Err(filesystem::Error::NotFound) => self
+                .session
+                .create_file(3, Node::root(self.session), name, true, false)
+                .map_err(map_error)?,
+            Err(error) => return Err(map_error(error)),
+        };
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.with_shared_buffer(bytes.len(), |handle, bulk| {
+            if ipc::shared_memory_write(handle, 0, bytes).ok() != Some(bytes.len()) {
+                return Err(Error::Transport);
+            }
+            self.session
+                .write_from_shared_buffer(5, node, 0, bulk, false)
+                .map_err(map_error)
+        })
     }
 
     pub fn read(self, name: &[u8], offset: usize, buffer: &mut [u8]) -> Result<usize, Error> {
         if buffer.len() > protocol::MAX_DATA_BYTES {
             return Err(Error::Range);
         }
-        let mut request_value = named(protocol::operation::READ, self.generation, name)?;
-        request_value.offset = u32::try_from(offset).map_err(|_| Error::Range)?;
-        request_value.data_length = buffer.len() as u16;
-        let reply = request(self.service, &request_value)?;
-        let count = reply.data_length as usize;
-        if count > buffer.len() || count > reply.data.len() {
-            return Err(Error::Transport);
+        validate_name(name)?;
+        if buffer.is_empty() {
+            return Ok(0);
         }
-        buffer[..count].copy_from_slice(&reply.data[..count]);
-        Ok(count)
+        let node = self
+            .session
+            .lookup_node(2, Node::root(self.session), name)
+            .map_err(map_error)?;
+        self.with_shared_buffer(buffer.len(), |handle, bulk| {
+            let count = self
+                .session
+                .read_to_shared_buffer(5, node, offset as u64, bulk)
+                .map_err(map_error)?;
+            if count > buffer.len()
+                || ipc::shared_memory_read(handle, 0, &mut buffer[..count]).ok() != Some(count)
+            {
+                return Err(Error::Transport);
+            }
+            Ok(count)
+        })
     }
 
     pub fn stat(self, name: &[u8]) -> Result<usize, Error> {
-        let request_value = named(protocol::operation::STAT, self.generation, name)?;
-        request(self.service, &request_value).map(|reply| reply.value as usize)
+        validate_name(name)?;
+        let node = self
+            .session
+            .lookup_node(2, Node::root(self.session), name)
+            .map_err(map_error)?;
+        let attributes = self.session.attributes(3, node).map_err(map_error)?;
+        usize::try_from(attributes.size).map_err(|_| Error::Range)
     }
 
     pub fn remove(self, name: &[u8]) -> Result<(), Error> {
-        let request_value = named(protocol::operation::REMOVE, self.generation, name)?;
-        request(self.service, &request_value).map(|_| ())
+        validate_name(name)?;
+        self.session
+            .unlink(2, Node::root(self.session), name)
+            .map_err(map_error)
     }
 
     pub fn list(self, buffer: &mut [u8]) -> Result<usize, Error> {
         if buffer.len() > protocol::MAX_DATA_BYTES {
             return Err(Error::Range);
         }
-        let mut request_value = protocol::Request::EMPTY;
-        request_value.operation = protocol::operation::LIST;
-        request_value.generation = self.generation;
-        request_value.data_length = buffer.len() as u16;
-        let reply = request(self.service, &request_value)?;
-        let count = reply.data_length as usize;
-        if count > buffer.len() || count > reply.data.len() {
-            return Err(Error::Transport);
+        if buffer.is_empty() {
+            return Ok(0);
         }
-        buffer[..count].copy_from_slice(&reply.data[..count]);
-        Ok(count)
+        let directory_bytes =
+            protocol::MAX_FILES * size_of::<filesystem::protocol::DirectoryEntry>();
+        self.with_shared_buffer(directory_bytes, |handle, bulk| {
+            let batch = self
+                .session
+                .read_directory_to_shared_buffer(5, Node::root(self.session), 0, bulk)
+                .map_err(map_error)?;
+            if !batch.end || batch.count > protocol::MAX_FILES {
+                return Err(Error::Transport);
+            }
+            let mut entry_bytes = [0_u8; size_of::<filesystem::protocol::DirectoryEntry>()];
+            let mut cursor = 0usize;
+            for index in 0..batch.count {
+                let offset = index * entry_bytes.len();
+                if ipc::shared_memory_read(handle, offset, &mut entry_bytes).ok()
+                    != Some(entry_bytes.len())
+                {
+                    return Err(Error::Transport);
+                }
+                let entry = unsafe {
+                    core::ptr::read_unaligned(
+                        entry_bytes.as_ptr() as *const filesystem::protocol::DirectoryEntry
+                    )
+                };
+                let name_length = usize::from(entry.name_length);
+                if name_length == 0 || name_length > entry.name.len() {
+                    return Err(Error::Transport);
+                }
+                let separator = usize::from(cursor != 0);
+                let Some(end) = cursor
+                    .checked_add(separator)
+                    .and_then(|value| value.checked_add(name_length))
+                else {
+                    return Err(Error::Range);
+                };
+                if end > buffer.len() {
+                    break;
+                }
+                if separator != 0 {
+                    buffer[cursor] = b'\n';
+                    cursor += 1;
+                }
+                buffer[cursor..end].copy_from_slice(&entry.name[..name_length]);
+                cursor = end;
+            }
+            Ok(cursor)
+        })
+    }
+
+    pub fn disconnect(self) -> Result<(), Error> {
+        self.session.disconnect(7).map_err(map_error)
+    }
+
+    fn with_shared_buffer<T>(
+        self,
+        length: usize,
+        operation: impl FnOnce(CapabilityHandle, filesystem::protocol::BulkBuffer) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if length == 0 {
+            return Err(Error::Range);
+        }
+        const BUFFER_ID: u64 = 1;
+        let handle = ipc::shared_memory_create(length).map_err(|_| Error::Transport)?;
+        if let Err(error) = self
+            .session
+            .attach_shared_buffer(4, BUFFER_ID, handle, length)
+            .map_err(map_error)
+        {
+            let _ = ipc::close(handle);
+            return Err(error);
+        }
+        let bulk = filesystem::protocol::BulkBuffer {
+            buffer_id: BUFFER_ID,
+            offset: 0,
+            length: length as u64,
+        };
+        let result = operation(handle, bulk);
+        let detached = self
+            .session
+            .detach_shared_buffer(6, BUFFER_ID)
+            .map_err(map_error);
+        let closed = ipc::close(handle).map_err(|_| Error::Transport);
+        detached?;
+        closed?;
+        result
     }
 }
 
-fn bytes_of<T>(value: &T) -> &[u8] {
-    unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
-}
-
-fn request(
-    service: CapabilityHandle,
-    request: &protocol::Request,
-) -> Result<protocol::Reply, Error> {
-    let reply_endpoint = ipc::endpoint_create().map_err(|_| Error::Transport)?;
-    let send_result = ipc::send(
-        service,
-        bytes_of(request),
-        Some(Transfer {
-            handle: reply_endpoint,
-            rights: Rights::SEND,
-        }),
-    );
-    if send_result.is_err() {
-        let _ = ipc::close(reply_endpoint);
-        return Err(Error::Transport);
-    }
-
-    // Keep the boot-critical tmpfs path on the proven cooperative receive loop
-    // until ENDPOINT_WAIT has an isolated runtime wake/cancellation probe.
-    let mut bytes = [0_u8; size_of::<protocol::Reply>()];
-    let message = ipc::receive(reply_endpoint, &mut bytes).map_err(|_| Error::Transport)?;
-    let _ = ipc::close(reply_endpoint);
-    if message.capability.is_some() || message.bytes != bytes.len() {
-        return Err(Error::Transport);
-    }
-    let reply = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const protocol::Reply) };
-    if !valid_reply(request, &reply) {
-        return Err(Error::Transport);
-    }
-    match reply.status {
-        protocol::status::OK => Ok(reply),
-        protocol::status::INVALID => Err(Error::Invalid),
-        protocol::status::NOT_FOUND => Err(Error::NotFound),
-        protocol::status::NO_SPACE => Err(Error::NoSpace),
-        protocol::status::RANGE => Err(Error::Range),
-        protocol::status::STALE_MOUNT => Err(Error::StaleMount),
-        _ => Err(Error::Transport),
-    }
-}
-
-fn valid_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
-    let generation_matches = if request.operation == protocol::operation::MOUNT {
-        reply.generation != 0
-    } else {
-        reply.generation == request.generation
-    };
-    reply.version == protocol::VERSION
-        && reply.operation == request.operation
-        && generation_matches
-        && reply.reserved == 0
-        && usize::from(reply.data_length) <= protocol::MAX_DATA_BYTES
-}
-
-fn named(operation: u16, generation: u32, name: &[u8]) -> Result<protocol::Request, Error> {
+fn validate_name(name: &[u8]) -> Result<(), Error> {
     if name.is_empty() || name.len() > protocol::MAX_NAME_BYTES || name.contains(&b'/') {
         return Err(Error::Invalid);
     }
-    let mut request = protocol::Request::EMPTY;
-    request.operation = operation;
-    request.generation = generation;
-    request.name_length = name.len() as u16;
-    request.name[..name.len()].copy_from_slice(name);
-    Ok(request)
+    Ok(())
+}
+
+fn map_error(error: filesystem::Error) -> Error {
+    match error {
+        filesystem::Error::InvalidName
+        | filesystem::Error::InvalidRequestId
+        | filesystem::Error::InvalidSession
+        | filesystem::Error::InvalidNode
+        | filesystem::Error::InvalidBuffer
+        | filesystem::Error::InvalidFlags => Error::Invalid,
+        filesystem::Error::Range => Error::Range,
+        filesystem::Error::NotFound => Error::NotFound,
+        filesystem::Error::StaleSession | filesystem::Error::StaleNode => Error::StaleMount,
+        filesystem::Error::Service(filesystem::protocol::status::NO_SPACE) => Error::NoSpace,
+        filesystem::Error::Transport | filesystem::Error::Service(_) => Error::Transport,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::mem::size_of;
-
-    use super::{named, protocol, valid_reply};
+    use super::{Error, protocol, validate_name};
 
     #[test]
-    fn protocol_records_fit_endpoint_messages() {
-        assert!(size_of::<protocol::Request>() <= 256);
-        assert!(size_of::<protocol::Reply>() <= 256);
-    }
-
-    #[test]
-    fn named_requests_preserve_mount_generation() {
-        let request = named(protocol::operation::STAT, 41, b"state").expect("valid request");
-        assert_eq!(request.version, protocol::VERSION);
-        assert_eq!(request.generation, 41);
-        assert_eq!(&request.name[..request.name_length as usize], b"state");
-    }
-
-    #[test]
-    fn replies_require_matching_generation_and_zero_reserved_fields() {
-        let request = named(protocol::operation::READ, 41, b"state").expect("valid request");
-        let mut reply = protocol::Reply::EMPTY;
-        reply.operation = request.operation;
-        reply.generation = request.generation;
-        assert!(valid_reply(&request, &reply));
-
-        reply.generation += 1;
-        assert!(!valid_reply(&request, &reply));
-        reply.generation = request.generation;
-        reply.reserved = 1;
-        assert!(!valid_reply(&request, &reply));
-        reply.reserved = 0;
-        reply.data_length = (protocol::MAX_DATA_BYTES + 1) as u16;
-        assert!(!valid_reply(&request, &reply));
-    }
-
-    #[test]
-    fn mount_replies_require_a_nonzero_generation() {
-        let mut request = protocol::Request::EMPTY;
-        request.operation = protocol::operation::MOUNT;
-        let mut reply = protocol::Reply::EMPTY;
-        reply.operation = protocol::operation::MOUNT;
-        assert!(!valid_reply(&request, &reply));
-        reply.generation = 1;
-        assert!(valid_reply(&request, &reply));
+    fn compatibility_names_keep_the_legacy_bound() {
+        assert_eq!(validate_name(b""), Err(Error::Invalid));
+        assert_eq!(validate_name(b"a/b"), Err(Error::Invalid));
+        assert_eq!(
+            validate_name(&[b'x'; protocol::MAX_NAME_BYTES + 1]),
+            Err(Error::Invalid)
+        );
+        assert_eq!(validate_name(b"state"), Ok(()));
     }
 }

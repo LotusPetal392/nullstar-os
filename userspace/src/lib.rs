@@ -4,6 +4,8 @@
 pub mod args;
 pub mod blocking_ipc;
 pub mod environment;
+pub mod filesystem;
+pub mod filesystem_service;
 pub mod heap;
 pub mod ipc;
 pub mod platform;
@@ -13,6 +15,7 @@ pub mod syscall;
 #[path = "syscall.rs"]
 mod syscall_legacy;
 pub mod tmpfs;
+pub mod vfs;
 
 pub mod abi {
     include!(concat!(
