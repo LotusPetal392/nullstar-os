@@ -6,6 +6,9 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/LotusPetal392/nullstar-os"
 build = "build.rs"
 
+[dependencies]
+nullfs-format = { path = "../crates/nullfs-format" }
+
 [[bin]]
 name = "init"
 path = "src/main.rs"

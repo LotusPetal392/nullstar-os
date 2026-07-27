@@ -20,6 +20,11 @@ const INIT_READY: &[u8] = b"userspace init ready: pid=1\n";
 const BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe";
 const BLOCK_DEVICE_PROBE_FAILED: &[u8] = b"userspace init: read-only block-device probe failed\n";
 const BLOCK_DEVICE_PROBE_PASSED: &[u8] = b"userspace init: read-only block-device probe passed\n";
+const NULLFS_BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe nullfs";
+const NULLFS_BLOCK_DEVICE_PROBE_FAILED: &[u8] =
+    b"userspace init: read-only NullFS partition probe failed\n";
+const NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
+    b"userspace init: read-only NullFS partition probe passed\n";
 const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to acquire block-device endpoint\n";
 const SERVICE_COMMAND: &[u8] = b"/tmpfs-service";
@@ -124,6 +129,25 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         BLOCK_DEVICE_PROBE_PASSED,
     );
     ipc::close(block_device_endpoint).unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+
+    let nullfs_block_device_endpoint = platform::open_block_device_endpoint(3)
+        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+    if !matches!(
+        ipc::info(nullfs_block_device_endpoint),
+        Ok(info)
+            if info.kind == ipc::ObjectKind::Endpoint
+                && info.rights == (Rights::SEND | Rights::TRANSFER)
+    ) {
+        fail(BLOCK_DEVICE_BOOTSTRAP_FAILED);
+    }
+    run_probe(
+        NULLFS_BLOCK_DEVICE_PROBE_COMMAND,
+        nullfs_block_device_endpoint,
+        NULLFS_BLOCK_DEVICE_PROBE_FAILED,
+        NULLFS_BLOCK_DEVICE_PROBE_PASSED,
+    );
+    ipc::close(nullfs_block_device_endpoint)
+        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
 
     let readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
