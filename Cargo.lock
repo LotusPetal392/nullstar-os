@@ -437,6 +437,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nullfs-service"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "nullfs-core",
+ "nullfs-format",
+ "nullfs-userspace-blockdev",
+ "spin 0.10.1",
+ "userspace",
+]
+
+[[package]]
 name = "nullfs-testkit"
 version = "0.1.0"
 dependencies = [
@@ -461,6 +473,7 @@ dependencies = [
  "kernel",
  "nullfs-blockdev",
  "nullfs-format",
+ "nullfs-service",
  "nullfs-testkit",
  "userspace",
 ]

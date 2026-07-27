@@ -169,9 +169,13 @@ buffer reads. Boot images now include a deterministic, 4096-byte-aligned NullFS
 partition that is identified explicitly in the MBR and validated through the real
 userspace endpoint during normal boot. The adapter aggregates the endpoint's
 512-byte device logical blocks into the 4096-byte blocks required by the shared
-NullFS core. The endpoint
-remains intentionally read-only; writable NullFS service integration still
-requires an explicit grant policy and durability validation as described in the
+NullFS core. A separately supervised `nullfs-service` mounts the partition and
+serves lookup, attributes, read-only open, file reads, paginated directory
+iteration, and `CLOSE_NODE` through the common filesystem protocol. A direct
+userspace protocol probe verifies those operations before normal boot continues;
+VFS mount registration remains separate policy work. The endpoint remains
+intentionally read-only. Writable NullFS integration still requires an explicit
+grant policy and durability validation as described in the
 [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
@@ -206,6 +210,9 @@ kernel state forever. Important current limits include:
 | tmpfs files | 32 |
 | tmpfs file size | 64 KiB |
 | tmpfs total size | 256 KiB |
+| NullFS service sessions | 4 |
+| NullFS open references per session | 64 |
+| NullFS service heap | 2 MiB |
 | FAT read/write window per file | 1 MiB |
 
 The constants in the implementation remain authoritative. Shared userspace ABI

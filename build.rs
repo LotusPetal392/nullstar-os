@@ -10,7 +10,7 @@ use nullfs_testkit::ImageBuilder;
 const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n";
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
-const NULLFS_BLOCK_COUNT: u64 = 1024;
+const NULLFS_BLOCK_COUNT: u64 = 256;
 const NULLFS_LABEL: &str = "NULLSTAR_DATA";
 const NULLFS_UUID: [u8; 16] = [
     0x4e, 0x75, 0x6c, 0x6c, 0x53, 0x74, 0x61, 0x72, 0x2d, 0x4e, 0x75, 0x6c, 0x6c, 0x46, 0x53, 0x01,
@@ -31,9 +31,17 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_init")
             .expect("userspace init artifact path was not set"),
     );
+    let userspace_nullfs_service = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_NULLFS_SERVICE_nullfs_service")
+            .expect("userspace NullFS service artifact path was not set"),
+    );
     let userspace_block_device_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_block_device_probe")
             .expect("userspace block-device-probe artifact path was not set"),
+    );
+    let userspace_nullfs_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_nullfs_probe")
+            .expect("userspace NullFS probe artifact path was not set"),
     );
     let userspace_tmpfs_service = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_tmpfs_service")
@@ -162,9 +170,14 @@ fn main() {
         image.set_file_contents(String::from("BOOTMODE"), boot_mode.to_vec());
         image.set_file(String::from("init"), userspace_init.clone());
         image.set_file(
+            String::from("nullfs-service"),
+            userspace_nullfs_service.clone(),
+        );
+        image.set_file(
             String::from("block-device-probe"),
             userspace_block_device_probe.clone(),
         );
+        image.set_file(String::from("nullfs-probe"), userspace_nullfs_probe.clone());
         image.set_file(
             String::from("tmpfs-service"),
             userspace_tmpfs_service.clone(),

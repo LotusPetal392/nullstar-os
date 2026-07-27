@@ -1,0 +1,29 @@
+[package]
+name = "nullfs-service"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/LotusPetal392/nullstar-os"
+build = "build.rs"
+
+[features]
+default = []
+freestanding = []
+
+[dependencies]
+nullfs-blockdev = { path = "../../crates/nullfs-blockdev", default-features = false }
+nullfs-core = { path = "../../crates/nullfs-core" }
+nullfs-format = { path = "../../crates/nullfs-format" }
+nullfs-userspace-blockdev = { path = "../../crates/nullfs-userspace-blockdev" }
+spin = "0.10"
+userspace = { path = ".." }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nullfs_service"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["freestanding"]
