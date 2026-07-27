@@ -154,6 +154,34 @@ fn platform_chdir(
     })
 }
 
+fn platform_unlink(
+    process_id: u64,
+    path_address: u64,
+    path_length: u64,
+    current_stack_pointer: usize,
+) -> ControlOutcome {
+    let path = match platform_user_path(process_id, path_address, path_length) {
+        Ok(path) => path,
+        Err(error) => return ControlOutcome::Ready(error_return(error)),
+    };
+    if vfs_route_ready() {
+        return vfs_route_unlink(process_id, &path, current_stack_pointer);
+    }
+    if tmpfs_proxy_state().is_some() {
+        return match tmpfs_proxy_path(&path) {
+            Ok(Some(TmpfsProxyPath::Directory)) => {
+                ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
+            }
+            Ok(Some(TmpfsProxyPath::File(_))) => {
+                tmpfs_proxy_unlink(process_id, &path, current_stack_pointer)
+            }
+            Ok(None) => ControlOutcome::Ready(error_return(ERR_NOT_IMPLEMENTED)),
+            Err(error) => ControlOutcome::Ready(error_return(error)),
+        };
+    }
+    ControlOutcome::Ready(error_return(ERR_NOT_IMPLEMENTED))
+}
+
 fn platform_getcwd(process_id: u64, address: u64, capacity: u64) -> u64 {
     let directory = platform_working_directory(process_id);
     let required = match directory.len().checked_add(1) {

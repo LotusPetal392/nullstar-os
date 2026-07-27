@@ -146,6 +146,39 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             syscall::exit(5);
         }
     }
+    let Ok(boot_file) = syscall::open(b"/hello.txt", syscall::OpenFlags::READ) else {
+        syscall::exit(6);
+    };
+    let mut first_byte = [0_u8; 1];
+    if syscall::read(boot_file, &mut first_byte).ok() != Some(1)
+        || syscall::close(boot_file).is_err()
+    {
+        syscall::exit(6);
+    }
+    let Ok(tmp_file) = syscall::open(
+        b"/tmp/vfs-open-probe",
+        syscall::OpenFlags::READ
+            | syscall::OpenFlags::WRITE
+            | syscall::OpenFlags::CREATE
+            | syscall::OpenFlags::TRUNCATE,
+    ) else {
+        syscall::exit(6);
+    };
+    let mut unlinked_bytes = [0_u8; 11];
+    if syscall::write_all(tmp_file, b"routed open").is_err()
+        || platform::stat(b"/tmp/vfs-open-probe")
+            .ok()
+            .map(|stat| stat.kind)
+            != Some(file::KIND_FILE)
+        || platform::unlink(b"/tmp/vfs-open-probe").is_err()
+        || platform::stat(b"/tmp/vfs-open-probe").err() != Some(platform::Errno::NO_ENTRY)
+        || syscall::seek(tmp_file, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || syscall::read(tmp_file, &mut unlinked_bytes).ok() != Some(unlinked_bytes.len())
+        || unlinked_bytes != *b"routed open"
+        || syscall::close(tmp_file).is_err()
+    {
+        syscall::exit(6);
+    }
     if !directory_contains(
         b"/",
         &[
@@ -169,26 +202,26 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         ],
     ) || !directory_contains(b"/System/var", &[b"log"])
     {
-        syscall::exit(6);
+        syscall::exit(7);
     }
     let mut cwd = [0_u8; 64];
     if platform::chdir(b"/System/var").is_err() {
-        syscall::exit(7);
-    }
-    if platform::getcwd(&mut cwd).ok() != Some(b"/System/var".as_slice()) {
         syscall::exit(8);
     }
-    if platform::chdir(b"/").is_err() {
+    if platform::getcwd(&mut cwd).ok() != Some(b"/System/var".as_slice()) {
         syscall::exit(9);
     }
-    if platform::chdir(b"/Volumes").is_err() {
+    if platform::chdir(b"/").is_err() {
         syscall::exit(10);
     }
-    if platform::getcwd(&mut cwd).ok() != Some(b"/Volumes".as_slice()) {
+    if platform::chdir(b"/Volumes").is_err() {
         syscall::exit(11);
     }
-    if platform::chdir(b"/").is_err() {
+    if platform::getcwd(&mut cwd).ok() != Some(b"/Volumes".as_slice()) {
         syscall::exit(12);
+    }
+    if platform::chdir(b"/").is_err() {
+        syscall::exit(13);
     }
     syscall::exit(0)
 }

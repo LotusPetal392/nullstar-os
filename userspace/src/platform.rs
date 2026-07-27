@@ -123,6 +123,19 @@ pub fn chdir(path: &[u8]) -> Result<()> {
     decode(result).map(|_| ())
 }
 
+pub fn unlink(path: &[u8]) -> Result<()> {
+    let mut result = syscall::UNLINK;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") path.as_ptr() as u64,
+            in("rsi") path.len() as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
 pub fn getcwd(buffer: &mut [u8]) -> Result<&[u8]> {
     let mut result = syscall::GETCWD;
     unsafe {

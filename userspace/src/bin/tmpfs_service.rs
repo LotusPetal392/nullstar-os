@@ -21,6 +21,7 @@ const READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
 #[derive(Clone, Copy)]
 struct File {
     used: bool,
+    linked: bool,
     node_id: u64,
     name_length: usize,
     name: [u8; protocol::MAX_NAME_BYTES],
@@ -31,6 +32,7 @@ struct File {
 impl File {
     const EMPTY: Self = Self {
         used: false,
+        linked: false,
         node_id: filesystem_protocol::INVALID_ID,
         name_length: 0,
         name: [0; protocol::MAX_NAME_BYTES],
@@ -39,7 +41,10 @@ impl File {
     };
 
     fn named(&self, name: &[u8]) -> bool {
-        self.used && self.name_length == name.len() && &self.name[..self.name_length] == name
+        self.used
+            && self.linked
+            && self.name_length == name.len()
+            && &self.name[..self.name_length] == name
     }
 }
 
@@ -496,7 +501,7 @@ fn read_directory_to_buffer(
     while count < capacity {
         let Some(file) = files
             .iter()
-            .filter(|file| file.used && file.node_id > cookie)
+            .filter(|file| file.used && file.linked && file.node_id > cookie)
             .min_by_key(|file| file.node_id)
         else {
             break;
@@ -518,7 +523,10 @@ fn read_directory_to_buffer(
         cookie = file.node_id;
     }
     reply.value = count as u64;
-    if !files.iter().any(|file| file.used && file.node_id > cookie) {
+    if !files
+        .iter()
+        .any(|file| file.used && file.linked && file.node_id > cookie)
+    {
         reply.flags |= filesystem_protocol::reply_flags::END_OF_DIRECTORY;
     }
 }
@@ -549,7 +557,7 @@ fn unlink_filesystem_node(
         reply.status = filesystem_protocol::status::NOT_FOUND;
         return;
     };
-    files[index] = File::EMPTY;
+    files[index].linked = false;
 }
 
 fn get_node_attributes(
@@ -870,6 +878,7 @@ fn write_file(
 
 fn initialize_file(file: &mut File, next_node_id: &mut u64, name: &[u8]) {
     file.used = true;
+    file.linked = true;
     file.node_id = *next_node_id;
     *next_node_id = next_node_id.saturating_add(1);
     file.name_length = name.len();
@@ -911,13 +920,13 @@ fn remove_file(files: &mut [File; protocol::MAX_FILES], name: &[u8], reply: &mut
         reply.status = protocol::status::NOT_FOUND;
         return;
     };
-    files[index] = File::EMPTY;
+    files[index].linked = false;
 }
 
 fn list_files(files: &[File; protocol::MAX_FILES], capacity: usize, reply: &mut protocol::Reply) {
     let capacity = capacity.min(reply.data.len());
     let mut cursor = 0usize;
-    for file in files.iter().filter(|file| file.used) {
+    for file in files.iter().filter(|file| file.used && file.linked) {
         let needed = file.name_length + if cursor != 0 { 1 } else { 0 };
         if cursor + needed > capacity {
             break;
@@ -931,5 +940,5 @@ fn list_files(files: &[File; protocol::MAX_FILES], capacity: usize, reply: &mut 
         cursor += file.name_length;
     }
     reply.data_length = cursor as u16;
-    reply.value = files.iter().filter(|file| file.used).count() as u32;
+    reply.value = files.iter().filter(|file| file.used && file.linked).count() as u32;
 }

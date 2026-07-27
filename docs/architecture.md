@@ -140,11 +140,12 @@ session-scoped node IDs, directory-relative lookup, request IDs, cancellation,
 and registered shared-memory windows. The tmpfs service is the active `/tmp`
 data path through the generic protocol. A separately supervised userspace VFS
 service now owns a versioned longest-prefix namespace table and validates the
-intended mount layout during boot. `stat`, path-based `read_directory`, and
-`chdir` now cross that service boundary, including synthetic directory metadata
-and merged namespace listings for VFS-owned nodes; other kernel file syscalls
-still perform their own routing until their asynchronous proxy handoffs are
-complete.
+intended mount layout during boot. `stat`, path-based `read_directory`,
+`chdir`, descriptor-producing `open`, and `unlink` now cross that service
+boundary, including synthetic directory metadata and merged namespace listings
+for VFS-owned nodes; other kernel file operations still use the backend
+recorded by the resulting descriptor while their service-owned open-file state
+is being developed.
 
 The intended rooted namespace includes service-backed `/dev` and `/tmp` mounts,
 a system hierarchy under `/System` (`config`, `var/log`, `bin`, `services`,
