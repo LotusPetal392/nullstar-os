@@ -44,9 +44,12 @@ const NORMAL_BOOT_BLOCK_DEVICE_MARKER: &str = "userspace init: read-only block-d
 const NORMAL_BOOT_NULLFS_DISCOVERY_MARKER: &str = "partition: index=3, kind=NullFS";
 const NORMAL_BOOT_NULLFS_PARTITION_MARKER: &str =
     "userspace init: read-only NullFS partition probe passed";
+const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str = "userspace init: read-only NullFS service mounted";
+const NORMAL_BOOT_NULLFS_PROBE_MARKER: &str = "userspace init: userspace NullFS probe passed";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
-const QEMU_TEST_TIMEOUT: Duration = Duration::from_secs(300);
+const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
+const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
 
 #[derive(Debug, Default)]
 struct NormalBootProgress {
@@ -56,6 +59,8 @@ struct NormalBootProgress {
     block_device_ready: bool,
     nullfs_partition_discovered: bool,
     nullfs_partition_verified: bool,
+    nullfs_service_ready: bool,
+    nullfs_probe_passed: bool,
     init_launched_shell: bool,
     shell_ready: bool,
 }
@@ -68,6 +73,8 @@ impl NormalBootProgress {
         self.block_device_ready |= line.contains(NORMAL_BOOT_BLOCK_DEVICE_MARKER);
         self.nullfs_partition_discovered |= line.contains(NORMAL_BOOT_NULLFS_DISCOVERY_MARKER);
         self.nullfs_partition_verified |= line.contains(NORMAL_BOOT_NULLFS_PARTITION_MARKER);
+        self.nullfs_service_ready |= line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
+        self.nullfs_probe_passed |= line.contains(NORMAL_BOOT_NULLFS_PROBE_MARKER);
         self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
         self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
 
@@ -77,6 +84,8 @@ impl NormalBootProgress {
             && self.block_device_ready
             && self.nullfs_partition_discovered
             && self.nullfs_partition_verified
+            && self.nullfs_service_ready
+            && self.nullfs_probe_passed
             && self.init_launched_shell
             && self.shell_ready
     }
@@ -193,9 +202,12 @@ fn run_interactive(mut command: Command) -> ExitCode {
 
 fn run_normal_boot_check(options: &Options) -> ExitCode {
     let mut progress = NormalBootProgress::default();
-    let passed = run_qemu_until(qemu_command(options), "normal boot check", move |line| {
-        progress.observe(line)
-    });
+    let passed = run_qemu_until(
+        qemu_command(options),
+        "normal boot check",
+        NORMAL_BOOT_TIMEOUT,
+        move |line| progress.observe(line),
+    );
     if passed {
         println!("QEMU normal boot check passed");
         ExitCode::SUCCESS
@@ -285,7 +297,7 @@ fn run_qemu_phase(command: Command, phase: SmokePhase) -> bool {
         SmokePhase::PreparePersistentFat => "persistent FAT preparation",
         SmokePhase::VerifyCompleteSystem => "complete-system smoke test",
     };
-    run_qemu_until(command, label, move |line| {
+    run_qemu_until(command, label, SMOKE_PHASE_TIMEOUT, move |line| {
         if phase == SmokePhase::PreparePersistentFat {
             return line.contains(FAT_PERSIST_PREPARED_MARKER)
                 || line.contains(FAT_PERSIST_VERIFIED_MARKER);
@@ -354,6 +366,7 @@ fn run_qemu_phase(command: Command, phase: SmokePhase) -> bool {
 fn run_qemu_until(
     mut command: Command,
     label: &'static str,
+    timeout: Duration,
     mut completion: impl FnMut(&str) -> bool + Send + 'static,
 ) -> bool {
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
@@ -390,7 +403,7 @@ fn run_qemu_until(
         Ok(())
     });
 
-    let deadline = Instant::now() + QEMU_TEST_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match marker_receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(()) => {
@@ -429,10 +442,7 @@ fn run_qemu_until(
             let _ = child.kill();
             let _ = child.wait();
             report_reader_result(reader.join());
-            eprintln!(
-                "QEMU {label} timed out after {} seconds",
-                QEMU_TEST_TIMEOUT.as_secs()
-            );
+            eprintln!("QEMU {label} timed out after {} seconds", timeout.as_secs());
             return false;
         }
     }
@@ -457,7 +467,8 @@ mod tests {
     use super::{
         NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_INIT_MARKER, NORMAL_BOOT_INIT_SHELL_MARKER,
         NORMAL_BOOT_MODE_MARKER, NORMAL_BOOT_NULLFS_DISCOVERY_MARKER,
-        NORMAL_BOOT_NULLFS_PARTITION_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
+        NORMAL_BOOT_NULLFS_PARTITION_MARKER, NORMAL_BOOT_NULLFS_PROBE_MARKER,
+        NORMAL_BOOT_NULLFS_SERVICE_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
         NormalBootProgress,
     };
 
@@ -471,6 +482,8 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_BLOCK_DEVICE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_DISCOVERY_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_PARTITION_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_PROBE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_SHELL_MARKER));
         assert!(progress.observe(NORMAL_BOOT_SHELL_MARKER));
     }

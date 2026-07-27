@@ -104,9 +104,9 @@ on-disk consistency and recovery rules.
 core transfers through the registered window. It exposes 4096-byte NullFS blocks
 and translates each one into a checked run of protocol logical blocks; the
 current 512-byte logical-block device therefore uses eight protocol blocks per
-core block. Keeping the adapter
-in a separate crate prevents host `std` features from leaking into allocator-free
-userspace binaries and lets the future NullFS service remain a distinct package.
+core block. Keeping the adapter in a separate crate prevents host `std` features
+from leaking into allocator-free userspace binaries and keeps `nullfs-service` a
+distinct package.
 
 The current QEMU boot probes verify init-only endpoint acquisition, delegated
 send-only authority, read-only device metadata, a partition-relative FAT boot
@@ -114,11 +114,15 @@ block read, and the checksummed superblock of the dedicated `NULLSTAR_DATA`
 NullFS fixture. They also cover buffer transfer, range rejection, write rejection,
 unsupported flush, and disconnect cleanup on the real kernel boundary.
 
+`nullfs-service` now mounts that endpoint through `nullfs-userspace-blockdev` and
+the shared NullFS core. Its direct generic-filesystem-protocol probe covers
+lookup, attributes, file reads, paginated directory iteration, duplicate
+`OPEN`/`CLOSE_NODE` accounting, mutation denial, and disconnect cleanup.
+
 ## Next step
 
-Mount the dedicated partition through `nullfs-userspace-blockdev` in a separately
-supervised NullFS service, then expose lookup, attributes, file reads, directory
-iteration, and `CLOSE_NODE` through the generic filesystem protocol. Writable
-authority remains a later milestone: the kernel must not advertise `WRITE` or
-`FLUSH` until an explicit grant policy and crash-ordering tests prove that the
-userspace adapter preserves NullFS durability semantics.
+Register the service as a VFS backend and mount it under `/Volumes` without
+adding NullFS-specific routing to the kernel. Writable authority remains a later
+milestone: the kernel must not advertise `WRITE` or `FLUSH` until an explicit
+grant policy and crash-ordering tests prove that the userspace adapter preserves
+NullFS durability semantics.

@@ -232,14 +232,22 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## Phase 4: NullStar filesystem service
 
-Add the NullFS userspace service as another backend behind the common protocol;
-do not route clients directly to a NullFS-specific endpoint. The build now
-appends a deterministic 4 MiB `NULLSTAR_DATA` volume as MBR partition 3, the
-kernel identifies it as NullFS, and an init-delegated boot probe validates its
-superblock through the read-only endpoint. The typed session client and adapter
-translate the endpoint's device logical-block geometry into 4096-byte core blocks.
-service milestone is therefore to mount this volume through that adapter and
-expose read-only filesystem operations.
+NullFS is now exposed by a separately supervised userspace backend behind the
+common filesystem protocol; clients are not routed to a NullFS-specific API. The
+build appends a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as MBR
+partition 3. The kernel identifies it as NullFS, and an init-delegated raw probe
+validates its superblock through the read-only endpoint. The typed session client
+and adapter translate the endpoint's 512-byte logical-block geometry into the
+4096-byte blocks required by the shared core.
+
+The service mounts that volume through the adapter and implements `CONNECT`,
+`DISCONNECT`, registered buffers, lookup, attributes, read-only open, file reads,
+paginated directory iteration, and `CLOSE_NODE`. Opaque node IDs are independent
+of core inode numbers and the map is bounded by the mounted volume's inode
+capacity. Canonical mutations are rejected with `PERMISSION`. A direct generic-
+protocol boot probe verifies fixture lookup and reads, directory continuation,
+duplicate-open close accounting, stale duplicate closes, mutation denial, and
+session cleanup before PID 1 continues boot.
 
 The service adapter must:
 
@@ -257,10 +265,10 @@ The service adapter must:
 - handle clean shutdown, dirty startup, service replacement, and block-device
   loss without weakening format rules.
 
-Integrate the service with PID 1 supervision and VFS backend registration using
-the same generation checks as other services. Mounting a NullFS volume under
-`/Volumes`, or selecting it as a future native root/system volume, remains a VFS
-policy decision. Keep the current FAT path until protocol parity, persistence,
+PID 1 supervision is implemented with the same restart-budget model as the other
+services. VFS backend registration is the next integration step. Mounting a
+NullFS volume under `/Volumes`, or selecting it as a future native root/system
+volume, remains a VFS policy decision. Keep the current FAT path until protocol parity, persistence,
 and recovery smoke coverage exist.
 
 Acceptance includes protocol conformance tests shared with tmpfs where

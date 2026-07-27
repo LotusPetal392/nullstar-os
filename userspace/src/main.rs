@@ -27,6 +27,18 @@ const NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
     b"userspace init: read-only NullFS partition probe passed\n";
 const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to acquire block-device endpoint\n";
+const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service";
+const NULLFS_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: nullfs";
+const NULLFS_SERVICE_STARTING: &[u8] = b"userspace init: starting NullFS service\n";
+const NULLFS_SERVICE_RESTARTING: &[u8] = b"userspace init: NullFS service exited; restarting\n";
+const NULLFS_SERVICE_READY: &[u8] = b"userspace init: read-only NullFS service mounted\n";
+const NULLFS_SERVICE_FAILED: &[u8] = b"userspace init: NullFS service exhausted restart budget\n";
+const NULLFS_SERVICE_BOOTSTRAP_FAILED: &[u8] =
+    b"userspace init: failed to grant NullFS capabilities\n";
+const NULLFS_SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid NullFS readiness message\n";
+const NULLFS_PROBE_COMMAND: &[u8] = b"/nullfs-probe";
+const NULLFS_PROBE_FAILED: &[u8] = b"userspace init: userspace NullFS probe failed\n";
+const NULLFS_PROBE_PASSED: &[u8] = b"userspace init: userspace NullFS probe passed\n";
 const SERVICE_COMMAND: &[u8] = b"/tmpfs-service";
 const SERVICE_READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
 const SERVICE_STARTING: &[u8] = b"userspace init: starting tmpfs service\n";
@@ -60,7 +72,16 @@ const SHELL_FOREGROUND_FAILED: &[u8] =
 
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
+const NULLFS_BLOCK_HANDLE: u64 = 3;
 
+const NULLFS_SERVICE: ServiceSpec = ServiceSpec {
+    name: b"nullfs",
+    command: NULLFS_SERVICE_COMMAND,
+    ready_message: NULLFS_SERVICE_READY_MESSAGE,
+    bootstrap_handle: READY_HANDLE,
+    restart_limit: 3,
+    restart_backoff_yields: 32,
+};
 const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"tmpfs",
     command: SERVICE_COMMAND,
@@ -87,6 +108,21 @@ struct ServiceMessages {
     protocol_failed: &'static [u8],
 }
 
+#[derive(Clone, Copy)]
+struct BootstrapCapability {
+    source_handle: CapabilityHandle,
+    rights: Rights,
+    target_handle: CapabilityHandle,
+}
+
+const NULLFS_MESSAGES: ServiceMessages = ServiceMessages {
+    starting: NULLFS_SERVICE_STARTING,
+    restarting: NULLFS_SERVICE_RESTARTING,
+    ready: NULLFS_SERVICE_READY,
+    failed: NULLFS_SERVICE_FAILED,
+    bootstrap_failed: NULLFS_SERVICE_BOOTSTRAP_FAILED,
+    protocol_failed: NULLFS_SERVICE_PROTOCOL_FAILED,
+};
 const TMPFS_MESSAGES: ServiceMessages = ServiceMessages {
     starting: SERVICE_STARTING,
     restarting: SERVICE_RESTARTING,
@@ -149,6 +185,40 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     ipc::close(nullfs_block_device_endpoint)
         .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
 
+    let nullfs_service_block_endpoint = platform::open_block_device_endpoint(3)
+        .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
+    if !matches!(
+        ipc::info(nullfs_service_block_endpoint),
+        Ok(info)
+            if info.kind == ipc::ObjectKind::Endpoint
+                && info.rights == (Rights::SEND | Rights::TRANSFER)
+    ) {
+        fail(NULLFS_SERVICE_BOOTSTRAP_FAILED);
+    }
+    let nullfs_readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
+    let nullfs_request_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
+    let mut nullfs_service = ServiceRuntime::new(NULLFS_SERVICE);
+    let nullfs_block_capability = BootstrapCapability {
+        source_handle: nullfs_service_block_endpoint,
+        rights: Rights::SEND,
+        target_handle: NULLFS_BLOCK_HANDLE,
+    };
+    start_service(
+        &mut nullfs_service,
+        nullfs_readiness_endpoint,
+        nullfs_request_endpoint,
+        Some(nullfs_block_capability),
+        &NULLFS_MESSAGES,
+    );
+    run_probe(
+        NULLFS_PROBE_COMMAND,
+        nullfs_request_endpoint,
+        NULLFS_PROBE_FAILED,
+        NULLFS_PROBE_PASSED,
+    );
+
     let readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let request_endpoint =
@@ -158,6 +228,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut service,
         readiness_endpoint,
         request_endpoint,
+        None,
         &TMPFS_MESSAGES,
     );
     register_tmpfs_proxy(request_endpoint);
@@ -171,6 +242,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut vfs_service,
         vfs_readiness_endpoint,
         vfs_request_endpoint,
+        None,
         &VFS_MESSAGES,
     );
     register_vfs_router(&vfs_service, vfs_request_endpoint);
@@ -183,6 +255,29 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let mut shell_process_id = spawn_shell();
 
     loop {
+        if let Some(service_process_id) = nullfs_service.process_id() {
+            match syscall::try_wait_child(service_process_id) {
+                Ok(status) => match nullfs_service.observe_status(status.raw()) {
+                    ServiceStatusDisposition::WaitForNextEvent => {}
+                    ServiceStatusDisposition::Restart { backoff_yields } => {
+                        let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
+                        backoff(backoff_yields);
+                        start_service(
+                            &mut nullfs_service,
+                            nullfs_readiness_endpoint,
+                            nullfs_request_endpoint,
+                            Some(nullfs_block_capability),
+                            &NULLFS_MESSAGES,
+                        );
+                    }
+                    ServiceStatusDisposition::Failed => fail(NULLFS_SERVICE_FAILED),
+                },
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+                Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                Err(_) => fail(NULLFS_SERVICE_FAILED),
+            }
+        }
+
         if let Some(service_process_id) = service.process_id() {
             match syscall::try_wait_child(service_process_id) {
                 Ok(status) => match service.observe_status(status.raw()) {
@@ -194,6 +289,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             &mut service,
                             readiness_endpoint,
                             request_endpoint,
+                            None,
                             &TMPFS_MESSAGES,
                         );
                         register_tmpfs_proxy(request_endpoint);
@@ -217,6 +313,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             &mut vfs_service,
                             vfs_readiness_endpoint,
                             vfs_request_endpoint,
+                            None,
                             &VFS_MESSAGES,
                         );
                         register_vfs_router(&vfs_service, vfs_request_endpoint);
@@ -277,6 +374,7 @@ fn start_service(
     service: &mut ServiceRuntime,
     readiness_endpoint: CapabilityHandle,
     request_endpoint: CapabilityHandle,
+    additional_capability: Option<BootstrapCapability>,
     messages: &ServiceMessages,
 ) {
     loop {
@@ -304,6 +402,16 @@ fn start_service(
             )
             .ok()
                 != Some(REQUEST_HANDLE)
+            || additional_capability.is_some_and(|capability| {
+                ipc::grant_child(
+                    process_id,
+                    capability.source_handle,
+                    capability.rights,
+                    capability.target_handle,
+                )
+                .ok()
+                    != Some(capability.target_handle)
+            })
         {
             fail(messages.bootstrap_failed);
         }

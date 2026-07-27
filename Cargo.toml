@@ -13,6 +13,7 @@ members = [
     "tools/nullfs-image",
     "tools/nullfs-info",
     "userspace",
+    "userspace/nullfs-service",
 ]
 
 [package]
@@ -40,6 +41,13 @@ userspace = {
     target = "x86_64-unknown-none"
 }
 
+nullfs-service = {
+    path = "userspace/nullfs-service",
+    artifact = "bin",
+    target = "x86_64-unknown-none",
+    features = ["freestanding"]
+}
+
 [profile.dev]
 panic = "abort"
 
@@ -50,6 +58,9 @@ panic = "abort"
 debug = 0
 
 [profile.dev.package.userspace]
+debug = 0
+
+[profile.dev.package.nullfs-service]
 debug = 0
 
 [profile.release]

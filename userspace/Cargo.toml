@@ -22,6 +22,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "nullfs_probe"
+path = "src/bin/nullfs_probe.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "tmpfs_service"
 path = "src/bin/tmpfs_service.rs"
 test = false

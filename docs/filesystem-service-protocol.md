@@ -270,6 +270,15 @@ reference still owned by that session. An unlinked node is reclaimed only after
 its global open count reaches zero, and reclaimed storage slots receive a new
 monotonic node ID when reused.
 
+The read-only `nullfs-service` implements the same session and node-reference
+contract around shared-core `OpenHandle`s. It presents generation-tagged opaque
+node IDs rather than inode numbers, sizes its identity map from the mounted
+volume's inode capacity, drains duplicate opens one reference at a time, and
+preserves both protocol and core accounting when a close fails. Its boot probe
+exercises multi-page directory cookies as well as open/close and disconnect
+cleanup. VFS registration is intentionally deferred; the probe talks directly to
+the common protocol endpoint.
+
 The kernel maps that contract to open-file descriptions rather than descriptor
 numbers. `dup`, `dup2`, fork inheritance, and file-backed standard streams share
 the same description, so closing one alias cannot close the service node early.
