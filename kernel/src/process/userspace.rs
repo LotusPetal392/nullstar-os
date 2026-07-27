@@ -1,5 +1,6 @@
 use alloc::{
     boxed::Box,
+    collections::VecDeque,
     string::{String, ToString},
     sync::Arc,
     vec,
@@ -144,6 +145,7 @@ const SIGNAL_SUPPORTED_MASK: u64 = abi::signal::SUPPORTED_MASK;
 const SIGNAL_UNBLOCKABLE_MASK: u64 = abi::signal::UNBLOCKABLE_MASK;
 const SIGNAL_RED_ZONE_BYTES: u64 = 128;
 pub const MAX_PROCESS_SLOTS: usize = 64;
+const MAX_PENDING_TMPFS_CLOSES: usize = MAX_PROCESS_SLOTS * (MAX_OPEN_FILES + 3) + 1;
 const PROCESS_HISTORY_LIMIT: usize = 128;
 // PID zero is reserved for the kernel reaper. Children assigned to it have no
 // userspace owner and therefore never become waitable zombies.
@@ -838,7 +840,12 @@ struct ActiveSignalFrame {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenFileBackend {
     Vfs,
-    TmpfsProxy { generation: u32, node_id: u64 },
+    TmpfsProxy {
+        generation: u32,
+        session_id: u64,
+        session_generation: u64,
+        node_id: u64,
+    },
 }
 
 struct OpenFileState {
@@ -849,6 +856,20 @@ struct OpenFileState {
     append: bool,
     size: u64,
     backend: OpenFileBackend,
+}
+
+impl Drop for OpenFileState {
+    fn drop(&mut self) {
+        if let OpenFileBackend::TmpfsProxy {
+            generation,
+            session_id,
+            session_generation,
+            node_id,
+        } = self.backend
+        {
+            tmpfs_proxy_enqueue_close(generation, session_id, session_generation, node_id);
+        }
+    }
 }
 
 type OpenFileHandle = Arc<Mutex<OpenFileState>>;
@@ -880,6 +901,8 @@ enum PendingTmpfsProxyOperation {
         append: bool,
         close_on_exec: bool,
         generation: u32,
+        session_id: u64,
+        session_generation: u64,
     },
     Read {
         handle: OpenFileHandle,
@@ -903,6 +926,23 @@ enum PendingTmpfsProxyOperation {
     Unlink,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingTmpfsClose {
+    generation: u32,
+    session_id: u64,
+    session_generation: u64,
+    node_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveTmpfsClose {
+    ticket: PendingTmpfsClose,
+    request_id: u64,
+    reply_endpoint: CapabilityObjectRef,
+    session_id: u64,
+    session_generation: u64,
+}
+
 #[derive(Clone, Copy)]
 struct TmpfsProxyState {
     request_endpoint: Option<CapabilityObjectRef>,
@@ -915,6 +955,7 @@ struct TmpfsProxyState {
     bulk_buffer_attached: bool,
     next_request_id: u64,
     active_request_id: u64,
+    active_close: Option<ActiveTmpfsClose>,
 }
 
 impl TmpfsProxyState {
@@ -930,12 +971,15 @@ impl TmpfsProxyState {
             bulk_buffer_attached: false,
             next_request_id: 3,
             active_request_id: filesystem_protocol::INVALID_ID,
+            active_close: None,
         }
     }
 }
 
 static KERNEL_CAPABILITY_ROOTS: Mutex<Vec<CapabilityObjectRef>> = Mutex::new(Vec::new());
 static TMPFS_PROXY: Mutex<TmpfsProxyState> = Mutex::new(TmpfsProxyState::new());
+static TMPFS_CLOSE_QUEUE: Mutex<VecDeque<PendingTmpfsClose>> = Mutex::new(VecDeque::new());
+static TMPFS_ABANDONED_REQUEST: Mutex<Option<PendingTmpfsProxyRequest>> = Mutex::new(None);
 
 #[derive(Clone, Copy)]
 struct VfsRouteState {
@@ -3110,10 +3154,7 @@ impl Runtime {
                             InterruptedWait::PipeWrite(pending.pipe_id),
                         )
                     } else if let Some(pending) = process.pending_tmpfs_proxy.take() {
-                        (
-                            pending.stack_pointer,
-                            InterruptedWait::TmpfsProxy(pending),
-                        )
+                        (pending.stack_pointer, InterruptedWait::TmpfsProxy(pending))
                     } else if let Some(pending) = process.pending_vfs_request.take() {
                         (pending.stack_pointer, InterruptedWait::VfsRequest(pending))
                     } else if let Some(pending) = process.pending_child_wait.take() {
@@ -3154,7 +3195,7 @@ impl Runtime {
                 let _ = pipe::note_writer_wakeup(pipe_id);
             }
             InterruptedWait::TmpfsProxy(pending) => {
-                tmpfs_proxy_release_pending(&pending);
+                tmpfs_proxy_abandon_pending(pending);
             }
             InterruptedWait::VfsRequest(pending) => vfs_request_release(&pending),
             InterruptedWait::Child => {}
@@ -3411,6 +3452,7 @@ impl Runtime {
         let page_table_address = address_space.page_table_frame.start_address().as_u64();
         let new_entry_point = address_space.entry_point;
         let new_path = core::mem::take(&mut request.path);
+        let mut closed_files = Vec::with_capacity(MAX_OPEN_FILES);
         let mut closed_pipes = [None; MAX_OPEN_FILES];
 
         let commit = cpu_interrupts::without_interrupts(|| {
@@ -3462,9 +3504,15 @@ impl Runtime {
             process.reset_signal_actions_for_exec();
             process.exec_count = process.exec_count.saturating_add(1);
 
-            let open_before = process.open_files.len();
-            process.open_files.retain(|file| !file.close_on_exec);
-            let closed_files = open_before.saturating_sub(process.open_files.len());
+            let mut index = 0usize;
+            while index < process.open_files.len() {
+                if process.open_files[index].close_on_exec {
+                    closed_files.push(process.open_files.remove(index));
+                } else {
+                    index = index.saturating_add(1);
+                }
+            }
+            let closed_file_count = closed_files.len();
             let mut closed_pipe_count = 0usize;
             let mut index = 0usize;
             while index < process.pipe_descriptors.len() {
@@ -3475,7 +3523,7 @@ impl Runtime {
                     index = index.saturating_add(1);
                 }
             }
-            let closed_descriptors = closed_files.saturating_add(closed_pipe_count);
+            let closed_descriptors = closed_file_count.saturating_add(closed_pipe_count);
             process.close_count = process
                 .close_count
                 .saturating_add(closed_descriptors as u64);
@@ -3498,6 +3546,7 @@ impl Runtime {
             }
         };
 
+        drop(closed_files);
         for descriptor in closed_pipes.into_iter().take(closed_pipe_count).flatten() {
             match descriptor.direction {
                 PipeDirection::Reader => {
@@ -3649,6 +3698,9 @@ impl Runtime {
 
     fn service_tmpfs_proxy_requests(&mut self) -> Result<usize, Error> {
         let mut completed = usize::from(tmpfs_proxy_service_connect());
+        if tmpfs_proxy_service_abandoned() {
+            completed = completed.saturating_add(1);
+        }
         let pending_requests: Vec<(u64, PendingTmpfsProxyRequest)> =
             cpu_interrupts::without_interrupts(|| {
                 PROCESS_MANAGER
@@ -3669,6 +3721,9 @@ impl Runtime {
             };
             tmpfs_proxy_release_pending(&pending);
             self.complete_tmpfs_proxy_request(process_id, pending, reply)?;
+            completed = completed.saturating_add(1);
+        }
+        if tmpfs_proxy_service_close() {
             completed = completed.saturating_add(1);
         }
         Ok(completed)
@@ -3843,13 +3898,12 @@ impl Runtime {
                             && reply.backend == vfs_protocol::backend::TMPFS
                             && pending.path == "/tmp" =>
                     {
-                        ControlOutcome::Ready(match platform_set_working_directory(
-                            process_id,
-                            &pending.path,
-                        ) {
-                            Ok(()) => 0,
-                            Err(error) => error_return(error),
-                        })
+                        ControlOutcome::Ready(
+                            match platform_set_working_directory(process_id, &pending.path) {
+                                Ok(()) => 0,
+                                Err(error) => error_return(error),
+                            },
+                        )
                     }
                     (PendingVfsOperation::Chdir, Ok(reply))
                         if reply.status == vfs_protocol::status::OK
@@ -3872,13 +3926,12 @@ impl Runtime {
                             && reply.backend == vfs_protocol::backend::NAMESPACE
                             && usize::from(reply.prefix_length) == pending.path.len() =>
                     {
-                        ControlOutcome::Ready(match platform_set_working_directory(
-                            process_id,
-                            &pending.path,
-                        ) {
-                            Ok(()) => 0,
-                            Err(error) => error_return(error),
-                        })
+                        ControlOutcome::Ready(
+                            match platform_set_working_directory(process_id, &pending.path) {
+                                Ok(()) => 0,
+                                Err(error) => error_return(error),
+                            },
+                        )
                     }
                     (PendingVfsOperation::Chdir, Ok(reply))
                         if reply.status == vfs_protocol::status::OK
@@ -3887,26 +3940,22 @@ impl Runtime {
                     {
                         ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
                     }
-                    (
-                        PendingVfsOperation::Open { .. },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                    (PendingVfsOperation::Open { .. }, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
                     {
-                        ControlOutcome::Ready(if usize::from(reply.prefix_length)
-                            == pending.path.len()
-                        {
-                            error_return(ERR_IS_DIRECTORY)
-                        } else {
-                            error_return(abi::errno::NO_ENTRY)
-                        })
+                        ControlOutcome::Ready(
+                            if usize::from(reply.prefix_length) == pending.path.len() {
+                                error_return(ERR_IS_DIRECTORY)
+                            } else {
+                                error_return(abi::errno::NO_ENTRY)
+                            },
+                        )
                     }
-                    (
-                        PendingVfsOperation::Open { .. },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::TMPFS
-                        && pending.path == "/tmp" =>
+                    (PendingVfsOperation::Open { .. }, Ok(reply))
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::TMPFS
+                            && pending.path == "/tmp" =>
                     {
                         ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
                     }
@@ -3964,13 +4013,13 @@ impl Runtime {
                         if reply.status == vfs_protocol::status::OK
                             && reply.backend == vfs_protocol::backend::NAMESPACE =>
                     {
-                        ControlOutcome::Ready(if usize::from(reply.prefix_length)
-                            == pending.path.len()
-                        {
-                            error_return(ERR_IS_DIRECTORY)
-                        } else {
-                            error_return(abi::errno::NO_ENTRY)
-                        })
+                        ControlOutcome::Ready(
+                            if usize::from(reply.prefix_length) == pending.path.len() {
+                                error_return(ERR_IS_DIRECTORY)
+                            } else {
+                                error_return(abi::errno::NO_ENTRY)
+                            },
+                        )
                     }
                     (PendingVfsOperation::Unlink, Ok(reply))
                         if reply.status == vfs_protocol::status::OK
@@ -3987,8 +4036,7 @@ impl Runtime {
             .ok_or(Error::ProcessNotFound(process_id))?;
             if let ControlOutcome::Ready(result) = outcome {
                 scheduler::with_process_address_space(process_id, || {
-                    let registers =
-                        unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+                    let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
                     registers.rax = result;
                 })
                 .ok_or(Error::ProcessNotFound(process_id))?;
@@ -4629,14 +4677,7 @@ fn vfs_routed_boot_directory(
     };
     let mut records = Vec::new();
     if path == "/" {
-        for name in [
-            "dev",
-            "tmp",
-            "System",
-            "Users",
-            "Applications",
-            "Volumes",
-        ] {
+        for name in ["dev", "tmp", "System", "Users", "Applications", "Volumes"] {
             records.push(vfs_namespace_directory_record(name, name == "System"));
         }
     }
@@ -4716,8 +4757,7 @@ fn vfs_write_directory_records(
 ) -> ControlOutcome {
     let mut written = 0usize;
     for record in records.iter().skip(start_index).take(capacity) {
-        let destination =
-            (records_address as *mut abi::file::DirectoryEntry).wrapping_add(written);
+        let destination = (records_address as *mut abi::file::DirectoryEntry).wrapping_add(written);
         unsafe { ptr::write_unaligned(destination, *record) };
         written = written.saturating_add(1);
     }
@@ -4762,17 +4802,8 @@ fn vfs_route_read_directory(
     )
 }
 
-fn vfs_route_chdir(
-    process_id: u64,
-    path: &str,
-    stack_pointer: usize,
-) -> ControlOutcome {
-    vfs_route_request(
-        process_id,
-        path,
-        PendingVfsOperation::Chdir,
-        stack_pointer,
-    )
+fn vfs_route_chdir(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
+    vfs_route_request(process_id, path, PendingVfsOperation::Chdir, stack_pointer)
 }
 
 fn vfs_route_open(
@@ -4795,17 +4826,8 @@ fn vfs_route_open(
     )
 }
 
-fn vfs_route_unlink(
-    process_id: u64,
-    path: &str,
-    stack_pointer: usize,
-) -> ControlOutcome {
-    vfs_route_request(
-        process_id,
-        path,
-        PendingVfsOperation::Unlink,
-        stack_pointer,
-    )
+fn vfs_route_unlink(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
+    vfs_route_request(process_id, path, PendingVfsOperation::Unlink, stack_pointer)
 }
 
 fn vfs_complete_boot_open(
@@ -4934,9 +4956,7 @@ fn vfs_route_request(
     ControlOutcome::Blocked
 }
 
-fn vfs_request_take_reply(
-    pending: &PendingVfsRequest,
-) -> Option<Result<vfs_protocol::Reply, i64>> {
+fn vfs_request_take_reply(pending: &PendingVfsRequest) -> Option<Result<vfs_protocol::Reply, i64>> {
     let message = {
         let mut registry = CAPABILITY_REGISTRY.lock();
         let index = registry.object_index(pending.reply_endpoint)?;
@@ -5069,8 +5089,7 @@ fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
 }
 
 fn vfs_path_has_prefix(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+    path == prefix || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
 }
 
 fn vfs_request_release(pending: &PendingVfsRequest) {
@@ -5136,7 +5155,7 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
             }
         }
         if let Some(pending) = process.pending_tmpfs_proxy.take() {
-            tmpfs_proxy_release_pending(&pending);
+            tmpfs_proxy_abandon_pending(pending);
         }
         if let Some(pending) = process.pending_vfs_request.take() {
             vfs_request_release(&pending);
@@ -6968,6 +6987,9 @@ fn tmpfs_proxy_begin_connect(
     request_endpoint: CapabilityObjectRef,
     legacy_generation: u32,
 ) -> Result<(), i64> {
+    if TMPFS_PROXY.lock().generation == legacy_generation {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
     let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
     let mut request = filesystem_protocol::Request::EMPTY;
     request.operation = filesystem_protocol::operation::CONNECT;
@@ -7020,8 +7042,11 @@ fn tmpfs_proxy_begin_connect(
         state.bulk_buffer = None;
         state.bulk_buffer_attached = false;
         state.active_request_id = filesystem_protocol::INVALID_ID;
+        state.active_close = None;
         previous
     };
+    let abandoned = TMPFS_ABANDONED_REQUEST.lock().take();
+    drop(abandoned);
     if previous.0 != Some(request_endpoint) {
         if let Some(endpoint) = previous.0 {
             kernel_capability_root_remove(endpoint);
@@ -7292,7 +7317,8 @@ fn tmpfs_proxy_decode_filesystem_reply(
     message: EndpointMessage,
     pending: &PendingTmpfsProxyRequest,
 ) -> Result<tmpfs_protocol::Reply, i64> {
-    if message.capability.is_some() || message.bytes.len() != size_of::<filesystem_protocol::Reply>()
+    if message.capability.is_some()
+        || message.bytes.len() != size_of::<filesystem_protocol::Reply>()
     {
         return Err(ERR_IO);
     }
@@ -7351,8 +7377,7 @@ fn tmpfs_proxy_decode_filesystem_reply(
     compatibility.value = value;
     match &pending.operation {
         PendingTmpfsProxyOperation::Open { .. } => {
-            compatibility.data[..size_of::<u64>()]
-                .copy_from_slice(&reply.node_id.to_ne_bytes());
+            compatibility.data[..size_of::<u64>()].copy_from_slice(&reply.node_id.to_ne_bytes());
             compatibility.data_length = size_of::<u64>() as u16;
         }
         PendingTmpfsProxyOperation::Read { length, .. } => {
@@ -7393,9 +7418,7 @@ fn tmpfs_proxy_translate_directory_entries(
     for index in 0..count {
         tmpfs_proxy_bulk_read_at(index * entry_size, &mut entry_bytes)?;
         let entry = unsafe {
-            ptr::read_unaligned(
-                entry_bytes.as_ptr() as *const filesystem_protocol::DirectoryEntry
-            )
+            ptr::read_unaligned(entry_bytes.as_ptr() as *const filesystem_protocol::DirectoryEntry)
         };
         let name_length = usize::from(entry.name_length);
         if entry.node_id == filesystem_protocol::INVALID_ID
@@ -7447,10 +7470,7 @@ fn tmpfs_proxy_bulk_read_at(offset: usize, destination: &mut [u8]) -> Result<(),
     let end = offset
         .checked_add(destination.len())
         .ok_or(abi::errno::RANGE)?;
-    let source = memory
-        .bytes
-        .get(offset..end)
-        .ok_or(abi::errno::RANGE)?;
+    let source = memory.bytes.get(offset..end).ok_or(abi::errno::RANGE)?;
     destination.copy_from_slice(source);
     Ok(())
 }
@@ -7477,6 +7497,257 @@ fn tmpfs_proxy_release_pending(pending: &PendingTmpfsProxyRequest) {
     }
 }
 
+fn tmpfs_proxy_abandon_pending(pending: PendingTmpfsProxyRequest) {
+    if TMPFS_PROXY.lock().active_request_id != pending.generic_request_id {
+        return;
+    }
+    let mut abandoned = TMPFS_ABANDONED_REQUEST.lock();
+    assert!(abandoned.is_none(), "multiple abandoned tmpfs requests");
+    *abandoned = Some(pending);
+}
+
+fn tmpfs_proxy_service_abandoned() -> bool {
+    let pending = TMPFS_ABANDONED_REQUEST.lock().clone();
+    let Some(pending) = pending else {
+        return false;
+    };
+    let Some(reply) = tmpfs_proxy_take_filesystem_reply(&pending) else {
+        return false;
+    };
+    tmpfs_proxy_release_pending(&pending);
+    let abandoned = {
+        let mut slot = TMPFS_ABANDONED_REQUEST.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.generic_request_id == pending.generic_request_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    let Some(abandoned) = abandoned else {
+        return true;
+    };
+    if let (
+        PendingTmpfsProxyOperation::Open {
+            generation,
+            session_id,
+            session_generation,
+            ..
+        },
+        Ok(reply),
+    ) = (&abandoned.operation, reply)
+        && reply.status == tmpfs_protocol::status::OK
+        && usize::from(reply.data_length) == size_of::<u64>()
+    {
+        let mut node_bytes = [0_u8; size_of::<u64>()];
+        node_bytes.copy_from_slice(&reply.data[..size_of::<u64>()]);
+        let node_id = u64::from_ne_bytes(node_bytes);
+        if node_id != filesystem_protocol::INVALID_ID {
+            tmpfs_proxy_enqueue_close(*generation, *session_id, *session_generation, node_id);
+        }
+    }
+    drop(abandoned);
+    true
+}
+
+fn tmpfs_proxy_enqueue_close(
+    generation: u32,
+    session_id: u64,
+    session_generation: u64,
+    node_id: u64,
+) {
+    debug_assert_ne!(generation, 0);
+    debug_assert_ne!(session_id, filesystem_protocol::INVALID_ID);
+    debug_assert_ne!(session_generation, 0);
+    debug_assert_ne!(node_id, filesystem_protocol::INVALID_ID);
+    let mut queue = TMPFS_CLOSE_QUEUE.lock();
+    assert!(
+        queue.len() < MAX_PENDING_TMPFS_CLOSES,
+        "bounded tmpfs close queue exhausted"
+    );
+    queue.push_back(PendingTmpfsClose {
+        generation,
+        session_id,
+        session_generation,
+        node_id,
+    });
+}
+
+fn tmpfs_proxy_service_close() -> bool {
+    let active = TMPFS_PROXY.lock().active_close;
+    if let Some(active) = active {
+        let message = {
+            let mut registry = CAPABILITY_REGISTRY.lock();
+            let Some(index) = registry.object_index(active.reply_endpoint) else {
+                return false;
+            };
+            let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[index].data else {
+                return false;
+            };
+            endpoint.queue.pop_front()
+        };
+        let Some(message) = message else {
+            return false;
+        };
+        match tmpfs_proxy_validate_close_reply(message, active) {
+            Some(filesystem_protocol::status::OK)
+            | Some(filesystem_protocol::status::STALE_NODE)
+            | Some(filesystem_protocol::status::STALE_SESSION) => {
+                tmpfs_proxy_finish_close(active);
+            }
+            Some(filesystem_protocol::status::TRY_AGAIN) => {
+                tmpfs_proxy_finish_close(active);
+                TMPFS_CLOSE_QUEUE.lock().push_front(active.ticket);
+            }
+            _ => return true,
+        }
+    }
+
+    loop {
+        let Some(ticket) = TMPFS_CLOSE_QUEUE.lock().pop_front() else {
+            return active.is_some();
+        };
+        let start = {
+            let mut state = TMPFS_PROXY.lock();
+            if ticket.generation != state.generation
+                || ticket.session_id != state.session_id
+                || ticket.session_generation != state.session_generation
+            {
+                None
+            } else if !state.bulk_buffer_attached
+                || state.active_request_id != filesystem_protocol::INVALID_ID
+            {
+                drop(state);
+                TMPFS_CLOSE_QUEUE.lock().push_front(ticket);
+                return active.is_some();
+            } else {
+                let request_endpoint = match state.request_endpoint {
+                    Some(endpoint) => endpoint,
+                    None => {
+                        drop(state);
+                        TMPFS_CLOSE_QUEUE.lock().push_front(ticket);
+                        return active.is_some();
+                    }
+                };
+                let reply_endpoint = match state.session_reply_endpoint {
+                    Some(endpoint) => endpoint,
+                    None => {
+                        drop(state);
+                        TMPFS_CLOSE_QUEUE.lock().push_front(ticket);
+                        return active.is_some();
+                    }
+                };
+                if state.session_id == filesystem_protocol::INVALID_ID
+                    || state.session_generation == 0
+                {
+                    drop(state);
+                    TMPFS_CLOSE_QUEUE.lock().push_front(ticket);
+                    return active.is_some();
+                }
+                let request_id = state.next_request_id;
+                let Some(next_request_id) = state
+                    .next_request_id
+                    .checked_add(1)
+                    .filter(|id| *id != filesystem_protocol::INVALID_ID)
+                else {
+                    drop(state);
+                    TMPFS_CLOSE_QUEUE.lock().push_front(ticket);
+                    return active.is_some();
+                };
+                state.next_request_id = next_request_id;
+                state.active_request_id = request_id;
+                let close = ActiveTmpfsClose {
+                    ticket,
+                    request_id,
+                    reply_endpoint,
+                    session_id: ticket.session_id,
+                    session_generation: ticket.session_generation,
+                };
+                state.active_close = Some(close);
+                Some((request_endpoint, close))
+            }
+        };
+        let Some((request_endpoint, close)) = start else {
+            continue;
+        };
+        let mut request = filesystem_protocol::Request::EMPTY;
+        request.operation = filesystem_protocol::operation::CLOSE_NODE;
+        request.request_id = close.request_id;
+        request.session_id = close.session_id;
+        request.generation = close.session_generation;
+        request.node_id = close.ticket.node_id;
+        let bytes = tmpfs_proxy_value_bytes(&request).to_vec();
+        let pushed = {
+            let mut registry = CAPABILITY_REGISTRY.lock();
+            match registry.object_index(request_endpoint) {
+                Some(index) => match &mut registry.objects[index].data {
+                    CapabilityObjectData::Endpoint(endpoint)
+                        if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES =>
+                    {
+                        endpoint.queue.push_back(EndpointMessage {
+                            sender_process_id: 0,
+                            bytes,
+                            capability: None,
+                        });
+                        true
+                    }
+                    _ => false,
+                },
+                None => false,
+            }
+        };
+        if !pushed {
+            let mut state = TMPFS_PROXY.lock();
+            if state.active_close == Some(close) {
+                state.active_close = None;
+                state.active_request_id = filesystem_protocol::INVALID_ID;
+            }
+            drop(state);
+            TMPFS_CLOSE_QUEUE.lock().push_front(ticket);
+            return active.is_some();
+        }
+        wake_endpoint_waiter(request_endpoint);
+        return true;
+    }
+}
+
+fn tmpfs_proxy_validate_close_reply(
+    message: EndpointMessage,
+    active: ActiveTmpfsClose,
+) -> Option<i32> {
+    if message.capability.is_some()
+        || message.bytes.len() != size_of::<filesystem_protocol::Reply>()
+    {
+        return None;
+    }
+    let reply =
+        unsafe { ptr::read_unaligned(message.bytes.as_ptr() as *const filesystem_protocol::Reply) };
+    (reply.version == filesystem_protocol::VERSION
+        && reply.operation == filesystem_protocol::operation::CLOSE_NODE
+        && reply.flags == 0
+        && reply.request_id == active.request_id
+        && reply.session_id == active.session_id
+        && reply.generation == active.session_generation
+        && reply.node_id == filesystem_protocol::INVALID_ID
+        && reply.value == 0
+        && reply.data_length == 0
+        && reply.node_kind == filesystem_protocol::node_kind::UNKNOWN
+        && reply.reserved == [0; 2]
+        && reply.data == [0; filesystem_protocol::MAX_INLINE_DATA_BYTES])
+        .then_some(reply.status)
+}
+
+fn tmpfs_proxy_finish_close(active: ActiveTmpfsClose) -> bool {
+    let mut state = TMPFS_PROXY.lock();
+    if state.active_close == Some(active) {
+        state.active_close = None;
+        state.active_request_id = filesystem_protocol::INVALID_ID;
+    }
+    true
+}
+
 fn tmpfs_proxy_value_bytes<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
 }
@@ -7484,13 +7755,12 @@ fn tmpfs_proxy_value_bytes<T>(value: &T) -> &[u8] {
 fn tmpfs_proxy_begin_filesystem_request(
     process_id: u64,
     mut request: filesystem_protocol::Request,
-    operation: PendingTmpfsProxyOperation,
+    mut operation: PendingTmpfsProxyOperation,
     stack_pointer: usize,
 ) -> Result<(), i64> {
     let (request_endpoint, reply_endpoint, legacy_generation, request_id) = {
         let mut state = TMPFS_PROXY.lock();
-        if !state.bulk_buffer_attached
-            || state.active_request_id != filesystem_protocol::INVALID_ID
+        if !state.bulk_buffer_attached || state.active_request_id != filesystem_protocol::INVALID_ID
         {
             return Err(ERR_TRY_AGAIN);
         }
@@ -7509,6 +7779,15 @@ fn tmpfs_proxy_begin_filesystem_request(
         request.request_id = request_id;
         request.session_id = state.session_id;
         request.generation = state.session_generation;
+        if let PendingTmpfsProxyOperation::Open {
+            session_id,
+            session_generation,
+            ..
+        } = &mut operation
+        {
+            *session_id = state.session_id;
+            *session_generation = state.session_generation;
+        }
         (
             request_endpoint,
             reply_endpoint,
@@ -7557,12 +7836,12 @@ fn tmpfs_proxy_begin_filesystem_request(
     let mut manager = PROCESS_MANAGER.lock();
     let Some(process) = manager.process_mut(process_id) else {
         drop(manager);
-        tmpfs_proxy_release_pending(&pending);
+        tmpfs_proxy_abandon_pending(pending);
         return Err(ERR_NO_PROCESS);
     };
     if process.pending_tmpfs_proxy.is_some() {
         drop(manager);
-        tmpfs_proxy_release_pending(&pending);
+        tmpfs_proxy_abandon_pending(pending);
         return Err(ERR_IO);
     }
     process.pending_tmpfs_proxy = Some(pending);
@@ -7599,11 +7878,9 @@ fn tmpfs_proxy_complete_operation(
             append,
             close_on_exec,
             generation,
+            session_id,
+            session_generation,
         } => {
-            if descriptor_in_use(process, descriptor) || descriptor_count(process) >= MAX_OPEN_FILES
-            {
-                return Ok(error_return(ERR_TOO_MANY_OPEN_FILES));
-            }
             let size = reply.value as u64;
             if usize::from(reply.data_length) != size_of::<u64>() {
                 return Ok(error_return(ERR_IO));
@@ -7624,9 +7901,16 @@ fn tmpfs_proxy_complete_operation(
                 size,
                 backend: OpenFileBackend::TmpfsProxy {
                     generation,
+                    session_id,
+                    session_generation,
                     node_id,
                 },
             }));
+            if descriptor_in_use(process, descriptor) || descriptor_count(process) >= MAX_OPEN_FILES
+            {
+                drop(handle);
+                return Ok(error_return(ERR_TOO_MANY_OPEN_FILES));
+            }
             process.open_files.push(OpenFile {
                 descriptor,
                 handle,
@@ -7849,6 +8133,8 @@ fn tmpfs_proxy_open(
         append: options.append,
         close_on_exec,
         generation,
+        session_id: filesystem_protocol::INVALID_ID,
+        session_generation: 0,
     };
     match tmpfs_proxy_begin_filesystem_request(process_id, request, operation, stack_pointer) {
         Ok(()) => ControlOutcome::Blocked,
@@ -7863,21 +8149,33 @@ fn tmpfs_proxy_read(
     length: usize,
     stack_pointer: usize,
 ) -> ReadOutcome {
-    let (offset, generation, node_id) = {
+    let (offset, generation, session_id, session_generation, node_id) = {
         let file = handle.lock();
         if !file.readable {
             return ReadOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
         }
         let OpenFileBackend::TmpfsProxy {
             generation,
+            session_id,
+            session_generation,
             node_id,
         } = file.backend
         else {
             return ReadOutcome::Ready(error_return(ERR_IO));
         };
-        (file.offset, generation, node_id)
+        (
+            file.offset,
+            generation,
+            session_id,
+            session_generation,
+            node_id,
+        )
     };
-    if tmpfs_proxy_state().is_none_or(|state| state.generation != generation) {
+    if tmpfs_proxy_state().is_none_or(|state| {
+        state.generation != generation
+            || state.session_id != session_id
+            || state.session_generation != session_generation
+    }) {
         return ReadOutcome::Ready(error_return(ERR_IO));
     }
     let count = length.min(tmpfs_protocol::MAX_DATA_BYTES);
@@ -7910,22 +8208,35 @@ fn tmpfs_proxy_write(
     bytes: &[u8],
     stack_pointer: usize,
 ) -> WriteOutcome {
-    let (offset, generation, node_id, append) = {
+    let (offset, generation, session_id, session_generation, node_id, append) = {
         let file = handle.lock();
         if !file.writable {
             return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
         }
         let OpenFileBackend::TmpfsProxy {
             generation,
+            session_id,
+            session_generation,
             node_id,
         } = file.backend
         else {
             return WriteOutcome::Ready(error_return(ERR_IO));
         };
         let offset = if file.append { file.size } else { file.offset };
-        (offset, generation, node_id, file.append)
+        (
+            offset,
+            generation,
+            session_id,
+            session_generation,
+            node_id,
+            file.append,
+        )
     };
-    if tmpfs_proxy_state().is_none_or(|state| state.generation != generation) {
+    if tmpfs_proxy_state().is_none_or(|state| {
+        state.generation != generation
+            || state.session_id != session_id
+            || state.session_generation != session_generation
+    }) {
         return WriteOutcome::Ready(error_return(ERR_IO));
     }
     let count = bytes.len().min(tmpfs_protocol::MAX_DATA_BYTES);
@@ -7934,8 +8245,7 @@ fn tmpfs_proxy_write(
     }
     {
         let state = TMPFS_PROXY.lock();
-        if !state.bulk_buffer_attached
-            || state.active_request_id != filesystem_protocol::INVALID_ID
+        if !state.bulk_buffer_attached || state.active_request_id != filesystem_protocol::INVALID_ID
         {
             return WriteOutcome::Ready(error_return(ERR_TRY_AGAIN));
         }
@@ -8010,11 +8320,7 @@ fn tmpfs_proxy_stat(
     }
 }
 
-fn tmpfs_proxy_unlink(
-    process_id: u64,
-    path: &str,
-    stack_pointer: usize,
-) -> ControlOutcome {
+fn tmpfs_proxy_unlink(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
     let name = match tmpfs_proxy_file_name(path) {
         Ok(name) => name,
         Err(error) => return ControlOutcome::Ready(error_return(error)),
@@ -8597,7 +8903,12 @@ fn syscall_close(process_id: u64, descriptor: u64) -> u64 {
         return error_return(ERR_BAD_FILE_DESCRIPTOR);
     }
 
-    let pipe_descriptor = {
+    enum ClosedDescriptor {
+        File(OpenFile),
+        Pipe(PipeDescriptor),
+    }
+
+    let closed = {
         let mut manager = PROCESS_MANAGER.lock();
         let Some(process) = manager.process_mut(process_id) else {
             return error_return(ERR_BAD_FILE_DESCRIPTOR);
@@ -8611,27 +8922,35 @@ fn syscall_close(process_id: u64, descriptor: u64) -> u64 {
             process.close_count = process.close_count.saturating_add(1);
             process.pipe_descriptor_close_count =
                 process.pipe_descriptor_close_count.saturating_add(1);
-            descriptor
+            ClosedDescriptor::Pipe(descriptor)
         } else if let Some(index) = process
             .open_files
             .iter()
             .position(|file| file.descriptor == descriptor)
         {
-            process.open_files.remove(index);
+            let file = process.open_files.remove(index);
             process.close_count = process.close_count.saturating_add(1);
-            return 0;
+            ClosedDescriptor::File(file)
         } else {
             return error_return(ERR_BAD_FILE_DESCRIPTOR);
         }
     };
 
-    let result = match pipe_descriptor.direction {
-        PipeDirection::Reader => pipe::close_reader(pipe_descriptor.pipe_id),
-        PipeDirection::Writer => pipe::close_writer(pipe_descriptor.pipe_id),
-    };
-    match result {
-        Ok(()) => 0,
-        Err(_) => error_return(ERR_IO),
+    match closed {
+        ClosedDescriptor::File(file) => {
+            drop(file);
+            0
+        }
+        ClosedDescriptor::Pipe(descriptor) => {
+            let result = match descriptor.direction {
+                PipeDirection::Reader => pipe::close_reader(descriptor.pipe_id),
+                PipeDirection::Writer => pipe::close_writer(descriptor.pipe_id),
+            };
+            match result {
+                Ok(()) => 0,
+                Err(_) => error_return(ERR_IO),
+            }
+        }
     }
 }
 

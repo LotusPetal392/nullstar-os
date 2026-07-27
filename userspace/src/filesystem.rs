@@ -190,6 +190,26 @@ impl Session {
         Node::from_reply(self, &reply).ok_or(Error::Transport)
     }
 
+    pub fn close_node(self, request_id: u64, node: Node) -> Result<(), Error> {
+        let request = self.close_node_request(request_id, node)?;
+        let reply = self.exchange(&request, None)?;
+        if valid_close_reply(&reply) {
+            Ok(())
+        } else {
+            Err(Error::Transport)
+        }
+    }
+
+    pub fn close_node_request(
+        self,
+        request_id: u64,
+        node: Node,
+    ) -> Result<protocol::Request, Error> {
+        let mut request = self.request(protocol::operation::CLOSE_NODE, request_id)?;
+        request.node_id = node.id_for(self)?;
+        Ok(request)
+    }
+
     pub fn read_directory_to_shared_buffer(
         self,
         request_id: u64,
@@ -396,6 +416,15 @@ pub fn connect_service(service: CapabilityHandle, request_id: u64) -> Result<Ses
     Ok(session)
 }
 
+fn valid_close_reply(reply: &protocol::Reply) -> bool {
+    reply.flags == 0
+        && reply.node_id == protocol::INVALID_ID
+        && reply.value == 0
+        && reply.data_length == 0
+        && reply.node_kind == protocol::node_kind::UNKNOWN
+        && reply.data == [0; protocol::MAX_INLINE_DATA_BYTES]
+}
+
 pub fn valid_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
     reply.version == protocol::VERSION
         && reply.operation == request.operation
@@ -461,7 +490,7 @@ const _: () = assert!(size_of::<protocol::Reply>() <= 256);
 mod tests {
     use core::mem::size_of;
 
-    use super::{Error, Node, Session, connect, protocol, valid_reply};
+    use super::{Error, Node, Session, connect, protocol, valid_close_reply, valid_reply};
 
     fn session() -> Session {
         let mut reply = protocol::Reply::EMPTY;
@@ -572,6 +601,58 @@ mod tests {
             .expect("valid directory request");
         assert_eq!(request.session_id, session.id());
         assert_eq!(request.generation, session.generation());
+    }
+
+    #[test]
+    fn close_node_request_preserves_typed_identity() {
+        let session = session();
+        let node = Node {
+            id: 42,
+            session_id: session.id(),
+            generation: session.generation(),
+        };
+        let request = session
+            .close_node_request(5, node)
+            .expect("valid close request");
+        let mut expected = protocol::Request::EMPTY;
+        expected.operation = protocol::operation::CLOSE_NODE;
+        expected.request_id = 5;
+        expected.session_id = session.id();
+        expected.generation = session.generation();
+        expected.node_id = 42;
+        assert_eq!(request, expected);
+
+        let stale_node = Node {
+            generation: session.generation() + 1,
+            ..node
+        };
+        assert_eq!(
+            session.close_node_request(6, stale_node),
+            Err(Error::InvalidSession)
+        );
+        assert_eq!(
+            session.close_node(7, stale_node),
+            Err(Error::InvalidSession)
+        );
+    }
+
+    #[test]
+    fn close_node_replies_are_canonical() {
+        let mut reply = protocol::Reply::EMPTY;
+        reply.operation = protocol::operation::CLOSE_NODE;
+        reply.request_id = 5;
+        reply.session_id = 7;
+        reply.generation = 11;
+        assert!(valid_close_reply(&reply));
+
+        reply.flags = protocol::reply_flags::END_OF_DIRECTORY;
+        assert!(!valid_close_reply(&reply));
+        reply.flags = 0;
+        reply.node_id = 42;
+        assert!(!valid_close_reply(&reply));
+        reply.node_id = protocol::INVALID_ID;
+        reply.data_length = 1;
+        assert!(!valid_close_reply(&reply));
     }
 
     #[test]
