@@ -125,6 +125,37 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if platform::stat(b"/hello.txt").ok().map(|stat| stat.kind) != Some(file::KIND_FILE) {
         syscall::exit(4);
     }
+    let mut invalid_path_entries = [platform::DirectoryEntry::EMPTY; 1];
+    if platform::read_directory(b"/invalid", 0, &mut invalid_path_entries).err()
+        != Some(platform::Errno::NO_ENTRY)
+    {
+        syscall::exit(14);
+    }
+    if platform::read_directory(b"invalid", 0, &mut invalid_path_entries).err()
+        != Some(platform::Errno::NO_ENTRY)
+    {
+        syscall::exit(15);
+    }
+    let Ok(ls_process) = syscall::spawn_command(
+        b"/ls /invalid",
+        syscall::SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+    ) else {
+        syscall::exit(16);
+    };
+    if syscall::wait_child(ls_process)
+        .ok()
+        .map(|status| status.raw())
+        != Some(1)
+    {
+        syscall::exit(17);
+    }
+    if platform::stat(b"/hello.txt").ok().map(|stat| stat.kind) != Some(file::KIND_FILE) {
+        syscall::exit(18);
+    }
     const NAMESPACE_DIRECTORIES: &[&[u8]] = &[
         b"/dev",
         b"/tmp",

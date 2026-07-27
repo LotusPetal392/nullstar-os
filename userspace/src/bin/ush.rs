@@ -252,7 +252,7 @@ enum WaitTarget {
 }
 #[derive(Clone, Copy, Default)]
 struct WaitSummary {
-    failed: bool,
+    wait_failed: bool,
     interrupted: bool,
     stopped: bool,
 }
@@ -896,7 +896,7 @@ impl Shell {
                 Self::collect_children(&job.process_ids, job.process_count);
                 self.error(JOB_LIMIT_FAILURE);
             }
-        } else if summary.failed {
+        } else if summary.wait_failed {
             self.error(WAIT_FAILURE);
         } else if summary.interrupted {
             self.error(INTERRUPTED);
@@ -941,7 +941,7 @@ impl Shell {
             return;
         }
         self.jobs[slot] = Job::EMPTY;
-        if summary.failed {
+        if summary.wait_failed {
             self.error(WAIT_FAILURE);
         } else if summary.interrupted {
             self.error(INTERRUPTED);
@@ -1101,14 +1101,12 @@ impl Shell {
                         summary.stopped = true;
                     } else if status.interrupted() {
                         summary.interrupted = true;
-                    } else if status.signal().is_some() || !status.success() {
-                        summary.failed = true;
                     }
                     if !status.continued() && status.stopped_signal().is_none() {
                         job.final_statuses[index] = Some(status);
                     }
                 }
-                Err(_) => summary.failed = true,
+                Err(_) => summary.wait_failed = true,
             }
         }
         summary
