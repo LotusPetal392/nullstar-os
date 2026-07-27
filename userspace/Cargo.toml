@@ -13,6 +13,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "block_device_probe"
+path = "src/bin/block_device_probe.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "tmpfs_service"
 path = "src/bin/tmpfs_service.rs"
 test = false

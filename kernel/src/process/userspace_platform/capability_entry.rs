@@ -399,6 +399,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::SHARED_MEMORY_CREATE
             | abi::syscall::SHARED_MEMORY_READ
             | abi::syscall::SHARED_MEMORY_WRITE
+            | abi::syscall::OPEN_BLOCK_DEVICE_ENDPOINT
     )
 }
 
@@ -467,6 +468,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
             registers.rdx,
             registers.r10,
         ),
+        abi::syscall::OPEN_BLOCK_DEVICE_ENDPOINT => {
+            open_block_device_endpoint(process_id, registers.rdi)
+        }
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer

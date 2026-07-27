@@ -17,6 +17,11 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const INIT_READY: &[u8] = b"userspace init ready: pid=1\n";
+const BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe";
+const BLOCK_DEVICE_PROBE_FAILED: &[u8] = b"userspace init: read-only block-device probe failed\n";
+const BLOCK_DEVICE_PROBE_PASSED: &[u8] = b"userspace init: read-only block-device probe passed\n";
+const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
+    b"userspace init: failed to acquire block-device endpoint\n";
 const SERVICE_COMMAND: &[u8] = b"/tmpfs-service";
 const SERVICE_READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
 const SERVICE_STARTING: &[u8] = b"userspace init: starting tmpfs service\n";
@@ -101,6 +106,24 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if syscall::write_all(STDOUT, INIT_READY).is_err() {
         syscall::exit(1);
     }
+
+    let block_device_endpoint = platform::open_block_device_endpoint(2)
+        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+    if !matches!(
+        ipc::info(block_device_endpoint),
+        Ok(info)
+            if info.kind == ipc::ObjectKind::Endpoint
+                && info.rights == (Rights::SEND | Rights::TRANSFER)
+    ) {
+        fail(BLOCK_DEVICE_BOOTSTRAP_FAILED);
+    }
+    run_probe(
+        BLOCK_DEVICE_PROBE_COMMAND,
+        block_device_endpoint,
+        BLOCK_DEVICE_PROBE_FAILED,
+        BLOCK_DEVICE_PROBE_PASSED,
+    );
+    ipc::close(block_device_endpoint).unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
 
     let readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));

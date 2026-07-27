@@ -51,6 +51,7 @@ impl Errno {
     pub const INVALID_ARGUMENT: Self = Self((-abi_errno::INVALID_ARGUMENT) as i32);
     pub const ARGUMENT_TOO_LARGE: Self = Self((-abi_errno::ARGUMENT_TOO_LARGE) as i32);
     pub const NO_SPACE: Self = Self((-abi_errno::NO_SPACE) as i32);
+    pub const PERMISSION: Self = Self((-abi_errno::PERMISSION) as i32);
 
     pub const fn code(self) -> i32 {
         self.0

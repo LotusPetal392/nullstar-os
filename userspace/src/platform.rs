@@ -227,6 +227,18 @@ pub fn set_process_group(
     decode(result)
 }
 
+pub fn open_block_device_endpoint(partition_index: u32) -> Result<FileDescriptor> {
+    let mut result = syscall::OPEN_BLOCK_DEVICE_ENDPOINT;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") u64::from(partition_index),
+        );
+    }
+    decode(result)
+}
+
 pub fn register_tmpfs_service(service: FileDescriptor, generation: u32) -> Result<()> {
     let mut result = syscall::REGISTER_TMPFS_SERVICE;
     unsafe {

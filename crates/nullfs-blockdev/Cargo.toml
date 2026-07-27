@@ -6,8 +6,9 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/LotusPetal392/nullstar-os"
 
 [features]
-default = ["std"]
-std = []
+default = []
+std = ["memory"]
+memory = []
 
 [lib]
 path = "src/lib.rs"

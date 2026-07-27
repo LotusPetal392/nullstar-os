@@ -162,8 +162,12 @@ not a new kernel-specific filesystem path. Its shared `no_std` format/core code
 is reused by host formatter, image, inspector, checker, and Linux FUSE tooling.
 The host implementation supports the version 1.2 inode/directory format,
 authoritative allocation maps, bounded data-journaling redo transactions,
-persistent orphan recovery, and deterministic crash testing. NullStar service
-integration remains a later stage in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
+persistent orphan recovery, and deterministic crash testing. A capability-based
+[block-device service protocol](block-device-service-protocol.md) now gives
+init-authorized filesystem services checked, partition-relative, registered-
+buffer reads. The initial endpoint is intentionally read-only; writable NullFS
+service integration requires a dedicated partition and durability validation as
+described in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
 

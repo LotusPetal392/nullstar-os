@@ -45,6 +45,14 @@ mod abi {
 }
 
 #[allow(dead_code)]
+mod block_device_protocol {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/block_device_protocol.rs"
+    ));
+}
+
+#[allow(dead_code)]
 mod tmpfs_protocol {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -976,7 +984,13 @@ impl TmpfsProxyState {
     }
 }
 
-static KERNEL_CAPABILITY_ROOTS: Mutex<Vec<CapabilityObjectRef>> = Mutex::new(Vec::new());
+#[derive(Clone, Copy)]
+struct KernelCapabilityRoot {
+    object: CapabilityObjectRef,
+    references: usize,
+}
+
+static KERNEL_CAPABILITY_ROOTS: Mutex<Vec<KernelCapabilityRoot>> = Mutex::new(Vec::new());
 static TMPFS_PROXY: Mutex<TmpfsProxyState> = Mutex::new(TmpfsProxyState::new());
 static TMPFS_CLOSE_QUEUE: Mutex<VecDeque<PendingTmpfsClose>> = Mutex::new(VecDeque::new());
 static TMPFS_ABANDONED_REQUEST: Mutex<Option<PendingTmpfsProxyRequest>> = Mutex::new(None);
@@ -1038,19 +1052,37 @@ struct PendingVfsRequest {
 
 fn kernel_capability_root_add(object: CapabilityObjectRef) {
     let mut roots = KERNEL_CAPABILITY_ROOTS.lock();
-    if !roots.contains(&object) {
-        roots.push(object);
+    if let Some(root) = roots.iter_mut().find(|root| root.object == object) {
+        root.references = root
+            .references
+            .checked_add(1)
+            .expect("kernel capability root reference count overflowed");
+    } else {
+        roots.push(KernelCapabilityRoot {
+            object,
+            references: 1,
+        });
     }
 }
 
 fn kernel_capability_root_remove(object: CapabilityObjectRef) {
-    KERNEL_CAPABILITY_ROOTS
-        .lock()
-        .retain(|candidate| *candidate != object);
+    let mut roots = KERNEL_CAPABILITY_ROOTS.lock();
+    let Some(index) = roots.iter().position(|root| root.object == object) else {
+        return;
+    };
+    if roots[index].references > 1 {
+        roots[index].references -= 1;
+    } else {
+        roots.remove(index);
+    }
 }
 
 fn kernel_capability_roots_snapshot() -> Vec<CapabilityObjectRef> {
-    KERNEL_CAPABILITY_ROOTS.lock().clone()
+    KERNEL_CAPABILITY_ROOTS
+        .lock()
+        .iter()
+        .map(|root| root.object)
+        .collect()
 }
 
 #[derive(Clone)]
@@ -3683,6 +3715,7 @@ impl Runtime {
         service_terminal_control();
         self.service_pending_signals()?;
         let reaped = reap(&mut self.frame_allocator)?;
+        service_block_device_endpoints();
         self.service_cow_faults()?;
         service_terminal_reads(self.physical_memory_offset)?;
         service_pipe_waiters(self.physical_memory_offset)?;

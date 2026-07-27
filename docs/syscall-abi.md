@@ -229,6 +229,21 @@ service-backed implementation removes flat files beneath `/tmp`; namespace
 directory nodes return `EISDIR`, and boot-FAT deletion remains unavailable
 until FAT is behind the generic filesystem protocol.
 
+## Version 1.7 read-only block-device endpoints
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 52 | `open_block_device_endpoint` | partition-table index | capability handle |
+
+Only PID 1 may open a discovered filesystem-candidate partition. Each successful
+call returns an independent endpoint handle with `SEND | TRANSFER`; PID 1 may
+delegate a reduced send-only handle to a supervised filesystem service. The
+endpoint implements the versioned protocol in
+[`block-device-service-protocol.md`](block-device-service-protocol.md), and the
+`READ_ONLY_BLOCK_DEVICE_ENDPOINTS` capability bit advertises availability.
+Other callers receive `EPERM`, invalid or unavailable partitions are rejected,
+and the initial endpoint never authorizes disk writes.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -238,6 +253,7 @@ until FAT is behind the generic filesystem protocol.
   kernel retains the send endpoint and completes a versioned root-route
   handshake asynchronously before treating the service as ready.
 - ABI 1.6 adds VFS-routed pathname deletion at syscall 51.
+- ABI 1.7 adds PID-1 read-only partition endpoint acquisition at syscall 52.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

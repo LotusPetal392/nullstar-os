@@ -445,6 +445,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nullfs-userspace-blockdev"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "userspace",
+]
+
+[[package]]
 name = "nullstar-os"
 version = "0.1.0"
 dependencies = [

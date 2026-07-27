@@ -8,3 +8,6 @@ repository = "https://github.com/LotusPetal392/nullstar-os"
 [dependencies]
 nullfs-blockdev = { path = "../nullfs-blockdev", default-features = false }
 nullfs-format = { path = "../nullfs-format" }
+
+[dev-dependencies]
+nullfs-blockdev = { path = "../nullfs-blockdev", features = ["memory"] }

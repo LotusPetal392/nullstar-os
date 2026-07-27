@@ -16,7 +16,7 @@ path = "src/main.rs"
 required-features = ["fuse"]
 
 [dependencies]
-nullfs-blockdev = { path = "../../crates/nullfs-blockdev" }
+nullfs-blockdev = { path = "../../crates/nullfs-blockdev", features = ["std"] }
 nullfs-core = { path = "../../crates/nullfs-core" }
 nullfs-format = { path = "../../crates/nullfs-format" }
 
