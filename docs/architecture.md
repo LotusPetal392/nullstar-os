@@ -155,6 +155,14 @@ network filesystems appear as named children of `/Volumes`. The VFS service
 will hide mount crossings from clients while preserving node and volume
 identity as routing and open-file ownership move out of the kernel.
 
+NullFS is the planned native persistent backend for that service architecture,
+not a new kernel-specific filesystem path. Its shared `no_std` format/core code
+is reused by host formatter, image, inspector, checker, and Linux FUSE tooling.
+The host implementation supports the version 1.2 inode/directory format,
+authoritative allocation maps, bounded data-journaling redo transactions,
+persistent orphan recovery, and deterministic crash testing. NullStar service
+integration remains a later stage in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
+
 ## Shells
 
 The kernel shell in `kernel/src/shell.rs` is a diagnostic and control surface.

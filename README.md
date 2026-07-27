@@ -16,6 +16,9 @@ experimentation, not production use or untrusted workloads.
   input
 - AHCI block access, MBR and GPT discovery, FAT12/16/32 reads, constrained
   FAT16 writes, a root VFS mount, and a bounded `/tmp` tmpfs
+- a host-testable NullFS 1.2 stack with explicit little-endian records,
+  authoritative allocation maps, bounded redo recovery, deterministic crash
+  testing, and formatter, image, inspection, and read-only checking tools
 - ELF64 ring-3 processes, file descriptors, pipes, `fork` with copy-on-write,
   transactional `exec`, parent/child waiting, environments, process groups,
   terminal ownership, and a focused signal implementation
@@ -35,8 +38,9 @@ experimentation, not production use or untrusted workloads.
 See [Architecture](docs/architecture.md) for how these pieces fit together,
 [Userspace ABI](docs/syscall-abi.md) for the ring-3 contract,
 [Protection model](docs/protection-model.md) for the capability and IPC
-foundation, and [Development](docs/development.md) for the toolchain, test
-workflow, and common build issues.
+foundation, [NullFS roadmap](docs/filesystems/nullfs-roadmap.md) for the native
+persistent filesystem plan, and [Development](docs/development.md) for the
+toolchain, test workflow, and common build issues.
 
 ## Requirements
 
@@ -133,11 +137,13 @@ include `--locked` so local results use the committed dependency graph.
 .
 ├── build.rs          Builds normal and smoke-test BIOS disk images
 ├── src/              Host-side QEMU runner and smoke-test harness
+├── crates/           Host-testable shared libraries, including NullFS format code
 ├── kernel/           Freestanding x86-64 kernel
+├── tools/            Host utilities for formatting, checking, inspecting, and mounting NullFS
 ├── userspace/        Shared no_std runtime and bundled ring-3 programs
 ├── shared/           ABI definitions included by kernel and userspace
 ├── scripts/          Local verification commands
-└── docs/             Architecture and development guides
+└── docs/             Architecture, format, and development guides
 ```
 
 The root package is a host executable. It uses Cargo artifact dependencies to
@@ -151,6 +157,8 @@ images, and launches QEMU.
 - There is no networking stack or network driver.
 - FAT writes are limited to regular files in the FAT16 root directory with 8.3
   names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
+  NullFS now supports host-side writable images and recovery, but offline repair
+  and the NullStar filesystem-service adapter are not yet implemented.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`

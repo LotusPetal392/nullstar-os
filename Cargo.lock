@@ -145,6 +145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsck-nullfs"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "nullfs-core",
+ "nullfs-format",
+ "nullfs-testkit",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -290,6 +300,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mkfs-nullfs"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "nullfs-core",
+ "nullfs-format",
+ "nullfs-testkit",
+]
+
+[[package]]
 name = "noto-sans-mono-bitmap"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -300,8 +320,43 @@ name = "nullfs-blockdev"
 version = "0.1.0"
 
 [[package]]
+name = "nullfs-core"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "nullfs-format",
+ "nullfs-testkit",
+]
+
+[[package]]
 name = "nullfs-format"
 version = "0.1.0"
+
+[[package]]
+name = "nullfs-image"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "nullfs-core",
+ "nullfs-format",
+ "nullfs-testkit",
+]
+
+[[package]]
+name = "nullfs-info"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "nullfs-format",
+]
+
+[[package]]
+name = "nullfs-testkit"
+version = "0.1.0"
+dependencies = [
+ "nullfs-blockdev",
+ "nullfs-format",
+]
 
 [[package]]
 name = "nullstar-os"

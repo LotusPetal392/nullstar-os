@@ -186,9 +186,18 @@ overloading generic flags or inline data.
 4. Move path routing and open-file descriptions into a VFS service. (routing
    service and boot namespace contract started)
 5. Put FAT behind the same protocol.
-6. Introduce the native metadata-rich filesystem as another service.
+6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
+   service.
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
+
+NullFS host development proceeds independently of service integration. The
+workspace contains the shared version 1.2 format and writable core, checked
+memory and host-file block devices, deterministic crash/recovery tests, and
+formatter, image, inspector, checker, and Linux FUSE tools. The frozen layout
+and staged path to a NullStar backend service are in the
+[NullFS format](filesystems/nullfs-format.md) and
+[NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 The current implementation completes the shared wire contract, typed request
 builders, bounded service session and buffer tables, monotonic tmpfs node IDs,
