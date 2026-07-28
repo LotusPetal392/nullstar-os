@@ -142,6 +142,22 @@ small built-in bootstrap set or come from an already available boot image. The
 current explicitly coded startup sequence serves as that bootstrap until the
 unit loader and dependency engine exist.
 
+### Future identity and access control
+
+NullStar's future multiuser model will add kernel-authenticated process
+credentials, filesystem UID/GID/mode enforcement, bounded supplementary groups,
+login sessions, and separate service identities. UID 0 (`root`) may receive a
+narrow discretionary-access override by policy, while GID 1 (`admin`) makes an
+account eligible to request brokered elevation. Neither identity can manufacture
+or amplify kernel capabilities; credential transitions must also filter inherited
+descriptors and capabilities.
+
+Regular users should receive private primary groups and homes under `/Users`.
+Account, group, and credential configuration belongs under
+`/System/config/identity`, with mutable identity state under
+`/System/var/lib/identity`. The complete future model and staged implementation
+plan are in [Identity and access-control design](identity-and-access.md).
+
 The process manager owns:
 
 - address spaces and copy-on-write fork state
@@ -193,14 +209,26 @@ reference when their final descriptor, stream, or inherited owner disappears,
 allowing tmpfs to reclaim unlinked nodes without closing duplicated or
 fork-inherited descriptors early.
 
-The rooted namespace includes service-backed `/dev` and `/tmp` mounts, a system
-hierarchy under `/System` (`config`, `var/log`, `bin`, `services`, `drivers`,
-`lib`, and `Applications`), user homes under `/Users`, and globally installed
-applications under `/Applications`. Additional local, removable, and network
-filesystems appear as named children of `/Volumes`. The VFS service hides the
-implemented mount crossings from clients; preserving broader node and volume
-identity remains part of moving routing and open-file ownership out of the
-kernel.
+The rooted namespace includes the current synthetic `/dev` namespace and the
+service-backed `/tmp` mount, a system hierarchy under `/System` (`config`,
+`var/log`, `bin`, `services`, `drivers`, `lib`, and `Applications`), user homes
+under `/Users`, and globally installed applications under `/Applications`.
+Additional local, removable, and network filesystems appear as named children of
+`/Volumes`. The VFS service hides the implemented mount crossings from clients;
+preserving broader node and volume identity remains part of moving routing and
+open-file ownership out of the kernel.
+
+### Future device filesystem
+
+The synthetic `/dev` namespace should eventually be replaced by a userspace
+`devfs-service` mount. Devfs will act as a bounded device registry and connection
+broker: paths expose discoverable metadata, while each successful open creates
+an attenuated, provider-generation-scoped session. Listing a node will not grant
+device authority, and root or admin identity will not substitute for the
+provider capabilities needed to use raw disks, input devices, MMIO, IRQs, or DMA.
+Kernel-backed terminal and storage adapters can supply the first providers before
+hardware drivers move to userspace. See [Device filesystem design](devfs.md) for
+the namespace, protocol, lifecycle, policy, and migration plan.
 
 NullFS is the native persistent backend for that service architecture, not a
 new kernel-resident filesystem implementation. Its shared `no_std` format/core
