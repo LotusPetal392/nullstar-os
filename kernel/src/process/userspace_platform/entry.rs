@@ -218,6 +218,9 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
         abi::syscall::REGISTER_VFS_SERVICE => {
             platform_register_vfs_service(process_id, registers.rdi, registers.rsi)
         }
+        abi::syscall::REGISTER_NULLFS_SERVICE => {
+            platform_register_nullfs_service(process_id, registers.rdi, registers.rsi)
+        }
         abi::syscall::DUP => platform_dup(process_id, registers.rdi),
         abi::syscall::DUP2 => platform_dup2(process_id, registers.rdi, registers.rsi),
         abi::syscall::GETPPID => platform_getppid(process_id),
@@ -248,6 +251,7 @@ fn platform_syscall_number(number: u64) -> bool {
             | abi::syscall::GETCWD
             | abi::syscall::REGISTER_TMPFS_SERVICE
             | abi::syscall::REGISTER_VFS_SERVICE
+            | abi::syscall::REGISTER_NULLFS_SERVICE
             | abi::syscall::UNLINK
             | abi::syscall::DUP
             | abi::syscall::DUP2
@@ -386,6 +390,47 @@ fn platform_register_tmpfs_service(process_id: u64, handle: u64, generation: u64
         return error_return(error);
     }
     0
+}
+
+fn platform_register_nullfs_service(process_id: u64, handle: u64, generation: u64) -> u64 {
+    let (entry, endpoint) = {
+        let registry = CAPABILITY_REGISTRY.lock();
+        let entry = registry.entry(process_id, handle);
+        (
+            entry.map(|entry| (entry.object.kind, entry.rights)),
+            entry.map(|entry| entry.object),
+        )
+    };
+    let generation = match crate::tmpfs_abi::validate_registration(
+        process_id,
+        INIT_PROCESS_ID,
+        generation,
+        entry,
+        abi::capability::KIND_ENDPOINT,
+        abi::capability::RIGHT_SEND,
+    ) {
+        Ok(generation) => generation,
+        Err(crate::tmpfs_abi::RegistrationError::Permission) => {
+            return error_return(abi::errno::PERMISSION);
+        }
+        Err(crate::tmpfs_abi::RegistrationError::BadHandle) => {
+            return error_return(ERR_BAD_FILE_DESCRIPTOR);
+        }
+        Err(crate::tmpfs_abi::RegistrationError::MissingSendRight) => {
+            return error_return(abi::errno::PERMISSION);
+        }
+        Err(
+            crate::tmpfs_abi::RegistrationError::InvalidGeneration
+            | crate::tmpfs_abi::RegistrationError::WrongObjectKind,
+        ) => return error_return(ERR_INVALID_ARGUMENT),
+    };
+    let Some(endpoint) = endpoint else {
+        return error_return(ERR_BAD_FILE_DESCRIPTOR);
+    };
+    match nullfs_proxy_begin_connect(endpoint, generation) {
+        Ok(()) => 0,
+        Err(error) => error_return(error),
+    }
 }
 
 fn platform_register_vfs_service(process_id: u64, handle: u64, generation: u64) -> u64 {

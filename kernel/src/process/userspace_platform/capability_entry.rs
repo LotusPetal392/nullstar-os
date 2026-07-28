@@ -2,7 +2,8 @@
 // Existing kernel services remain the fallback path, so this layer can be
 // introduced without moving the VFS, drivers, pipes, or shell out of ring 0.
 
-static CAPABILITY_REGISTRY: Mutex<CapabilityRegistry> = Mutex::new(CapabilityRegistry::new());
+static CAPABILITY_REGISTRY: PreemptMutex<CapabilityRegistry> =
+    PreemptMutex::new(CapabilityRegistry::new());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapabilityObjectRef {

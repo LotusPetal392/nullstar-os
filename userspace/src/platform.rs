@@ -19,6 +19,7 @@ pub struct Errno(i32);
 impl Errno {
     pub const NO_ENTRY: Self = Self((-abi::errno::NO_ENTRY) as i32);
     pub const NO_PROCESS: Self = Self((-abi::errno::NO_PROCESS) as i32);
+    pub const TRY_AGAIN: Self = Self((-abi::errno::TRY_AGAIN) as i32);
     pub const PERMISSION: Self = Self((-abi::errno::PERMISSION) as i32);
     pub const BAD_FILE_DESCRIPTOR: Self = Self((-abi::errno::BAD_FILE_DESCRIPTOR) as i32);
     pub const BAD_ADDRESS: Self = Self((-abi::errno::BAD_ADDRESS) as i32);
@@ -237,6 +238,19 @@ pub fn open_block_device_endpoint(partition_index: u32) -> Result<FileDescriptor
         );
     }
     decode(result)
+}
+
+pub fn register_nullfs_service(service: FileDescriptor, generation: u32) -> Result<()> {
+    let mut result = syscall::REGISTER_NULLFS_SERVICE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") service,
+            in("rsi") generation as u64,
+        );
+    }
+    decode(result).map(|_| ())
 }
 
 pub fn register_tmpfs_service(service: FileDescriptor, generation: u32) -> Result<()> {

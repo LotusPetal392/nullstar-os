@@ -218,6 +218,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         NULLFS_PROBE_FAILED,
         NULLFS_PROBE_PASSED,
     );
+    register_nullfs_proxy(&nullfs_service, nullfs_request_endpoint);
 
     let readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
@@ -269,6 +270,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             Some(nullfs_block_capability),
                             &NULLFS_MESSAGES,
                         );
+                        register_nullfs_proxy(&nullfs_service, nullfs_request_endpoint);
                     }
                     ServiceStatusDisposition::Failed => fail(NULLFS_SERVICE_FAILED),
                 },
@@ -348,6 +350,24 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             fail(SHELL_WAIT_FAILED);
         }
     }
+}
+
+fn register_nullfs_proxy(service: &ServiceRuntime, request_endpoint: CapabilityHandle) {
+    let generation = service
+        .process_id()
+        .and_then(|process_id| u32::try_from(process_id).ok())
+        .filter(|generation| *generation != 0)
+        .unwrap_or_else(|| fail(NULLFS_SERVICE_PROTOCOL_FAILED));
+    for _ in 0..8 {
+        match platform::register_nullfs_service(request_endpoint, generation) {
+            Ok(()) => return,
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
+            }
+            Err(_) => fail(NULLFS_SERVICE_BOOTSTRAP_FAILED),
+        }
+    }
+    fail(NULLFS_SERVICE_BOOTSTRAP_FAILED)
 }
 
 fn register_tmpfs_proxy(request_endpoint: CapabilityHandle) {

@@ -6,23 +6,23 @@ system's userspace filesystem architecture. The format baseline is defined in
 [`nullfs-format.md`](nullfs-format.md); the service boundary is defined in
 [`../filesystem-service-protocol.md`](../filesystem-service-protocol.md).
 
-This roadmap describes intended work. Phases 1 and 2 now include the
+This roadmap describes intended and completed work. Phases 1 and 2 include the
 `nullfs-format`, `nullfs-blockdev`, `nullfs-core`, and `nullfs-testkit` crates;
 mountable Phase 2 output from `mkfs-nullfs`; inspection through `nullfs-info`;
 deterministic source-tree population through `nullfs-image`; and an optional
 Linux read-only `nullfs-fuse` adapter. Writable core operation and checking are
-implemented; offline repair policy and the NullStar filesystem service remain
-future work. Boot images now contain a deterministic dedicated NullFS partition,
-and normal boot validates its checksummed superblock through the read-only
-capability boundary. The `nullfs_blockdev::BlockDevice` adapter exposes the
-4096-byte logical geometry required by the shared core over the endpoint's device
-logical blocks.
+implemented; offline repair policy and writable NullStar service authority
+remain future work. Boot images contain a deterministic dedicated NullFS
+partition, and a separately supervised read-only service is statically mounted
+at `/Volumes/NULLSTAR_DATA`. The `nullfs_blockdev::BlockDevice` adapter exposes
+the 4096-byte logical geometry required by the shared core over the endpoint's
+device logical blocks.
 
 ## Architectural position
 
-NullFS will be a backend filesystem service selected by the existing VFS
-routing layer. It must not bypass that layer, add NullFS-specific syscalls, or
-move path resolution and persistent filesystem logic into the kernel.
+NullFS is a backend filesystem service selected by the existing VFS routing
+layer. It does not bypass that layer, add NullFS-specific application syscalls,
+or move persistent filesystem logic into the kernel.
 
 ```text
 NullStar applications
@@ -37,12 +37,13 @@ common filesystem-service protocol
 NullFS service -> shared NullFS core -> block-device adapter
 ```
 
-The VFS resolves the rooted namespace and crosses mount points one component at
-a time. The NullFS service implements the common `CONNECT` session model, opaque
-node IDs, attributes, lookup/open, registered-buffer reads and writes, stable
-directory iteration, mutation operations, cancellation, and generation
-handling as those operations become available. On-disk inode or extent numbers
-remain an implementation detail.
+The VFS resolves the rooted namespace and selects the static NullFS mount at
+`/Volumes/NULLSTAR_DATA`. The read-only service implements the common `CONNECT`
+session model, opaque node IDs, attributes, lookup/open, registered-buffer
+reads, stable directory iteration, close accounting, and generation handling.
+Registered-buffer writes and mutation operations remain disabled until writable
+authority is deliberately granted. On-disk inode or extent numbers remain an
+implementation detail.
 
 FUSE is the first integration target because it exercises realistic filesystem
 workloads with ordinary host tooling and faster debugging. FUSE is an adapter,
@@ -232,49 +233,72 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## Phase 4: NullStar filesystem service
 
-NullFS is now exposed by a separately supervised userspace backend behind the
-common filesystem protocol; clients are not routed to a NullFS-specific API. The
-build appends a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as MBR
-partition 3. The kernel identifies it as NullFS, and an init-delegated raw probe
-validates its superblock through the read-only endpoint. The typed session client
-and adapter translate the endpoint's 512-byte logical-block geometry into the
+NullFS is exposed by a separately supervised userspace backend behind the common
+filesystem protocol; clients are not routed to a NullFS-specific API. The build
+appends a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as MBR partition
+3. The kernel identifies it as NullFS, and an init-delegated raw probe validates
+its superblock through the read-only endpoint. The typed session client and
+adapter translate the endpoint's 512-byte logical-block geometry into the
 4096-byte blocks required by the shared core.
 
 The service mounts that volume through the adapter and implements `CONNECT`,
-`DISCONNECT`, registered buffers, lookup, attributes, read-only open, file reads,
-paginated directory iteration, and `CLOSE_NODE`. Opaque node IDs are independent
-of core inode numbers and the map is bounded by the mounted volume's inode
-capacity. Canonical mutations are rejected with `PERMISSION`. A direct generic-
-protocol boot probe verifies fixture lookup and reads, directory continuation,
-duplicate-open close accounting, stale duplicate closes, mutation denial, and
-session cleanup before PID 1 continues boot.
+`DISCONNECT`, registered buffers, lookup, attributes, read-only open, file
+reads, paginated directory iteration, and `CLOSE_NODE`. Opaque node IDs are
+independent of core inode numbers and the map is bounded by the mounted volume's
+inode capacity. Canonical mutations are rejected with `PERMISSION`. A direct
+generic-protocol boot probe verifies fixture lookup and reads, directory
+continuation, duplicate-open close accounting, stale duplicate closes, mutation
+denial, and session cleanup before PID 1 continues boot.
 
-The service adapter must:
+PID 1 registers `nullfs-service` independently of tmpfs as a generation-scoped
+kernel filesystem proxy. The VFS has a static longest-prefix route and mount at
+`/Volumes/NULLSTAR_DATA`; `/Volumes` exposes the mount as a read-only directory.
+The kernel proxy creates its own protocol session and registers one kernel-owned
+4 KiB shared-memory buffer for file and directory transfers. Through the public
+file-descriptor and filesystem ABI, the mount supports ordinary `stat`,
+read-only `open`, `read`, `fstat`, `seek`, `read_directory`, and `chdir`.
+Canonical cwd handling routes relative directory changes and opens back through
+NullFS after a process enters the mounted volume. Write, create, truncate,
+append, descriptor-write, and unlink attempts return the read-only error.
+
+Successful opens retain opaque, generation- and session-scoped service nodes in
+kernel open-file descriptions. Descriptor duplication and inheritance share the
+description, and only final destruction queues `CLOSE_NODE`. When supervision
+starts a replacement and registers a higher generation, old in-flight requests
+fail with I/O and old descriptors remain stale rather than being rebound to the
+replacement. Their later NullFS I/O fails with I/O, and queued close tickets
+whose generation or session does not match are discarded without being sent to
+the replacement.
+
+The service adapter must continue to:
 
 - use `CONNECT`/`DISCONNECT`, session IDs, generations, request IDs, and stale
   session rejection;
 - assign opaque node IDs independent of disk addresses and preserve required
-  identity across rename;
+  identity across future rename support;
 - use registered shared-memory buffers for file and directory data;
 - validate buffer bounds, file offsets, capacities, operation flags, and reply
   byte counts;
-- implement `CLOSE_NODE` lifetime accounting so unlinked-but-open nodes can be
-  reclaimed correctly;
+- implement `CLOSE_NODE` lifetime accounting so future unlinked-but-open nodes
+  can be reclaimed correctly;
 - expose volume capabilities through versioned generic operations as the common
   protocol gains them;
 - handle clean shutdown, dirty startup, service replacement, and block-device
   loss without weakening format rules.
 
-PID 1 supervision is implemented with the same restart-budget model as the other
-services. VFS backend registration is the next integration step. Mounting a
-NullFS volume under `/Volumes`, or selecting it as a future native root/system
-volume, remains a VFS policy decision. Keep the current FAT path until protocol parity, persistence,
-and recovery smoke coverage exist.
+PID 1 supervision uses the same restart-budget model as the other services.
+Selecting NullFS as a future native root/system volume remains a VFS policy
+decision, and the current FAT path remains until protocol parity, persistence,
+and recovery smoke coverage exist. Writable block and filesystem authority is a
+later milestone and requires an explicit grant policy plus durability validation.
 
-Acceptance includes protocol conformance tests shared with tmpfs where
-applicable, service restart/stale-handle tests, registered-buffer bounds tests,
-VFS longest-prefix and mount-crossing tests, and QEMU smoke tests through public
-file-descriptor syscalls. Run the complete repository check:
+Current normal-boot coverage includes the direct protocol probe and a mounted
+VFS probe through public syscalls, including longest-prefix routing, ordinary
+read operations, read-only mutation denial, directory traversal, and relative
+cwd routing. It does not deliberately terminate and restart `nullfs-service`
+with live descriptors. Explicit restart/stale-handle fault injection, broader
+registered-buffer bounds cases, and recovery smoke coverage remain acceptance
+work rather than implemented test claims. Run the complete repository check:
 
 ```sh
 ./scripts/check-local.sh

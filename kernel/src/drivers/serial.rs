@@ -1,17 +1,18 @@
 use core::fmt::{self, Write};
 
 use lazy_static::lazy_static;
-use spin::Mutex;
 use uart_16550::SerialPort;
+
+use crate::preemption::PreemptMutex;
 
 const COM1_PORT: u16 = 0x3f8;
 
 lazy_static! {
-    static ref SERIAL1: Mutex<SerialPort> = {
+    static ref SERIAL1: PreemptMutex<SerialPort> = {
         // Outputs serial data to COM1
         let mut serial_port = unsafe { SerialPort::new(COM1_PORT) };
         serial_port.init();
-        Mutex::new(serial_port)
+        PreemptMutex::new(serial_port)
     };
 }
 

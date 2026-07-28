@@ -69,6 +69,11 @@ const ROUTES: &[Route] = &[
         backend: protocol::backend::NAMESPACE,
     },
     Route {
+        path: b"/Volumes/NULLSTAR_DATA",
+        id: protocol::route::NULLSTAR_DATA,
+        backend: protocol::backend::NULLFS,
+    },
+    Route {
         path: b"/Volumes",
         id: protocol::route::VOLUMES,
         backend: protocol::backend::NAMESPACE,
