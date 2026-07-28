@@ -3,8 +3,9 @@
 
 use core::{mem::size_of, slice};
 
+use nullfs_format::BLOCK_SIZE;
 use userspace::{
-    abi::file,
+    abi::{errno, file},
     ipc::{self, ObjectKind, Rights, Transfer},
     platform, syscall,
     vfs::protocol,
@@ -14,6 +15,13 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const SERVICE_HANDLE: u64 = 1;
+const NULLFS_MOUNT: &[u8] = b"/Volumes/NULLSTAR_DATA";
+const NULLFS_DOCS: &[u8] = b"/Volumes/NULLSTAR_DATA/docs";
+const NULLFS_WELCOME: &[u8] = b"/Volumes/NULLSTAR_DATA/welcome.txt";
+const NULLFS_README: &[u8] = b"/Volumes/NULLSTAR_DATA/docs/readme.txt";
+const NULLFS_MISSING: &[u8] = b"/Volumes/NULLSTAR_DATA/missing";
+const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
+const README: &[u8] = b"This volume is prepared for read-only Phase 4 service integration.\n";
 
 const CASES: &[(&[u8], u32, u16, u16)] = &[
     (
@@ -93,6 +101,18 @@ const CASES: &[(&[u8], u32, u16, u16)] = &[
         protocol::route::APPLICATIONS,
         protocol::backend::NAMESPACE,
         13,
+    ),
+    (
+        b"/Volumes/NULLSTAR_DATA",
+        protocol::route::NULLSTAR_DATA,
+        protocol::backend::NULLFS,
+        22,
+    ),
+    (
+        b"/Volumes/NULLSTAR_DATA/docs/readme.txt",
+        protocol::route::NULLSTAR_DATA,
+        protocol::backend::NULLFS,
+        22,
     ),
     (
         b"/Volumes/Disk",
@@ -277,7 +297,204 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if platform::chdir(b"/").is_err() {
         syscall::exit(13);
     }
+
+    probe_mounted_nullfs();
     syscall::exit(0)
+}
+
+fn probe_mounted_nullfs() {
+    let mut entries = [platform::DirectoryEntry::EMPTY; 1];
+    if platform::read_directory(b"/Volumes", 0, &mut entries).ok() != Some(1)
+        || entries[0].name() != b"NULLSTAR_DATA"
+        || entries[0].kind != file::KIND_DIRECTORY
+    {
+        syscall::exit(19);
+    }
+
+    if !stat_matches(NULLFS_MOUNT, file::KIND_DIRECTORY, 0) {
+        syscall::exit(20);
+    }
+    if !stat_matches(NULLFS_DOCS, file::KIND_DIRECTORY, BLOCK_SIZE as u64) {
+        syscall::exit(21);
+    }
+    if !stat_matches(NULLFS_WELCOME, file::KIND_FILE, WELCOME.len() as u64) {
+        syscall::exit(22);
+    }
+    if !platform_failed_with(platform::stat(NULLFS_MISSING), errno::NO_ENTRY) {
+        syscall::exit(23);
+    }
+
+    let welcome = match syscall::open(NULLFS_WELCOME, syscall::OpenFlags::READ) {
+        Ok(descriptor) => descriptor,
+        Err(_) => syscall::exit(24),
+    };
+    let mut welcome_bytes = [0_u8; WELCOME.len()];
+    if syscall::read(welcome, &mut welcome_bytes).ok() != Some(WELCOME.len())
+        || welcome_bytes != WELCOME
+    {
+        syscall::exit(25);
+    }
+    if platform::fstat(welcome).ok()
+        != Some(file::Stat {
+            kind: file::KIND_FILE,
+            size: WELCOME.len() as u64,
+            flags: file::FLAG_READ_ONLY,
+        })
+    {
+        syscall::exit(26);
+    }
+    const WELCOME_TAIL: &[u8] = b"fixture.\n";
+    if syscall::seek(
+        welcome,
+        syscall::SeekFrom::End(-(WELCOME_TAIL.len() as i64)),
+    )
+    .ok()
+        != Some((WELCOME.len() - WELCOME_TAIL.len()) as u64)
+    {
+        syscall::exit(27);
+    }
+    let mut tail = [0_u8; WELCOME_TAIL.len()];
+    if syscall::read(welcome, &mut tail).ok() != Some(tail.len()) || tail != WELCOME_TAIL {
+        syscall::exit(28);
+    }
+
+    let readme = match syscall::open(NULLFS_README, syscall::OpenFlags::READ) {
+        Ok(descriptor) => descriptor,
+        Err(_) => syscall::exit(30),
+    };
+    let mut readme_bytes = [0_u8; README.len()];
+    if syscall::read(readme, &mut readme_bytes).ok() != Some(README.len()) || readme_bytes != README
+    {
+        syscall::exit(31);
+    }
+
+    entries[0] = platform::DirectoryEntry::EMPTY;
+    if platform::read_directory(NULLFS_MOUNT, 0, &mut entries).ok() != Some(1)
+        || !directory_entry_matches(&entries[0], b"docs", file::KIND_DIRECTORY)
+    {
+        syscall::exit(33);
+    }
+    entries[0] = platform::DirectoryEntry::EMPTY;
+    if platform::read_directory(NULLFS_MOUNT, 1, &mut entries).ok() != Some(1)
+        || !directory_entry_matches(&entries[0], b"welcome.txt", file::KIND_FILE)
+    {
+        syscall::exit(34);
+    }
+    entries[0] = platform::DirectoryEntry::EMPTY;
+    if platform::read_directory(NULLFS_MOUNT, 2, &mut entries).ok() != Some(0) {
+        syscall::exit(35);
+    }
+    entries[0] = platform::DirectoryEntry::EMPTY;
+    if platform::read_directory(NULLFS_DOCS, 0, &mut entries).ok() != Some(1)
+        || !directory_entry_matches(&entries[0], b"readme.txt", file::KIND_FILE)
+    {
+        syscall::exit(36);
+    }
+    entries[0] = platform::DirectoryEntry::EMPTY;
+    if platform::read_directory(NULLFS_DOCS, 1, &mut entries).ok() != Some(0) {
+        syscall::exit(37);
+    }
+
+    let mut cwd = [0_u8; 64];
+    if platform::chdir(NULLFS_MOUNT).is_err() {
+        syscall::exit(38);
+    }
+    if platform::getcwd(&mut cwd).ok() != Some(NULLFS_MOUNT) {
+        syscall::exit(39);
+    }
+    if platform::chdir(b"docs").is_err() {
+        syscall::exit(40);
+    }
+    if platform::getcwd(&mut cwd).ok() != Some(NULLFS_DOCS) {
+        syscall::exit(41);
+    }
+    let relative_readme = match syscall::open(b"readme.txt", syscall::OpenFlags::READ) {
+        Ok(descriptor) => descriptor,
+        Err(_) => syscall::exit(42),
+    };
+    readme_bytes.fill(0);
+    if syscall::read(relative_readme, &mut readme_bytes).ok() != Some(README.len())
+        || readme_bytes != README
+    {
+        syscall::exit(43);
+    }
+    if platform::chdir(b"/").is_err() || platform::getcwd(&mut cwd).ok() != Some(b"/".as_slice()) {
+        syscall::exit(45);
+    }
+
+    if !syscall_failed_with(
+        syscall::open(NULLFS_MOUNT, syscall::OpenFlags::READ),
+        errno::IS_DIRECTORY,
+    ) {
+        syscall::exit(46);
+    }
+    if !syscall_failed_with(
+        syscall::open(NULLFS_WELCOME, syscall::OpenFlags::WRITE),
+        errno::READ_ONLY,
+    ) {
+        syscall::exit(47);
+    }
+    if !syscall_failed_with(
+        syscall::open(
+            b"/Volumes/NULLSTAR_DATA/denied",
+            syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
+        ),
+        errno::READ_ONLY,
+    ) {
+        syscall::exit(48);
+    }
+    if !syscall_failed_with(
+        syscall::open(
+            NULLFS_WELCOME,
+            syscall::OpenFlags::WRITE | syscall::OpenFlags::TRUNCATE,
+        ),
+        errno::READ_ONLY,
+    ) {
+        syscall::exit(49);
+    }
+    if !syscall_failed_with(
+        syscall::open(
+            NULLFS_WELCOME,
+            syscall::OpenFlags::WRITE | syscall::OpenFlags::APPEND,
+        ),
+        errno::READ_ONLY,
+    ) {
+        syscall::exit(50);
+    }
+    if !platform_failed_with(platform::unlink(NULLFS_WELCOME), errno::READ_ONLY) {
+        syscall::exit(51);
+    }
+    if syscall::close(relative_readme).is_err()
+        || syscall::close(readme).is_err()
+        || syscall::close(welcome).is_err()
+    {
+        syscall::exit(52);
+    }
+}
+
+fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
+    platform::stat(path).ok()
+        == Some(file::Stat {
+            kind,
+            size,
+            flags: file::FLAG_READ_ONLY,
+        })
+}
+
+fn directory_entry_matches(entry: &platform::DirectoryEntry, name: &[u8], kind: u64) -> bool {
+    entry.name() == name && entry.kind == kind && entry.flags == file::FLAG_READ_ONLY
+}
+
+fn syscall_failed_with<T>(result: syscall::Result<T>, expected: i64) -> bool {
+    result
+        .err()
+        .is_some_and(|error| i64::from(error.code()) == -expected)
+}
+
+fn platform_failed_with<T>(result: platform::Result<T>, expected: i64) -> bool {
+    result
+        .err()
+        .is_some_and(|error| i64::from(error.code()) == -expected)
 }
 
 fn open_with_retry(path: &[u8], flags: syscall::OpenFlags) -> Option<syscall::FileDescriptor> {

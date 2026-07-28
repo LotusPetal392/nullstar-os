@@ -134,48 +134,66 @@ bounded buffers and wake blocked readers or writers as state changes. The
 terminal tracks a foreground process group so keyboard-generated interrupt and
 stop events reach the correct pipeline.
 
-The next filesystem boundary is defined by the versioned userspace
-[filesystem service protocol](filesystem-service-protocol.md). It introduces
+The versioned userspace
+[filesystem service protocol](filesystem-service-protocol.md) provides
 session-scoped node IDs, directory-relative lookup, request IDs, cancellation,
 and registered shared-memory windows. The tmpfs service is the active `/tmp`
-data path through the generic protocol. A separately supervised userspace VFS
-service now owns a versioned longest-prefix namespace table and validates the
-intended mount layout during boot. `stat`, path-based `read_directory`,
-`chdir`, descriptor-producing `open`, and `unlink` now cross that service
-boundary, including synthetic directory metadata and merged namespace listings
-for VFS-owned nodes; other kernel file operations use the backend recorded by
-the resulting open-file description. Service-backed descriptions now release
-one generation- and session-bound node reference when their final descriptor,
-stream, or inherited owner disappears, allowing tmpfs to reclaim unlinked
-nodes without closing duplicated or fork-inherited descriptors early.
+data path through that protocol. A separately supervised userspace VFS service
+owns a versioned longest-prefix namespace table and validates the mount layout
+during boot. `stat`, path-based `read_directory`, `chdir`, descriptor-producing
+`open`, and `unlink` cross that routing boundary, including synthetic directory
+metadata and merged namespace listings for VFS-owned nodes; other kernel file
+operations use the backend recorded by the resulting open-file description.
+Service-backed descriptions release one generation- and session-bound node
+reference when their final descriptor, stream, or inherited owner disappears,
+allowing tmpfs to reclaim unlinked nodes without closing duplicated or
+fork-inherited descriptors early.
 
-The intended rooted namespace includes service-backed `/dev` and `/tmp` mounts,
-a system hierarchy under `/System` (`config`, `var/log`, `bin`, `services`,
-`drivers`, `lib`, and `Applications`), user homes under `/Users`, and globally
-installed applications under `/Applications`. Additional local, removable, and
-network filesystems appear as named children of `/Volumes`. The VFS service
-will hide mount crossings from clients while preserving node and volume
-identity as routing and open-file ownership move out of the kernel.
+The rooted namespace includes service-backed `/dev` and `/tmp` mounts, a system
+hierarchy under `/System` (`config`, `var/log`, `bin`, `services`, `drivers`,
+`lib`, and `Applications`), user homes under `/Users`, and globally installed
+applications under `/Applications`. Additional local, removable, and network
+filesystems appear as named children of `/Volumes`. The VFS service hides the
+implemented mount crossings from clients; preserving broader node and volume
+identity remains part of moving routing and open-file ownership out of the
+kernel.
 
-NullFS is the planned native persistent backend for that service architecture,
-not a new kernel-specific filesystem path. Its shared `no_std` format/core code
-is reused by host formatter, image, inspector, checker, and Linux FUSE tooling.
-The host implementation supports the version 1.2 inode/directory format,
-authoritative allocation maps, bounded data-journaling redo transactions,
-persistent orphan recovery, and deterministic crash testing. A capability-based
-[block-device service protocol](block-device-service-protocol.md) now gives
-init-authorized filesystem services checked, partition-relative, registered-
-buffer reads. Boot images now include a deterministic, 4096-byte-aligned NullFS
-partition that is identified explicitly in the MBR and validated through the real
-userspace endpoint during normal boot. The adapter aggregates the endpoint's
-512-byte device logical blocks into the 4096-byte blocks required by the shared
-NullFS core. A separately supervised `nullfs-service` mounts the partition and
-serves lookup, attributes, read-only open, file reads, paginated directory
-iteration, and `CLOSE_NODE` through the common filesystem protocol. A direct
-userspace protocol probe verifies those operations before normal boot continues;
-VFS mount registration remains separate policy work. The endpoint remains
-intentionally read-only. Writable NullFS integration still requires an explicit
-grant policy and durability validation as described in the
+NullFS is the native persistent backend for that service architecture, not a
+new kernel-resident filesystem implementation. Its shared `no_std` format/core
+code is reused by host formatter, image, inspector, checker, and Linux FUSE
+tooling. The host implementation supports the version 1.2 inode/directory
+format, authoritative allocation maps, bounded data-journaling redo
+transactions, persistent orphan recovery, and deterministic crash testing. A
+capability-based
+[block-device service protocol](block-device-service-protocol.md) gives
+init-authorized filesystem services checked, partition-relative,
+registered-buffer reads. Boot images include a deterministic,
+4096-byte-aligned NullFS partition identified explicitly in the MBR. The
+adapter aggregates the endpoint's 512-byte device logical blocks into the
+4096-byte blocks required by the shared NullFS core.
+
+A separately supervised, read-only `nullfs-service` mounts that partition. PID
+1 registers each service generation as an independent generation-scoped kernel
+filesystem proxy, and the VFS statically mounts it at
+`/Volumes/NULLSTAR_DATA`. The proxy establishes its own protocol session and
+registers one kernel-owned 4 KiB shared-memory buffer. Ordinary `stat`, `open`,
+`read`, `fstat`, `seek`, `read_directory`, and `chdir` operations route through
+the mount; canonical path handling also makes relative operations resolve
+through NullFS after the process changes its cwd into the volume. Write,
+create, truncate, append, descriptor-write, and unlink attempts are denied as
+read-only.
+
+NullFS node IDs are opaque and scoped to the service session and generation.
+Each successful open is retained by the kernel open-file description, so
+aliases and inherited descriptors share one service reference; final
+description destruction queues one matching `CLOSE_NODE`. On service
+replacement, in-flight operations from the old generation fail with I/O, old
+descriptors remain stale and fail subsequent NullFS I/O, and stale close
+tickets are discarded rather than sent to the replacement session. The direct
+protocol probe covers service operations and the VFS boot probe covers the
+ordinary mounted syscall path; neither currently fault-injects a NullFS service
+restart with live descriptors. Writable NullFS authority still requires an
+explicit grant policy and durability validation as described in the
 [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
@@ -213,6 +231,7 @@ kernel state forever. Important current limits include:
 | NullFS service sessions | 4 |
 | NullFS open references per session | 64 |
 | NullFS service heap | 2 MiB |
+| Kernel NullFS proxy registered buffer | 4 KiB |
 | FAT read/write window per file | 1 MiB |
 
 The constants in the implementation remain authoritative. Shared userspace ABI

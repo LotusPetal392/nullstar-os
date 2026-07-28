@@ -114,15 +114,25 @@ block read, and the checksummed superblock of the dedicated `NULLSTAR_DATA`
 NullFS fixture. They also cover buffer transfer, range rejection, write rejection,
 unsupported flush, and disconnect cleanup on the real kernel boundary.
 
-`nullfs-service` now mounts that endpoint through `nullfs-userspace-blockdev` and
+`nullfs-service` mounts that endpoint through `nullfs-userspace-blockdev` and
 the shared NullFS core. Its direct generic-filesystem-protocol probe covers
 lookup, attributes, file reads, paginated directory iteration, duplicate
 `OPEN`/`CLOSE_NODE` accounting, mutation denial, and disconnect cleanup.
 
-## Next step
+PID 1 also registers each `nullfs-service` process as an independent,
+generation-scoped kernel filesystem proxy, while the VFS statically mounts the
+backend at `/Volumes/NULLSTAR_DATA`. The filesystem proxy's own kernel-registered
+4 KiB buffer is distinct from the service's block-device session window. It
+allows ordinary `stat`, read-only `open`, `read`, `fstat`, `seek`,
+`read_directory`, and `chdir` traffic—including cwd-relative routing—to reach
+the service through the common filesystem protocol. Filesystem mutation remains
+denied.
 
-Register the service as a VFS backend and mount it under `/Volumes` without
-adding NullFS-specific routing to the kernel. Writable authority remains a later
-milestone: the kernel must not advertise `WRITE` or `FLUSH` until an explicit
-grant policy and crash-ordering tests prove that the userspace adapter preserves
-NullFS durability semantics.
+## Writable authority
+
+The mounted service and its raw block-device endpoint remain read-only. The
+kernel must not advertise block `WRITE` or `FLUSH`, or grant writable filesystem
+service authority, until an explicit grant policy and crash-ordering tests prove
+that the userspace adapter preserves NullFS durability semantics. Writable
+integration is therefore a later milestone, not part of the current static VFS
+mount.

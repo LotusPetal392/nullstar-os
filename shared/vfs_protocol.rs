@@ -21,6 +21,7 @@ pub mod backend {
     pub const NAMESPACE: u16 = 1;
     pub const BOOT_FILESYSTEM: u16 = 2;
     pub const TMPFS: u16 = 3;
+    pub const NULLFS: u16 = 4;
 }
 
 pub mod route {
@@ -39,6 +40,7 @@ pub mod route {
     pub const APPLICATIONS: u32 = 13;
     pub const VOLUMES: u32 = 14;
     pub const SYSTEM_VAR: u32 = 15;
+    pub const NULLSTAR_DATA: u32 = 16;
 }
 
 #[repr(C)]

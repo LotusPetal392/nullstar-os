@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 7;
+pub const ABI_VERSION_MINOR: u64 = 8;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -72,6 +72,7 @@ pub mod syscall {
     pub const REGISTER_VFS_SERVICE: u64 = 50;
     pub const UNLINK: u64 = 51;
     pub const OPEN_BLOCK_DEVICE_ENDPOINT: u64 = 52;
+    pub const REGISTER_NULLFS_SERVICE: u64 = 53;
 }
 
 pub mod capability {

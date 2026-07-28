@@ -1,17 +1,18 @@
 # Filesystem service protocol
 
 NullStar OS is migrating from filesystem-specific kernel routing to a common
-userspace filesystem-service contract. The first version of that contract is
-defined in `shared/filesystem_protocol.rs`. It is a migration target: the
-existing tmpfs v2 protocol remains active until tmpfs implements sessions,
-node handles, and registered bulk buffers.
+userspace filesystem-service contract defined in
+`shared/filesystem_protocol.rs`. Generic sessions, opaque node handles, and
+registered bulk buffers are active for tmpfs and the read-only NullFS service;
+the public file-descriptor ABI remains unchanged while kernel proxies bridge
+the migration.
 
 ## Design goals
 
 The protocol separates responsibilities that are currently combined in the
 kernel VFS:
 
-- a future VFS service resolves mount points and selects a filesystem service;
+- the VFS service resolves mount points and selects a filesystem backend;
 - filesystem services own directory lookup, node identity, metadata, and file
   contents;
 - applications and the VFS refer to filesystem objects by opaque node IDs
@@ -145,9 +146,10 @@ services or volumes provide parts of it:
 Mount traversal must be component-based. Looking up `dev` or `tmp` beneath the
 root returns a mount-root node owned by the selected service, while lookup of
 `System`, `Users`, or `Applications` continues on the native root filesystem.
-Clients must not need to know that the returned node belongs to a different
-service; the future VFS service owns that routing and returns its own stable
-vnode capability or handle.
+Clients do not need to know that the selected backend belongs to a different
+service. The current VFS service owns longest-prefix routing and the kernel
+chains the operation into the selected generation-scoped proxy; moving stable
+vnode handles and all open-file ownership into userspace remains later work.
 
 The root filesystem, `/dev`, and `/tmp` are boot namespace entries and do not
 also appear beneath `/Volumes`. Mounting and unmounting a child of `/Volumes`
@@ -183,11 +185,13 @@ overloading generic flags or inline data.
    generic client. (complete)
 3. Teach the kernel proxy to speak the generic protocol without changing the
    public file-descriptor ABI. (complete)
-4. Move path routing and open-file descriptions into a VFS service. (routing
-   service and boot namespace contract started)
+4. Move path routing and open-file descriptions into a VFS service. (routing,
+   the boot namespace contract, and mounted tmpfs/NullFS dispatch are active;
+   broader open-file ownership migration remains)
 5. Put FAT behind the same protocol.
 6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
-   service.
+   service. (read-only service and static VFS mount complete; writable authority
+   remains later)
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
 
@@ -274,18 +278,42 @@ The read-only `nullfs-service` implements the same session and node-reference
 contract around shared-core `OpenHandle`s. It presents generation-tagged opaque
 node IDs rather than inode numbers, sizes its identity map from the mounted
 volume's inode capacity, drains duplicate opens one reference at a time, and
-preserves both protocol and core accounting when a close fails. Its boot probe
-exercises multi-page directory cookies as well as open/close and disconnect
-cleanup. VFS registration is intentionally deferred; the probe talks directly to
-the common protocol endpoint.
+preserves both protocol and core accounting when a close fails. PID 1 registers
+it independently of tmpfs as a generation-scoped kernel filesystem proxy. The
+VFS has a static longest-prefix route for `/Volumes/NULLSTAR_DATA`, and its
+`/Volumes` listing exposes that mount.
 
-The kernel maps that contract to open-file descriptions rather than descriptor
-numbers. `dup`, `dup2`, fork inheritance, and file-backed standard streams share
-the same description, so closing one alias cannot close the service node early.
-The description's final destruction—through explicit close, close-on-exec, or
-process reap—queues one generation- and session-bound `CLOSE_NODE`. Old tickets
-are never sent to a replacement service session. Accepted close requests are not
-blindly replayed because a lost or malformed reply cannot prove whether the
-service already decremented the reference; explicit `TRY_AGAIN` is the only
-retryable close status, while malformed replies leave the proxy fail-stopped
-until service replacement rather than risking a double close.
+The NullFS proxy performs `CONNECT` for each registered service generation and
+attaches one kernel-owned 4 KiB shared-memory buffer. It translates ordinary
+`stat`, read-only `open`, `read`, `fstat`, `seek`, `read_directory`, and `chdir`
+behavior without adding a NullFS-specific application ABI. Canonical path
+resolution happens before VFS routing, so after `chdir` enters the mounted
+volume, relative directory changes and opens are routed back to NullFS. Open
+requests carrying write, create, truncate, or append intent, descriptor writes,
+and unlink are rejected with the public read-only error.
+
+The kernel maps successful `OPEN` references to open-file descriptions rather
+than descriptor numbers. `dup`, `dup2`, fork inheritance, and file-backed
+standard streams share the same description, so closing one alias cannot close
+the service node early. The description's final destruction—through explicit
+close, close-on-exec, or process reap—queues one generation- and session-bound
+`CLOSE_NODE`. The serialized request slot remains owned through reply payload
+validation and shared-buffer consumption, and multi-stage lookup or directory
+operations replace the active request ID atomically before sending their next
+stage. Accepted close requests are not blindly replayed because a lost or failed
+reply cannot prove whether the service already decremented the reference;
+explicit `TRY_AGAIN` is the only retryable close status, while failed or
+malformed replies leave the proxy fail-stopped until service replacement rather
+than risking a leaked or duplicate close.
+
+When PID 1 supervises a replacement, it registers a higher proxy generation.
+The kernel releases the previous endpoint, session reply endpoint, and bulk
+buffer, fails old in-flight requests with I/O, and refuses to rebind existing
+open-file descriptions; subsequent NullFS I/O through those old descriptors
+therefore fails with I/O. Close tickets carry the old proxy generation, session
+ID, and session generation and are discarded rather than sent to the
+replacement. The direct service probe covers protocol lookup, reads, directory
+cookies, mutation denial, and close/disconnect accounting. The normal-boot VFS
+probe covers the mounted ordinary syscall path, including cwd-relative routing,
+but does not yet deliberately restart `nullfs-service` with live descriptors;
+that restart fault-injection coverage remains future work.
