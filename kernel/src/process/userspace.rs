@@ -10815,22 +10815,22 @@ fn syscall_seek(process_id: u64, descriptor: u64, offset: u64, whence: u64) -> u
     let signed = offset as i64;
     let new_offset = {
         let mut f = handle.lock();
+        if let OpenFileBackend::NullfsProxy {
+            generation,
+            session_id,
+            session_generation,
+            ..
+        } = f.backend
+            && !nullfs_proxy_backend_is_current(generation, session_id, session_generation)
+        {
+            return error_return(ERR_IO);
+        }
         let base = match whence {
             SEEK_SET => 0_i128,
             SEEK_CURRENT => i128::from(f.offset),
             SEEK_END => match f.backend {
                 OpenFileBackend::TmpfsProxy { .. } => i128::from(f.size),
-                OpenFileBackend::NullfsProxy {
-                    generation,
-                    session_id,
-                    session_generation,
-                    ..
-                } if nullfs_proxy_backend_is_current(
-                    generation,
-                    session_id,
-                    session_generation,
-                ) => i128::from(f.size),
-                OpenFileBackend::NullfsProxy { .. } => return error_return(ERR_IO),
+                OpenFileBackend::NullfsProxy { .. } => i128::from(f.size),
                 OpenFileBackend::Vfs => match vfs::metadata(&f.path) {
                     Ok(md) => i128::from(md.size),
                     Err(e) => return error_return(vfs_errno(&e)),

@@ -6,6 +6,7 @@ use core::{mem::size_of, slice};
 use nullfs_format::BLOCK_SIZE;
 use userspace::{
     abi::{errno, file},
+    args::Args,
     ipc::{self, ObjectKind, Rights, Transfer},
     platform, syscall,
     vfs::protocol,
@@ -15,6 +16,10 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const SERVICE_HANDLE: u64 = 1;
+const RESTART_CONTROL_HANDLE: u64 = 2;
+const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
+const NULLFS_RESTART_READY: &[u8] = b"nullfs-restart: live descriptor ready";
+const NULLFS_RESTART_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
 const NULLFS_MOUNT: &[u8] = b"/Volumes/NULLSTAR_DATA";
 const NULLFS_DOCS: &[u8] = b"/Volumes/NULLSTAR_DATA/docs";
 const NULLFS_WELCOME: &[u8] = b"/Volumes/NULLSTAR_DATA/welcome.txt";
@@ -122,7 +127,14 @@ const CASES: &[(&[u8], u32, u16, u16)] = &[
     ),
 ];
 
-extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
+extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+    let arguments = unsafe { Args::from_stack(initial_stack) };
+    if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_RESTART_MODE) {
+        probe_nullfs_restart();
+    }
+    if arguments.len() != 1 {
+        syscall::exit(57);
+    }
     if !matches!(
         ipc::wait_for_handle(SERVICE_HANDLE),
         Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
@@ -491,6 +503,92 @@ fn probe_mounted_nullfs() {
             syscall::exit(56);
         }
     }
+}
+
+fn probe_nullfs_restart() -> ! {
+    if !matches!(
+        ipc::wait_for_handle(SERVICE_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
+    ) || !matches!(
+        ipc::wait_for_handle(RESTART_CONTROL_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
+    ) {
+        syscall::exit(60);
+    }
+
+    let stale = match open_with_retry(NULLFS_WELCOME, syscall::OpenFlags::READ) {
+        Some(descriptor) => descriptor,
+        None => syscall::exit(61),
+    };
+    if platform::fstat(stale).ok()
+        != Some(file::Stat {
+            kind: file::KIND_FILE,
+            size: WELCOME.len() as u64,
+            flags: file::FLAG_READ_ONLY,
+        })
+        || ipc::send(SERVICE_HANDLE, NULLFS_RESTART_READY, None).is_err()
+    {
+        syscall::exit(62);
+    }
+
+    let mut control = [0_u8; 64];
+    let message = match ipc::receive(RESTART_CONTROL_HANDLE, &mut control) {
+        Ok(message) => message,
+        Err(_) => syscall::exit(63),
+    };
+    if message.sender_process_id != 1
+        || message.capability.is_some()
+        || message.bytes != NULLFS_RESTART_BEGIN_READ.len()
+        || &control[..message.bytes] != NULLFS_RESTART_BEGIN_READ
+    {
+        syscall::exit(64);
+    }
+
+    let mut bytes = [0_u8; WELCOME.len()];
+    if syscall::read(stale, &mut bytes) != Err(syscall::Errno::IO)
+        || !platform_failed_with(platform::fstat(stale), errno::IO)
+        || syscall::seek(stale, syscall::SeekFrom::Start(0)) != Err(syscall::Errno::IO)
+        || syscall::seek(stale, syscall::SeekFrom::Current(0)) != Err(syscall::Errno::IO)
+        || syscall::seek(stale, syscall::SeekFrom::End(0)) != Err(syscall::Errno::IO)
+    {
+        syscall::exit(65);
+    }
+
+    let replacement = match open_after_restart(NULLFS_WELCOME) {
+        Some(descriptor) => descriptor,
+        None => syscall::exit(66),
+    };
+    if syscall::read(replacement, &mut bytes).ok() != Some(WELCOME.len()) || bytes != WELCOME {
+        syscall::exit(67);
+    }
+    if syscall::close(stale).is_err() {
+        syscall::exit(68);
+    }
+    for _ in 0..8 {
+        syscall::yield_now().unwrap_or_else(|_| syscall::exit(69));
+    }
+    bytes.fill(0);
+    if syscall::seek(replacement, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || syscall::read(replacement, &mut bytes).ok() != Some(WELCOME.len())
+        || bytes != WELCOME
+        || syscall::close(replacement).is_err()
+    {
+        syscall::exit(70);
+    }
+    syscall::exit(0)
+}
+
+fn open_after_restart(path: &[u8]) -> Option<syscall::FileDescriptor> {
+    for _ in 0..128 {
+        match syscall::open(path, syscall::OpenFlags::READ) {
+            Ok(descriptor) => return Some(descriptor),
+            Err(error) if error == syscall::Errno::TRY_AGAIN || error == syscall::Errno::IO => {
+                syscall::yield_now().ok()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {

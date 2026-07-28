@@ -4,6 +4,7 @@ pub const BOOT_MODE_PATH: &str = "/BOOTMODE";
 pub enum BootMode {
     Normal,
     SmokeTest,
+    NullfsRestartTest,
 }
 
 impl BootMode {
@@ -11,6 +12,7 @@ impl BootMode {
         match bytes {
             b"normal" | b"normal\n" => Some(Self::Normal),
             b"smoke-test" | b"smoke-test\n" => Some(Self::SmokeTest),
+            b"nullfs-restart-test" | b"nullfs-restart-test\n" => Some(Self::NullfsRestartTest),
             _ => None,
         }
     }
@@ -23,6 +25,7 @@ impl BootMode {
         match self {
             Self::Normal => "normal",
             Self::SmokeTest => "smoke-test",
+            Self::NullfsRestartTest => "nullfs-restart-test",
         }
     }
 }
@@ -35,6 +38,10 @@ mod tests {
     fn parses_supported_image_modes() {
         assert_eq!(BootMode::parse(b"normal\n"), Some(BootMode::Normal));
         assert_eq!(BootMode::parse(b"smoke-test\n"), Some(BootMode::SmokeTest));
+        assert_eq!(
+            BootMode::parse(b"nullfs-restart-test\n"),
+            Some(BootMode::NullfsRestartTest)
+        );
     }
 
     #[test]

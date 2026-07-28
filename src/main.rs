@@ -48,8 +48,12 @@ const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str = "userspace init: read-only NullF
 const NORMAL_BOOT_NULLFS_PROBE_MARKER: &str = "userspace init: userspace NullFS probe passed";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
+const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-test";
+const NULLFS_RESTART_PASSED_MARKER: &str =
+    "userspace init: NullFS restart and stale descriptors verified";
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
+const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Default)]
 struct NormalBootProgress {
@@ -96,6 +100,7 @@ struct Options {
     headless: bool,
     boot_check: bool,
     test: bool,
+    nullfs_restart_check: bool,
 }
 
 fn main() -> ExitCode {
@@ -106,6 +111,8 @@ fn main() -> ExitCode {
 
     if options.test {
         run_kernel_smoke_test(&options)
+    } else if options.nullfs_restart_check {
+        run_nullfs_restart_check(&options)
     } else if options.boot_check {
         run_normal_boot_check(&options)
     } else {
@@ -120,8 +127,8 @@ fn parse_options() -> Result<Options, ExitCode> {
         match argument.as_str() {
             "--headless" => options.headless = true,
             "--boot-check" => {
-                if options.test {
-                    eprintln!("--boot-check and --test cannot be used together");
+                if options.test || options.nullfs_restart_check {
+                    eprintln!("only one boot verification mode may be selected");
                     print_usage();
                     return Err(ExitCode::from(2));
                 }
@@ -129,12 +136,21 @@ fn parse_options() -> Result<Options, ExitCode> {
                 options.headless = true;
             }
             "--test" => {
-                if options.boot_check {
-                    eprintln!("--boot-check and --test cannot be used together");
+                if options.boot_check || options.nullfs_restart_check {
+                    eprintln!("only one boot verification mode may be selected");
                     print_usage();
                     return Err(ExitCode::from(2));
                 }
                 options.test = true;
+                options.headless = true;
+            }
+            "--nullfs-restart-check" => {
+                if options.boot_check || options.test {
+                    eprintln!("only one boot verification mode may be selected");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
+                options.nullfs_restart_check = true;
                 options.headless = true;
             }
             "-h" | "--help" => {
@@ -153,9 +169,10 @@ fn parse_options() -> Result<Options, ExitCode> {
 }
 
 fn print_usage() {
-    println!("Usage: cargo run -- [--headless] [--boot-check | --test]");
+    println!("Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!("  --boot-check  Verify that PID 1 launches the userspace shell");
+    println!("  --nullfs-restart-check  Verify NullFS service replacement with a live descriptor");
     println!(
         "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, process environments, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
     );
@@ -239,7 +256,7 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
         qemu_command_for_image(options, &test_image),
         SmokePhase::PreparePersistentFat,
     );
-    let result = if prepare {
+    let smoke_result = if prepare {
         run_qemu_phase(
             qemu_command_for_image(options, &test_image),
             SmokePhase::VerifyCompleteSystem,
@@ -247,13 +264,39 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
     } else {
         false
     };
+    let restart_result = smoke_result && run_nullfs_restart_test(options);
     let _ = fs::remove_file(&test_image);
-    if result {
+    if restart_result {
         println!("QEMU kernel smoke test passed");
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn run_nullfs_restart_check(options: &Options) -> ExitCode {
+    if run_nullfs_restart_test(options) {
+        println!("QEMU NullFS restart fault injection passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_nullfs_restart_test(options: &Options) -> bool {
+    let image = Path::new(env!("NULLFS_RESTART_TEST_BIOS_IMAGE"));
+    let mut mode_selected = false;
+    let mut restart_verified = false;
+    run_qemu_until(
+        qemu_command_for_image(options, image),
+        "NullFS restart fault injection",
+        NULLFS_RESTART_TEST_TIMEOUT,
+        move |line| {
+            mode_selected |= line.contains(NULLFS_RESTART_MODE_MARKER);
+            restart_verified |= line.contains(NULLFS_RESTART_PASSED_MARKER);
+            mode_selected && restart_verified
+        },
+    )
 }
 
 fn persistent_test_image_path() -> PathBuf {

@@ -2,7 +2,7 @@
 #![no_main]
 
 use userspace::{
-    abi::INIT_PROCESS_ID,
+    abi::{INIT_PROCESS_ID, signal},
     ipc::{self, CapabilityHandle, Rights},
     platform,
     supervisor::{
@@ -61,6 +61,15 @@ const VFS_SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid vfs readine
 const VFS_PROBE_COMMAND: &[u8] = b"/vfs-probe";
 const VFS_PROBE_FAILED: &[u8] = b"userspace init: userspace vfs probe failed\n";
 const VFS_PROBE_PASSED: &[u8] = b"userspace init: userspace vfs probe passed\n";
+const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
+const NULLFS_RESTART_PROBE_READY: &[u8] = b"nullfs-restart: live descriptor ready";
+const NULLFS_RESTART_PROBE_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
+const NULLFS_RESTART_PROBE_PASSED: &[u8] =
+    b"userspace init: NullFS restart and stale descriptors verified\n";
+const NULLFS_RESTART_PROBE_FAILED: &[u8] = b"userspace init: NullFS restart probe failed\n";
+const BOOT_MODE_PATH: &[u8] = b"/BOOTMODE";
+const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
+const BOOT_MODE_PROBE_FAILED: &[u8] = b"userspace init: unable to read boot mode\n";
 const SHELL_COMMAND: &[u8] = b"/ush";
 const SHELL_LAUNCHED: &[u8] = b"userspace init launched /ush\n";
 const SHELL_RESTARTING: &[u8] = b"userspace init: /ush exited; restarting\n";
@@ -197,7 +206,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     }
     let nullfs_readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
-    let nullfs_request_endpoint =
+    let mut nullfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
     let mut nullfs_service = ServiceRuntime::new(NULLFS_SERVICE);
     let nullfs_block_capability = BootstrapCapability {
@@ -253,6 +262,14 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         VFS_PROBE_FAILED,
         VFS_PROBE_PASSED,
     );
+    if nullfs_restart_test_boot() {
+        run_nullfs_restart_probe(
+            &mut nullfs_service,
+            nullfs_readiness_endpoint,
+            &mut nullfs_request_endpoint,
+            nullfs_block_capability,
+        );
+    }
     let mut shell_process_id = spawn_shell();
 
     loop {
@@ -350,6 +367,190 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             fail(SHELL_WAIT_FAILED);
         }
     }
+}
+
+fn nullfs_restart_test_boot() -> bool {
+    let descriptor = syscall::open(BOOT_MODE_PATH, syscall::OpenFlags::READ)
+        .unwrap_or_else(|_| fail(BOOT_MODE_PROBE_FAILED));
+    let mut bytes = [0_u8; 32];
+    let count =
+        syscall::read(descriptor, &mut bytes).unwrap_or_else(|_| fail(BOOT_MODE_PROBE_FAILED));
+    syscall::close(descriptor).unwrap_or_else(|_| fail(BOOT_MODE_PROBE_FAILED));
+    match &bytes[..count] {
+        b"nullfs-restart-test" | NULLFS_RESTART_TEST_BOOT_MODE => true,
+        b"normal" | b"normal\n" | b"smoke-test" | b"smoke-test\n" => false,
+        _ => fail(BOOT_MODE_PROBE_FAILED),
+    }
+}
+
+fn run_nullfs_restart_probe(
+    service: &mut ServiceRuntime,
+    readiness_endpoint: CapabilityHandle,
+    request_endpoint: &mut CapabilityHandle,
+    block_capability: BootstrapCapability,
+) {
+    let ready_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let control_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let barrier =
+        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let probe_process_id = syscall::spawn_command_with_barrier(
+        NULLFS_RESTART_PROBE_COMMAND,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    if ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, READY_HANDLE).ok()
+        != Some(READY_HANDLE)
+        || ipc::grant_child(
+            probe_process_id,
+            control_endpoint,
+            Rights::RECEIVE,
+            REQUEST_HANDLE,
+        )
+        .ok()
+            != Some(REQUEST_HANDLE)
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+
+    let mut ready = [0_u8; 64];
+    loop {
+        match ipc::try_receive(ready_endpoint, &mut ready) {
+            Ok(message) => {
+                if message.sender_process_id != probe_process_id
+                    || message.capability.is_some()
+                    || message.bytes != NULLFS_RESTART_PROBE_READY.len()
+                    || &ready[..message.bytes] != NULLFS_RESTART_PROBE_READY
+                {
+                    fail(NULLFS_RESTART_PROBE_FAILED);
+                }
+                break;
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+        if !matches!(
+            syscall::try_wait_child(probe_process_id),
+            Err(error) if error == syscall::Errno::TRY_AGAIN
+                || error == syscall::Errno::INTERRUPTED
+        ) {
+            fail(NULLFS_RESTART_PROBE_FAILED);
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    }
+
+    let old_service_process_id = service
+        .process_id()
+        .unwrap_or_else(|| fail(NULLFS_RESTART_PROBE_FAILED));
+    if ipc::info(*request_endpoint)
+        .map(|info| info.size)
+        .unwrap_or(1)
+        != 0
+        || syscall::signal_process_group(old_service_process_id, signal::STOP).ok() != Some(1)
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    loop {
+        match syscall::wait_child(old_service_process_id) {
+            Ok(status) if status.stopped_signal() == Some(signal::STOP) => {
+                if service.observe_status(status.raw())
+                    != ServiceStatusDisposition::WaitForNextEvent
+                {
+                    fail(NULLFS_RESTART_PROBE_FAILED);
+                }
+                break;
+            }
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+    }
+
+    ipc::send(control_endpoint, NULLFS_RESTART_PROBE_BEGIN_READ, None)
+        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let mut request_queued = false;
+    for _ in 0..256 {
+        match ipc::info(*request_endpoint) {
+            Ok(info) if info.size != 0 => {
+                request_queued = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+        if !matches!(
+            syscall::try_wait_child(probe_process_id),
+            Err(error) if error == syscall::Errno::TRY_AGAIN
+                || error == syscall::Errno::INTERRUPTED
+        ) {
+            fail(NULLFS_RESTART_PROBE_FAILED);
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    }
+    if !request_queued
+        || syscall::signal_process_group(old_service_process_id, signal::TERMINATE).ok() != Some(1)
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+
+    let backoff_yields = loop {
+        match syscall::wait_child(old_service_process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {
+                if service.observe_status(status.raw())
+                    != ServiceStatusDisposition::WaitForNextEvent
+                {
+                    fail(NULLFS_RESTART_PROBE_FAILED);
+                }
+            }
+            Ok(status) => match service.observe_status(status.raw()) {
+                ServiceStatusDisposition::Restart { backoff_yields } => break backoff_yields,
+                ServiceStatusDisposition::WaitForNextEvent | ServiceStatusDisposition::Failed => {
+                    fail(NULLFS_RESTART_PROBE_FAILED)
+                }
+            },
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+    };
+    let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
+    backoff(backoff_yields);
+
+    let replacement_request_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    start_service(
+        service,
+        readiness_endpoint,
+        replacement_request_endpoint,
+        Some(block_capability),
+        &NULLFS_MESSAGES,
+    );
+    register_nullfs_proxy(service, replacement_request_endpoint);
+    let stale_request_endpoint = *request_endpoint;
+    *request_endpoint = replacement_request_endpoint;
+    ipc::close(stale_request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+
+    loop {
+        match syscall::wait_child(probe_process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(status) if status.success() => break,
+            Ok(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+    }
+    ipc::close(ready_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    ipc::close(control_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let _ = syscall::write_all(STDOUT, NULLFS_RESTART_PROBE_PASSED);
 }
 
 fn register_nullfs_proxy(service: &ServiceRuntime, request_endpoint: CapabilityHandle) {

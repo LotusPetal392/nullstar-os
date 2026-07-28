@@ -25,13 +25,15 @@ binary for `x86_64-unknown-none`. The root build script embeds those artifacts,
 the boot-mode marker, and test fixtures into images produced by
 `bootloader 0.11`.
 
-Both images contain the same kernel and userspace programs. Their `/BOOTMODE`
-file selects one of two paths:
+The generated images contain the same kernel and userspace programs. Their
+`/BOOTMODE` file selects one of three paths:
 
 - `normal` initializes services, starts `/init` as PID 1, and lets init launch
   the foreground userspace shell.
 - `smoke-test` runs deterministic subsystem probes and emits serial markers for
   the host harness. The persistence test uses two boots of a temporary image.
+- `nullfs-restart-test` follows the normal PID 1 path but replaces the mounted
+  NullFS service while a probe has a live descriptor and blocked read.
 
 ## Boot sequence
 
@@ -47,10 +49,11 @@ Initialization proceeds in dependency order:
 4. Enumerate PCIe through MCFG/ECAM, initialize an AHCI disk, and discover its
    MBR or GPT partitions.
 5. Mount the first supported FAT volume at `/`, then mount tmpfs at `/tmp`.
-6. Initialize the scheduler and branch into normal or smoke-test behavior.
-7. On normal boot, create PID 1 from `/init`; init launches and supervises
-   `/ush`. If init cannot start or later terminates, enter the emergency kernel
-   shell.
+6. Initialize the scheduler and branch into normal, smoke-test, or targeted
+   service-fault behavior.
+7. On normal and targeted service-fault boots, create PID 1 from `/init`; init
+   launches and supervises `/ush`. If init cannot start or later terminates,
+   enter the emergency kernel shell.
 
 Serial logging remains available throughout boot, including before the
 framebuffer is ready. Fatal early-boot failures report a diagnostic and halt.
@@ -231,9 +234,12 @@ description destruction queues one matching `CLOSE_NODE`. On service
 replacement, in-flight operations from the old generation fail with I/O, old
 descriptors remain stale and fail subsequent NullFS I/O, and stale close
 tickets are discarded rather than sent to the replacement session. The direct
-protocol probe covers service operations and the VFS boot probe covers the
-ordinary mounted syscall path; neither currently fault-injects a NullFS service
-restart with live descriptors. Writable NullFS authority still requires an
+protocol probe covers service operations and the normal VFS boot probe covers
+the ordinary mounted syscall path. A dedicated restart-test image stops the old
+service with a live descriptor, confirms a read is queued, registers a
+replacement on a fresh endpoint, and verifies canceled in-flight I/O, stale
+`read`/`fstat`/`seek`, and that closing the stale description cannot disrupt a
+live new-generation descriptor. Writable NullFS authority still requires an
 explicit grant policy and durability validation as described in the
 [NullFS roadmap](filesystems/nullfs-roadmap.md).
 

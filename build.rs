@@ -10,6 +10,7 @@ use nullfs_testkit::ImageBuilder;
 const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n";
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
+const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
 const NULLFS_BLOCK_COUNT: u64 = 256;
 const NULLFS_LABEL: &str = "NULLSTAR_DATA";
 const NULLFS_UUID: [u8; 16] = [
@@ -258,11 +259,22 @@ fn main() {
         .expect("failed to create smoke-test BIOS disk image");
     append_nullfs_partition(&smoke_test_bios_image, &nullfs_fixture)
         .expect("failed to append NullFS partition to smoke-test BIOS disk image");
+    let nullfs_restart_test_bios_image =
+        output_directory.join("nullstar-os-nullfs-restart-test-bios.img");
+    build_image(NULLFS_RESTART_TEST_BOOT_MODE)
+        .create_bios_image(&nullfs_restart_test_bios_image)
+        .expect("failed to create NullFS restart-test BIOS disk image");
+    append_nullfs_partition(&nullfs_restart_test_bios_image, &nullfs_fixture)
+        .expect("failed to append NullFS partition to restart-test BIOS disk image");
 
     println!("cargo:rustc-env=BIOS_IMAGE={}", bios_image.display());
     println!(
         "cargo:rustc-env=SMOKE_TEST_BIOS_IMAGE={}",
         smoke_test_bios_image.display()
+    );
+    println!(
+        "cargo:rustc-env=NULLFS_RESTART_TEST_BIOS_IMAGE={}",
+        nullfs_restart_test_bios_image.display()
     );
 }
 

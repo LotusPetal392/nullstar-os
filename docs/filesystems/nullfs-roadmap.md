@@ -295,10 +295,18 @@ later milestone and requires an explicit grant policy plus durability validation
 Current normal-boot coverage includes the direct protocol probe and a mounted
 VFS probe through public syscalls, including longest-prefix routing, ordinary
 read operations, read-only mutation denial, directory traversal, and relative
-cwd routing. It does not deliberately terminate and restart `nullfs-service`
-with live descriptors. Explicit restart/stale-handle fault injection, broader
-registered-buffer bounds cases, and recovery smoke coverage remain acceptance
-work rather than implemented test claims. Run the complete repository check:
+cwd routing. A separate `nullfs-restart-test` image deterministically stops the
+old service after a probe opens a live descriptor, queues a read while the
+service is stopped, terminates it, and registers a replacement on a fresh
+endpoint. The host requires the probe to observe `IO` from the canceled read and
+from later stale `fstat` and all-mode `seek`, close the stale description, and
+successfully open and read through the replacement generation. Broader
+registered-buffer bounds cases and recovery smoke coverage remain acceptance
+work. Run the targeted restart check or the complete repository check:
+
+```sh
+cargo run --locked --quiet -- --nullfs-restart-check
+```
 
 ```sh
 ./scripts/check-local.sh
