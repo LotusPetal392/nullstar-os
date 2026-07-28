@@ -135,7 +135,7 @@ include `--locked` so local results use the committed dependency graph.
 
 ```text
 .
-├── build.rs          Builds normal and smoke-test BIOS disk images
+├── build.rs          Builds normal, smoke-test, and targeted fault-test BIOS images
 ├── src/              Host-side QEMU runner and smoke-test harness
 ├── crates/           Host-testable shared libraries, including NullFS format code
 ├── kernel/           Freestanding x86-64 kernel
@@ -157,8 +157,9 @@ images, and launches QEMU.
 - There is no networking stack or network driver.
 - FAT writes are limited to regular files in the FAT16 root directory with 8.3
   names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
-  NullFS now supports host-side writable images and recovery, but offline repair
-  and the NullStar filesystem-service adapter are not yet implemented.
+  NullFS supports host-side writable images and recovery plus a read-only
+  userspace service mounted through the VFS. Writable service authority and
+  offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`

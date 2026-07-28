@@ -65,9 +65,16 @@ cargo +nightly-2026-02-01 run --locked --quiet -- --test
 ```
 
 The first command verifies that normal boot executes PID 1 and reaches the
-userspace shell. The second creates a temporary smoke image and boots it twice
-to verify persistent FAT writes as well as the complete subsystem suite. QEMU
-must be installed for the full path.
+userspace shell. The second creates a temporary smoke image, boots it twice to
+verify persistent FAT writes and the complete subsystem suite, then also
+requires the targeted NullFS restart phase. Run only that fault-injection phase
+with:
+
+```sh
+cargo +nightly-2026-02-01 run --locked --quiet -- --nullfs-restart-check
+```
+
+QEMU must be installed for these paths.
 
 Do not substitute `cargo build --workspace` for the release-build command. That
 mode also tries to link the freestanding `_start` binaries as host executables,
