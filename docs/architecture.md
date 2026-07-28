@@ -103,6 +103,42 @@ after final exit or signal termination. Direct shell children remain owned and
 reaped by `ush`; abandoned descendants continue to use the bounded internal
 kernel reaper.
 
+### Future service manager
+
+The intended successor to the current hard-coded init sequence is a declarative,
+systemd-inspired service manager implemented by PID 1. NullStar does not intend
+to require systemd unit-file compatibility; it should adopt the useful model of
+named units, explicit dependencies, readiness, restart policy, and observable
+state while keeping the format and capability rules native to NullStar.
+
+Packaged service definitions should live under `/System/services`, matching the
+existing system namespace. Future machine-local enablement, overrides, and
+drop-ins should live under `/System/config/services` so generated or
+administrator-owned policy does not modify packaged definitions. The first
+format only needs service units; target-style grouping, timers, sockets, and
+other activation types can be added when their lifecycle semantics are defined.
+
+A service definition should eventually describe:
+
+- a stable unit name, executable path, arguments, and environment;
+- dependency and ordering relationships without treating ordering as authority;
+- restart conditions, backoff, startup timeout, and shutdown timeout;
+- the readiness mechanism and whether dependents require readiness or only a
+  started process;
+- requested capabilities, filesystem access, and delegated service endpoints,
+  which PID 1 resolves against policy rather than granting as ambient authority;
+- logging destination and resource limits once those facilities exist.
+
+The parser should be versioned, bounded, deterministic, and reject unknown
+mandatory fields. Command lines should remain structured argument arrays rather
+than being interpreted by a shell. PID 1 must also detect dependency cycles and
+report actionable unit failures instead of silently changing startup order.
+Services required to make `/System/services` accessible create a bootstrap
+cycle; those earliest mounts and service-manager prerequisites must remain in a
+small built-in bootstrap set or come from an already available boot image. The
+current explicitly coded startup sequence serves as that bootstrap until the
+unit loader and dependency engine exist.
+
 The process manager owns:
 
 - address spaces and copy-on-write fork state
