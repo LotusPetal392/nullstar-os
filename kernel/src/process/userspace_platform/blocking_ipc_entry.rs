@@ -7,7 +7,7 @@ struct EndpointWaiter {
     process_id: u64,
 }
 
-static ENDPOINT_WAITERS: Mutex<Vec<EndpointWaiter>> = Mutex::new(Vec::new());
+static ENDPOINT_WAITERS: PreemptMutex<Vec<EndpointWaiter>> = PreemptMutex::new(Vec::new());
 
 global_asm!(
     r#"

@@ -15,6 +15,7 @@ mod arch;
 mod boot_mode;
 mod drivers;
 mod memory;
+mod preemption;
 mod process;
 mod process_completion;
 mod scheduler;

@@ -13,7 +13,7 @@ use core::{
     ptr, slice, str,
 };
 
-use spin::Mutex;
+
 use x86_64::{
     PhysAddr, VirtAddr,
     instructions::{hlt, interrupts as cpu_interrupts},
@@ -25,7 +25,8 @@ use x86_64::{
 };
 
 use crate::{
-    gdt, memory::BootInfoFrameAllocator, process_completion::CompletionQueue, scheduler, vfs,
+    gdt, memory::BootInfoFrameAllocator, preemption::PreemptMutex,
+    process_completion::CompletionQueue, scheduler, vfs,
 };
 
 use super::{
@@ -178,7 +179,8 @@ const ERR_READ_ONLY: i64 = abi::errno::READ_ONLY;
 const ERR_BROKEN_PIPE: i64 = abi::errno::BROKEN_PIPE;
 const ERR_NOT_IMPLEMENTED: i64 = abi::errno::NOT_IMPLEMENTED;
 
-static PROCESS_MANAGER: Mutex<ProcessManager> = Mutex::new(ProcessManager::new());
+static PROCESS_MANAGER: PreemptMutex<ProcessManager> =
+    PreemptMutex::new(ProcessManager::new());
 
 #[derive(Debug, Clone, Copy)]
 struct SharedFrameReference {
@@ -241,7 +243,8 @@ impl SharedFrameTable {
     }
 }
 
-static SHARED_USER_FRAMES: Mutex<SharedFrameTable> = Mutex::new(SharedFrameTable::new());
+static SHARED_USER_FRAMES: PreemptMutex<SharedFrameTable> =
+    PreemptMutex::new(SharedFrameTable::new());
 
 fn retain_shared_frame(frame: PhysFrame<Size4KiB>) {
     SHARED_USER_FRAMES.lock().retain(frame);
@@ -894,7 +897,7 @@ impl Drop for OpenFileState {
     }
 }
 
-type OpenFileHandle = Arc<Mutex<OpenFileState>>;
+type OpenFileHandle = Arc<PreemptMutex<OpenFileState>>;
 
 #[derive(Clone)]
 struct OpenFile {
@@ -1059,13 +1062,18 @@ struct KernelCapabilityRoot {
     references: usize,
 }
 
-static KERNEL_CAPABILITY_ROOTS: Mutex<Vec<KernelCapabilityRoot>> = Mutex::new(Vec::new());
-static TMPFS_PROXY: Mutex<TmpfsProxyState> = Mutex::new(TmpfsProxyState::new());
-static TMPFS_CLOSE_QUEUE: Mutex<VecDeque<PendingTmpfsClose>> = Mutex::new(VecDeque::new());
-static TMPFS_ABANDONED_REQUEST: Mutex<Option<PendingTmpfsProxyRequest>> = Mutex::new(None);
-static NULLFS_PROXY: Mutex<TmpfsProxyState> = Mutex::new(TmpfsProxyState::new());
-static NULLFS_CLOSE_QUEUE: Mutex<VecDeque<PendingTmpfsClose>> = Mutex::new(VecDeque::new());
-static NULLFS_ABANDONED_REQUEST: Mutex<Option<PendingNullfsProxyRequest>> = Mutex::new(None);
+static KERNEL_CAPABILITY_ROOTS: PreemptMutex<Vec<KernelCapabilityRoot>> =
+    PreemptMutex::new(Vec::new());
+static TMPFS_PROXY: PreemptMutex<TmpfsProxyState> = PreemptMutex::new(TmpfsProxyState::new());
+static TMPFS_CLOSE_QUEUE: PreemptMutex<VecDeque<PendingTmpfsClose>> =
+    PreemptMutex::new(VecDeque::new());
+static TMPFS_ABANDONED_REQUEST: PreemptMutex<Option<PendingTmpfsProxyRequest>> =
+    PreemptMutex::new(None);
+static NULLFS_PROXY: PreemptMutex<TmpfsProxyState> = PreemptMutex::new(TmpfsProxyState::new());
+static NULLFS_CLOSE_QUEUE: PreemptMutex<VecDeque<PendingTmpfsClose>> =
+    PreemptMutex::new(VecDeque::new());
+static NULLFS_ABANDONED_REQUEST: PreemptMutex<Option<PendingNullfsProxyRequest>> =
+    PreemptMutex::new(None);
 
 #[derive(Clone, Copy)]
 struct VfsRouteState {
@@ -1090,7 +1098,7 @@ impl VfsRouteState {
     }
 }
 
-static VFS_ROUTE: Mutex<VfsRouteState> = Mutex::new(VfsRouteState::new());
+static VFS_ROUTE: PreemptMutex<VfsRouteState> = PreemptMutex::new(VfsRouteState::new());
 
 #[derive(Clone)]
 enum PendingVfsOperation {
@@ -5139,7 +5147,7 @@ fn vfs_complete_boot_open(
         Err(error) => return error_return(vfs_errno(&error)),
     };
     let offset = if options.append { metadata.size } else { 0 };
-    let handle = Arc::new(Mutex::new(OpenFileState {
+    let handle = Arc::new(PreemptMutex::new(OpenFileState {
         path: metadata.path,
         offset,
         readable: options.read,
@@ -8212,7 +8220,7 @@ fn tmpfs_proxy_complete_operation(
                 return Ok(error_return(ERR_IO));
             }
             let offset = if append { size } else { 0 };
-            let handle = Arc::new(Mutex::new(OpenFileState {
+            let handle = Arc::new(PreemptMutex::new(OpenFileState {
                 path,
                 offset,
                 readable,
@@ -10061,7 +10069,7 @@ fn nullfs_proxy_complete_success(
                     }),
                 );
             }
-            let handle = Arc::new(Mutex::new(OpenFileState {
+            let handle = Arc::new(PreemptMutex::new(OpenFileState {
                 path,
                 offset: 0,
                 readable: true,
@@ -10350,7 +10358,7 @@ fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
         Err(e) => return error_return(vfs_errno(&e)),
     };
     let offset = if options.append { metadata.size } else { 0 };
-    let handle = Arc::new(Mutex::new(OpenFileState {
+    let handle = Arc::new(PreemptMutex::new(OpenFileState {
         path: metadata.path,
         offset,
         readable: options.read,

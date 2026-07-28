@@ -78,7 +78,12 @@ allocation with aligned splitting and adjacent free-block coalescing.
 The scheduler owns bootstrap, kernel-thread, and user-process tasks. Each task
 has a kernel stack and saved interrupt context. Timer interrupts can switch
 between runnable tasks; blocked processes are made runnable when their I/O,
-child, signal, or terminal condition changes.
+child, signal, or terminal condition changes. Task-shared kernel state uses a
+preemption-aware mutex: hardware interrupts continue, but timer-driven task
+switching is deferred until the outermost guard is released. This prevents a
+single-CPU task from spinning on a lock whose owner was suspended by the timer.
+The preemption depth is global while NullStar remains single-CPU and must become
+per-CPU before an SMP scheduler is introduced.
 
 The normal image starts only the services needed for interactive use. Scheduler
 stress probes and other destructive checks are restricted to the smoke image.

@@ -7,12 +7,12 @@ use core::{
     sync::atomic::{Ordering, compiler_fence},
 };
 
-use spin::Mutex;
 use x86_64::{VirtAddr, structures::paging::FrameAllocator};
 
 use crate::{
     acpi::McfgInfo,
     memory::{BootInfoFrameAllocator, FRAME_SIZE},
+    preemption::PreemptMutex,
 };
 
 use super::{
@@ -93,7 +93,7 @@ const PORT_TRANSITION_SPINS: usize = 10_000_000;
 const PORT_READY_SPINS: usize = 10_000_000;
 const COMMAND_COMPLETION_SPINS: usize = 50_000_000;
 
-static DEVICE: Mutex<Option<Controller>> = Mutex::new(None);
+static DEVICE: PreemptMutex<Option<Controller>> = PreemptMutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

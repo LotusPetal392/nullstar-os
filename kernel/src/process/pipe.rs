@@ -1,14 +1,14 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::fmt;
 
-use spin::Mutex;
+use crate::preemption::PreemptMutex;
 
 pub type PipeId = u64;
 
 pub const PIPE_CAPACITY_BYTES: usize = 4096;
 pub const MAX_PIPES: usize = 32;
 
-static PIPE_MANAGER: Mutex<PipeManager> = Mutex::new(PipeManager::new());
+static PIPE_MANAGER: PreemptMutex<PipeManager> = PreemptMutex::new(PipeManager::new());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

@@ -17,7 +17,7 @@ use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
 };
 
-use crate::gdt;
+use crate::{gdt, preemption};
 
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_STACK_WORDS: usize = KERNEL_STACK_SIZE / size_of::<u128>();
@@ -938,11 +938,11 @@ pub fn snapshot() -> Snapshot {
 }
 
 pub fn current_process_id() -> Option<u64> {
-    SCHEDULER.lock().current_process_id()
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().current_process_id())
 }
 
 pub fn current_task_kind() -> TaskKind {
-    SCHEDULER.lock().current_task_kind()
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().current_task_kind())
 }
 
 pub fn spawn_user_process(
@@ -968,7 +968,11 @@ pub fn spawn_user_process(
 }
 
 pub fn on_timer_interrupt(current_stack_pointer: usize) -> usize {
-    SCHEDULER.lock().schedule(current_stack_pointer)
+    if preemption::is_disabled() {
+        current_stack_pointer
+    } else {
+        SCHEDULER.lock().schedule(current_stack_pointer)
+    }
 }
 
 pub fn on_yield(current_stack_pointer: usize) -> usize {

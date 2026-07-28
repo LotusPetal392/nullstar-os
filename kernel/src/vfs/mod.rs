@@ -6,9 +6,7 @@ use alloc::{
 };
 use core::fmt;
 
-use spin::Mutex;
-
-use crate::fat;
+use crate::{fat, preemption::PreemptMutex};
 
 pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_PATH_COMPONENTS: usize = 32;
@@ -19,8 +17,8 @@ pub const TMPFS_MAX_FILE_BYTES: usize = 64 * 1024;
 pub const TMPFS_MAX_TOTAL_BYTES: usize = 256 * 1024;
 pub const TMPFS_MAX_NAME_BYTES: usize = 128;
 
-static ROOT_MOUNT: Mutex<Option<MountedRoot>> = Mutex::new(None);
-static TMPFS: Mutex<TmpFileSystem> = Mutex::new(TmpFileSystem::new());
+static ROOT_MOUNT: PreemptMutex<Option<MountedRoot>> = PreemptMutex::new(None);
+static TMPFS: PreemptMutex<TmpFileSystem> = PreemptMutex::new(TmpFileSystem::new());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSystemKind {

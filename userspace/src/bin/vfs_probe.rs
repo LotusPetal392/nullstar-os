@@ -470,6 +470,27 @@ fn probe_mounted_nullfs() {
     {
         syscall::exit(52);
     }
+
+    for _ in 0..4 {
+        for _ in 0..2 {
+            if syscall::yield_now().is_err() {
+                syscall::exit(53);
+            }
+        }
+        let descriptor = match open_with_retry(NULLFS_WELCOME, syscall::OpenFlags::READ) {
+            Some(descriptor) => descriptor,
+            None => syscall::exit(54),
+        };
+        welcome_bytes.fill(0);
+        if syscall::read(descriptor, &mut welcome_bytes).ok() != Some(WELCOME.len())
+            || welcome_bytes != WELCOME
+        {
+            syscall::exit(55);
+        }
+        if syscall::close(descriptor).is_err() {
+            syscall::exit(56);
+        }
+    }
 }
 
 fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {

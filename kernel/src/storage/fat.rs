@@ -1,9 +1,7 @@
 use alloc::{string::String, vec, vec::Vec};
 use core::{char::decode_utf16, fmt};
 
-use spin::Mutex;
-
-use crate::ahci;
+use crate::{ahci, preemption::PreemptMutex};
 
 use super::partition::{Inventory as PartitionInventory, Partition};
 
@@ -19,7 +17,7 @@ pub const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
 const ATTR_ARCHIVE: u8 = 0x20;
 const FAT16_END_OF_CHAIN: u16 = 0xffff;
 
-static VOLUME: Mutex<Option<FatVolume>> = Mutex::new(None);
+static VOLUME: PreemptMutex<Option<FatVolume>> = PreemptMutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

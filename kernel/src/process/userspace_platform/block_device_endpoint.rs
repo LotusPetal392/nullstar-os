@@ -63,8 +63,8 @@ struct BlockDeviceTransfer {
     buffer_offset: usize,
 }
 
-static BLOCK_DEVICE_ENDPOINTS: Mutex<BlockDeviceEndpointState> =
-    Mutex::new(BlockDeviceEndpointState::new());
+static BLOCK_DEVICE_ENDPOINTS: PreemptMutex<BlockDeviceEndpointState> =
+    PreemptMutex::new(BlockDeviceEndpointState::new());
 
 pub fn configure_block_device_endpoints(inventory: &crate::partition::Inventory) -> usize {
     let mut state = BLOCK_DEVICE_ENDPOINTS.lock();
