@@ -38,7 +38,9 @@ experimentation, not production use or untrusted workloads.
 See [Architecture](docs/architecture.md) for how these pieces fit together,
 [Userspace ABI](docs/syscall-abi.md) for the ring-3 contract,
 [Protection model](docs/protection-model.md) for the capability and IPC
-foundation, [NullFS roadmap](docs/filesystems/nullfs-roadmap.md) for the native
+foundation, [Identity and access-control design](docs/identity-and-access.md) and
+[device filesystem design](docs/devfs.md) for planned policy and `/dev`
+architecture, [NullFS roadmap](docs/filesystems/nullfs-roadmap.md) for the native
 persistent filesystem plan, and [Development](docs/development.md) for the
 toolchain, test workflow, and common build issues.
 

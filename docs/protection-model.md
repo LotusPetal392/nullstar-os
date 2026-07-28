@@ -116,6 +116,26 @@ This deliberately postpones several harder requirements:
 Those requirements should be addressed before userspace hardware drivers are
 introduced.
 
+## Future identity policy
+
+The future [identity and access-control model](identity-and-access.md) will add
+root, admin-group, regular-user, and service identities; authenticated sessions;
+and UID/GID/mode checks for filesystem and device policy. Those identities are a
+policy input, not an alternative authority namespace.
+
+Capabilities remain authoritative for kernel objects and privileged service
+endpoints. A filesystem or authorization broker may use kernel-authenticated
+process credentials to decide whether to perform an operation or delegate a
+rights-reduced capability, but it can grant only authority it already possesses.
+UID 0 and admin-group membership cannot forge a capability, amplify its rights,
+or make an unavailable device endpoint reachable. Credential transitions must
+also filter inherited capabilities and descriptors so changing identity cannot
+carry unrelated authority across the boundary.
+
+The future [device filesystem](devfs.md) follows the same rule: `/dev` paths
+provide discovery and policy metadata, while a successful open creates a checked,
+generation-scoped provider session.
+
 ## Lifetime and cleanup
 
 The registry records object identity separately from process-local handles.
