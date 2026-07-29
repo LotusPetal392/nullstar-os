@@ -14,6 +14,43 @@ not replace milestone-specific plans elsewhere in the repository.
 - Stabilize the userspace startup block and safe platform wrappers.
 - Introduce a named, versioned service-broker contract.
 
+## Namespace and persistent storage
+
+- Preserve the VFS as owner of a synthetic logical root.
+- Give the primary NullFS volume a stable UUID and human-facing `/Volumes/NullStar`
+  identity.
+- Populate `System`, `Applications`, and `Users` trees on the primary volume.
+- Define namespace bindings that project those trees into canonical `/System`,
+  `/Applications`, and `/Users` paths without symbolic links.
+- Preserve canonical file identity across logical bindings and administrative backing
+  views.
+- Add writable NullStar filesystem-service authority, shutdown ordering, recovery, and
+  administrative tooling.
+- Load non-bootstrap programs and service definitions through the bound `/System` tree.
+- Treat `/System/boot` as the canonical source of boot generations and initially mirror
+  the selected generation to a firmware-readable bootstrap partition.
+- Retain an independent bootstrap and recovery environment whenever persistent bindings
+  are unavailable.
+
+## Driver and service evolution
+
+- Define common device identity, ownership generation, reset, and discovery records.
+- Add verified driver manifests, deterministic matching, and a supervised device
+  manager.
+- Add dynamic devfs provider registration and generation-scoped sessions.
+- Introduce constrained PCI configuration, MMIO, IRQ, pinned DMA, and later IOMMU-domain
+  capabilities.
+- Move a queue-oriented virtual block or network driver to userspace first.
+- Separate controller drivers from block, network, input, audio, and display class
+  policy.
+- Add hotplug, firmware brokerage, suspend/resume, crash recovery, quarantine, and
+  driver rollback.
+- Define the service-manager control protocol and state machine.
+- Implement `sv list`, `status`, `start`, `stop`, `restart`, and `logs` against the
+  evolving supervisor.
+- Add versioned service definitions, readiness, dependency validation, restart budgets,
+  resource limits, capability grants, enablement, and local overrides.
+
 ## Desktop kernel evolution
 
 - Add multilevel feedback scheduling with interactive wakeup preemption.
@@ -35,18 +72,90 @@ not replace milestone-specific plans elsewhere in the repository.
 - Defer compressed memory, swap, huge pages, NUMA, and hibernation until reclaim and
   failure semantics are reliable.
 
-## Userspace evolution
+## Userspace and command-line evolution
 
 - Build raw ABI, safe handle, runtime, and service-client layers.
-- Define application and service manifests.
+- Define application, service, driver, and package manifests.
 - Adopt `/Users/<name>/Profile/{config,cache,state,data,logs,runtime}`.
 - Add system-managed filesystem metadata so graphical tools may hide `Profile` without
   dot-prefix naming.
 - Add application jobs, sandbox policy, and portal-style brokers.
-- Add structured logging, crash reporting, and service health.
 - Add threads and futex-like synchronization.
+- Expand the native Rust utility set for boot, recovery, and ordinary shell use.
+- Grow `ush` scripting while documenting its native behavior separately from future
+  POSIX `sh` compatibility.
+- Map XDG base-directory compatibility to `Profile` without making Unix paths native.
 - Add libc and POSIX compatibility after native contracts stabilize.
+- Use external utility suites and eventually GNU coreutils as compatibility workloads,
+  not boot dependencies.
 - Add transactional packages and dynamic linking later.
+
+## Logging and diagnostics
+
+- Add a bounded kernel early-boot log ring and boot IDs.
+- Add structured userspace records with process, application, package, service,
+  generation, user, session, and subsystem attribution.
+- Capture managed-service stdout/stderr and implement `logctl show`, `follow`, and
+  `sv logs`.
+- Persist a size-bounded append-only journal.
+- Add immutable segments, indexes, compression, age and size rotation, low-disk policy,
+  and configurable retention classes.
+- Add rate limits, drop summaries, field-level privacy, crash-report links, and a
+  stronger audit stream.
+- Add syslog, legacy text-file rotation, and remote forwarding only as compatibility
+  or optional services.
+
+## Networking and policy
+
+- Route sockets through a userspace network service and attach immutable caller
+  identity.
+- Record connection and listener address, port, protocol, state, interface, and byte
+  counts.
+- Add per-application connect and listen rules plus `netctl connections` and rule
+  explanations.
+- Add a native resolver with domain-to-connection attribution and domain policy.
+- Distinguish internet, local-network, discovery, listener, raw, VPN, and DNS-provider
+  capabilities.
+- Add user-scoped history, graphical policy controls, application profiles, and
+  explicit privacy retention.
+- Add verified malware and tracker lists with isolated parsing, immutable compiled
+  snapshots, exceptions, explanations, and rollback.
+- Add VPN awareness, per-application routing, rate limits, and a bounded packet-layer
+  enforcement path later.
+
+## Graphics and desktop evolution
+
+1. Define native surface, buffer, role, commit, damage, input, and presentation objects.
+2. Build a software-composited single-output session over the existing framebuffer.
+3. Add isolated toplevels, dialogs, popups, focus, clipboard offers, and accessibility
+   foundations.
+4. Add a nested panel compositor with process-isolated applets and service-manager
+   supervision.
+5. Support panel, dock, or neither on every screen edge, including work-area reservation,
+   auto-hide, and popup forwarding.
+6. Add capture, file-transfer, global-shortcut, sensitive-input, and permission portals.
+7. Add compositor-owned backdrop blur and materials without exposing underlying pixels.
+8. Add accelerated buffers, explicit synchronization, modesetting, color management,
+   multiple outputs, and protected-content handling.
+9. Add a Wayland compatibility frontend beginning with core protocol and `xdg-shell`.
+10. Add freedesktop application metadata, MIME, icon, notification, portal, settings,
+    Secret Service, D-Bus session, and tray compatibility in measured stages.
+
+## Native renderer and toolkit evolution
+
+1. Implement a software vector/raster renderer for paths, images, clipping, alpha,
+   rounded geometry, gradients, shadows, and basic text.
+2. Define a safe SVG asset profile, symbolic icon roles, and scalable cursor metadata.
+3. Implement a Rust widget toolkit with row, column, stack, scroll, common controls,
+   input, focus, and accessibility identities.
+4. Specify NullStar Style Sheets with variables, type/class/ID selectors, stable widget
+   parts, pseudo-states, borders, radii, spacing, gradients, text, and shadows.
+5. Add live themes, high contrast, reduced motion, animation, and compositor backdrop
+   material requests.
+6. Add damage tracking, retained scene fragments, glyph and image caches, and a GPU
+   backend.
+7. Add complex text, input methods, color management, richer SVG, and document or print
+   backends later.
 
 ## Media graph evolution
 

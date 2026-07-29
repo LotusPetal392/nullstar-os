@@ -35,8 +35,10 @@ experimentation, not production use or untrusted workloads.
 - separate normal-boot and destructive smoke-test images, plus host-side unit
   tests and a local pre-push check script
 
-See [Architecture](docs/architecture.md) for how these pieces fit together,
-[Userspace ABI](docs/syscall-abi.md) for the ring-3 contract,
+See [Architecture](docs/architecture.md) for how the implemented pieces fit
+together, [Design direction](docs/design/README.md) and the
+[architecture design roadmap](docs/design/roadmap.md) for accepted long-term
+planning, [Userspace ABI](docs/syscall-abi.md) for the ring-3 contract,
 [Protection model](docs/protection-model.md) for the capability and IPC
 foundation, [Identity and access-control design](docs/identity-and-access.md) and
 [device filesystem design](docs/devfs.md) for planned policy and `/dev`

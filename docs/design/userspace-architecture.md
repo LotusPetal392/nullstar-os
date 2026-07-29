@@ -3,9 +3,9 @@
 ## Status
 
 A native capability-oriented userspace API, service-oriented system architecture,
-application jobs, and the `Profile` directory layout are **accepted direction**.
-Complete POSIX behavior, package details, and dynamic-linker policy remain
-**tentative design**.
+application jobs, the synthetic logical namespace, and the `Profile` directory layout
+are **accepted direction**. Complete POSIX behavior, package details, dynamic-linker
+policy, and external compatibility profiles remain **tentative design**.
 
 ## Layering and ABI
 
@@ -19,8 +19,8 @@ The direct syscall ABI should remain focused on mechanism:
 - synchronization, clocks, timers, and waiting;
 - low-level descriptor and exception operations.
 
-Policy-heavy features such as filesystems, networking, graphics, media, identity,
-packages, notifications, and secrets belong in userspace services.
+Policy-heavy features such as filesystems, drivers, networking, graphics, media,
+identity, packages, notifications, logging, and secrets belong in userspace services.
 
 The Rust-facing platform should separate:
 
@@ -45,12 +45,19 @@ Protocols advertise a name, major version, minor version, and optional feature s
 Examples of stable service names include:
 
 - `system.filesystem`;
+- `device.manager`;
 - `system.network`;
+- `network.policy`;
+- `system.logging`;
 - `system.media`;
 - `system.display`;
 - `system.input`;
 - `system.identity`;
-- `system.notifications`.
+- `system.notifications`;
+- `system.portal`.
+
+Names are illustrative until each protocol is specified. Canonical configuration
+should use unambiguous names even when interactive tools provide shorter aliases.
 
 ## Threads and event handling
 
@@ -59,8 +66,8 @@ support includes thread creation, thread-local storage, join and detach, thread 
 affinity, and a futex-like wait/wake primitive.
 
 A unified completion or event-waiting model should cover IPC, timers, process exit,
-file and network completion, display events, and media notifications. Subsystems
-should not invent incompatible polling mechanisms.
+file and network completion, display events, device notifications, and media events.
+Subsystems should not invent incompatible polling mechanisms.
 
 ## Native API and compatibility
 
@@ -72,6 +79,12 @@ A musl-based libc port is a plausible later path once virtual memory, threading,
 signals, filesystem semantics, and dynamic linking are sufficiently stable. Static
 programs remain the simpler early target.
 
+Freedesktop formats and selected Wayland and D-Bus protocols are desktop compatibility
+contracts, not native IPC or authorization. Privileged external interfaces translate
+through native services and portals. See
+[Freedesktop compatibility](freedesktop-compatibility.md) and
+[the graphics-stack design](graphics-stack.md).
+
 ## Filesystem namespace
 
 The major user-visible namespace uses short descriptive names:
@@ -82,6 +95,22 @@ The major user-visible namespace uses short descriptive names:
 /Volumes
 /Applications
 ```
+
+The long-term root is a synthetic VFS namespace rather than the root directory of one
+disk filesystem. The primary NullFS volume is expected to provide `System`,
+`Applications`, and `Users` trees that the VFS projects into their canonical paths
+through namespace bindings, not symbolic links.
+
+```text
+/Volumes/NullStar/System        => /System
+/Volumes/NullStar/Applications  => /Applications
+/Volumes/NullStar/Users         => /Users
+```
+
+Applications use only the canonical logical paths. Stable volume and node identities
+allow the backing layout to move to separate, encrypted, or read-only volumes later.
+The complete transition and boot model is in
+[Filesystem namespace and boot](filesystem-namespace.md).
 
 A user home should use familiar visible content directories and one system-managed
 profile directory:
@@ -117,46 +146,88 @@ Directory contracts are:
 - `runtime`: sockets, locks, and ephemeral per-login state.
 
 Applications should obtain these paths from the runtime using their stable application
-identifier instead of constructing paths. The resulting layout is category-first,
-for example `Profile/cache/org.nullstar.Player/`.
+identifier instead of constructing paths. The resulting layout is category-first, for
+example `Profile/cache/org.nullstar.Player/`.
 
 `Profile` should not rely on dot-prefix hiding. The filesystem or desktop metadata
 marks it system-managed and hidden by default in a graphical file manager. Terminal
 visibility remains a shell policy. Backup and cleanup tools may use category metadata
 to include configuration and data while excluding cache and runtime contents.
 
+For ported applications, the XDG configuration, cache, state, and data homes map to the
+corresponding `Profile` categories. XDG runtime compatibility must use a private
+session-scoped binding below `Profile/runtime` and be cleared with the login session.
+
 ## Application model and sandboxing
 
 An application is a bundle containing a manifest, executables, private libraries,
-resources, localization, icons, requested capabilities, and optional service or
-plugin declarations. The stable application identifier names profile storage and
+resources, localization, icons, requested capabilities, and optional service, driver,
+or plugin declarations. The stable application identifier names profile storage and
 sandbox policy.
 
 Applications should launch inside job objects that control lifecycle, process
-membership, memory and CPU limits, I/O priority, and capability inheritance.
+membership, memory and CPU limits, I/O priority, scheduling class, and capability
+inheritance.
 
 Desktop applications eventually run sandboxed by default. Sensitive operations use
-portal-like brokers for user-selected files, microphone access, screen sharing,
-clipboard transfer, secret storage, and URL opening. The result is a narrow capability
-to the approved resource rather than broad filesystem or device access.
+portal-like brokers for user-selected files, microphone and camera access, screen
+sharing, clipboard transfer, secrets, local-network discovery, global shortcuts, and
+URL opening. The result is a narrow capability or stream to the approved resource
+rather than broad filesystem, device, input, or desktop access.
 
 ## System services
 
 PID 1 should evolve into a declarative service manager with named units, dependencies,
-readiness, restart policy, backoff, capability grants, service identities, limits,
-and structured logging. Startup commands remain structured argument arrays rather
-than shell strings.
+readiness, restart policy, backoff, capability grants, service identities, limits, and
+structured logging. Startup commands remain structured argument arrays rather than
+shell strings.
 
-Userspace also needs early common infrastructure for structured logs, crash records,
-configuration layering, and service health. Native services and plugin hosts should
-be restartable without destabilizing the desktop session.
+The native `sv` client should inspect and request state transitions through the
+service-manager protocol. It does not manage services by searching for PIDs. See
+[Service management and command line](service-management-and-cli.md).
+
+Userspace also needs common infrastructure for structured logs, crash records,
+configuration layering, service health, network attribution, device supervision, and
+authorization. Native services, applets, drivers, compatibility processes, and plugin
+hosts should be restartable without destabilizing the desktop session.
+
+The logging contract, retention, rotation, and syslog compatibility are described in
+[Logging, journal, and rotation](logging.md). The userspace-first hardware boundary is
+described in [Driver model](driver-model.md), and application-aware firewall policy is
+described in [Network policy and firewall](network-policy.md).
+
+## Command-line environment
+
+Essential boot and recovery utilities should be native Rust programs that do not
+depend on a complete libc, dynamic linker, or GNU installation. Common POSIX behavior
+and selected GNU extensions can be added deliberately.
+
+Actual GNU coreutils are a later compatibility milestone and test workload. They must
+not become required to boot, repair NullFS, inspect services, read logs, or restore the
+system.
+
+`ush` remains the native shell while its scripting support evolves. A future `sh`
+compatibility target should make an explicit promise rather than silently redefining
+`ush` behavior.
+
+## Desktop userspace
+
+The compositor is the trusted boundary for surfaces, input, capture, clipboard,
+window-level effects, and secure UI. Applications cannot inspect other clients'
+buffers or input. Panels and docks may occupy each screen edge and run as nested
+compositors whose applets are separate supervised jobs.
+
+The native Rust UI stack should combine a backend-independent vector/raster renderer,
+SVG-first assets, accessible widgets, and a constrained CSS-derived style system.
+These are specified in [Graphics stack and compositor](graphics-stack.md) and
+[Native graphics renderer and UI toolkit](graphics-renderer-and-toolkit.md).
 
 ## Packages and dynamic linking
 
 Packages should be verified, staged, and atomically activated. Manifests eventually
 cover signatures, hashes, dependencies, architecture, ABI requirements, ownership,
-and rollback. Installed applications must not write into their own bundle during
-normal operation.
+compatibility metadata, services, drivers, and rollback. Installed applications must
+not write into their own bundle during normal operation.
 
 Dynamic linking is deferred but should eventually support ELF shared objects, TLS,
 ASLR, RELRO, versioned symbols, controlled search paths, and application-private
@@ -169,3 +240,4 @@ libraries. Current-directory library loading should not be part of the default p
 - Whether the service broker is part of PID 1 or a separate supervised service.
 - The initial libc scope and POSIX compatibility target.
 - Filesystem metadata representation for system-managed and backup-policy attributes.
+- Exact service names and the compatibility environment projected for unbundled ports.
