@@ -1,22 +1,15 @@
 # Developing NullStar OS
 
-NullStar OS mixes a host-side runner with bare-metal kernel and userspace
-artifacts. Keeping those targets separate is the most important part of a
-predictable development environment.
+NullStar OS combines a host-side runner, freestanding kernel and userspace artifacts,
+host-testable libraries, and host filesystem tools. Keeping host and target environments
+separate is the most important part of a predictable development setup.
 
 ## Toolchain model
 
-`rust-toolchain.toml` pins `nightly-2026-02-01` with:
-
-- `rust-src`
-- `llvm-tools-preview`
-- `rustfmt`
-- `clippy`
-- `rust-analyzer`
-- the `x86_64-unknown-none` target
-
-The pinned nightly is required for Cargo artifact dependencies and the kernel's
-x86 interrupt ABI. `.cargo/config.toml` enables `bindeps` for the workspace.
+`rust-toolchain.toml` pins `nightly-2026-02-01` with `rust-src`,
+`llvm-tools-preview`, `rustfmt`, `clippy`, `rust-analyzer`, and the
+`x86_64-unknown-none` target. The pinned nightly is required for Cargo artifact
+dependencies and the kernel's x86 interrupt ABI. `.cargo/config.toml` enables `bindeps`.
 
 Run commands from the repository root so Rustup discovers the pinned toolchain:
 
@@ -26,72 +19,64 @@ cargo --version
 rustc --version
 ```
 
-All three should identify `nightly-2026-02-01` when invoked here. An explicit
-`+nightly-2026-02-01` override is useful in scripts and diagnostics.
+All should identify `nightly-2026-02-01`. An explicit
+`+nightly-2026-02-01` override remains useful in scripts and diagnostics.
+
+## Workspace and target layout
+
+The root workspace contains more than the host runner, kernel, and bundled userspace.
+It also includes the separately packaged NullFS service, host-testable NullFS crates,
+and host tools such as `mkfs-nullfs`, `nullfs-image`, `nullfs-info`, `fsck-nullfs`, and
+`nullfs-fuse`.
+
+The root runner is built for the host. The kernel, bundled userspace binaries, and
+freestanding NullFS service are built for `x86_64-unknown-none`. Host libraries and tools
+use the host target unless an individual command explicitly selects otherwise.
+
+Do not substitute `cargo build --workspace` for the release-build command used by the
+repository checks. That mode attempts to link freestanding `_start` binaries as ordinary
+host executables.
 
 ## Local and automated checks
 
-GitHub Actions runs `.github/workflows/kernel-qemu.yml` for pull requests and
-pushes to `main`. The workflow checks formatting, builds the bootable image, and
-runs the QEMU smoke test. Treat the automated result as a required integration
-check, not as a replacement for local verification.
+GitHub Actions runs `.github/workflows/kernel-qemu.yml` for pull requests and pushes to
+`main`. It checks formatting, builds the image, and runs QEMU smoke validation. Automated
+results complement rather than replace local verification.
 
-Use the checked-in wrapper rather than maintaining a separate command list:
+Use the checked-in wrapper:
 
 ```sh
 ./scripts/check-local.sh --quick
 ```
 
-The quick path runs:
+The quick path runs formatting, workspace tests, Clippy with warnings denied, and a
+release build using the pinned toolchain and lockfile.
 
-```sh
-cargo +nightly-2026-02-01 fmt --all -- --check
-cargo +nightly-2026-02-01 test --workspace --locked
-cargo +nightly-2026-02-01 clippy --workspace --all-targets --locked -- -D warnings
-cargo +nightly-2026-02-01 build --release --locked
-```
-
-Run the complete pre-push check with:
+Before publishing, run:
 
 ```sh
 ./scripts/check-local.sh
 ```
 
-It additionally executes:
-
-```sh
-cargo +nightly-2026-02-01 run --locked --quiet -- --boot-check
-cargo +nightly-2026-02-01 run --locked --quiet -- --test
-```
-
-The first command verifies that normal boot executes PID 1 and reaches the
-userspace shell. The second creates a temporary smoke image, boots it twice to
-verify persistent FAT writes and the complete subsystem suite, then also
-requires the targeted NullFS restart phase. Run only that fault-injection phase
-with:
+The complete path additionally runs normal-boot readiness, the two-boot smoke suite,
+and the targeted NullFS replacement phase. The targeted fault path can be run directly:
 
 ```sh
 cargo +nightly-2026-02-01 run --locked --quiet -- --nullfs-restart-check
 ```
 
-QEMU must be installed for these paths.
-
-Do not substitute `cargo build --workspace` for the release-build command. That
-mode also tries to link the freestanding `_start` binaries as host executables,
-which is not a meaningful workspace build.
+QEMU must be available for integrated checks.
 
 ## Rust-analyzer
 
-The repository root contains two target kinds:
+The repository contains host and freestanding targets:
 
-- `nullstar-os` must be analyzed for the host target because it launches QEMU.
-- `kernel` and userspace binaries must be analyzed for
-  `x86_64-unknown-none`.
+- the root runner and host tools use the host target;
+- the kernel and freestanding userspace use `x86_64-unknown-none`.
 
-Do not set `rust-analyzer.cargo.target` to `x86_64-unknown-none` for the entire
-root workspace; that makes the host runner use the bare-metal target. If the
-editor cannot infer the artifact target for kernel work, open `kernel/` as a
-separate editor workspace and configure:
+Do not set `rust-analyzer.cargo.target` to `x86_64-unknown-none` for the entire root
+workspace. When concentrating on kernel or userspace code, open that package as a
+separate editor workspace and configure its target explicitly:
 
 ```json
 {
@@ -101,82 +86,77 @@ separate editor workspace and configure:
 }
 ```
 
-Use the same approach with `userspace/` when concentrating on a userspace
-binary. Restart rust-analyzer after changing the toolchain or target. The local
-check script is authoritative when editor diagnostics and Cargo disagree.
+Restart rust-analyzer after changing toolchain or target settings. The checked-in local
+verification script is authoritative when editor diagnostics disagree with Cargo.
 
 ## Adding a userspace program
 
-Bundled programs are explicit build artifacts. To add one:
+Bundled programs are explicit artifacts. To add one:
 
 1. Create `userspace/src/bin/<name>.rs` with `#![no_std]`, `#![no_main]`,
    `userspace::entry!(...)`, and `userspace::panic_handler!()`.
-2. Add a `[[bin]]` entry to `userspace/Cargo.toml` with tests and benches
-   disabled for the freestanding binary.
-3. Read `CARGO_BIN_FILE_USERSPACE_<name>` in the root `build.rs` and add the
-   artifact to `build_image`.
-4. Add host-testable logic to a library module where practical; reserve QEMU
-   tests for behavior that depends on the kernel or emulated hardware.
-5. Run the complete local check before publishing the change.
+2. Add a `[[bin]]` entry to `userspace/Cargo.toml` with tests and benches disabled.
+3. Read `CARGO_BIN_FILE_USERSPACE_<name>` in the root `build.rs` and include the artifact
+   in the generated image.
+4. Put target-independent logic in a testable library module where practical.
+5. Run the complete local check before publishing.
 
-Program names embedded at the image root are resolved with or without a leading
-slash by the process-spawn command parser. Filesystem paths themselves must be
-absolute.
+## Path and executable resolution
+
+Filesystem operations support both absolute paths and paths relative to the process's
+validated current working directory. The resolver canonicalizes `.`, `..`, and repeated
+separators.
+
+Executable lookup currently has two modes:
+
+```text
+cat              bare command name; resolves in the root command namespace as /cat
+./cat            explicit relative executable path
+../tools/cat     explicit relative executable path
+/System/bin/cat  absolute executable path
+```
+
+A bare name does **not** search a configurable `PATH` yet. An executable name containing
+a slash is resolved relative to the current working directory unless it begins with
+`/`. Redirection and ordinary filesystem paths may also be relative.
+
+`PWD` is kernel-managed working-directory state rather than a caller-controlled claim.
+See [Userspace ABI](syscall-abi.md) for the authoritative current behavior.
 
 ## Unsafe-code expectations
 
-The kernel and userspace runtime deny unsafe operations inside `unsafe fn`
-bodies. Keep unsafe blocks small and document the invariant that makes each one
-valid. In particular:
+The kernel and userspace runtime deny unsafe operations inside `unsafe fn` bodies. Keep
+unsafe blocks small and document the invariant that makes each valid. In particular:
 
-- interrupt and context-switch assembly must preserve its documented frame
-  layout and stack alignment
-- page-table code must prove mapped ranges and frame ownership
-- raw userspace pointers must be range-checked and copied while the owning
-  address space is active
-- global allocator changes must preserve alignment and avoid overlapping free
-  regions
+- interrupt and context-switch assembly must preserve frame layout and stack alignment;
+- page-table code must prove ranges and frame ownership;
+- userspace pointers must be checked and copied while the owning address space is active;
+- allocators must preserve alignment and prevent overlapping regions;
+- filesystem and protocol parsers must use checked arithmetic and bounded allocation.
 
-Prefer extracting target-independent state machines into library modules so
-they can be covered by host tests.
+Prefer target-independent state machines that can be tested on the host.
 
 ## Common failures
 
 ### `unwinding panics are not supported without std`
 
-Build the freestanding crates through this workspace and pinned target. The root
-profiles set `panic = "abort"`. A standalone host-target invocation can bypass
-that setup and produce this error.
+Build freestanding packages through the pinned workspace and target. The repository
+profiles use `panic = "abort"`; a standalone host-target invocation can bypass that.
 
 ### `duplicate symbol: _start`
 
-Each freestanding binary must define exactly one entry point. Kernel entry comes
-from `bootloader_api::entry_point!`; userspace entry comes from
-`userspace::entry!`. Do not add a second `_start` function or link a freestanding
-binary as a normal host test executable.
+Each freestanding binary defines exactly one entry point. The kernel uses
+`bootloader_api::entry_point!`; userspace uses `userspace::entry!`. Do not add another
+`_start` or link a freestanding binary as an ordinary host test executable.
 
-### Bootloader or `rust-lld` build failures
+### Bootloader or `rust-lld` failures
 
-Confirm the active pinned nightly and installed components:
-
-```sh
-rustup show active-toolchain
-rustup component list --installed --toolchain nightly-2026-02-01
-rustup target list --installed --toolchain nightly-2026-02-01
-```
-
-The required target is `x86_64-unknown-none`; the required low-level components
-include `rust-src` and `llvm-tools-preview`.
+Confirm the pinned toolchain, target, `rust-src`, and `llvm-tools-preview` are installed.
 
 ### QEMU does not start
 
-Confirm that the executable used by the runner is available:
-
-```sh
-qemu-system-x86_64 --version
-```
-
-The current runner assumes that exact executable name and the `q35` machine.
+Confirm `qemu-system-x86_64` is available. The runner currently targets that executable
+and the `q35` machine.
 
 ## Before opening a pull request
 
@@ -186,6 +166,6 @@ git diff --check
 git status --short
 ```
 
-Document new user-visible behavior in the root README or the appropriate guide,
-and keep serial smoke markers synchronized with the host runner when an
-integration test changes.
+Document new user-visible behavior in the root README or the appropriate current-system
+guide, and update design documents separately when a change implements or revises an
+accepted long-term direction.
