@@ -1,0 +1,240 @@
+# Filesystem namespace and boot direction
+
+## Status
+
+A synthetic VFS root, canonical logical paths, and VFS namespace bindings are
+**accepted direction**. The primary NullFS volume backing `/System`, `/Applications`,
+and `/Users` is also accepted direction. Exact boot-generation metadata, raw backing
+visibility, and the transition from the current FAT-rooted image remain
+**tentative design**.
+
+This document describes future architecture. The current mounted layout remains
+specified by [the implementation architecture](../architecture.md), and NullFS
+implementation work remains tracked by the
+[NullFS roadmap](../filesystems/nullfs-roadmap.md).
+
+## Core principle
+
+NullStar separates the logical operating-system namespace from physical storage.
+Applications use stable paths that describe what an object is for; the VFS decides
+which volume or service provides it.
+
+The long-term root is assembled by the VFS rather than inherited from one disk
+filesystem:
+
+```text
+/
+├── System
+├── Applications
+├── Users
+├── Volumes
+├── dev
+└── tmp
+```
+
+The primary persistent NullFS volume initially contains:
+
+```text
+/Volumes/NullStar/
+├── System/
+├── Applications/
+└── Users/
+```
+
+The VFS projects those trees into their canonical locations:
+
+```text
+/System         => NullStar volume, System node
+/Applications   => NullStar volume, Applications node
+/Users          => NullStar volume, Users node
+```
+
+`/dev` and `/tmp` remain service-backed mounts. Other local, removable, encrypted,
+and network volumes appear below `/Volumes` without changing the logical locations
+used by applications.
+
+## Namespace bindings
+
+A namespace binding is a VFS routing record, not a symbolic link. It identifies:
+
+- the canonical logical path;
+- the backing volume identity;
+- the backing filesystem node identity;
+- the provider generation and protocol session;
+- mount and access policy;
+- whether a raw administrative view is exposed.
+
+Opening `/System/bin/example` must retain `/System/bin/example` as its canonical view
+path. Ordinary clients should not observe a symlink expansion to
+`/Volumes/NullStar/System/bin/example`.
+
+Bindings avoid the problems caused by path aliases:
+
+- applications do not persist storage-layout details;
+- sandbox rules can target one canonical namespace;
+- moving a tree to another volume does not change application-visible paths;
+- a changed display label does not break boot or configuration;
+- file identity is based on volume and node identity rather than only text paths.
+
+The term **namespace binding** is preferred in native documentation. A POSIX
+compatibility layer may expose equivalent behavior as a bind mount where useful.
+
+## Volume identity and naming
+
+The display name `NullStar` is intended for the human-facing mount below `/Volumes`.
+Boot selection and namespace policy must use a stable volume UUID or another
+non-display identifier.
+
+A volume record should distinguish:
+
+- stable volume identity;
+- current provider and generation;
+- display name;
+- filesystem type and feature set;
+- writable, removable, encrypted, and degraded state;
+- the stable root node supplied by the filesystem service.
+
+Renaming a volume changes its display path below `/Volumes`; it must not invalidate a
+binding selected by UUID.
+
+## Canonical and administrative views
+
+`/System`, `/Applications`, and `/Users` are the canonical paths for normal software.
+The raw backing view below `/Volumes/NullStar` is intended for recovery and
+administration.
+
+The final visibility policy is tentative. Acceptable implementations include:
+
+- exposing both views only to authorized administrative tools;
+- showing the volume root while hiding nodes already projected elsewhere;
+- exposing a read-only raw view;
+- retaining both views but marking logical paths as canonical in file identity APIs.
+
+Regardless of presentation, path-based access checks must not accidentally grant more
+authority because the same node is reachable through an administrative alias.
+
+## Future volume separation
+
+The logical namespace allows storage policy to evolve without changing applications.
+For example:
+
+```text
+/System         => verified read-only system volume
+/Applications   => application volume
+/Users          => writable user-data volume
+```
+
+A user home may later be backed by an encrypted per-user volume:
+
+```text
+/Users/Natalie  => encrypted volume selected at login
+```
+
+Applications continue to use `/Users/Natalie`. They neither select nor need to know
+the physical provider.
+
+The accepted per-user managed-data layout remains:
+
+```text
+/Users/<name>/Profile/
+├── config/
+├── cache/
+├── state/
+├── data/
+├── logs/
+└── runtime/
+```
+
+Its directory contracts are defined in
+[the userspace architecture](userspace-architecture.md).
+
+## Boot architecture
+
+The persistent source of truth for boot artifacts should be `/System/boot`:
+
+```text
+/System/boot/
+├── generations/
+│   ├── 41/
+│   │   ├── kernel
+│   │   ├── bootstrap-image
+│   │   ├── manifest
+│   │   └── checksums
+│   └── 42/
+│       ├── kernel
+│       ├── bootstrap-image
+│       ├── manifest
+│       └── checksums
+├── selected-generation
+└── previous-generation
+```
+
+The exact record format and naming are tentative. The required behavior is:
+
+1. stage a complete new generation;
+2. verify all required artifacts;
+3. durably commit the generation;
+4. atomically select it for the next boot;
+5. retain a known-good previous generation;
+6. mark a generation successful only after normal boot reaches an agreed health point.
+
+Initially, a boot synchronization service should copy the selected generation to a
+small firmware-readable bootstrap partition. This keeps BIOS and future UEFI loading
+independent from the full NullFS format while making `/System/boot` canonical after the
+system is running.
+
+Direct bootloader traversal of NullFS is a distant option, not a prerequisite. It
+should be considered only after the on-disk format, recovery rules, and loader
+compatibility policy are stable.
+
+## Bootstrap and recovery
+
+A userspace filesystem service cannot load itself from a root that is unavailable.
+The boot image therefore needs a small independent bootstrap set containing enough to:
+
+- start PID 1 or an early supervisor;
+- access the boot storage path;
+- start the VFS and NullFS services;
+- validate or recover the primary volume;
+- install namespace bindings;
+- provide a recovery shell and diagnostics when normal activation fails.
+
+If the primary NullFS service cannot mount, the synthetic root and bootstrap facilities
+remain available. `/System`, `/Applications`, and `/Users` may be marked unavailable,
+while `/Volumes`, essential devices, temporary storage, logs, and recovery tools remain
+usable.
+
+A root-backing service restart must preserve the normal provider-generation rules:
+old in-flight requests fail deterministically, old handles remain stale, and a
+replacement does not silently inherit old sessions. Essential services must reopen
+resources through the new generation.
+
+## Transition from the current system
+
+The recommended progression is:
+
+1. Keep the current FAT root and read-only NullFS mount while strengthening protocol
+   and recovery coverage.
+2. Give the main NullFS volume the human-facing `/Volumes/NullStar` identity and
+   populate `System`, `Applications`, and `Users` trees in generated images.
+3. Add VFS namespace-binding records and bind one non-bootstrap tree first.
+4. Load ordinary programs and service definitions through `/System` while retaining
+   the existing bootstrap path.
+5. Add writable NullStar service authority, shutdown ordering, recovery, and
+   administrative tooling.
+6. Bind all three persistent trees and treat the synthetic VFS root as the normal
+   namespace.
+7. Add transactional boot generations and synchronization to the firmware-readable
+   bootstrap partition.
+
+Each stage must retain an independent recovery path and integrated boot smoke tests.
+
+## Open questions
+
+- Whether the raw `/Volumes/NullStar/System` view is visible to ordinary sessions.
+- The exact stable file-identity representation across bindings and service restart.
+- How namespace changes are authorized, audited, and made atomic.
+- Whether `/System` and `/Applications` become read-only deployments before or after
+  the first writable NullFS-backed user homes.
+- The boot-generation manifest, signature, rollback, and health-confirmation formats.
+- How removable or temporarily unavailable bound volumes appear to applications.
