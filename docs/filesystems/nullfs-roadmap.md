@@ -1,34 +1,43 @@
 # NullFS implementation roadmap
 
-NullFS is NullStar's planned native persistent filesystem. Development should
-keep the disk-format engine testable on a host while preserving the operating
-system's userspace filesystem architecture. The format baseline is defined in
-[`nullfs-format.md`](nullfs-format.md); the service boundary is defined in
-[`../filesystem-service-protocol.md`](../filesystem-service-protocol.md).
+NullFS is NullStar's native persistent-filesystem format and the planned primary
+persistent storage backend for the operating system. Development keeps the on-disk
+format and filesystem engine host-testable while preserving the userspace filesystem
+service architecture. The format baseline is defined in
+[`nullfs-format.md`](nullfs-format.md), the service boundary is defined in
+[`../filesystem-service-protocol.md`](../filesystem-service-protocol.md), and the
+accepted logical namespace and boot direction is defined in
+[`../design/filesystem-namespace.md`](../design/filesystem-namespace.md).
 
-This roadmap describes intended and completed work. Phases 1 and 2 include the
-`nullfs-format`, `nullfs-blockdev`, `nullfs-core`, and `nullfs-testkit` crates;
-mountable Phase 2 output from `mkfs-nullfs`; inspection through `nullfs-info`;
-deterministic source-tree population through `nullfs-image`; and an optional
-Linux read-only `nullfs-fuse` adapter. Writable core operation and checking are
-implemented; offline repair policy and writable NullStar service authority
-remain future work. Boot images contain a deterministic dedicated NullFS
-partition, and a separately supervised read-only service is statically mounted
-at `/Volumes/NULLSTAR_DATA`. The `nullfs_blockdev::BlockDevice` adapter exposes
-the 4096-byte logical geometry required by the shared core over the endpoint's
-device logical blocks.
+The shared format and core implementation now support writable version 1.2 images,
+recovery, checking, deterministic image creation, and an explicitly enabled writable
+FUSE adapter. NullStar currently exposes a separately supervised **read-only** service
+mounted at `/Volumes/NULLSTAR_DATA`. Writable NullStar service authority, namespace
+bindings, offline repair policy, and adoption as the primary backing volume remain
+future work.
+
+## Status summary
+
+| Phase | Scope | Status |
+| --- | --- | --- |
+| 1 | Format foundation | Implemented |
+| 2 | Read-only core and host tooling | Implemented |
+| 3 | Writable core and recovery | Implemented; hardening continues |
+| 4 | Read-only NullStar filesystem service | Implemented |
+| 5 | Writable service and namespace adoption | Planned |
+| 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
 
-NullFS is a backend filesystem service selected by the existing VFS routing
-layer. It does not bypass that layer, add NullFS-specific application syscalls,
-or move persistent filesystem logic into the kernel.
+NullFS is a backend selected by the VFS and accessed through the common filesystem
+service protocol. It does not add NullFS-specific application syscalls or move
+persistent filesystem policy into the kernel.
 
 ```text
 NullStar applications
         |
         v
-VFS routing and mount namespace
+synthetic VFS namespace and routing
         |
         v
 common filesystem-service protocol
@@ -37,69 +46,77 @@ common filesystem-service protocol
 NullFS service -> shared NullFS core -> block-device adapter
 ```
 
-The VFS resolves the rooted namespace and selects the static NullFS mount at
-`/Volumes/NULLSTAR_DATA`. The read-only service implements the common `CONNECT`
-session model, opaque node IDs, attributes, lookup/open, registered-buffer
-reads, stable directory iteration, close accounting, and generation handling.
-Registered-buffer writes and mutation operations remain disabled until writable
-authority is deliberately granted. On-disk inode or extent numbers remain an
-implementation detail.
+The current generated image contains a deterministic NullFS partition labelled
+`NULLSTAR_DATA`, and the read-only service is mounted at
+`/Volumes/NULLSTAR_DATA`. That path describes implemented behavior, not the final
+human-facing layout.
 
-FUSE is the first integration target because it exercises realistic filesystem
-workloads with ordinary host tooling and faster debugging. FUSE is an adapter,
-not the NullStar production interface and not a substitute for protocol-level
-service tests.
+The accepted long-term direction is:
 
-## Proposed component boundaries
+```text
+/Volumes/NullStar/
+├── System/
+├── Applications/
+└── Users/
 
-Names may be adjusted when crates are added, but dependencies should continue to
-point inward:
+/System         => namespace binding to the NullStar volume's System node
+/Applications   => namespace binding to the NullStar volume's Applications node
+/Users          => namespace binding to the NullStar volume's Users node
+```
 
-- **format crate**: constants, semantic on-disk types, explicit encoders and
-  decoders, CRC32C, feature negotiation, and validation; no ambient I/O;
-- **core crate**: allocation, namespace, metadata, file I/O, transactions, and
-  recovery over narrow storage and clock traits; independent of FUSE and
-  NullStar IPC;
-- **storage adapters**: checked access to files, memory images, and the
-  capability-based NullStar block-device endpoint described in
+The VFS owns the synthetic root and canonical logical paths. Namespace bindings are
+routing records, not symbolic links. Volume selection uses a stable UUID or equivalent
+identity; `NullStar` is a display name. NullFS is therefore planned as the primary
+**backing volume**, not as the literal owner of `/`.
+
+The canonical source of future boot generations should be `/System/boot`. Initially,
+the selected generation is mirrored to a firmware-readable bootstrap partition. Direct
+bootloader traversal of NullFS remains a distant option after the format and recovery
+contracts are stable.
+
+## Component boundaries
+
+Dependencies should continue to point inward:
+
+- **format crate**: constants, semantic on-disk types, explicit encoders and decoders,
+  CRC32C, feature negotiation, and validation; no ambient I/O;
+- **core crate**: allocation, namespace, metadata, file I/O, transactions, recovery,
+  and checking over narrow storage and clock traits; independent of FUSE and NullStar
+  IPC;
+- **storage adapters**: checked access to files, memory images, and the capability-based
+  NullStar block-device endpoint described in
   [`../block-device-service-protocol.md`](../block-device-service-protocol.md);
-- **service adapter**: maps the common filesystem-service protocol to core
-  operations and maintains sessions, generation-bound node handles, registered
-  buffers, and error translation;
-- **FUSE adapter**: maps host FUSE requests to the same core operations;
-- **tooling**: formatter, inspector, checker/repair tool, image builder, and
-  corruption-test helpers using the format/core crates rather than duplicate
+- **service adapter**: maps the common filesystem-service protocol to core operations
+  and maintains sessions, generation-bound node handles, registered buffers, and error
+  translation;
+- **FUSE adapter**: maps host FUSE requests to the same core implementation;
+- **tooling**: formatter, image builder, inspector, checker, future repair modes, and
+  corruption-test helpers using the shared format and core crates rather than duplicate
   parsers.
 
-The format and core crates should remain host-testable Rust libraries. Platform
-adapters own IPC, capabilities, async/event loops, and OS-specific lifetimes.
-Tools must not silently repair malformed input; inspection, checking, and repair
-are distinct modes.
+The format and core crates remain host-testable Rust libraries. Platform adapters own
+IPC, capabilities, asynchronous waiting, and OS-specific lifetimes. Inspection,
+checking, and repair are distinct modes; tools must not silently repair malformed
+input.
 
-## Phase 1: format foundation
+## Phase 1: format foundation — implemented
 
-Freeze and test the superblock and initial image geometry in
+Phase 1 established the frozen superblock and initial image geometry documented in
 [`nullfs-format.md`](nullfs-format.md).
 
-Deliverables:
+Implemented deliverables include:
 
-1. A host-testable format library with explicit little-endian field encoding and
-   decoding. No Rust struct is copied directly to or from disk bytes.
-2. CRC32C generation and verification over the complete 4096-byte superblock.
-3. Validation of magic, version, the three feature categories, UUID, UTF-8 label,
-   capacity, group geometry, descriptor reservation, and clean/dirty state.
-4. A deterministic formatter that reserves 64 KiB, writes the primary
-   superblock at block 16, and reserves allocation-group descriptor space from
-   block 17.
-5. A read-only inspector that reports semantic fields and precise validation
-   errors.
-6. Golden images/byte vectors and malformed-input tests. Phase 1 does not mount
-   files or claim crash recovery.
+1. explicit little-endian encoding and decoding without copying Rust structs directly
+   to or from disk;
+2. CRC32C generation and verification over the complete 4096-byte superblock;
+3. validation of magic, version, feature categories, UUID, UTF-8 label, capacity,
+   allocation-group geometry, descriptor reservation, and clean or dirty state;
+4. a deterministic formatter with a reserved 64 KiB boot area, primary superblock at
+   block 16, and allocation-group descriptor reservation beginning at block 17;
+5. a read-only semantic inspector with precise validation errors;
+6. golden byte vectors, malformed-input cases, and checked-arithmetic coverage.
 
-### Phase 1 acceptance
-
-The Phase 1 workspace packages are `nullfs-format`, `nullfs-blockdev`,
-`mkfs-nullfs`, and `nullfs-info`. The acceptance commands are:
+Representative validation commands are:
 
 ```sh
 cargo +nightly-2026-02-01 fmt --all -- --check
@@ -107,61 +124,33 @@ cargo +nightly-2026-02-01 test -p nullfs-format -p nullfs-blockdev -p mkfs-nullf
 cargo +nightly-2026-02-01 clippy -p nullfs-format -p nullfs-blockdev -p mkfs-nullfs -p nullfs-info --all-targets --locked -- -D warnings
 cargo +nightly-2026-02-01 run -p mkfs-nullfs --locked -- --size 64MiB --label Phase1 /tmp/nullfs-phase1.img
 cargo +nightly-2026-02-01 run -p nullfs-info --locked -- /tmp/nullfs-phase1.img
-cargo +nightly-2026-02-01 test --workspace --locked
-./scripts/check-local.sh --quick
 ```
 
-Formatter tests use temporary paths rather than depending on `/tmp`; `/tmp`
-above is only a manual smoke-test example.
+The phase acceptance coverage verifies deterministic layout, field offsets, reserved
+bytes, CRC behavior, feature negotiation, malformed geometry, truncation, dirty-state
+handling, arbitrary 4096-byte inputs, and arithmetic near integer limits.
 
-Phase 1 is accepted only when automated tests demonstrate all of the following:
+## Phase 2: read-only core and host tooling — implemented
 
-- golden encoding places every field at its documented offset, writes only
-  little-endian values, zeros all reserved bytes, and is byte-for-byte
-  deterministic;
-- a formatted image has a zeroed 64 KiB boot area, its superblock starts at byte
-  65536, and descriptor reservation starts at block 17;
-- format/inspect round trips preserve UUID, label, capacity, group fields,
-  feature masks, and state;
-- known CRC32C vectors pass, single-byte corruption is detected, and the
-  checksum field is treated as zero during calculation;
-- truncation and mutations of every validated field return errors without panic
-  or out-of-bounds I/O;
-- non-4096 block sizes, invalid UUID/UTF-8/state/geometry, unsupported major
-  versions, and unknown incompatible bits are rejected;
-- an unknown read-only-compatible bit rejects writable use but remains eligible
-  for read-only inspection/mount planning;
-- unknown compatible bits do not prevent use;
-- dirty images cannot be selected for writable use in the absence of recovery;
-- property or fuzz-style decode tests cover arbitrary 4096-byte inputs and
-  checked arithmetic near integer limits;
-- the existing workspace test and quick local check remain green.
+Phase 2 added allocation-group descriptors, inode records, extents, directories,
+metadata checksums, and a read-only core over an abstract block source.
 
-No QEMU boot marker is required for the host-only format milestone. Once a
-NullStar service is added, the full `./scripts/check-local.sh` path and a boot
-smoke test become acceptance requirements.
+Implemented behavior includes:
 
-## Phase 2: read-only core
+- root and component lookup;
+- attributes and stable generation-aware node identity;
+- sparse bounded reads;
+- deterministic directory cookies and paginated iteration;
+- whole-volume consistency validation;
+- deterministic source-tree population through `nullfs-image`;
+- corruption tests for records, pointers, lengths, and arbitrary input;
+- an optional Linux FUSE adapter using the same format and core implementation.
 
-Specify allocation-group descriptors, inode records, extents, directories, and
-metadata checksums before depending on them. Implement a read-only core over an
-abstract block source.
+FUSE was the first realistic host integration target because it enabled ordinary host
+workloads and faster debugging. It remains an adapter rather than the NullStar
+production interface.
 
-Deliverables include root lookup, component lookup, attributes, stable node
-identity, bounded reads, and deterministic directory cookies. Add fixtures for
-empty, sparse, fragmented, and multi-group images, plus corruption tests for
-every pointer and length. The checker and inspector should share decoders with
-the core.
-
-Implemented Phase 2 packages provide root/component lookup, attributes, sparse
-bounded reads, stable directory cookies, whole-volume consistency validation,
-deterministic image population, and an optional read-only FUSE adapter. Unit
-coverage currently includes traversal, sparse reads, cookies, record corruption,
-and arbitrary-record decoding. The adapter builds on Linux; an automated live
-FUSE mount workload remains environment-dependent and should run where `/dev/fuse`
-is available.
-
-Phase 2 acceptance commands are:
+Representative validation commands are:
 
 ```sh
 cargo test -p nullfs-format -p nullfs-blockdev -p nullfs-testkit -p nullfs-core -p mkfs-nullfs -p nullfs-info -p nullfs-image --locked
@@ -171,57 +160,53 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ./scripts/check-local.sh --quick
 ```
 
-Representative images must remain read-only and malformed images must fail
-without panic or access outside declared capacity.
+Malformed images must fail without panic or access outside their declared capacity.
 
-## Phase 3: writable core and recovery
+## Phase 3: writable core and recovery — implemented, hardening continues
 
-Phase 3 is implemented as format version 1.2 with authoritative allocation
-bitmaps, redundant superblocks, persistent generation/transaction state, and a
-fixed data-journaling redo transaction containing at most 64 home-block
-updates. The shared core now supports writable mount/recovery, create, mkdir,
-sparse and partial writes, truncate, unlink, rmdir, rename, sync, and clean
-unmount. The FUSE adapter exposes writable operation only with the explicit
-`--read-write` option.
+Format version 1.2 implements authoritative allocation bitmaps, redundant superblocks,
+persistent generation and transaction state, persistent orphan recovery, and a bounded
+data-journaling redo transaction containing at most 64 home-block updates.
 
-Define the free-space maps and crash-consistency model before enabling writes.
-A journal, copy-on-write scheme, or another transaction design is acceptable
-only with documented ordering and replay rules.
+The shared core supports:
 
-Implement create, unlink, rename, truncate, allocation, sparse writes, durable
-sync, and clean unmount. Add deterministic crash injection at each persistence
-boundary, remount/recovery tests, out-of-space behavior, and checker validation.
-The dirty bit must be set durably before mutation and cleared only after the
-specified durable commit conditions hold.
+- writable mount and recovery;
+- create and `mkdir`;
+- sparse, partial, append, and multi-block writes;
+- truncate;
+- unlink and POSIX unlink-while-open behavior;
+- `rmdir`;
+- rename, replacement, and directory-cycle rejection;
+- durable `sync` and retryable clean unmount;
+- generation-bound opaque open handles;
+- transactional free-space accounting;
+- read-only committed-journal overlays;
+- interrupted-superblock-state reconciliation.
 
-FUSE remains the primary workload adapter in this phase. Current automated
-coverage enumerates every write/flush failure boundary for create, a multi-block
-single-transaction write, and cross-directory rename, requiring recovery to
-produce exactly the old or committed new semantic state. It also covers sparse
-writes, truncation tail clearing, directory growth/hole reuse, inode generation
-changes on reuse, rename replacement, and cycle rejection.
+The FUSE adapter exposes writable operation only when explicitly launched with
+`--read-write`.
 
-Phase 3 hardening now includes generation-bound opaque open handles, persistent
-orphan-list recovery and POSIX unlink-while-open behavior, transactional and
-validated free-space counters, read-only committed-journal overlays,
-interrupted-superblock-state reconciliation, retryable clean unmount, and 660
-deterministic randomized model operations across three seeds with periodic full
-tree comparison after remount. FUSE uses the same generation-bound handle model
-and propagates clean-unmount failures.
+Current automated hardening covers every persistence boundary for representative
+create, write, rename, mount, and unmount operations. It includes:
 
-Further hardening now also preserves device ownership on mount failure and
-enumerates 51 writable-mount/unmount transition boundaries. A 126-case
-non-atomic persistence matrix covers partial dirty-block persistence, explicit
-block sets, reversed write-record persistence, and torn critical-record prefixes;
-outcomes are old, fully new, or safe rejection, never mixed semantic state. A
-live writable FUSE create/write/append/rename/read/unlink workload also passes.
+- old-or-fully-committed-new semantic outcomes after injected failures;
+- sparse writes and tail clearing after truncate;
+- directory growth and hole reuse;
+- inode-generation changes on reuse;
+- persistent orphan recovery;
+- 660 deterministic randomized model operations across three seeds with periodic
+  remount and full-tree comparison;
+- 51 writable mount and unmount transition boundaries;
+- a 126-case non-atomic persistence matrix covering partial dirty-block persistence,
+  explicit block sets, reversed write-record persistence, and torn critical-record
+  prefixes;
+- a live writable FUSE create, write, append, rename, read, and unlink workload.
 
-Remaining hardening includes broader long-running randomized seeds, additional
-media policies such as partial completion inside a real device flush, offline
-repair policy, and eventually authenticated integrity rather than accidental
-corruption detection alone.
+Remaining Phase 3 hardening includes broader long-running randomized seeds, additional
+real-device flush and partial-completion policies, offline repair policy, and eventual
+authenticated integrity beyond accidental-corruption detection.
 
-Phase 3 acceptance commands are:
+Representative validation commands are:
 
 ```sh
 cargo test -p nullfs-format -p nullfs-blockdev -p nullfs-testkit -p nullfs-core -p mkfs-nullfs -p fsck-nullfs -p nullfs-info -p nullfs-image --locked
@@ -231,114 +216,190 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ./scripts/check-local.sh --quick
 ```
 
-## Phase 4: NullStar filesystem service
+## Phase 4: read-only NullStar filesystem service — implemented
 
 NullFS is exposed by a separately supervised userspace backend behind the common
-filesystem protocol; clients are not routed to a NullFS-specific API. The build
-appends a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as MBR partition
-3. The kernel identifies it as NullFS, and an init-delegated raw probe validates
-its superblock through the read-only endpoint. The typed session client and
-adapter translate the endpoint's 512-byte logical-block geometry into the
-4096-byte blocks required by the shared core.
+filesystem protocol. Clients are not routed to a NullFS-specific API.
 
-The service mounts that volume through the adapter and implements `CONNECT`,
-`DISCONNECT`, registered buffers, lookup, attributes, read-only open, file
-reads, paginated directory iteration, and `CLOSE_NODE`. Opaque node IDs are
-independent of core inode numbers and the map is bounded by the mounted volume's
-inode capacity. Canonical mutations are rejected with `PERMISSION`. A direct
-generic-protocol boot probe verifies fixture lookup and reads, directory
-continuation, duplicate-open close accounting, stale duplicate closes, mutation
-denial, and session cleanup before PID 1 continues boot.
+The current build appends a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as
+MBR partition 3. The kernel identifies the partition as NullFS, and an init-delegated
+raw probe validates its superblock through the read-only block endpoint. The typed
+session client and storage adapter translate the endpoint's 512-byte device geometry
+into the 4096-byte blocks required by the shared core.
 
-PID 1 registers `nullfs-service` independently of tmpfs as a generation-scoped
-kernel filesystem proxy. The VFS has a static longest-prefix route and mount at
-`/Volumes/NULLSTAR_DATA`; `/Volumes` exposes the mount as a read-only directory.
-The kernel proxy creates its own protocol session and registers one kernel-owned
-4 KiB shared-memory buffer for file and directory transfers. Through the public
-file-descriptor and filesystem ABI, the mount supports ordinary `stat`,
-read-only `open`, `read`, `fstat`, `seek`, `read_directory`, and `chdir`.
-Canonical cwd handling routes relative directory changes and opens back through
-NullFS after a process enters the mounted volume. Write, create, truncate,
-append, descriptor-write, and unlink attempts return the read-only error.
+The service currently implements:
 
-Successful opens retain opaque, generation- and session-scoped service nodes in
-kernel open-file descriptions. Descriptor duplication and inheritance share the
-description, and only final destruction queues `CLOSE_NODE`. When supervision
-starts a replacement and registers a higher generation, old in-flight requests
-fail with I/O and old descriptors remain stale rather than being rebound to the
-replacement. Their later NullFS I/O fails with I/O, and queued close tickets
-whose generation or session does not match are discarded without being sent to
-the replacement.
+- `CONNECT` and `DISCONNECT`;
+- registered shared-memory buffers;
+- lookup and attributes;
+- read-only open and file reads;
+- paginated directory iteration;
+- `CLOSE_NODE` accounting;
+- session, request, provider-generation, and stale-handle validation.
 
-The service adapter must continue to:
+Canonical mutations return `PERMISSION` because writable service authority is not yet
+granted.
 
-- use `CONNECT`/`DISCONNECT`, session IDs, generations, request IDs, and stale
-  session rejection;
-- assign opaque node IDs independent of disk addresses and preserve required
-  identity across future rename support;
-- use registered shared-memory buffers for file and directory data;
-- validate buffer bounds, file offsets, capacities, operation flags, and reply
-  byte counts;
-- implement `CLOSE_NODE` lifetime accounting so future unlinked-but-open nodes
-  can be reclaimed correctly;
-- expose volume capabilities through versioned generic operations as the common
-  protocol gains them;
-- handle clean shutdown, dirty startup, service replacement, and block-device
-  loss without weakening format rules.
+PID 1 registers `nullfs-service` independently of tmpfs as a generation-scoped kernel
+filesystem proxy. The VFS currently mounts it at `/Volumes/NULLSTAR_DATA`. The proxy
+creates its own protocol session and registers one kernel-owned 4 KiB shared-memory
+buffer for file and directory transfers. Through the public descriptor and filesystem
+ABI, the mount supports ordinary `stat`, read-only `open`, `read`, `fstat`, `seek`,
+`read_directory`, and `chdir` operations.
 
-PID 1 supervision uses the same restart-budget model as the other services.
-Selecting NullFS as a future native root/system volume remains a VFS policy
-decision, and the current FAT path remains until protocol parity, persistence,
-and recovery smoke coverage exist. Writable block and filesystem authority is a
-later milestone and requires an explicit grant policy plus durability validation.
+Successful opens retain opaque, generation- and session-scoped service nodes in kernel
+open-file descriptions. Descriptor duplication and inheritance share the description,
+and only final destruction queues `CLOSE_NODE`. When supervision registers a
+replacement generation:
 
-Current normal-boot coverage includes the direct protocol probe and a mounted
-VFS probe through public syscalls, including longest-prefix routing, ordinary
-read operations, read-only mutation denial, directory traversal, and relative
-cwd routing. A separate `nullfs-restart-test` image deterministically stops the
-old service after a probe opens a live descriptor, queues a read while the
-service is stopped, terminates it, and registers a replacement on a fresh
-endpoint. The host requires the probe to observe `IO` from the canceled read and
-from later stale `fstat` and all-mode `seek`, close the stale description, and
-successfully open and read through the replacement generation. Broader
-registered-buffer bounds cases and recovery smoke coverage remain acceptance
-work. Run the targeted restart check or the complete repository check:
+- old in-flight requests fail with `IO`;
+- old descriptors remain stale instead of silently rebinding;
+- later stale I/O continues to fail with `IO`;
+- close tickets from the old generation are discarded rather than sent to the
+  replacement.
+
+The service adapter must continue to validate buffer bounds, file offsets, capacities,
+operation flags, reply byte counts, session ownership, and provider generation. It must
+also preserve clean shutdown, dirty startup, replacement, and block-device-loss
+semantics without weakening the on-disk rules.
+
+Current normal-boot coverage includes direct protocol probes and mounted VFS probes
+through public syscalls. The dedicated `nullfs-restart-test` image stops a service with
+a live descriptor and queued read, registers a replacement on a fresh endpoint, and
+verifies deterministic cancellation, stale-handle behavior, safe close handling, and
+successful access through the replacement generation.
 
 ```sh
 cargo run --locked --quiet -- --nullfs-restart-check
-```
-
-```sh
 ./scripts/check-local.sh
 ```
 
-## Phase 5: hardening and native-volume features
+The current FAT bootstrap path and `/Volumes/NULLSTAR_DATA` mount remain until Phase 5
+has writable protocol parity, namespace-binding support, persistence coverage, and an
+independent recovery path.
 
-After the basic service is reliable:
+## Phase 5: writable service and namespace adoption — planned
 
-- add redundant superblocks and allocation-group metadata with explicit recovery
-  selection;
-- fuzz every decoder and protocol adapter and retain minimized corruption cases;
-- add online checking/scrubbing and an explicitly gated offline repair mode;
-- benchmark allocation, fragmentation, directory scaling, and shared-buffer I/O;
-- add extended attributes, named forks, normalization-aware lookup, clones,
-  snapshots, or quotas only through assigned format features and versioned
-  generic service operations;
-- define compatible format upgrade and rollback procedures;
-- remove legacy kernel-resident persistent filesystem paths only after equivalent
+Phase 5 moves from a read-only test mount to the accepted persistent-volume and
+synthetic-namespace architecture.
+
+### Writable service authority
+
+The generic filesystem protocol and service adapter must gain bounded, validated
+support for:
+
+- create and `mkdir`;
+- descriptor and registered-buffer writes;
+- append and truncate;
+- unlink, `rmdir`, and rename;
+- sync, flush, clean shutdown, and recovery status;
+- writable mount negotiation and feature reporting;
+- cancellation and failure semantics for partially completed operations.
+
+PID 1 or another policy authority grants a filesystem service access only to its
+partition-scoped block capability and an explicit writable-service capability. Merely
+finding a volume, running as UID 0, or registering a filesystem provider must not
+manufacture write authority.
+
+Writable integration must preserve the existing generation rules. Retrying an operation
+after provider failure is allowed only when the protocol can prove that doing so is
+semantically safe.
+
+### Primary volume identity and layout
+
+The generated primary volume should transition from the development label
+`NULLSTAR_DATA` to a stable UUID-backed volume with the human-facing display name
+`NullStar`. Generated images should contain:
+
+```text
+System/
+Applications/
+Users/
+```
+
+The display name is not a boot key. Namespace and boot policy select the volume by UUID
+or another stable identifier.
+
+### Namespace bindings
+
+The VFS must support namespace bindings that map a canonical logical path to a volume
+and backing node without exposing symbolic-link aliases. Required bindings are:
+
+```text
+/System
+/Applications
+/Users
+```
+
+The VFS must preserve canonical logical paths, stable volume-and-node identity, provider
+generation, mount policy, and authorization across each binding. A raw administrative
+view below `/Volumes/NullStar` may remain available according to policy, but ordinary
+applications use only canonical paths.
+
+A staged transition should bind one non-bootstrap tree first, then load ordinary
+programs and service definitions through `/System`, and finally bind all three trees.
+The synthetic root and bootstrap facilities must remain usable when the primary volume
+or service is unavailable.
+
+### Boot generations
+
+After the namespace is reliable, `/System/boot` should become the canonical source for
+complete versioned boot generations. An updater stages and verifies a generation,
+commits it durably, atomically selects it, retains a known-good previous generation,
+and mirrors the selected artifacts to the firmware-readable bootstrap partition.
+Direct NullFS loading by the bootloader is not required for Phase 5.
+
+### Phase 5 acceptance
+
+Phase 5 is complete only when integrated tests demonstrate:
+
+- writable generic-protocol operations through the service and public VFS ABI;
+- crash injection and remount recovery for service-backed mutations;
+- deterministic out-of-space and block-device-loss behavior;
+- clean shutdown ordering and dirty-start recovery;
+- namespace binding, canonical-path, and file-identity behavior;
+- provider replacement without silent stale-handle rebinding;
+- continued access to the bootstrap and recovery environment when the primary volume
+  cannot mount;
+- normal boot loading non-bootstrap programs and service definitions through
+  `/System`;
+- boot-generation synchronization and rollback without corrupting the previously
+  selected generation.
+
+## Phase 6: hardening and native-volume features — planned
+
+After the writable service and namespace transition are reliable:
+
+- broaden fuzzing across every decoder, protocol adapter, namespace-binding record,
+  and recovery transition and retain minimized failures;
+- add online checking and scrubbing plus an explicitly gated offline repair mode;
+- benchmark allocation, fragmentation, directory scaling, shared-buffer I/O, service
+  transitions, and namespace traversal;
+- add authenticated integrity where justified;
+- add extended attributes, normalization-aware lookup, clones, snapshots, quotas,
+  named forks, or other native-volume facilities only through assigned format features
+  and versioned generic operations;
+- define format, protocol, package, and boot-generation upgrade and rollback procedures;
+- evaluate read-only verified system deployments and separately writable application or
+  user volumes without changing canonical paths;
+- remove legacy persistent-filesystem and bootstrap assumptions only after equivalent
   functionality and recovery coverage are demonstrated.
 
 ## Cross-phase rules
 
-- Update the format specification before merging a change to frozen bytes or
-  assigning a feature bit.
-- Keep generated fixtures reproducible and small; document generators rather
-  than checking in opaque large images.
-- Treat every disk image and protocol request as untrusted input. Use checked
-  arithmetic, bounded allocation, and structured errors.
-- Do not couple core transactions to FUSE request boundaries or NullStar IPC
-  message boundaries.
-- Keep host tools and both adapters on the same format/core implementation to
-  prevent semantic drift.
-- Preserve the current VFS's ownership of routing and mount traversal throughout
-  migration.
+- Update the format specification before merging a change to frozen bytes or assigning
+  a feature bit.
+- Keep generated fixtures reproducible and small; document generators rather than
+  checking in opaque large images.
+- Treat every disk image and protocol request as untrusted input. Use checked arithmetic,
+  bounded allocation, and structured errors.
+- Do not couple core transactions to FUSE request boundaries or NullStar IPC message
+  boundaries.
+- Keep host tools and all platform adapters on the same format and core implementation
+  to prevent semantic drift.
+- Preserve VFS ownership of routing, mount traversal, canonical paths, and namespace
+  bindings throughout migration.
+- Keep the independent bootstrap and recovery path until the persistent volume can be
+  validated, recovered, mounted, and replaced without depending on itself.
+- Update current architecture documentation when a planned phase becomes implemented;
+  design documents must not be used to claim features that do not yet exist.
