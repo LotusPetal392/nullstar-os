@@ -3,9 +3,10 @@
 ## Status
 
 A native capability-oriented userspace API, service-oriented system architecture,
-application jobs, the synthetic logical namespace, and the `Profile` directory layout
-are **accepted direction**. Complete POSIX behavior, package details, dynamic-linker
-policy, and external compatibility profiles remain **tentative design**.
+application jobs, the synthetic logical namespace, the `Profile` directory layout,
+a 64-bit-native executable environment, and Magnetar generation-based deployment are
+**accepted direction**. Complete POSIX behavior, exact `.nspkg` encoding, dynamic-
+linker ABI details, and external compatibility profiles remain **tentative design**.
 
 ## Layering and ABI
 
@@ -53,6 +54,7 @@ Examples of stable service names include:
 - `system.display`;
 - `system.input`;
 - `system.identity`;
+- `system.packages`;
 - `system.notifications`;
 - `system.portal`.
 
@@ -77,7 +79,9 @@ ported without making ambient Unix authority the native system model.
 
 A musl-based libc port is a plausible later path once virtual memory, threading,
 signals, filesystem semantics, and dynamic linking are sufficiently stable. Static
-programs remain the simpler early target.
+programs remain the simpler early target. Native execution is x86-64-only through the
+early and medium-term milestones; public protocols and file formats remain pointer-
+size independent so an isolated 32-bit compatibility environment can be added later.
 
 Freedesktop formats and selected Wayland and D-Bus protocols are desktop compatibility
 contracts, not native IPC or authorization. Privileged external interfaces translate
@@ -222,22 +226,48 @@ SVG-first assets, accessible widgets, and a constrained CSS-derived style system
 These are specified in [Graphics stack and compositor](graphics-stack.md) and
 [Native graphics renderer and UI toolkit](graphics-renderer-and-toolkit.md).
 
-## Packages and dynamic linking
+## Executables and linking
 
-Packages should be verified, staged, and atomically activated. Manifests eventually
-cover signatures, hashes, dependencies, architecture, ABI requirements, ownership,
-compatibility metadata, services, drivers, and rollback. Installed applications must
-not write into their own bundle during normal operation.
+NullStar is a 64-bit-native platform. The kernel, system services, userspace drivers,
+recovery environment, native applications, and native machine-code libraries use the
+x86-64 ABI. Architecture-independent assets may be packaged as `any`; native 32-bit
+execution is deferred to an optional compatibility milestone.
 
-Dynamic linking is deferred but should eventually support ELF shared objects, TLS,
-ASLR, RELRO, versioned symbols, controlled search paths, and application-private
-libraries. Current-directory library loading should not be part of the default policy.
+Bootstrap, recovery, and early services should remain statically linked. Dynamic
+linking is introduced only after ELF loading, virtual memory, threads, stable library
+ABI rules, immutable deployments, and rollback are reliable. A process may load only
+libraries built for its own architecture and ABI. Rust's compiler-private ABI is not a
+stable shared-library contract.
+
+The executable profile, PIE/ASLR path, dynamic-loader policy, TLS, RELRO, library search,
+NullStar ELF notes, build IDs, and deferred 32-bit compatibility are specified in
+[Executable loading and linking](executable-loading.md).
+
+## Packages and deployments
+
+The native package and deployment manager is **Magnetar**, invoked as `mag`. Native
+archives use the `.nspkg` suffix.
+
+Magnetar is a reliable deployment system rather than a tool that overwrites the active
+system file by file. It verifies immutable package objects, resolves dependencies,
+constructs a complete generation, commits it durably, atomically selects it, performs
+bounded health confirmation, and retains a previous healthy generation for rollback.
+
+System and application deployments may have different activation scopes. Mutable
+configuration, state, logs, caches, and user data remain outside immutable package
+payloads and require explicit migration and rollback compatibility rules.
+
+The archive model, manifests, repositories and trust, mirror ranking, dependency
+semantics, manual and automatic package tracking, pruning, generations, boot fallback,
+configuration handling, garbage collection, recovery, and CLI are specified in
+[Magnetar package and deployment management](package-management.md).
 
 ## Open questions
 
 - Exact capitalization and localization rules for ordinary visible home directories.
-- Application bundle and package manifest formats.
+- The canonical `.nspkg` container, manifest encoding, and version comparison rules.
 - Whether the service broker is part of PID 1 or a separate supervised service.
 - The initial libc scope and POSIX compatibility target.
+- The stable platform shared-library ABI and first dynamic-loader relocation subset.
 - Filesystem metadata representation for system-managed and backup-policy attributes.
 - Exact service names and the compatibility environment projected for unbundled ports.

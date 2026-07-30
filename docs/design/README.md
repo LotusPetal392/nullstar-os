@@ -19,6 +19,8 @@ authoritative when it differs from a future design.
 - [Kernel, IPC, and scheduling](kernel-ipc-scheduling.md)
 - [Memory management](memory-management.md)
 - [Userspace architecture](userspace-architecture.md)
+- [Executable loading and linking](executable-loading.md)
+- [Magnetar package and deployment management](package-management.md)
 - [Filesystem namespace and boot](filesystem-namespace.md)
 - [Driver model](driver-model.md)
 - [Service management and command line](service-management-and-cli.md)

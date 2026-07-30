@@ -4,9 +4,10 @@
 
 A synthetic VFS root, canonical logical paths, and VFS namespace bindings are
 **accepted direction**. The primary NullFS volume backing `/System`, `/Applications`,
-and `/Users` is also accepted direction. Exact boot-generation metadata, raw backing
-visibility, and the transition from the current FAT-rooted image remain
-**tentative design**.
+and `/Users` is also accepted direction. Magnetar-managed immutable deployments and
+previous-generation boot selection are accepted direction. Exact deployment-store
+layout, boot-generation encoding, raw backing visibility, and the transition from
+the current FAT-rooted image remain **tentative design**.
 
 This document describes future architecture. The current mounted layout remains
 specified by [the implementation architecture](../architecture.md), and NullFS
@@ -169,19 +170,26 @@ The persistent source of truth for boot artifacts should be `/System/boot`:
 └── previous-generation
 ```
 
-The exact record format and naming are tentative. The required behavior is:
+The exact record format and naming are tentative. Magnetar owns construction and
+verification of complete deployment and boot generations; the bootstrap loader owns
+independent enumeration and selection. The required behavior is:
 
-1. stage a complete new generation;
-2. verify all required artifacts;
-3. durably commit the generation;
-4. atomically select it for the next boot;
-5. retain a known-good previous generation;
-6. mark a generation successful only after normal boot reaches an agreed health point.
+1. resolve and stage a complete deployment generation;
+2. verify every package object, boot artifact, manifest, and compatibility requirement;
+3. durably commit the generation without modifying the active deployment;
+4. mark it `pending` and atomically select it for the next boot;
+5. retain a known-good `healthy` previous generation;
+6. let the bootstrap loader enumerate retained healthy, pending, and failed generations;
+7. mark the pending generation `healthy` only after PID 1 reports the agreed system
+   health milestone through an authenticated channel;
+8. mark or count a failed attempt without destroying the parent generation;
+9. automatically or manually return to the last healthy generation according to policy.
 
 Initially, a boot synchronization service should copy the selected generation to a
 small firmware-readable bootstrap partition. This keeps BIOS and future UEFI loading
 independent from the full NullFS format while making `/System/boot` canonical after the
-system is running.
+system is running. Boot selection must not depend on the active dynamic linker,
+package-management service, or the potentially damaged generation.
 
 Direct bootloader traversal of NullFS is a distant option, not a prerequisite. It
 should be considered only after the on-disk format, recovery rules, and loader
@@ -224,7 +232,8 @@ The recommended progression is:
    administrative tooling.
 6. Bind all three persistent trees and treat the synthetic VFS root as the normal
    namespace.
-7. Add transactional boot generations and synchronization to the firmware-readable
+7. Add Magnetar-managed immutable system and boot generations, health states,
+   previous-generation selection, and synchronization to the firmware-readable
    bootstrap partition.
 
 Each stage must retain an independent recovery path and integrated boot smoke tests.
@@ -236,5 +245,8 @@ Each stage must retain an independent recovery path and integrated boot smoke te
 - How namespace changes are authorized, audited, and made atomic.
 - Whether `/System` and `/Applications` become read-only deployments before or after
   the first writable NullFS-backed user homes.
-- The boot-generation manifest, signature, rollback, and health-confirmation formats.
+- The deployment-store backing layout and exact relationship between system,
+  application, and boot generation identifiers.
+- The boot-generation manifest, signature, rollback, attempt-counter, and
+  health-confirmation formats.
 - How removable or temporarily unavailable bound volumes appear to applications.

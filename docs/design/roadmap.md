@@ -88,7 +88,49 @@ not replace milestone-specific plans elsewhere in the repository.
 - Add libc and POSIX compatibility after native contracts stabilize.
 - Use external utility suites and eventually GNU coreutils as compatibility workloads,
   not boot dependencies.
-- Add transactional packages and dynamic linking later.
+- Keep bootstrap, recovery, and early services statically linked while loader and
+  deployment ABIs evolve.
+- Introduce shared libraries only through versioned, verified deployments and
+  controlled loader policy.
+
+## Executable and linking evolution
+
+1. Keep the native kernel, services, drivers, recovery environment, executables, and
+   machine-code libraries x86-64-only.
+2. Harden static ELF64 program-header validation, segment bounds, zero-fill, entry-point
+   checks, and final W^X page permissions.
+3. Add build IDs, separate debug-symbol packages, non-executable stacks, and versioned
+   NullStar ELF notes whose identity is verified against package metadata.
+4. Add static PIE, a bounded relocation subset, and ASLR for executable, stack, heap, and
+   mapping bases.
+5. Define a stable platform-library ABI rather than exposing Rust's compiler-private ABI.
+6. Add a versioned dynamic loader, immediate relocation, shared objects, TLS,
+   constructors, RELRO, application-private libraries, and controlled search policy.
+7. Keep bootstrap, recovery, and critical repair utilities statically linked permanently.
+8. Defer ELF32/i386 execution, 32-bit libraries, and legacy plugin hosts to an optional
+   compatibility deployment after the 64-bit platform is mature.
+
+## Magnetar package and deployment evolution
+
+1. Define deterministic `.nspkg` archives, canonical package IDs, version comparison,
+   architecture fields, file classes, and signed manifests.
+2. Implement local install and verification, repository snapshots, a trusted key store,
+   mirror ranking and history, configurable parallel downloads, and package queries.
+3. Add dependency solving, minimum-version and ABI requirements, conflicts, providers,
+   manual/automatic tracking, removal, and generation-aware pruning.
+4. Import verified immutable content into a content-addressed object store and record
+   embedded static components for vulnerability auditing.
+5. Construct complete application generations and atomically switch application bundles.
+6. Construct complete system and boot generations, preserve the previous healthy
+   generation, and allow selection from the independent bootstrap environment.
+7. Add staged, pending, healthy, failed, superseded, and pinned generation states plus
+   bounded failed-boot fallback.
+8. Separate package defaults from mutable configuration and state; define schema-aware
+   merge, migration, snapshot, and rollback-compatibility rules.
+9. Coordinate services, drivers, namespace bindings, health checks, and reboots through
+   declarative activation rather than unrestricted package scripts.
+10. Add generation-aware garbage collection, offline transaction bundles, repair,
+    provenance, repository-key rotation, and recovery tooling.
 
 ## Logging and diagnostics
 
