@@ -114,7 +114,8 @@ pub const SIGNAL_TERMINAL_STOP: u64 = abi::signal::TERMINAL_STOP;
 const USER_MIN_ADDRESS: u64 = 0x0001_0000;
 const USER_PML4_SLOT_END: u64 = 0x0000_0080_0000_0000;
 const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
-const USER_STACK_SIZE: usize = 128 * 1024;
+// Writable filesystem transactions use multiple block-sized frames even in unoptimized builds.
+const USER_STACK_SIZE: usize = 256 * 1024;
 const USER_STACK_GUARD_SIZE: usize = Size4KiB::SIZE as usize;
 const KERNEL_TRANSITION_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_TRANSITION_STACK_WORDS: usize = KERNEL_TRANSITION_STACK_SIZE / size_of::<u128>();

@@ -53,6 +53,7 @@ struct SessionSlot {
     id: u64,
     generation: u64,
     reply_endpoint: CapabilityHandle,
+    features: u64,
     buffers: [BufferSlot; MAX_BUFFERS_PER_SESSION],
     node_references: [NodeReference; MAX_NODE_REFERENCES_PER_SESSION],
 }
@@ -62,6 +63,7 @@ impl SessionSlot {
         id: 0,
         generation: 0,
         reply_endpoint: 0,
+        features: 0,
         buffers: [BufferSlot::EMPTY; MAX_BUFFERS_PER_SESSION],
         node_references: [NodeReference::EMPTY; MAX_NODE_REFERENCES_PER_SESSION],
     };
@@ -91,6 +93,15 @@ impl SessionTable {
         generation: u64,
         reply_endpoint: CapabilityHandle,
     ) -> Result<u64, Error> {
+        self.connect_with_features(generation, reply_endpoint, 0)
+    }
+
+    pub fn connect_with_features(
+        &mut self,
+        generation: u64,
+        reply_endpoint: CapabilityHandle,
+        features: u64,
+    ) -> Result<u64, Error> {
         if generation == 0 || reply_endpoint == 0 {
             return Err(Error::StaleSession);
         }
@@ -104,6 +115,7 @@ impl SessionTable {
             id: id.max(1),
             generation,
             reply_endpoint,
+            features,
             buffers: [BufferSlot::EMPTY; MAX_BUFFERS_PER_SESSION],
             node_references: [NodeReference::EMPTY; MAX_NODE_REFERENCES_PER_SESSION],
         };
@@ -113,6 +125,15 @@ impl SessionTable {
     pub fn reply_endpoint(&self, id: u64, generation: u64) -> Result<CapabilityHandle, Error> {
         self.session(id, generation)
             .map(|session| session.reply_endpoint)
+    }
+
+    pub fn features(&self, id: u64, generation: u64) -> Result<u64, Error> {
+        self.session(id, generation).map(|session| session.features)
+    }
+
+    pub fn require(&self, id: u64, generation: u64, required_features: u64) -> Result<bool, Error> {
+        self.features(id, generation)
+            .map(|features| features & required_features == required_features)
     }
 
     pub fn attach_buffer(
@@ -285,6 +306,7 @@ mod tests {
         Error, MAX_BUFFERS_PER_SESSION, MAX_NODE_REFERENCES_PER_SESSION, MAX_SESSIONS,
         NodeReference, NodeReferenceError, SessionTable,
     };
+    use crate::filesystem::protocol;
 
     #[test]
     fn sessions_are_generation_scoped_and_bounded() {
@@ -298,6 +320,30 @@ mod tests {
                 .expect("bounded session");
         }
         assert_eq!(table.connect(7, 999), Err(Error::NoSpace));
+    }
+
+    #[test]
+    fn session_features_are_isolated_and_connect_remains_read_only() {
+        let mut table = SessionTable::new();
+        let read_only = table.connect(5, 10).expect("read-only session");
+        let writable = table
+            .connect_with_features(5, 11, protocol::session_features::WRITE)
+            .expect("writable session");
+
+        assert_eq!(table.features(read_only, 5), Ok(0));
+        assert_eq!(
+            table.features(writable, 5),
+            Ok(protocol::session_features::WRITE)
+        );
+        assert_eq!(
+            table.require(read_only, 5, protocol::session_features::WRITE),
+            Ok(false)
+        );
+        assert_eq!(
+            table.require(writable, 5, protocol::session_features::WRITE),
+            Ok(true)
+        );
+        assert_eq!(table.features(writable, 6), Err(Error::StaleSession));
     }
 
     #[test]

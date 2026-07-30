@@ -20,8 +20,27 @@ pub enum NodeMapError {
     IdentityMismatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeReservation {
+    index: usize,
+    opaque_id: u64,
+}
+
+impl NodeReservation {
+    pub const fn opaque_id(self) -> u64 {
+        self.opaque_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeSlot {
+    Vacant,
+    Reserved(u64),
+    Occupied(NodeIdentity),
+}
+
 pub struct NodeMap {
-    entries: Vec<Option<NodeIdentity>>,
+    entries: Vec<NodeSlot>,
     service_generation: u64,
     next_sequence: u32,
 }
@@ -41,8 +60,8 @@ impl NodeMap {
         entries
             .try_reserve_exact(capacity)
             .map_err(|_| NodeMapError::NoSpace)?;
-        entries.resize(capacity, None);
-        entries[0] = Some(NodeIdentity {
+        entries.resize(capacity, NodeSlot::Vacant);
+        entries[0] = NodeSlot::Occupied(NodeIdentity {
             opaque_id: userspace::filesystem::protocol::ROOT_NODE_ID,
             node: root,
             generation: root_generation,
@@ -59,11 +78,80 @@ impl NodeMap {
         if opaque_id == userspace::filesystem::protocol::INVALID_ID {
             return None;
         }
+        self.entries.iter().find_map(|slot| match slot {
+            NodeSlot::Occupied(entry) if entry.opaque_id == opaque_id => Some(*entry),
+            _ => None,
+        })
+    }
+
+    pub fn vacant_index(&self) -> Option<usize> {
+        self.next_sequence.checked_add(1)?;
         self.entries
             .iter()
-            .flatten()
-            .find(|entry| entry.opaque_id == opaque_id)
-            .copied()
+            .position(|slot| matches!(slot, NodeSlot::Vacant))
+    }
+
+    pub fn reserve(&mut self) -> Result<NodeReservation, NodeMapError> {
+        let index = self.vacant_index().ok_or(NodeMapError::NoSpace)?;
+        let opaque_id = self.allocate_opaque_id()?;
+        self.entries[index] = NodeSlot::Reserved(opaque_id);
+        Ok(NodeReservation { index, opaque_id })
+    }
+
+    pub fn rollback(&mut self, reservation: NodeReservation) -> bool {
+        let Some(slot) = self.entries.get_mut(reservation.index) else {
+            return false;
+        };
+        if !matches!(slot, NodeSlot::Reserved(opaque_id) if *opaque_id == reservation.opaque_id) {
+            return false;
+        }
+        *slot = NodeSlot::Vacant;
+        true
+    }
+
+    pub fn install(
+        &mut self,
+        reservation: NodeReservation,
+        node: NodeId,
+        generation: u64,
+        kind: NodeKind,
+    ) -> Result<u64, NodeMapError> {
+        if !matches!(
+            self.entries.get(reservation.index),
+            Some(NodeSlot::Reserved(opaque_id)) if *opaque_id == reservation.opaque_id
+        ) {
+            return Err(NodeMapError::NoSpace);
+        }
+
+        if let Some(existing) = self.find_exact(node, generation) {
+            let _ = self.rollback(reservation);
+            return (existing.kind == kind)
+                .then_some(existing.opaque_id)
+                .ok_or(NodeMapError::IdentityMismatch);
+        }
+
+        self.entries[reservation.index] = NodeSlot::Occupied(NodeIdentity {
+            opaque_id: reservation.opaque_id,
+            node,
+            generation,
+            kind,
+        });
+        Ok(reservation.opaque_id)
+    }
+
+    pub fn insert_at(
+        &mut self,
+        index: usize,
+        node: NodeId,
+        generation: u64,
+        kind: NodeKind,
+    ) -> Result<u64, NodeMapError> {
+        if !matches!(self.entries.get(index), Some(NodeSlot::Vacant)) {
+            return Err(NodeMapError::NoSpace);
+        }
+        let opaque_id = self.allocate_opaque_id()?;
+        self.entries[index] = NodeSlot::Reserved(opaque_id);
+        self.install(NodeReservation { index, opaque_id }, node, generation, kind)
     }
 
     pub fn intern(
@@ -72,33 +160,61 @@ impl NodeMap {
         generation: u64,
         kind: NodeKind,
     ) -> Result<u64, NodeMapError> {
-        if let Some(existing) = self
-            .entries
-            .iter()
-            .flatten()
-            .find(|entry| entry.node == node && entry.generation == generation)
-        {
+        if let Some(existing) = self.find_exact(node, generation) {
             return (existing.kind == kind)
                 .then_some(existing.opaque_id)
                 .ok_or(NodeMapError::IdentityMismatch);
         }
 
-        let slot = self
+        let reservation = self.reserve()?;
+        self.install(reservation, node, generation, kind)
+    }
+
+    pub fn retire(&mut self, opaque_id: u64) -> Option<NodeIdentity> {
+        let index = self
             .entries
             .iter()
-            .position(Option::is_none)
-            .ok_or(NodeMapError::NoSpace)?;
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, slot)| {
+                matches!(slot, NodeSlot::Occupied(identity) if identity.opaque_id == opaque_id)
+                    .then_some(index)
+            })?;
+        self.retire_index(index)
+    }
+
+    pub fn retire_exact(&mut self, node: NodeId, generation: u64) -> Option<NodeIdentity> {
+        let index = self.entries.iter().enumerate().skip(1).find_map(|(index, slot)| {
+            matches!(slot, NodeSlot::Occupied(identity) if identity.node == node && identity.generation == generation)
+                .then_some(index)
+        })?;
+        self.retire_index(index)
+    }
+
+    fn find_exact(&self, node: NodeId, generation: u64) -> Option<NodeIdentity> {
+        self.entries.iter().find_map(|slot| match slot {
+            NodeSlot::Occupied(entry) if entry.node == node && entry.generation == generation => {
+                Some(*entry)
+            }
+            _ => None,
+        })
+    }
+
+    fn retire_index(&mut self, index: usize) -> Option<NodeIdentity> {
+        let slot = self.entries.get_mut(index)?;
+        let NodeSlot::Occupied(identity) = *slot else {
+            return None;
+        };
+        *slot = NodeSlot::Vacant;
+        Some(identity)
+    }
+
+    fn allocate_opaque_id(&mut self) -> Result<u64, NodeMapError> {
         let opaque_id = self.next_opaque_id();
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or(NodeMapError::NoSpace)?;
-        self.entries[slot] = Some(NodeIdentity {
-            opaque_id,
-            node,
-            generation,
-            kind,
-        });
         Ok(opaque_id)
     }
 
@@ -153,13 +269,51 @@ impl OpenTable {
         session_generation: u64,
         opaque_node: u64,
     ) -> Option<(usize, OpenHandle)> {
+        self.find_one_record(session_id, session_generation, opaque_node)
+            .map(|(index, record)| (index, record.handle))
+    }
+
+    pub fn find_one_record(
+        &self,
+        session_id: u64,
+        session_generation: u64,
+        opaque_node: u64,
+    ) -> Option<(usize, OpenRecord)> {
         self.records.iter().enumerate().find_map(|(index, record)| {
             let record = record.as_ref()?;
             (record.session_id == session_id
                 && record.session_generation == session_generation
                 && record.opaque_node == opaque_node)
-                .then_some((index, record.handle))
+                .then_some((index, *record))
         })
+    }
+
+    pub fn is_open(&self, node: NodeId, generation: u64) -> bool {
+        self.records_for_identity(node, generation).next().is_some()
+    }
+
+    pub fn records_for_identity(
+        &self,
+        node: NodeId,
+        generation: u64,
+    ) -> impl Iterator<Item = OpenRecord> + '_ {
+        self.records
+            .iter()
+            .flatten()
+            .copied()
+            .filter(move |record| {
+                record.handle.node == node && record.handle.generation == generation
+            })
+    }
+
+    pub fn is_open_for_session(
+        &self,
+        session_id: u64,
+        session_generation: u64,
+        opaque_node: u64,
+    ) -> bool {
+        self.find_one_record(session_id, session_generation, opaque_node)
+            .is_some()
     }
 
     pub fn remove(&mut self, index: usize) -> Option<OpenRecord> {
@@ -197,6 +351,8 @@ impl Default for OpenTable {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use nullfs_core::{NodeId, OpenHandle};
     use nullfs_format::NodeKind;
 
@@ -242,6 +398,120 @@ mod tests {
             nodes.intern(NodeId(10_000), 1, NodeKind::Regular),
             Err(NodeMapError::NoSpace)
         );
+    }
+
+    #[test]
+    fn node_reservations_can_be_rolled_back_and_installed() {
+        let mut nodes = NodeMap::new(3, 2, NodeId(1), 1, NodeKind::Directory).expect("node map");
+
+        let abandoned = nodes.reserve().expect("reserve only non-root slot");
+        assert_eq!(nodes.resolve(abandoned.opaque_id()), None);
+        assert_eq!(nodes.reserve(), Err(NodeMapError::NoSpace));
+        assert!(nodes.rollback(abandoned));
+        assert!(!nodes.rollback(abandoned));
+
+        let committed = nodes.reserve().expect("reserve rolled-back slot");
+        assert_ne!(committed.opaque_id(), abandoned.opaque_id());
+        let opaque_id = nodes
+            .install(committed, NodeId(2), 5, NodeKind::Regular)
+            .expect("install reserved identity");
+        assert_eq!(opaque_id, committed.opaque_id());
+        assert_eq!(
+            nodes.resolve(opaque_id).expect("installed node").node,
+            NodeId(2)
+        );
+        assert_eq!(nodes.resolve(abandoned.opaque_id()), None);
+    }
+
+    #[test]
+    fn retired_opaque_ids_are_stale_and_slots_are_reusable() {
+        let mut nodes = NodeMap::new(5, 2, NodeId(1), 1, NodeKind::Directory).expect("node map");
+        let mut retired_ids = Vec::new();
+
+        for generation in 1..=16 {
+            let opaque_id = nodes
+                .intern(NodeId(2), generation, NodeKind::Regular)
+                .expect("reuse non-root slot");
+            assert!(!retired_ids.contains(&opaque_id));
+            assert_eq!(
+                nodes.resolve(opaque_id).expect("live node").generation,
+                generation
+            );
+
+            let retired = if generation % 2 == 0 {
+                nodes.retire_exact(NodeId(2), generation)
+            } else {
+                nodes.retire(opaque_id)
+            }
+            .expect("retire live node");
+            assert_eq!(retired.opaque_id, opaque_id);
+            assert_eq!(nodes.resolve(opaque_id), None);
+            retired_ids.push(opaque_id);
+        }
+
+        assert_eq!(retired_ids.len(), 16);
+    }
+
+    #[test]
+    fn root_identity_cannot_be_retired() {
+        let mut nodes = NodeMap::new(7, 2, NodeId(11), 9, NodeKind::Directory).expect("node map");
+
+        assert_eq!(
+            nodes.retire(userspace::filesystem::protocol::ROOT_NODE_ID),
+            None
+        );
+        assert_eq!(nodes.retire_exact(NodeId(11), 9), None);
+        assert_eq!(
+            nodes
+                .resolve(userspace::filesystem::protocol::ROOT_NODE_ID)
+                .expect("root remains live")
+                .node,
+            NodeId(11)
+        );
+    }
+
+    #[test]
+    fn exact_open_identity_is_detected_across_sessions() {
+        let mut opens = OpenTable::new();
+        for (index, session_id, opaque_node) in [(0, 7, 90), (1, 8, 91)] {
+            opens
+                .insert_at(
+                    index,
+                    OpenRecord {
+                        session_id,
+                        session_generation: 4,
+                        opaque_node,
+                        handle: OpenHandle {
+                            id: index as u64 + 1,
+                            node: NodeId(6),
+                            generation: 12,
+                            kind: NodeKind::Regular,
+                        },
+                    },
+                )
+                .expect("open slot");
+        }
+
+        assert!(opens.is_open(NodeId(6), 12));
+        assert!(!opens.is_open(NodeId(6), 13));
+        assert_eq!(
+            opens
+                .records_for_identity(NodeId(6), 12)
+                .map(|record| record.session_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        assert!(opens.records_for_identity(NodeId(6), 13).next().is_none());
+        assert!(opens.is_open_for_session(7, 4, 90));
+        assert!(!opens.is_open_for_session(7, 4, 91));
+        let (first_index, first_record) = opens.find_one_record(7, 4, 90).expect("full record");
+        assert_eq!(first_index, 0);
+        assert_eq!(first_record.handle.id, 1);
+
+        assert_eq!(opens.remove(0), Some(first_record));
+        assert!(opens.is_open(NodeId(6), 12));
+        assert!(opens.remove(1).is_some());
+        assert!(!opens.is_open(NodeId(6), 12));
     }
 
     #[test]

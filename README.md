@@ -20,7 +20,8 @@ experimentation, not production use or untrusted workloads.
   a bounded `/tmp` tmpfs
 - a host-testable NullFS 1.2 stack with explicit little-endian records,
   authoritative allocation maps, bounded redo recovery, deterministic crash
-  testing, and formatter, image, inspection, and read-only checking tools
+  testing, formatter, image, inspection, and read-only checking tools, plus a
+  userspace service with explicitly negotiated direct writable sessions
 - ELF64 ring-3 processes, file descriptors, pipes, `fork` with copy-on-write,
   transactional `exec`, parent/child waiting, environments, process groups,
   terminal ownership, and a focused signal implementation
@@ -164,10 +165,13 @@ images, and launches QEMU.
 - There is no networking stack or network driver.
 - FAT writes are limited to regular files in the FAT16 root directory with 8.3
   names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
-  NullFS supports host-side writable images and recovery. PID 1 can delegate a
-  writable raw NullFS partition endpoint, but `nullfs-service` deliberately wraps
-  it in a read-only block adapter, so the filesystem protocol and VFS mount remain
-  read-only. Writable filesystem syscalls and offline repair remain future work.
+  NullFS supports host-side writable images and recovery. PID 1 launches
+  `nullfs-service --writable` with a partition-scoped raw `READ | WRITE | FLUSH`
+  endpoint; the service mounts read-write and explicit direct clients can
+  negotiate writable filesystem sessions. The kernel proxy still negotiates a
+  read-only session, so `/Volumes/NULLSTAR_DATA` and ordinary VFS mutation remain
+  read-only. Namespace adoption, writable VFS syscalls, and offline repair remain
+  future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`

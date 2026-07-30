@@ -10,11 +10,11 @@ mod server;
 
 use core::alloc::Layout;
 
-use nullfs_blockdev::ReadOnlyBlockDevice;
 use nullfs_core::Filesystem;
 use nullfs_format::NodeKind;
 use nullfs_userspace_blockdev::SessionBlockDevice;
 use userspace::{
+    args::Args,
     block_device::{self, protocol},
     ipc::{self, ObjectKind, Rights},
     syscall,
@@ -34,8 +34,16 @@ const EXPECTED_UUID: [u8; 16] = [
 ];
 const EXPECTED_CAPACITY_BLOCKS: u64 = 256;
 
-extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
+extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     allocator::init();
+
+    let arguments = unsafe { Args::from_stack(initial_stack) };
+    if arguments.len() != 2
+        || arguments.get(0) != Some(b"/nullfs-service")
+        || arguments.get(1) != Some(b"--writable")
+    {
+        fail(2, b"usage: /nullfs-service --writable\n");
+    }
 
     require_handle(
         READY_HANDLE,
@@ -91,10 +99,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         Ok(device) => device,
         Err(_) => fail(25, b"nullfs: invalid block-device geometry\n"),
     };
-    let device = ReadOnlyBlockDevice::new(device);
-    let mut filesystem = match Filesystem::try_mount(device) {
+    let mut filesystem = match Filesystem::try_mount_read_write(device) {
         Ok(filesystem) => filesystem,
-        Err(_) => fail(26, b"nullfs: read-only mount failed\n"),
+        Err(_) => fail(26, b"nullfs: read-write mount failed\n"),
     };
 
     let superblock = filesystem.superblock();

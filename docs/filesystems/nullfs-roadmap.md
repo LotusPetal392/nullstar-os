@@ -11,11 +11,12 @@ accepted logical namespace and boot direction is defined in
 
 The shared format and core implementation now support writable version 1.2 images,
 recovery, checking, deterministic image creation, and an explicitly enabled writable
-FUSE adapter. NullStar now implements narrowly scoped raw writable block-device
-authority for discovered NullFS partitions. The separately supervised filesystem service
-still deliberately mounts through a read-only adapter at `/Volumes/NULLSTAR_DATA`;
-writable filesystem-service operations, namespace bindings, offline repair policy, and
-adoption as the primary backing volume remain future work.
+FUSE adapter. NullStar implements narrowly scoped raw writable block-device authority and
+a separately supervised service that mounts `nullfs-core` read-write and offers explicitly
+negotiated writable protocol sessions. The kernel proxy still uses a read-only session, so
+the public `/Volumes/NULLSTAR_DATA` VFS mount remains read-only. Namespace bindings,
+ordinary VFS mutation, offline repair policy, and adoption as the primary backing volume
+remain future work.
 
 ## Status summary
 
@@ -25,7 +26,7 @@ adoption as the primary backing volume remain future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw writable block authority implemented |
+| 5 | Writable service and namespace adoption | In progress; raw authority and writable service operation implemented, namespace adoption next |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -48,9 +49,9 @@ NullFS service -> shared NullFS core -> block-device adapter
 ```
 
 The current generated image contains a deterministic NullFS partition labelled
-`NULLSTAR_DATA`, and the read-only service is mounted at
-`/Volumes/NULLSTAR_DATA`. That path describes implemented behavior, not the final
-human-facing layout.
+`NULLSTAR_DATA`. Its service mounts the core read-write, but the kernel proxy negotiates a
+read-only session and exposes a read-only VFS mount at `/Volumes/NULLSTAR_DATA`. That path
+describes implemented behavior, not the final human-facing layout.
 
 The accepted long-term direction is:
 
@@ -219,8 +220,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## Phase 4: read-only NullStar filesystem service — implemented
 
-NullFS is exposed by a separately supervised userspace backend behind the common
-filesystem protocol. Clients are not routed to a NullFS-specific API.
+Phase 4 exposed NullFS through a separately supervised userspace backend behind the
+common filesystem protocol. Clients were not routed to a NullFS-specific API. The
+read-only service details in this section are historical and are explicitly superseded by
+the implemented Phase 5 service-operation submilestone below.
 
 The current build appends a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as
 MBR partition 3. The kernel identifies the partition as NullFS, and an init-delegated
@@ -228,7 +231,7 @@ raw probe validates its superblock through the read-only block endpoint. The typ
 session client and storage adapter translate the endpoint's 512-byte device geometry
 into the 4096-byte blocks required by the shared core.
 
-The service currently implements:
+The Phase 4 service implemented:
 
 - `CONNECT` and `DISCONNECT`;
 - registered shared-memory buffers;
@@ -238,10 +241,13 @@ The service currently implements:
 - `CLOSE_NODE` accounting;
 - session, request, provider-generation, and stale-handle validation.
 
-PID 1 now delegates a writable raw NullFS endpoint to the service, which requires
-`READ | WRITE | FLUSH` metadata and then deliberately wraps the adapter in
-`ReadOnlyBlockDevice`. Canonical filesystem mutations therefore still return
-`PERMISSION`; raw block authority alone does not enable writable filesystem operations.
+At the Phase 4 milestone, PID 1 delegated a writable raw NullFS endpoint to the service,
+which required `READ | WRITE | FLUSH` metadata and deliberately wrapped the adapter in
+`ReadOnlyBlockDevice`. Canonical filesystem mutations therefore returned `PERMISSION`;
+that historical behavior demonstrated that raw block authority alone did not enable
+writable filesystem operations. Phase 5 has superseded the adapter and service-operation
+parts of this description: the service now mounts read-write and supports explicitly
+writable sessions, while the public VFS client remains read-only.
 
 PID 1 registers `nullfs-service` independently of tmpfs as a generation-scoped kernel
 filesystem proxy. The VFS currently mounts it at `/Volumes/NULLSTAR_DATA`. The proxy
@@ -277,15 +283,16 @@ cargo run --locked --quiet -- --nullfs-restart-check
 ./scripts/check-local.sh
 ```
 
-The current FAT bootstrap path and `/Volumes/NULLSTAR_DATA` mount remain until Phase 5
-has writable filesystem-protocol parity, namespace-binding support, persistence coverage,
-and an independent recovery path.
+The current FAT bootstrap path and read-only public `/Volumes/NULLSTAR_DATA` mount remain
+until Phase 5 adds namespace-binding support, ordinary VFS mutation and persistence
+coverage, and an independent recovery path.
 
 ## Phase 5: writable service and namespace adoption — in progress
 
-Phase 5 moves from a read-only test mount to the accepted persistent-volume and
-synthetic-namespace architecture. Its raw block-authority milestone is implemented; the
-filesystem-service and namespace work remains.
+Phase 5 moves from a read-only public test mount to the accepted persistent-volume and
+synthetic-namespace architecture. Its raw block-authority and writable
+filesystem-service-operation submilestones are implemented. Namespace adoption and
+ordinary VFS mutation remain next (PR C).
 
 ### Raw writable block authority — implemented
 
@@ -314,32 +321,49 @@ cache flush; read-only `WRITE` and `FLUSH` retain `READ_ONLY` and `NOT_SUPPORTED
 Normal boot performs a reversible write/flush/readback/restore probe on a known free
 sector in the deterministic NullFS fixture. An exact marker left by interruption is
 restored and verified on the next boot before testing resumes. All previous read-only and
-mutation-denial probes remain active. PID 1
-then delegates the writable raw endpoint to `nullfs-service`, but the service deliberately
-wraps it in `ReadOnlyBlockDevice`. The filesystem protocol and VFS mount at
-`/Volumes/NULLSTAR_DATA` therefore remain read-only in this milestone.
+mutation-denial probes remain active. PID 1 then delegates the writable raw endpoint to
+`nullfs-service`; Phase 5's service-operation submilestone consumes that authority as
+described below.
 
-### Writable filesystem-service operations — next
+### Writable filesystem-service operations — implemented
 
-The generic filesystem protocol and service adapter must gain bounded, validated
-support for:
+PID 1 launches `/nullfs-service --writable`. The service accepts only a partition-scoped
+raw endpoint advertising `READ | WRITE | FLUSH`, mounts `nullfs-core` read-write, and
+announces readiness after journal recovery, orphan reclamation, whole-volume validation,
+and dirty-state publication.
 
-- create and `mkdir`;
-- descriptor and registered-buffer writes;
-- append and truncate;
-- unlink, `rmdir`, and rename;
-- sync, flush, clean shutdown, and recovery status;
-- writable mount negotiation and feature reporting;
-- cancellation and failure semantics for partially completed operations.
+Generic `CONNECT` negotiates exact session authority:
 
-The implemented PID 1 path grants a filesystem service only its partition-scoped block
-capability. Enabling mutations must additionally require explicit writable-filesystem
-service policy. Merely finding a volume, running as UID 0, or registering a filesystem
-provider must not manufacture either authority.
+- flags `0` return feature bits `0` and create a read-only session;
+- exactly `WRITE` returns the `WRITE` feature and creates a writable session;
+- unsupported flags are rejected rather than silently downgraded.
 
-Writable integration must preserve the existing generation rules. Retrying an operation
-after provider failure is allowed only when the protocol can prove that doing so is
-semantically safe.
+Explicit direct writable clients can use `CREATE_FILE`, `CREATE_DIRECTORY`, `WRITE`,
+append, `TRUNCATE`, `UNLINK`, `RMDIR`, `RENAME`, and `SYNC`. New files and directories use
+modes `0644` and `0755`. Writes are bounded to 4 KiB and copied completely from the
+registered window into private service memory before mutation. Rename carries its
+destination component through a checked registered bulk-buffer range. Every mutation
+requires a session that negotiated `WRITE`; raw authority alone remains insufficient.
+
+Open-unlinked access requires the actual matching open handle. Unlink returns `TRY_AGAIN`
+when a read-only-owned matching open would make its later close reclaim storage. Removal
+of open directories and unsafe replacement of open rename destinations remain restricted,
+and the core continues to reject directory cycles.
+
+A poisoned core or any mutation failure with an uncertain durable result replies
+`OUTCOME_UNKNOWN`, then the service fail-stops. Supervision restarts it and the next mount
+runs recovery before readiness. Clients must not automatically retry an uncertain or
+lost operation; retry is allowed only when an explicit status proves it safe.
+
+The direct normal-boot probe retains read-only-session denial, opens an explicit writable
+session, exercises the mutation surface, and cleans its namespace. After interruption it
+recognizes and safely removes only the exact reserved artifact forms that the probe itself
+can leave behind.
+
+The kernel NullFS proxy deliberately still connects with flags `0`. Kernel mutation
+guards and the public `/Volumes/NULLSTAR_DATA` VFS mount therefore remain read-only.
+Exposing ordinary VFS mutation is part of namespace adoption/PR C, not this implemented
+service-operation submilestone.
 
 ### Primary volume identity and layout
 
