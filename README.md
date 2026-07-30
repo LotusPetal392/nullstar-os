@@ -14,8 +14,10 @@ experimentation, not production use or untrusted workloads.
 - ACPI discovery, PCIe ECAM enumeration, APIC/IOAPIC interrupts with legacy
   PIC/PIT fallback, a framebuffer console, serial diagnostics, and PS/2 keyboard
   input
-- AHCI block access, MBR and GPT discovery, FAT12/16/32 reads, constrained
-  FAT16 writes, a root VFS mount, and a bounded `/tmp` tmpfs
+- AHCI block access, MBR and GPT discovery, checked partition-relative read-only
+  endpoints, narrowly scoped writable raw endpoints for discovered NullFS
+  partitions, FAT12/16/32 reads, constrained FAT16 writes, a root VFS mount, and
+  a bounded `/tmp` tmpfs
 - a host-testable NullFS 1.2 stack with explicit little-endian records,
   authoritative allocation maps, bounded redo recovery, deterministic crash
   testing, and formatter, image, inspection, and read-only checking tools
@@ -32,8 +34,9 @@ experimentation, not production use or untrusted workloads.
 - a PID 1 userspace supervisor, a userspace shell (`ush`) with pipelines,
   redirection, variables, background jobs and basic job control, and an
   emergency kernel diagnostic shell
-- separate normal-boot and destructive smoke-test images, plus host-side unit
-  tests and a local pre-push check script
+- separate normal-boot and destructive smoke-test images, including a reversible
+  free-sector NullFS write/flush/readback/restore probe during normal boot, plus
+  host-side unit tests and a local pre-push check script
 
 See [Architecture](docs/architecture.md) for how the implemented pieces fit
 together, [Design direction](docs/design/README.md) and the
@@ -161,9 +164,10 @@ images, and launches QEMU.
 - There is no networking stack or network driver.
 - FAT writes are limited to regular files in the FAT16 root directory with 8.3
   names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
-  NullFS supports host-side writable images and recovery plus a read-only
-  userspace service mounted through the VFS. Writable service authority and
-  offline repair remain future work.
+  NullFS supports host-side writable images and recovery. PID 1 can delegate a
+  writable raw NullFS partition endpoint, but `nullfs-service` deliberately wraps
+  it in a read-only block adapter, so the filesystem protocol and VFS mount remain
+  read-only. Writable filesystem syscalls and offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`

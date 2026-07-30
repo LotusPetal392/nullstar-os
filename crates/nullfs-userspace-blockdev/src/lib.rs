@@ -36,6 +36,7 @@ impl SessionBlockDevice {
             return Err(ClientError::InvalidRequestId);
         }
         session.validate_device_info(info)?;
+        validate_durability_features(info.is_read_only(), info.features())?;
         let buffer = session
             .registered_buffer()
             .ok_or(ClientError::MissingBuffer)?;
@@ -232,6 +233,15 @@ fn preflight_range(
     Ok(())
 }
 
+fn validate_durability_features(read_only: bool, features: u64) -> Result<(), ClientError> {
+    let required = protocol::features::WRITE | protocol::features::FLUSH;
+    if !read_only && features & required != required {
+        Err(ClientError::InvalidDeviceInfo)
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_writable(info: DeviceInfo) -> Result<(), BlockDeviceError> {
     if info.is_read_only() || !info.supports(protocol::features::WRITE) {
         Err(BlockDeviceError::ReadOnly)
@@ -263,7 +273,7 @@ mod tests {
 
     use super::{
         AdapterGeometry, adapter_geometry, map_block_device_error, preflight_range, protocol_range,
-        take_request_id,
+        take_request_id, validate_durability_features,
     };
 
     #[test]
@@ -348,6 +358,27 @@ mod tests {
         );
         assert_eq!(preflight_range(512, 8, 8, 0), Ok(()));
         assert_eq!(preflight_range(4096, u64::MAX, u64::MAX, 0), Ok(()));
+    }
+
+    #[test]
+    fn writable_devices_require_write_and_flush_support() {
+        let read = protocol::features::READ;
+        let write = protocol::features::WRITE;
+        let flush = protocol::features::FLUSH;
+
+        assert_eq!(validate_durability_features(true, read), Ok(()));
+        assert_eq!(
+            validate_durability_features(false, read | write),
+            Err(ClientError::InvalidDeviceInfo)
+        );
+        assert_eq!(
+            validate_durability_features(false, read | flush),
+            Err(ClientError::InvalidDeviceInfo)
+        );
+        assert_eq!(
+            validate_durability_features(false, read | write | flush),
+            Ok(())
+        );
     }
 
     #[test]

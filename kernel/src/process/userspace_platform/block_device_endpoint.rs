@@ -1,6 +1,36 @@
-// Kernel-serviced, capability-based read-only partition block devices.
+// Kernel-serviced, capability-based partition block devices.
 
 const MAX_BLOCK_DEVICE_SESSIONS: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockDeviceAccess {
+    ReadOnly,
+    Writable,
+}
+
+impl BlockDeviceAccess {
+    const fn features(self) -> u64 {
+        match self {
+            Self::ReadOnly => block_device_protocol::features::READ,
+            Self::Writable => {
+                block_device_protocol::features::READ
+                    | block_device_protocol::features::WRITE
+                    | block_device_protocol::features::FLUSH
+            }
+        }
+    }
+
+    const fn device_flags(self) -> u32 {
+        match self {
+            Self::ReadOnly => block_device_protocol::device_flags::READ_ONLY,
+            Self::Writable => 0,
+        }
+    }
+
+    const fn is_writable(self) -> bool {
+        matches!(self, Self::Writable)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct BlockDevicePartition {
@@ -28,6 +58,7 @@ struct BlockDeviceSession {
 
 struct BlockDeviceEndpoint {
     partition: BlockDevicePartition,
+    access: BlockDeviceAccess,
     endpoint: Option<CapabilityObjectRef>,
     generation: u64,
     next_session_id: u64,
@@ -53,6 +84,7 @@ impl BlockDeviceEndpointState {
 #[derive(Clone, Copy)]
 struct BlockDeviceSessionSnapshot {
     partition: BlockDevicePartition,
+    access: BlockDeviceAccess,
     session: BlockDeviceSession,
 }
 
@@ -66,16 +98,16 @@ struct BlockDeviceTransfer {
 static BLOCK_DEVICE_ENDPOINTS: PreemptMutex<BlockDeviceEndpointState> =
     PreemptMutex::new(BlockDeviceEndpointState::new());
 
-pub fn configure_block_device_endpoints(inventory: &crate::partition::Inventory) -> usize {
+pub fn configure_block_device_endpoints(inventory: &crate::partition::Inventory) -> (usize, usize) {
     let mut state = BLOCK_DEVICE_ENDPOINTS.lock();
     if state.configured {
-        return state.devices.len();
+        return block_device_endpoint_counts(&state);
     }
 
     let logical_block_size = inventory.disk_block_size;
     if logical_block_size == 0 || logical_block_size > block_device_protocol::MAX_TRANSFER_BYTES {
         state.configured = true;
-        return 0;
+        return (0, 0);
     }
 
     for partition in inventory.filesystem_candidates() {
@@ -85,24 +117,147 @@ pub fn configure_block_device_endpoints(inventory: &crate::partition::Inventory)
         if partition.block_count == 0 || end_lba > inventory.disk_block_count {
             continue;
         }
+        let partition_snapshot = BlockDevicePartition {
+            index: partition.index,
+            start_lba: partition.start_lba,
+            block_count: partition.block_count,
+            logical_block_size,
+        };
         state.devices.push(BlockDeviceEndpoint {
-            partition: BlockDevicePartition {
-                index: partition.index,
-                start_lba: partition.start_lba,
-                block_count: partition.block_count,
-                logical_block_size,
-            },
+            partition: partition_snapshot,
+            access: BlockDeviceAccess::ReadOnly,
             endpoint: None,
             generation: 0,
             next_session_id: 1,
             sessions: Vec::new(),
         });
+        if matches!(partition.kind, crate::partition::PartitionKind::NullFs)
+            && block_device_partition_avoids_disk_metadata(inventory, partition)
+            && block_device_partition_is_exclusive(inventory, partition)
+            && block_device_partition_has_valid_nullfs(partition_snapshot)
+        {
+            state.devices.push(BlockDeviceEndpoint {
+                partition: partition_snapshot,
+                access: BlockDeviceAccess::Writable,
+                endpoint: None,
+                generation: 0,
+                next_session_id: 1,
+                sessions: Vec::new(),
+            });
+        }
     }
     state.configured = true;
-    state.devices.len()
+    block_device_endpoint_counts(&state)
 }
 
-fn open_block_device_endpoint(process_id: u64, partition_index: u64) -> u64 {
+fn block_device_partition_avoids_disk_metadata(
+    inventory: &crate::partition::Inventory,
+    partition: &crate::partition::Partition,
+) -> bool {
+    match inventory.table_kind {
+        crate::partition::TableKind::Mbr => {
+            (1..=4).contains(&partition.index)
+                && partition.start_lba > 0
+                && !inventory
+                    .partitions()
+                    .iter()
+                    .any(|other| matches!(other.kind, crate::partition::PartitionKind::Extended))
+        }
+        crate::partition::TableKind::Gpt | crate::partition::TableKind::SuperFloppy => false,
+    }
+}
+
+fn block_device_partition_is_exclusive(
+    inventory: &crate::partition::Inventory,
+    partition: &crate::partition::Partition,
+) -> bool {
+    inventory
+        .partitions()
+        .iter()
+        .filter(|other| other.index != partition.index)
+        .all(|other| !block_device_partitions_overlap(partition, other))
+}
+
+fn block_device_partitions_overlap(
+    left: &crate::partition::Partition,
+    right: &crate::partition::Partition,
+) -> bool {
+    let Some(left_end) = left.start_lba.checked_add(left.block_count) else {
+        return true;
+    };
+    let Some(right_end) = right.start_lba.checked_add(right.block_count) else {
+        return true;
+    };
+    left.start_lba < right_end && right.start_lba < left_end
+}
+
+fn block_device_partition_has_valid_nullfs(partition: BlockDevicePartition) -> bool {
+    let block_size = partition.logical_block_size;
+    if block_size == 0
+        || !nullfs_format::BLOCK_SIZE.is_multiple_of(block_size)
+        || !nullfs_format::SUPERBLOCK_OFFSET.is_multiple_of(block_size as u64)
+    {
+        return false;
+    }
+    let first_relative_lba = nullfs_format::SUPERBLOCK_OFFSET / block_size as u64;
+    let protocol_blocks = nullfs_format::BLOCK_SIZE / block_size;
+    let Ok(protocol_blocks_u64) = u64::try_from(protocol_blocks) else {
+        return false;
+    };
+    let Some(end_relative_lba) = first_relative_lba.checked_add(protocol_blocks_u64) else {
+        return false;
+    };
+    if end_relative_lba > partition.block_count {
+        return false;
+    }
+
+    let mut encoded = [0_u8; nullfs_format::BLOCK_SIZE];
+    for relative in 0..protocol_blocks {
+        let Some(lba) = partition
+            .start_lba
+            .checked_add(first_relative_lba)
+            .and_then(|first| first.checked_add(relative as u64))
+        else {
+            return false;
+        };
+        let offset = relative * block_size;
+        if crate::ahci::read_block(lba, &mut encoded[offset..offset + block_size]).is_err() {
+            return false;
+        }
+    }
+    let Some(device_bytes) = partition
+        .block_count
+        .checked_mul(partition.logical_block_size as u64)
+    else {
+        return false;
+    };
+    nullfs_format::Superblock::decode(
+        &encoded,
+        Some(device_bytes),
+        nullfs_format::MountMode::ReadOnly,
+    )
+    .is_ok()
+}
+
+fn block_device_endpoint_counts(state: &BlockDeviceEndpointState) -> (usize, usize) {
+    let read_only = state
+        .devices
+        .iter()
+        .filter(|device| device.access == BlockDeviceAccess::ReadOnly)
+        .count();
+    let writable = state
+        .devices
+        .iter()
+        .filter(|device| device.access == BlockDeviceAccess::Writable)
+        .count();
+    (read_only, writable)
+}
+
+fn open_block_device_endpoint(
+    process_id: u64,
+    partition_index: u64,
+    access: BlockDeviceAccess,
+) -> u64 {
     if process_id != INIT_PROCESS_ID {
         return error_return(abi::errno::PERMISSION);
     }
@@ -111,17 +266,26 @@ fn open_block_device_endpoint(process_id: u64, partition_index: u64) -> u64 {
         Err(_) => return error_return(ERR_INVALID_ARGUMENT),
     };
 
-    let existing = {
-        let state = BLOCK_DEVICE_ENDPOINTS.lock();
-        let Some(device) = state
-            .devices
-            .iter()
-            .find(|device| device.partition.index == partition_index)
-        else {
-            return error_return(ERR_NO_ENTRY);
+    let existing =
+        {
+            let state = BLOCK_DEVICE_ENDPOINTS.lock();
+            let Some(device) = state.devices.iter().find(|device| {
+                device.partition.index == partition_index && device.access == access
+            }) else {
+                let error = if access.is_writable()
+                    && state
+                        .devices
+                        .iter()
+                        .any(|device| device.partition.index == partition_index)
+                {
+                    abi::errno::PERMISSION
+                } else {
+                    ERR_NO_ENTRY
+                };
+                return error_return(error);
+            };
+            device.endpoint
         };
-        device.endpoint
-    };
     if let Some(endpoint) = existing {
         return block_device_insert_bootstrap_handle(process_id, endpoint);
     }
@@ -156,7 +320,7 @@ fn open_block_device_endpoint(process_id: u64, partition_index: u64) -> u64 {
         match state
             .devices
             .iter_mut()
-            .find(|device| device.partition.index == partition_index)
+            .find(|device| device.partition.index == partition_index && device.access == access)
         {
             Some(device) if device.endpoint.is_none() => {
                 device.endpoint = Some(endpoint);
@@ -181,7 +345,7 @@ fn open_block_device_endpoint(process_id: u64, partition_index: u64) -> u64 {
         state
             .devices
             .iter()
-            .find(|device| device.partition.index == partition_index)
+            .find(|device| device.partition.index == partition_index && device.access == access)
             .and_then(|device| device.endpoint)
     };
     match existing {
@@ -201,7 +365,7 @@ fn block_device_insert_bootstrap_handle(process_id: u64, endpoint: CapabilityObj
 
 fn service_block_device_endpoints() {
     block_device_reap_dead_sessions();
-    let Some((partition_index, message)) = block_device_take_message() else {
+    let Some((partition_index, access, message)) = block_device_take_message() else {
         return;
     };
 
@@ -221,6 +385,7 @@ fn service_block_device_endpoints() {
     if request.operation == block_device_protocol::operation::CONNECT {
         block_device_connect(
             partition_index,
+            access,
             message.sender_process_id,
             request,
             message.capability,
@@ -230,6 +395,7 @@ fn service_block_device_endpoints() {
 
     let Some(snapshot) = block_device_session_snapshot(
         partition_index,
+        access,
         message.sender_process_id,
         request.session_id,
     ) else {
@@ -256,10 +422,10 @@ fn service_block_device_endpoints() {
         }
         block_device_protocol::operation::INFO => {
             if block_device_reject_unexpected_transfer(message.capability, &mut reply) {
-                reply.features = block_device_protocol::features::READ;
+                reply.features = snapshot.access.features();
                 reply.block_count = snapshot.partition.block_count;
                 reply.logical_block_size = snapshot.partition.logical_block_size as u32;
-                reply.device_flags = block_device_protocol::device_flags::READ_ONLY;
+                reply.device_flags = snapshot.access.device_flags();
             }
         }
         block_device_protocol::operation::READ => {
@@ -269,12 +435,20 @@ fn service_block_device_endpoints() {
         }
         block_device_protocol::operation::WRITE => {
             if block_device_reject_unexpected_transfer(message.capability, &mut reply) {
-                reply.status = block_device_protocol::status::READ_ONLY;
+                if snapshot.access.is_writable() {
+                    block_device_write(snapshot, &request, &mut reply);
+                } else {
+                    reply.status = block_device_protocol::status::READ_ONLY;
+                }
             }
         }
         block_device_protocol::operation::FLUSH => {
             if block_device_reject_unexpected_transfer(message.capability, &mut reply) {
-                reply.status = block_device_protocol::status::NOT_SUPPORTED;
+                if snapshot.access.is_writable() {
+                    block_device_flush(&mut reply);
+                } else {
+                    reply.status = block_device_protocol::status::NOT_SUPPORTED;
+                }
             }
         }
         block_device_protocol::operation::DISCONNECT => {
@@ -284,6 +458,7 @@ fn service_block_device_endpoints() {
             }
             let Some(released) = block_device_remove_session(
                 partition_index,
+                snapshot.access,
                 snapshot.session.owner_process_id,
                 snapshot.session.id,
             ) else {
@@ -300,7 +475,7 @@ fn service_block_device_endpoints() {
     block_device_queue_reply_or_remove_session(snapshot, reply);
 }
 
-fn block_device_take_message() -> Option<(u32, EndpointMessage)> {
+fn block_device_take_message() -> Option<(u32, BlockDeviceAccess, EndpointMessage)> {
     let candidates = {
         let mut state = BLOCK_DEVICE_ENDPOINTS.lock();
         let endpoints = state
@@ -309,7 +484,7 @@ fn block_device_take_message() -> Option<(u32, EndpointMessage)> {
             .filter_map(|device| {
                 device
                     .endpoint
-                    .map(|endpoint| (device.partition.index, endpoint))
+                    .map(|endpoint| (device.partition.index, device.access, endpoint))
             })
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
@@ -322,7 +497,7 @@ fn block_device_take_message() -> Option<(u32, EndpointMessage)> {
             .collect::<Vec<_>>()
     };
 
-    for (partition_index, endpoint_object) in candidates {
+    for (partition_index, access, endpoint_object) in candidates {
         let message = {
             let mut registry = CAPABILITY_REGISTRY.lock();
             let Some(index) = registry.object_index(endpoint_object) else {
@@ -341,7 +516,7 @@ fn block_device_take_message() -> Option<(u32, EndpointMessage)> {
             endpoint.queue.pop_front()
         };
         if let Some(message) = message {
-            return Some((partition_index, message));
+            return Some((partition_index, access, message));
         }
     }
     None
@@ -349,6 +524,7 @@ fn block_device_take_message() -> Option<(u32, EndpointMessage)> {
 
 fn block_device_connect(
     partition_index: u32,
+    access: BlockDeviceAccess,
     sender_process_id: u64,
     request: block_device_protocol::Request,
     capability: Option<TransferredCapability>,
@@ -376,7 +552,7 @@ fn block_device_connect(
         match state
             .devices
             .iter_mut()
-            .find(|device| device.partition.index == partition_index)
+            .find(|device| device.partition.index == partition_index && device.access == access)
         {
             None => Err(block_device_protocol::status::IO),
             Some(device)
@@ -422,7 +598,7 @@ fn block_device_connect(
     reply.generation = session.generation;
     if !block_device_queue_reply(session.reply_endpoint, reply)
         && let Some(released) =
-            block_device_remove_session(partition_index, sender_process_id, session.id)
+            block_device_remove_session(partition_index, access, sender_process_id, session.id)
     {
         block_device_release_session(released);
     }
@@ -455,7 +631,10 @@ fn block_device_attach_buffer(
         state
             .devices
             .iter_mut()
-            .find(|device| device.partition.index == snapshot.partition.index)
+            .find(|device| {
+                device.partition.index == snapshot.partition.index
+                    && device.access == snapshot.access
+            })
             .and_then(|device| {
                 device.sessions.iter_mut().find(|session| {
                     session.id == snapshot.session.id
@@ -565,6 +744,93 @@ fn block_device_read(
     reply.transferred_blocks = request.block_count;
 }
 
+fn block_device_write(
+    snapshot: BlockDeviceSessionSnapshot,
+    request: &block_device_protocol::Request,
+    reply: &mut block_device_protocol::Reply,
+) {
+    let Some(buffer) = snapshot.session.buffer else {
+        reply.status = block_device_protocol::status::STALE_BUFFER;
+        return;
+    };
+    if buffer.id != request.buffer_id {
+        reply.status = block_device_protocol::status::STALE_BUFFER;
+        return;
+    }
+    let transfer = match checked_block_device_transfer(snapshot.partition, buffer, request) {
+        Some(transfer) => transfer,
+        None => {
+            reply.status = block_device_protocol::status::RANGE;
+            return;
+        }
+    };
+
+    let Some(disk) = crate::ahci::info() else {
+        reply.status = block_device_protocol::status::IO;
+        return;
+    };
+    let Ok(disk_block_size) = usize::try_from(disk.logical_block_size) else {
+        reply.status = block_device_protocol::status::IO;
+        return;
+    };
+    let Some(partition_end) = snapshot
+        .partition
+        .start_lba
+        .checked_add(snapshot.partition.block_count)
+    else {
+        reply.status = block_device_protocol::status::RANGE;
+        return;
+    };
+    let Some(transfer_end) = transfer
+        .absolute_lba
+        .checked_add(u64::from(request.block_count))
+    else {
+        reply.status = block_device_protocol::status::RANGE;
+        return;
+    };
+    if disk_block_size != snapshot.partition.logical_block_size
+        || partition_end > disk.logical_block_count
+        || transfer_end > partition_end
+        || transfer_end > disk.logical_block_count
+    {
+        reply.status = block_device_protocol::status::RANGE;
+        return;
+    }
+
+    let mut scratch = vec![0_u8; transfer.byte_length];
+    if !block_device_copy_from_shared_memory(buffer.object, transfer.buffer_offset, &mut scratch) {
+        reply.status = block_device_protocol::status::IO;
+        return;
+    }
+    for relative in 0..request.block_count {
+        let Some(lba) = transfer.absolute_lba.checked_add(u64::from(relative)) else {
+            reply.status = block_device_protocol::status::RANGE;
+            return;
+        };
+        let Some(offset) = usize::try_from(relative)
+            .ok()
+            .and_then(|relative| relative.checked_mul(snapshot.partition.logical_block_size))
+        else {
+            reply.status = block_device_protocol::status::RANGE;
+            return;
+        };
+        let end = offset + snapshot.partition.logical_block_size;
+        if crate::ahci::write_block(lba, &scratch[offset..end]).is_err() {
+            reply.status = block_device_protocol::status::IO;
+            return;
+        }
+    }
+
+    reply.buffer_id = request.buffer_id;
+    reply.transferred_blocks = request.block_count;
+}
+
+fn block_device_flush(reply: &mut block_device_protocol::Reply) {
+    if crate::ahci::flush().is_err() {
+        reply.status = block_device_protocol::status::IO;
+    }
+}
+
 fn checked_block_device_transfer(
     partition: BlockDevicePartition,
     buffer: BlockDeviceBuffer,
@@ -661,6 +927,7 @@ fn block_device_reply(request: &block_device_protocol::Request) -> block_device_
 
 fn block_device_session_snapshot(
     partition_index: u32,
+    access: BlockDeviceAccess,
     owner_process_id: u64,
     session_id: u64,
 ) -> Option<BlockDeviceSessionSnapshot> {
@@ -668,7 +935,7 @@ fn block_device_session_snapshot(
     let device = state
         .devices
         .iter()
-        .find(|device| device.partition.index == partition_index)?;
+        .find(|device| device.partition.index == partition_index && device.access == access)?;
     let session = device
         .sessions
         .iter()
@@ -676,12 +943,14 @@ fn block_device_session_snapshot(
     device.endpoint?;
     Some(BlockDeviceSessionSnapshot {
         partition: device.partition,
+        access: device.access,
         session: *session,
     })
 }
 
 fn block_device_remove_session(
     partition_index: u32,
+    access: BlockDeviceAccess,
     owner_process_id: u64,
     session_id: u64,
 ) -> Option<BlockDeviceSession> {
@@ -689,7 +958,7 @@ fn block_device_remove_session(
     let device = state
         .devices
         .iter_mut()
-        .find(|device| device.partition.index == partition_index)?;
+        .find(|device| device.partition.index == partition_index && device.access == access)?;
     let index = device.sessions.iter().position(|session| {
         session.id == session_id && session.owner_process_id == owner_process_id
     })?;
@@ -705,6 +974,7 @@ fn block_device_queue_reply_or_remove_session(
     }
     if let Some(released) = block_device_remove_session(
         snapshot.partition.index,
+        snapshot.access,
         snapshot.session.owner_process_id,
         snapshot.session.id,
     ) {
@@ -810,6 +1080,28 @@ fn block_device_shared_memory_length(object: CapabilityObjectRef) -> Option<u64>
         return None;
     };
     u64::try_from(memory.bytes.len()).ok()
+}
+
+fn block_device_copy_from_shared_memory(
+    object: CapabilityObjectRef,
+    offset: usize,
+    bytes: &mut [u8],
+) -> bool {
+    let registry = CAPABILITY_REGISTRY.lock();
+    let Some(index) = registry.object_index(object) else {
+        return false;
+    };
+    let CapabilityObjectData::SharedMemory(memory) = &registry.objects[index].data else {
+        return false;
+    };
+    let Some(end) = offset.checked_add(bytes.len()) else {
+        return false;
+    };
+    let Some(source) = memory.bytes.get(offset..end) else {
+        return false;
+    };
+    bytes.copy_from_slice(source);
+    true
 }
 
 fn block_device_copy_to_shared_memory(

@@ -682,6 +682,19 @@ mod tests {
         }
     }
 
+    fn writable_info() -> DeviceInfo {
+        DeviceInfo {
+            logical_block_size: protocol::INITIAL_LOGICAL_BLOCK_SIZE,
+            block_count: 8,
+            features: protocol::features::READ
+                | protocol::features::WRITE
+                | protocol::features::FLUSH,
+            flags: 0,
+            session_id: 7,
+            generation: 11,
+        }
+    }
+
     #[test]
     fn wire_records_have_fixed_bounded_shape() {
         assert_eq!(size_of::<protocol::Request>(), 80);
@@ -740,6 +753,20 @@ mod tests {
     }
 
     #[test]
+    fn writable_metadata_builds_bounded_write_requests() {
+        let session = session_with_buffer(1024);
+        let info = writable_info();
+        let request = session
+            .write_request(9, info, 6, 2, 0)
+            .expect("bounded writable request");
+        assert_eq!(request.block_offset, 6);
+        assert_eq!(request.block_count, 2);
+        assert_eq!(request.buffer_length, 1024);
+        assert!(valid_request(&request));
+        assert_eq!(session.write_request(10, info, 7, 2, 0), Err(Error::Range));
+    }
+
+    #[test]
     fn replies_are_canonical_and_bound_to_request_identity() {
         let session = session_with_buffer(1024);
         let request = session
@@ -779,6 +806,16 @@ mod tests {
         reply.device_flags = protocol::device_flags::READ_ONLY;
         assert!(valid_reply(&request, &reply));
         assert!(DeviceInfo::from_info_reply(&session, &request, &reply).is_some());
+
+        reply.features =
+            protocol::features::READ | protocol::features::WRITE | protocol::features::FLUSH;
+        reply.device_flags = 0;
+        assert!(valid_reply(&request, &reply));
+        assert_eq!(
+            DeviceInfo::from_info_reply(&session, &request, &reply),
+            Some(writable_info())
+        );
+
         reply.generation += 1;
         assert!(DeviceInfo::from_info_reply(&session, &request, &reply).is_none());
         reply.generation = request.generation;
@@ -787,7 +824,8 @@ mod tests {
         assert!(!valid_reply(&request, &reply));
         assert!(DeviceInfo::from_info_reply(&session, &request, &reply).is_none());
         reply.block_count = 8;
-        reply.features |= protocol::features::WRITE;
+        reply.device_flags = protocol::device_flags::READ_ONLY;
+        reply.features = protocol::features::READ | protocol::features::WRITE;
         assert!(!valid_reply(&request, &reply));
         reply.features = protocol::features::READ;
         reply.reserved[0] = 1;

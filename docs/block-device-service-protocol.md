@@ -8,23 +8,27 @@ access.
 
 ## Authorization and capability model
 
-Only PID 1 may call `OPEN_BLOCK_DEVICE_ENDPOINT`. The syscall selects a discovered
-filesystem-candidate partition by its partition-table index and returns an
-endpoint capability with `SEND | TRANSFER`. PID 1 can delegate a reduced
-send-only capability to a supervised filesystem service. The service cannot
-receive another client's requests, access the containing disk outside the
-selected partition, or manufacture additional authority.
+Only PID 1 may acquire a partition endpoint. `OPEN_BLOCK_DEVICE_ENDPOINT`
+retains its original read-only contract. The separate
+`OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT` syscall requests writable access and
+succeeds only when the disk has no extended partition and the selected entry is
+a nonzero-start primary MBR partition classified as `PartitionKind::NullFs` that
+does not overlap any other discovered partition and
+contains a valid decoded NullFS superblock. Logical/extended MBR, GPT, and
+superfloppy writable grants remain disabled until their reserved disk-metadata
+ranges are modeled explicitly. Each successful call returns an endpoint capability
+with `SEND | TRANSFER`; PID 1 can delegate a reduced send-only capability to a
+supervised filesystem service. The service cannot receive another client's
+requests or access the containing disk outside the selected partition.
 
-Every endpoint-open call returns an independent handle to the same kernel-rooted
-endpoint object. Closing one handle therefore does not invalidate another
-caller's handle. Endpoint object identity supplies a nonzero generation used to
-scope sessions and reject stale requests.
-
-The initial implementation exports partitions read-only. This includes the
-mounted FAT partition and a dedicated NullFS fixture partition for protocol
-validation, but no write command can reach AHCI. Keeping the NullFS partition
-read-only until a separate grant policy and durability tests exist also ensures
-that raw writes can never race the mounted boot filesystem.
+Read-only and writable access to the same partition are separate kernel-rooted
+endpoint objects with separate nonzero generations. Repeated acquisition of the
+same partition and access mode returns an independent handle to that mode's
+object, so closing one handle does not invalidate another caller's handle. Both
+modes use ordinary endpoint rights, including delegated `SEND`; the endpoint
+object's access mode is the write authority. Discovering a path or partition,
+registering a provider, or possessing a UID—including a future UID 0—cannot
+manufacture that authority.
 
 ## Session bootstrap
 
@@ -62,39 +66,53 @@ cooperatively yield and retry when the bounded request queue reports
   reply endpoint.
 - `ATTACH_BUFFER` registers one shared-memory object for block transfers.
 - `INFO` returns the logical block size, partition-relative block count,
-  supported feature bits, and read-only state.
+  supported feature bits, and read-only state. Read-only endpoints advertise
+  `READ` plus `READ_ONLY`; writable endpoints advertise `READ | WRITE | FLUSH`
+  without `READ_ONLY`.
 - `READ` copies one or more complete logical blocks into the registered buffer.
-- `WRITE` is defined for forward compatibility but currently always returns
-  `READ_ONLY` without reading the buffer or issuing disk I/O.
-- `FLUSH` is defined for forward compatibility but currently returns
-  `NOT_SUPPORTED`.
+- `WRITE` writes one or more complete logical blocks from the registered buffer
+  on a writable endpoint. A read-only endpoint returns `READ_ONLY` without
+  reading the buffer or issuing disk I/O.
+- `FLUSH` on a writable endpoint maps to an AHCI cache flush. A read-only
+  endpoint returns `NOT_SUPPORTED`.
 - `DISCONNECT` releases the session and all kernel roots owned by it.
 
 Unknown operations, flags, reserved fields, transferred capabilities, and
 noncanonical operation-specific fields are rejected. Request and reply records
 are fixed-size, `repr(C)`, and bounded below the 256-byte endpoint message limit.
 
-## Read bounds and atomicity
+## Transfer bounds and completion
 
 All block offsets are relative to the selected partition, never the physical
-disk. For every read the kernel validates:
+disk. For every read and write the kernel validates:
 
-1. nonzero whole-block count;
+1. a nonzero whole-block count and exact complete-block buffer length;
 2. checked `block_offset + block_count` within the partition;
-3. checked transfer byte length equal to the requested buffer range;
-4. transfer size no greater than `MAX_TRANSFER_BYTES` (4096 bytes);
-5. registered-buffer range within both its declared and actual size;
-6. checked partition translation to an absolute LBA;
-7. current AHCI block size and disk capacity against the configured snapshot.
+3. a checked transfer byte length no greater than `MAX_TRANSFER_BYTES` (4096
+   bytes);
+4. the registered buffer identity and range against both its declared and actual
+   size;
+5. checked partition translation to an absolute LBA;
+6. current AHCI logical block size and disk capacity against the configured
+   partition snapshot.
 
 The kernel reads into a scratch buffer without holding process, capability, or
 session locks. Only after every AHCI block succeeds does it copy the complete
 result into shared memory. A failed read therefore cannot expose a partially
 updated transfer window.
 
-Raw reads are serialized with FAT I/O by the AHCI device lock, but they are not a
-multi-operation filesystem snapshot. Filesystem services must rely on their own
-on-disk consistency and recovery rules.
+For writes, the kernel first copies the complete source range from registered
+shared memory into a scratch buffer, then issues the AHCI block writes. It sets
+`transferred_blocks` only after every requested block succeeds. That reply rule
+does **not** make a multi-block write atomic: if an AHCI write fails, earlier
+physical blocks may already have changed even though the reply reports no
+transferred blocks. Callers must use filesystem durability and recovery rules
+and must never treat such a failure as a safely retryable partial write.
+
+Raw reads, writes, and flushes are serialized with FAT I/O by the AHCI device
+lock, but they are not a multi-operation filesystem transaction or snapshot.
+Filesystem services must rely on their own on-disk consistency and recovery
+rules.
 
 ## NullFS adapter
 
@@ -104,20 +122,30 @@ on-disk consistency and recovery rules.
 core transfers through the registered window. It exposes 4096-byte NullFS blocks
 and translates each one into a checked run of protocol logical blocks; the
 current 512-byte logical-block device therefore uses eight protocol blocks per
-core block. Keeping the adapter in a separate crate prevents host `std` features
-from leaking into allocator-free userspace binaries and keeps `nullfs-service` a
-distinct package.
+core block. The adapter rejects metadata that marks a device writable unless
+both `WRITE` and `FLUSH` are advertised, preventing a writable core from running
+without the durability primitive it requires. Keeping the adapter in a separate
+crate prevents host `std` features from leaking into allocator-free userspace
+binaries and keeps `nullfs-service` a distinct package.
 
-The current QEMU boot probes verify init-only endpoint acquisition, delegated
-send-only authority, read-only device metadata, a partition-relative FAT boot
-block read, and the checksummed superblock of the dedicated `NULLSTAR_DATA`
-NullFS fixture. They also cover buffer transfer, range rejection, write rejection,
-unsupported flush, and disconnect cleanup on the real kernel boundary.
+The current normal boot verifies init-only endpoint acquisition, delegated
+send-only authority, read-only and writable metadata, a partition-relative FAT
+boot-block read, and the checksummed superblock of the dedicated `NULLSTAR_DATA`
+It also performs a reversible probe on a known free sector in the deterministic
+NullFS fixture: read the original sector, write a distinct marker, flush, read it
+back, restore the original sector, flush again, and verify the restoration. If a
+previous boot stopped after making the marker durable, the next probe recognizes
+that exact marker and restores it before repeating the test. The previous
+read-only buffer-transfer, range-rejection, write-denial, unsupported-flush,
+mutation-denial, and disconnect-cleanup probes remain active.
 
-`nullfs-service` mounts that endpoint through `nullfs-userspace-blockdev` and
-the shared NullFS core. Its direct generic-filesystem-protocol probe covers
-lookup, attributes, file reads, paginated directory iteration, duplicate
-`OPEN`/`CLOSE_NODE` accounting, mutation denial, and disconnect cleanup.
+PID 1 gives `nullfs-service` a send-only handle to the writable raw NullFS
+endpoint. The service requires `READ | WRITE | FLUSH` metadata, constructs the
+`nullfs-userspace-blockdev` adapter, and then deliberately wraps it in
+`ReadOnlyBlockDevice` before mounting the shared NullFS core. Its direct
+generic-filesystem-protocol probe covers lookup, attributes, file reads,
+paginated directory iteration, duplicate `OPEN`/`CLOSE_NODE` accounting,
+mutation denial, and disconnect cleanup.
 
 PID 1 also registers each `nullfs-service` process as an independent,
 generation-scoped kernel filesystem proxy, while the VFS statically mounts the
@@ -130,9 +158,12 @@ denied.
 
 ## Writable authority
 
-The mounted service and its raw block-device endpoint remain read-only. The
-kernel must not advertise block `WRITE` or `FLUSH`, or grant writable filesystem
-service authority, until an explicit grant policy and crash-ordering tests prove
-that the userspace adapter preserves NullFS durability semantics. Writable
-integration is therefore a later milestone, not part of the current static VFS
-mount.
+Partition-scoped raw writable authority is implemented only for discovered
+NullFS partitions and can enter userspace only through PID 1 acquisition and
+capability delegation. It is distinct from writable filesystem-service
+authority: the current `nullfs-service` attenuates the raw device with
+`ReadOnlyBlockDevice`, the generic filesystem protocol exposes only its existing
+read-only NullFS operations, and the VFS mount at `/Volumes/NULLSTAR_DATA`
+remains read-only. This milestone does not make writable filesystem syscalls
+work; those operations and their recovery coverage remain the next integration
+step.

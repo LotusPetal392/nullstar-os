@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 8;
+pub const ABI_VERSION_MINOR: u64 = 9;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -73,6 +73,7 @@ pub mod syscall {
     pub const UNLINK: u64 = 51;
     pub const OPEN_BLOCK_DEVICE_ENDPOINT: u64 = 52;
     pub const REGISTER_NULLFS_SERVICE: u64 = 53;
+    pub const OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT: u64 = 54;
 }
 
 pub mod capability {
@@ -90,6 +91,7 @@ pub mod capability {
     pub const BLOCKING_ENDPOINT_WAIT: u64 = 1 << 11;
     pub const PATH_MUTATION: u64 = 1 << 12;
     pub const READ_ONLY_BLOCK_DEVICE_ENDPOINTS: u64 = 1 << 13;
+    pub const WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS: u64 = 1 << 14;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -105,7 +107,8 @@ pub mod capability {
         | SHARED_MEMORY_OBJECTS
         | BLOCKING_ENDPOINT_WAIT
         | PATH_MUTATION
-        | READ_ONLY_BLOCK_DEVICE_ENDPOINTS;
+        | READ_ONLY_BLOCK_DEVICE_ENDPOINTS
+        | WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS;
 
     pub const INVALID_HANDLE: u64 = 0;
 

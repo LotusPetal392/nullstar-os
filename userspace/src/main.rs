@@ -25,6 +25,11 @@ const NULLFS_BLOCK_DEVICE_PROBE_FAILED: &[u8] =
     b"userspace init: read-only NullFS partition probe failed\n";
 const NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
     b"userspace init: read-only NullFS partition probe passed\n";
+const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe nullfs-writable";
+const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_FAILED: &[u8] =
+    b"userspace init: writable NullFS partition probe failed\n";
+const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
+    b"userspace init: writable NullFS partition probe passed\n";
 const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to acquire block-device endpoint\n";
 const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service";
@@ -156,6 +161,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if syscall::write_all(STDOUT, INIT_READY).is_err() {
         syscall::exit(1);
     }
+    if platform::open_writable_block_device_endpoint(2).err() != Some(platform::Errno::PERMISSION) {
+        fail(BLOCK_DEVICE_BOOTSTRAP_FAILED);
+    }
 
     let block_device_endpoint = platform::open_block_device_endpoint(2)
         .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
@@ -194,7 +202,26 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     ipc::close(nullfs_block_device_endpoint)
         .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
 
-    let nullfs_service_block_endpoint = platform::open_block_device_endpoint(3)
+    let writable_nullfs_block_device_endpoint = platform::open_writable_block_device_endpoint(3)
+        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+    if !matches!(
+        ipc::info(writable_nullfs_block_device_endpoint),
+        Ok(info)
+            if info.kind == ipc::ObjectKind::Endpoint
+                && info.rights == (Rights::SEND | Rights::TRANSFER)
+    ) {
+        fail(BLOCK_DEVICE_BOOTSTRAP_FAILED);
+    }
+    run_probe(
+        WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_COMMAND,
+        writable_nullfs_block_device_endpoint,
+        WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_FAILED,
+        WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_PASSED,
+    );
+    ipc::close(writable_nullfs_block_device_endpoint)
+        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+
+    let nullfs_service_block_endpoint = platform::open_writable_block_device_endpoint(3)
         .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
     if !matches!(
         ipc::info(nullfs_service_block_endpoint),
