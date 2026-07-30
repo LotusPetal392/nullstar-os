@@ -28,6 +28,9 @@ pub mod operation {
     pub const CLOSE_NODE: u16 = 14;
     pub const CANCEL: u16 = 15;
     pub const DISCONNECT: u16 = 16;
+    pub const TRUNCATE: u16 = 17;
+    pub const RMDIR: u16 = 18;
+    pub const SYNC: u16 = 19;
 }
 
 pub mod status {
@@ -47,6 +50,9 @@ pub mod status {
     pub const IO: i32 = 13;
     pub const NOT_SUPPORTED: i32 = 14;
     pub const CANCELLED: i32 = 15;
+    pub const NOT_EMPTY: i32 = 16;
+    pub const WOULD_CYCLE: i32 = 17;
+    pub const OUTCOME_UNKNOWN: i32 = 18;
 }
 
 pub mod request_flags {
@@ -58,6 +64,18 @@ pub mod request_flags {
     pub const WRITE: u32 = 1 << 5;
 
     pub const ALL: u32 = CREATE | EXCLUSIVE | TRUNCATE | APPEND | READ | WRITE;
+}
+
+pub mod connect_flags {
+    pub const WRITE: u32 = super::request_flags::WRITE;
+
+    pub const ALL: u32 = WRITE;
+}
+
+pub mod session_features {
+    pub const WRITE: u64 = 1;
+
+    pub const ALL: u64 = WRITE;
 }
 
 pub mod reply_flags {

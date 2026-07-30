@@ -46,7 +46,8 @@ const NORMAL_BOOT_NULLFS_PARTITION_MARKER: &str =
     "userspace init: read-only NullFS partition probe passed";
 const NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER: &str =
     "userspace init: writable NullFS partition probe passed";
-const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str = "userspace init: read-only NullFS service mounted";
+const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str =
+    "userspace init: writable NullFS service ready; VFS mount remains read-only";
 const NORMAL_BOOT_NULLFS_PROBE_MARKER: &str = "userspace init: userspace NullFS probe passed";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";

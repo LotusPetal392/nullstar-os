@@ -17,7 +17,8 @@ filesystem responsibilities across userspace service boundaries:
 
 - the userspace tmpfs service is the active `/tmp` backend;
 - a separately supervised VFS service owns the versioned longest-prefix namespace table;
-- a separately supervised read-only NullFS service is mounted through a kernel proxy;
+- a separately supervised NullFS service mounts its core read-write and offers explicitly
+  negotiated writable sessions, while its kernel proxy and public mount stay read-only;
 - PID 1 delegates endpoint authority, including a narrowly scoped writable raw NullFS
   block endpoint, to those services;
 - provider generation, protocol session, request, and stale-handle checks protect
@@ -92,6 +93,10 @@ The common [filesystem service protocol](filesystem-service-protocol.md) builds 
 primitives. A client establishes a session through an endpoint, transfers a persistent
 reply endpoint and registered shared-memory capability, then uses bounded request and
 reply records carrying session, generation, request, operation, and buffer identities.
+For NullFS, `CONNECT` flags `0` negotiate no writable features and exactly `WRITE`
+negotiates the `WRITE` session feature; unsupported requests are rejected without
+downgrade. Every mutation requires that feature even though the service process itself
+holds raw write authority.
 
 The VFS and kernel proxies validate:
 
@@ -105,6 +110,17 @@ The VFS and kernel proxies validate:
 Open-file descriptions retain generation-scoped service nodes. When a provider is
 replaced, old in-flight requests fail deterministically, old descriptors remain stale,
 and close records from old generations are not sent to the replacement service.
+
+For writable NullFS operations, the service copies each complete write of at most 4 KiB
+from shared memory into private storage before entering the core. Open-unlinked access
+requires the actual matching session-owned open handle. Unlink is rejected if a read-only
+session owns an open whose later close could reclaim storage; open-directory removal and
+unsafe rename replacement are also restricted.
+
+If a mutation's durable outcome is uncertain or the core is poisoned, the service sends
+`OUTCOME_UNKNOWN` and fail-stops. Its supervisor replaces it, causing a fresh mount and
+recovery before readiness. Automatic retry is forbidden because neither a lost reply nor
+service replacement proves that the prior mutation did not commit.
 
 ## Raw block-device authority
 
@@ -126,10 +142,22 @@ physical modification of earlier blocks, so possession of the capability does no
 blind retry safe; the filesystem must provide ordering and recovery. Writable flushes
 reach the AHCI cache flush.
 
-PID 1 gives `nullfs-service` this writable raw endpoint, but the service deliberately
-wraps it in `ReadOnlyBlockDevice`. The filesystem protocol and VFS mount at
-`/Volumes/NULLSTAR_DATA` remain read-only, demonstrating that raw device authority and
-writable filesystem policy are separate layers.
+PID 1 explicitly starts `/nullfs-service --writable` and gives it this writable raw
+endpoint. The service requires `READ | WRITE | FLUSH` and mounts `nullfs-core` read-write,
+but that still grants no client mutation authority by itself. There are three distinct
+layers:
+
+1. the partition-scoped raw endpoint authorizes block `READ`, `WRITE`, and `FLUSH` only
+   within that discovered partition;
+2. a filesystem session authorizes mutations only if its exact `CONNECT` negotiation
+   returned the `WRITE` feature;
+3. the public VFS path is writable only if its kernel proxy and mount policy grant that
+   authority.
+
+The current kernel NullFS proxy connects with flags `0`, and its mutation guards keep
+`/Volumes/NULLSTAR_DATA` read-only. Explicit direct clients can negotiate writable service
+sessions, but neither they nor the service's raw endpoint make ordinary VFS syscalls
+writable.
 
 ## Security boundaries and limitations
 

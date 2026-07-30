@@ -3,9 +3,10 @@
 NullStar OS is migrating from filesystem-specific kernel routing to a common
 userspace filesystem-service contract defined in
 `shared/filesystem_protocol.rs`. Generic sessions, opaque node handles, and
-registered bulk buffers are active for tmpfs and the read-only NullFS service;
-the public file-descriptor ABI remains unchanged while kernel proxies bridge
-the migration.
+registered bulk buffers are active for tmpfs and NullFS. NullFS additionally
+supports explicitly negotiated direct writable sessions, while its kernel proxy
+and public VFS mount remain read-only. The public file-descriptor ABI remains
+unchanged while kernel proxies bridge the migration.
 
 ## Design goals
 
@@ -51,6 +52,13 @@ The service returns a nonzero session ID and generation. All later replies use
 the persistent endpoint and must match the request ID, session ID, generation,
 operation, protocol version, and reserved-field contract.
 
+`CONNECT` also performs exact feature negotiation. Flags `0` request a read-only
+session and return feature bits `0`; exactly `WRITE` requests and returns the
+`WRITE` session feature. Unsupported flags or combinations are rejected rather
+than downgraded. A writable service process or writable raw device therefore
+does not make a client session writable: each mutating request must belong to a
+session that negotiated `WRITE`.
+
 Clients end a session with `DISCONNECT`. The service replies first, then closes
 its persistent reply-endpoint handle and every shared-memory handle registered
 to that session. This makes normal client lifetime bounded. Reaping sessions
@@ -88,9 +96,10 @@ directory --lookup("notes")--> file node
 
 This avoids duplicating path parsing in every filesystem and allows a VFS
 service to cross mount points one component at a time. The first protocol
-version reserves operations for lookup, attributes, open, bulk read/write,
-directory iteration, file and directory creation, unlink, rename, node close,
-and request cancellation.
+version defines operations for lookup, attributes, open, bulk read/write,
+directory iteration, file and directory creation, truncate, unlink, `rmdir`,
+rename, sync, node close, and request cancellation. Backends expose only the
+operations supported by the negotiated session and mounted filesystem.
 
 Names are single components. They may not be empty or contain `/` or NUL.
 Unicode normalization and case-comparison policy belong to each mounted
@@ -102,6 +111,31 @@ a component name. The named form applies create, truncate, append, read, and
 write flags in one service round trip; this lets syscall proxies preserve one
 blocked operation without embedding path-resolution continuations in the
 kernel.
+
+### Writable NullFS sessions
+
+An explicitly writable NullFS session implements `CREATE_FILE`,
+`CREATE_DIRECTORY`, `WRITE`, append, `TRUNCATE`, `UNLINK`, `RMDIR`, `RENAME`,
+and `SYNC`, as well as mutating `OPEN` forms. New files use mode `0644` and new
+directories use `0755`. Each write is limited to 4096 bytes. The service first
+copies the complete registered-buffer range into private memory, so later
+client changes cannot alter bytes during the core mutation. `RENAME` carries
+the source name inline and reads the destination component from a checked
+registered-buffer range. All names remain single validated components.
+
+Open-unlinked reads, writes, attributes, and truncation use the actual matching
+session-owned open handle, not merely an opaque ID that once named the inode.
+Unlink is rejected with `TRY_AGAIN` if a read-only session owns a matching open
+and its eventual close could reclaim storage. Removing an open directory is
+also rejected, and rename retains the core's cycle checks plus restrictions on
+unsafe replacement of open destinations.
+
+A mutation can fail after durable state changed or after the in-memory core
+became poisoned. When the service cannot prove the result, it replies
+`OUTCOME_UNKNOWN`, then fail-stops after sending that reply. Supervision starts
+a replacement that remounts and runs normal recovery. `OUTCOME_UNKNOWN`, a
+failed service generation, and a lost reply are never permission to retry a
+mutation automatically; only an explicitly retryable status may be retried.
 
 ## Target system namespace
 
@@ -190,8 +224,9 @@ overloading generic flags or inline data.
    broader open-file ownership migration remains)
 5. Put FAT behind the same protocol.
 6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
-   service. (read-only service and static VFS mount complete; raw writable block
-   authority implemented; writable filesystem operations remain next)
+   service. (read-write service mount and explicitly writable direct sessions
+   complete; static public VFS mount remains read-only pending namespace
+   adoption and ordinary VFS mutation routing)
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
 
@@ -274,12 +309,12 @@ reference still owned by that session. An unlinked node is reclaimed only after
 its global open count reaches zero, and reclaimed storage slots receive a new
 monotonic node ID when reused.
 
-The read-only `nullfs-service` implements the same session and node-reference
-contract around shared-core `OpenHandle`s. PID 1 delegates a send-only handle to
-the writable raw NullFS block endpoint, and the service requires block metadata
-advertising `READ | WRITE | FLUSH`. It nevertheless wraps the userspace adapter
-in `ReadOnlyBlockDevice` before mounting the core. Raw block authority therefore
-does not make any generic filesystem operation writable.
+`nullfs-service` implements the session and node-reference contract around
+shared-core `OpenHandle`s. PID 1 launches it explicitly with `--writable` and
+delegates a send-only handle to the partition-scoped raw NullFS endpoint. The
+service requires block metadata advertising `READ | WRITE | FLUSH`, mounts the
+core read-write, and announces readiness only after mount-time journal recovery,
+orphan reclamation, volume validation, and dirty publication complete.
 
 The service presents generation-tagged opaque node IDs rather than inode numbers,
 sizes its identity map from the mounted volume's inode capacity, drains duplicate
@@ -288,16 +323,17 @@ when a close fails. PID 1 registers it independently of tmpfs as a
 generation-scoped kernel filesystem proxy. The VFS has a static longest-prefix
 route for `/Volumes/NULLSTAR_DATA`, and its `/Volumes` listing exposes that mount.
 
-The NullFS proxy performs `CONNECT` for each registered service generation and
-attaches one kernel-owned 4 KiB shared-memory buffer. It translates ordinary
-`stat`, read-only `open`, `read`, `fstat`, `seek`, `read_directory`, and `chdir`
-behavior without adding a NullFS-specific application ABI. Canonical path
-resolution happens before VFS routing, so after `chdir` enters the mounted
-volume, relative directory changes and opens are routed back to NullFS. Open
-requests carrying write, create, truncate, or append intent, descriptor writes,
-and unlink are rejected with the public read-only error. This milestone does not enable
-writable filesystem syscalls; implementing those operations with recovery-safe failure
-semantics remains the next NullFS service step.
+The NullFS proxy performs `CONNECT` with flags `0` for each registered service
+generation and attaches one kernel-owned 4 KiB shared-memory buffer. It therefore
+receives a read-only session even though the service's core mount is writable.
+The proxy translates ordinary `stat`, read-only `open`, `read`, `fstat`, `seek`,
+`read_directory`, and `chdir` behavior without adding a NullFS-specific
+application ABI. Canonical path resolution happens before VFS routing, so after
+`chdir` enters the mounted volume, relative directory changes and opens are
+routed back to NullFS. Kernel mutation guards continue to reject write, create,
+truncate, append, unlink, and other mutation intent with the public read-only
+error. Direct clients can explicitly negotiate `WRITE`; public
+`/Volumes/NULLSTAR_DATA` VFS users cannot.
 
 The kernel maps successful `OPEN` references to open-file descriptions rather
 than descriptor numbers. `dup`, `dup2`, fork inheritance, and file-backed
@@ -319,8 +355,13 @@ buffer, fails old in-flight requests with I/O, and refuses to rebind existing
 open-file descriptions; subsequent NullFS I/O through those old descriptors
 therefore fails with I/O. Close tickets carry the old proxy generation, session
 ID, and session generation and are discarded rather than sent to the
-replacement. The direct service probe covers protocol lookup, reads, directory
-cookies, mutation denial, and close/disconnect accounting. The normal-boot VFS
-probe covers the mounted ordinary syscall path, including cwd-relative routing,
-but does not yet deliberately restart `nullfs-service` with live descriptors;
-that restart fault-injection coverage remains future work.
+replacement service. The direct service probe preserves protocol lookup, reads,
+directory cookies,
+read-only-session mutation denial, and close/disconnect accounting. It also
+opens an explicit writable session, tests create, directory creation, write,
+append, truncate, rename, unlink, `rmdir`, and sync, and cleans the probe
+namespace. If a prior run was interrupted, recovery recognizes and removes only
+the exact reserved artifact forms the probe can leave behind. The normal-boot
+VFS probe continues to cover the read-only mounted syscall path, including
+cwd-relative routing; the dedicated restart test covers replacement with live
+descriptors.

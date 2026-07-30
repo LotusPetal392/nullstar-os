@@ -174,21 +174,44 @@ endpoint only for discovered NullFS partitions. PID 1 alone acquires those objec
 delegates ordinary send-only endpoint handles; endpoint identity, not path, discovery,
 or UID, carries raw write authority.
 
-PID 1 gives the supervised `nullfs-service` the writable raw NullFS endpoint. The service
-requires `READ | WRITE | FLUSH` device metadata but deliberately wraps the adapter in
-`ReadOnlyBlockDevice`, so its generic filesystem protocol and VFS mount at
-`/Volumes/NULLSTAR_DATA` remain read-only. Ordinary `stat`, `open`, `read`, `fstat`,
-`seek`, `read_directory`, and `chdir` work through the mount; mutation attempts are
-denied, and no writable NullFS filesystem syscalls are enabled. Open nodes and requests
-remain scoped to their service session and generation. On replacement, old in-flight
-operations fail, old descriptors remain stale, and old close tickets are not sent to the
-new service.
+PID 1 explicitly launches the supervised service as `/nullfs-service --writable` and
+delegates a partition-scoped raw endpoint advertising exactly the required
+`READ | WRITE | FLUSH` operations. The service mounts `nullfs-core` read-write. Mounting
+performs journal recovery, orphan reclamation, full-volume validation, and dirty-state
+publication before the service announces readiness, so registration never exposes a
+pre-recovery filesystem.
 
-Normal boot exercises the raw path with a reversible free-sector
-write/flush/readback/restore probe while retaining the previous read-only and
-mutation-denial probes. Writable filesystem-service operations, namespace bindings, and
-transition to the planned `/Volumes/NullStar` backing volume remain future work described
-in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
+Raw block authority, writable filesystem-session authority, and public VFS authority are
+separate boundaries. A generic filesystem `CONNECT` with flags `0` creates a read-only
+session; exactly `WRITE` creates a writable session and returns the `WRITE` feature. The
+service rejects unsupported combinations rather than silently downgrading them. Explicit
+direct writable clients can create files and directories, write or append at most 4 KiB
+per request from a registered buffer copied into private memory, truncate, unlink,
+`rmdir`, rename using a registered-buffer destination name, and sync. New files and
+directories use modes `0644` and `0755`. Every mutation rechecks the session's writable
+feature.
+
+Mutation failures whose durable outcome cannot be proven return `OUTCOME_UNKNOWN`; the
+service then fail-stops so supervision can restart it and remount through normal recovery.
+Clients must not automatically retry an uncertain operation. Open-unlinked access is
+accepted only through an actual matching open handle. Unlink is rejected when a read-only
+session owns an open whose later close would reclaim storage, and open-directory `rmdir`
+and unsafe rename replacement remain restricted.
+
+The kernel NullFS proxy still connects with flags `0`, and the public
+`/Volumes/NULLSTAR_DATA` mount remains read-only. Ordinary `stat`, read-only `open`,
+`read`, `fstat`, `seek`, `read_directory`, and `chdir` work through the mount; the
+kernel's mutation guards still reject write, create, truncate, append, unlink, and other
+mutation intent before it can become public VFS authority. Open nodes and requests remain
+scoped to their service session and generation. On replacement, old in-flight operations
+fail, old descriptors remain stale, and old close tickets are not sent to the new service.
+
+Normal boot retains raw read-only and reversible write/flush/readback/restore coverage.
+The direct filesystem probe also verifies read-only denial, exercises the writable
+mutation surface, cleans its namespace, and recognizes and safely removes only exact
+reserved artifacts left by an interrupted prior probe. Namespace bindings, ordinary VFS
+mutation, and transition to the planned `/Volumes/NullStar` backing volume remain the
+next integration work described in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
 

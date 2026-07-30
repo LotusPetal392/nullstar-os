@@ -32,11 +32,12 @@ const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
     b"userspace init: writable NullFS partition probe passed\n";
 const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to acquire block-device endpoint\n";
-const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service";
+const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service --writable";
 const NULLFS_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const NULLFS_SERVICE_STARTING: &[u8] = b"userspace init: starting NullFS service\n";
 const NULLFS_SERVICE_RESTARTING: &[u8] = b"userspace init: NullFS service exited; restarting\n";
-const NULLFS_SERVICE_READY: &[u8] = b"userspace init: read-only NullFS service mounted\n";
+const NULLFS_SERVICE_READY: &[u8] =
+    b"userspace init: writable NullFS service ready; VFS mount remains read-only\n";
 const NULLFS_SERVICE_FAILED: &[u8] = b"userspace init: NullFS service exhausted restart budget\n";
 const NULLFS_SERVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to grant NullFS capabilities\n";
