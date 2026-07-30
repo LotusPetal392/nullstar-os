@@ -267,8 +267,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
 
     if let Some(partitions) = partition_inventory.as_ref() {
-        let configured = userspace::configure_block_device_endpoints(partitions);
-        serial_println!("read-only block-device endpoints configured: partitions={configured}");
+        let (configured, writable_nullfs) = userspace::configure_block_device_endpoints(partitions);
+        serial_println!(
+            "block-device endpoints configured: partitions={configured}, writable_nullfs={writable_nullfs}"
+        );
     }
 
     let mut filesystem_info = match partition_inventory.as_ref() {

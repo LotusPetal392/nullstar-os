@@ -18,6 +18,10 @@ const NULLFS_PARTITION_INDEX: u32 = 3;
 const NULLFS_SUPERBLOCK_SECTOR: u64 = 128;
 const NULLFS_SUPERBLOCK_SECTORS: u32 = 8;
 const NULLFS_BLOCK_COUNT: u64 = 256;
+const NULLFS_BLOCK_DEVICE_SECTORS: u64 = NULLFS_BLOCK_COUNT * (BLOCK_SIZE / BLOCK_BYTES) as u64;
+// The deterministic fixture allocates upward from block 168 and leaves final block 255 free.
+const NULLFS_WRITABLE_PROBE_SECTOR: u64 =
+    (NULLFS_BLOCK_COUNT - 1) * (BLOCK_SIZE / BLOCK_BYTES) as u64;
 const NULLFS_LABEL: &str = "NULLSTAR_DATA";
 const NULLFS_UUID: [u8; 16] = [
     0x4e, 0x75, 0x6c, 0x6c, 0x53, 0x74, 0x61, 0x72, 0x2d, 0x4e, 0x75, 0x6c, 0x6c, 0x46, 0x53, 0x01,
@@ -28,7 +32,9 @@ const BUFFER_BYTES: usize = 8192;
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
-    let nullfs_mode = arguments.get(1) == Some(b"nullfs");
+    let read_only_nullfs_mode = arguments.get(1) == Some(b"nullfs");
+    let writable_nullfs_mode = arguments.get(1) == Some(b"nullfs-writable");
+    let nullfs_mode = read_only_nullfs_mode || writable_nullfs_mode;
     if arguments.len() != usize::from(nullfs_mode) + 1 {
         syscall::exit(1);
     }
@@ -48,6 +54,12 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     {
         syscall::exit(2);
     }
+    if writable_nullfs_mode
+        && platform::open_writable_block_device_endpoint(partition_index).err()
+            != Some(platform::Errno::PERMISSION)
+    {
+        syscall::exit(20);
+    }
 
     let mut session = match block_device::connect_service(SERVICE_HANDLE, 1) {
         Ok(session) => session,
@@ -57,7 +69,19 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         Ok(info) => info,
         Err(_) => syscall::exit(4),
     };
-    if info.logical_block_size() != BLOCK_BYTES as u32
+    if writable_nullfs_mode {
+        if info.logical_block_size() != BLOCK_BYTES as u32
+            || info.block_count() != NULLFS_BLOCK_DEVICE_SECTORS
+            || info.is_read_only()
+            || !info.supports(
+                block_device::protocol::features::READ
+                    | block_device::protocol::features::WRITE
+                    | block_device::protocol::features::FLUSH,
+            )
+        {
+            syscall::exit(5);
+        }
+    } else if info.logical_block_size() != BLOCK_BYTES as u32
         || info.block_count() == 0
         || !info.is_read_only()
         || !info.supports(block_device::protocol::features::READ)
@@ -76,7 +100,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     {
         syscall::exit(7);
     }
-    if nullfs_mode {
+    if writable_nullfs_mode {
+        probe_writable_nullfs(&mut session, info, shared_memory);
+    }
+    if read_only_nullfs_mode {
         probe_nullfs(&mut session, info, shared_memory);
     }
     if session.read_to_shared_buffer(4, info, 0, 1, 0).ok() != Some(1) {
@@ -129,6 +156,124 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
     if session.disconnect(10).is_err() || ipc::close(shared_memory).is_err() {
         syscall::exit(14);
+    }
+    syscall::exit(0)
+}
+
+fn probe_writable_nullfs(
+    session: &mut block_device::Session,
+    info: block_device::DeviceInfo,
+    shared_memory: u64,
+) -> ! {
+    if session
+        .read_to_shared_buffer(4, info, NULLFS_WRITABLE_PROBE_SECTOR, 1, 0)
+        .ok()
+        != Some(1)
+    {
+        syscall::exit(21);
+    }
+    let mut observed = [0_u8; BLOCK_BYTES];
+    if ipc::shared_memory_read(shared_memory, 0, &mut observed).ok() != Some(observed.len()) {
+        syscall::exit(22);
+    }
+    let original = [0_u8; BLOCK_BYTES];
+    let mut modified = original;
+    modified[0] = 0xa5;
+    if observed == modified {
+        let recovered = ipc::shared_memory_write(shared_memory, 0, &original).ok()
+            == Some(original.len())
+            && session.write_from_shared_buffer(5, info, NULLFS_WRITABLE_PROBE_SECTOR, 1, 0)
+                == Ok(1)
+            && session.flush(6).is_ok()
+            && session
+                .read_to_shared_buffer(7, info, NULLFS_WRITABLE_PROBE_SECTOR, 1, 3 * BLOCK_BYTES)
+                .ok()
+                == Some(1);
+        let mut reread = [0_u8; BLOCK_BYTES];
+        if !recovered
+            || ipc::shared_memory_read(shared_memory, 3 * BLOCK_BYTES, &mut reread).ok()
+                != Some(reread.len())
+            || reread != original
+        {
+            syscall::exit(29);
+        }
+    } else if observed != original {
+        syscall::exit(22);
+    }
+    if ipc::shared_memory_write(shared_memory, BLOCK_BYTES, &modified).ok() != Some(modified.len())
+    {
+        syscall::exit(23);
+    }
+
+    let mut failure = 0;
+    if session.write_from_shared_buffer(8, info, NULLFS_WRITABLE_PROBE_SECTOR, 1, BLOCK_BYTES)
+        != Ok(1)
+    {
+        failure = 24;
+    }
+    if failure == 0 && session.flush(9).is_err() {
+        failure = 25;
+    }
+    if failure == 0
+        && session
+            .read_to_shared_buffer(10, info, NULLFS_WRITABLE_PROBE_SECTOR, 1, 2 * BLOCK_BYTES)
+            .ok()
+            != Some(1)
+    {
+        failure = 26;
+    }
+    if failure == 0 {
+        let mut reread = [0_u8; BLOCK_BYTES];
+        if ipc::shared_memory_read(shared_memory, 2 * BLOCK_BYTES, &mut reread).ok()
+            != Some(reread.len())
+            || reread != modified
+        {
+            failure = 27;
+        }
+    }
+    if failure == 0 {
+        let range_request = transfer_request(
+            session,
+            block_device::protocol::operation::WRITE,
+            11,
+            info.block_count(),
+            1,
+        );
+        if session.exchange_protocol_request(&range_request) != Err(Error::Range) {
+            failure = 28;
+        }
+    }
+
+    let original_staged =
+        ipc::shared_memory_write(shared_memory, 0, &original).ok() == Some(original.len());
+    let original_written =
+        session.write_from_shared_buffer(12, info, NULLFS_WRITABLE_PROBE_SECTOR, 1, 0) == Ok(1);
+    let original_flushed = session.flush(13).is_ok();
+    let original_reread = session
+        .read_to_shared_buffer(14, info, NULLFS_WRITABLE_PROBE_SECTOR, 1, 3 * BLOCK_BYTES)
+        .ok()
+        == Some(1);
+    let mut restored = [0_u8; BLOCK_BYTES];
+    let original_verified = ipc::shared_memory_read(shared_memory, 3 * BLOCK_BYTES, &mut restored)
+        .ok()
+        == Some(restored.len())
+        && restored == original;
+    let restoration_succeeded = original_staged
+        && original_written
+        && original_flushed
+        && original_reread
+        && original_verified;
+
+    let disconnected = session.disconnect(15).is_ok();
+    let shared_memory_closed = ipc::close(shared_memory).is_ok();
+    if !restoration_succeeded {
+        syscall::exit(29);
+    }
+    if !disconnected || !shared_memory_closed {
+        syscall::exit(30);
+    }
+    if failure != 0 {
+        syscall::exit(failure);
     }
     syscall::exit(0)
 }

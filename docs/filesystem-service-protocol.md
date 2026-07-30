@@ -190,8 +190,8 @@ overloading generic flags or inline data.
    broader open-file ownership migration remains)
 5. Put FAT behind the same protocol.
 6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
-   service. (read-only service and static VFS mount complete; writable authority
-   remains later)
+   service. (read-only service and static VFS mount complete; raw writable block
+   authority implemented; writable filesystem operations remain next)
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
 
@@ -275,13 +275,18 @@ its global open count reaches zero, and reclaimed storage slots receive a new
 monotonic node ID when reused.
 
 The read-only `nullfs-service` implements the same session and node-reference
-contract around shared-core `OpenHandle`s. It presents generation-tagged opaque
-node IDs rather than inode numbers, sizes its identity map from the mounted
-volume's inode capacity, drains duplicate opens one reference at a time, and
-preserves both protocol and core accounting when a close fails. PID 1 registers
-it independently of tmpfs as a generation-scoped kernel filesystem proxy. The
-VFS has a static longest-prefix route for `/Volumes/NULLSTAR_DATA`, and its
-`/Volumes` listing exposes that mount.
+contract around shared-core `OpenHandle`s. PID 1 delegates a send-only handle to
+the writable raw NullFS block endpoint, and the service requires block metadata
+advertising `READ | WRITE | FLUSH`. It nevertheless wraps the userspace adapter
+in `ReadOnlyBlockDevice` before mounting the core. Raw block authority therefore
+does not make any generic filesystem operation writable.
+
+The service presents generation-tagged opaque node IDs rather than inode numbers,
+sizes its identity map from the mounted volume's inode capacity, drains duplicate
+opens one reference at a time, and preserves both protocol and core accounting
+when a close fails. PID 1 registers it independently of tmpfs as a
+generation-scoped kernel filesystem proxy. The VFS has a static longest-prefix
+route for `/Volumes/NULLSTAR_DATA`, and its `/Volumes` listing exposes that mount.
 
 The NullFS proxy performs `CONNECT` for each registered service generation and
 attaches one kernel-owned 4 KiB shared-memory buffer. It translates ordinary
@@ -290,7 +295,9 @@ behavior without adding a NullFS-specific application ABI. Canonical path
 resolution happens before VFS routing, so after `chdir` enters the mounted
 volume, relative directory changes and opens are routed back to NullFS. Open
 requests carrying write, create, truncate, or append intent, descriptor writes,
-and unlink are rejected with the public read-only error.
+and unlink are rejected with the public read-only error. This milestone does not enable
+writable filesystem syscalls; implementing those operations with recovery-safe failure
+semantics remains the next NullFS service step.
 
 The kernel maps successful `OPEN` references to open-file descriptions rather
 than descriptor numbers. `dup`, `dup2`, fork inheritance, and file-backed

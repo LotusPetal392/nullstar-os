@@ -6,8 +6,8 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query a documented version and
-capability mask before relying on optional platform services.
+The ABI is experimental, but callers can query the current version, 1.9, and a
+documented capability mask before relying on optional platform services.
 
 ## Calling convention
 
@@ -235,14 +235,42 @@ until FAT is behind the generic filesystem protocol.
 | ---: | --- | --- | --- |
 | 52 | `open_block_device_endpoint` | partition-table index | capability handle |
 
-Only PID 1 may open a discovered filesystem-candidate partition. Each successful
-call returns an independent endpoint handle with `SEND | TRANSFER`; PID 1 may
-delegate a reduced send-only handle to a supervised filesystem service. The
-endpoint implements the versioned protocol in
-[`block-device-service-protocol.md`](block-device-service-protocol.md), and the
-`READ_ONLY_BLOCK_DEVICE_ENDPOINTS` capability bit advertises availability.
-Other callers receive `EPERM`, invalid or unavailable partitions are rejected,
-and the initial endpoint never authorizes disk writes.
+Version 1.7 introduced PID-1 acquisition of discovered filesystem-candidate
+partitions in read-only mode. Each successful call returns an endpoint handle
+with `SEND | TRANSFER`; PID 1 may delegate a reduced send-only handle to a
+supervised filesystem service. The endpoint implements the versioned protocol
+in [`block-device-service-protocol.md`](block-device-service-protocol.md), and
+the `READ_ONLY_BLOCK_DEVICE_ENDPOINTS` capability bit advertises availability.
+Other callers receive `EPERM`, and invalid or unavailable partitions are
+rejected.
+
+## Version 1.9 writable NullFS block-device acquisition
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 54 | `open_writable_block_device_endpoint` | partition-table index | capability handle |
+
+Syscall 52 remains unconditionally read-only so older callers cannot accidentally
+acquire more authority through an unspecified register. Only PID 1 may call the
+new writable operation, and it currently succeeds only when the disk has no
+extended partition and the selected entry is a nonzero-start primary MBR
+`PartitionKind::NullFs` partition that does not overlap another discovered partition and contains a valid decoded NullFS superblock. Logical/extended MBR,
+GPT, and superfloppy writable grants remain disabled until their reserved
+disk-metadata ranges are modeled explicitly.
+
+Read-only and writable access to the same partition are distinct endpoint objects
+with distinct generations, although both are returned with ordinary endpoint
+`SEND | TRANSFER` rights and are normally delegated with `SEND` only. Endpoint
+object identity, rather than path, discovery, UID, or an amplified rights mask,
+carries the write authority.
+
+Read-only `INFO` replies advertise `READ` and the `READ_ONLY` device flag.
+Writable `INFO` replies advertise `READ | WRITE | FLUSH` without `READ_ONLY`.
+Read-only `WRITE` remains `READ_ONLY`, and read-only `FLUSH` remains
+`NOT_SUPPORTED`; writable `FLUSH` reaches the AHCI cache-flush operation. The
+`WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS` system capability bit advertises this
+extension. It grants raw partition authority only and does not enable writable
+filesystem-service or VFS syscalls.
 
 ## Compatibility rules
 
@@ -254,6 +282,8 @@ and the initial endpoint never authorizes disk writes.
   handshake asynchronously before treating the service as ready.
 - ABI 1.6 adds VFS-routed pathname deletion at syscall 51.
 - ABI 1.7 adds PID-1 read-only partition endpoint acquisition at syscall 52.
+- ABI 1.9 adds the narrowly scoped writable NullFS partition endpoint at syscall
+  54 while preserving syscall 52 as unconditionally read-only.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

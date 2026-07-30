@@ -44,6 +44,8 @@ const NORMAL_BOOT_BLOCK_DEVICE_MARKER: &str = "userspace init: read-only block-d
 const NORMAL_BOOT_NULLFS_DISCOVERY_MARKER: &str = "partition: index=3, kind=NullFS";
 const NORMAL_BOOT_NULLFS_PARTITION_MARKER: &str =
     "userspace init: read-only NullFS partition probe passed";
+const NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER: &str =
+    "userspace init: writable NullFS partition probe passed";
 const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str = "userspace init: read-only NullFS service mounted";
 const NORMAL_BOOT_NULLFS_PROBE_MARKER: &str = "userspace init: userspace NullFS probe passed";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
@@ -63,6 +65,7 @@ struct NormalBootProgress {
     block_device_ready: bool,
     nullfs_partition_discovered: bool,
     nullfs_partition_verified: bool,
+    writable_nullfs_partition_verified: bool,
     nullfs_service_ready: bool,
     nullfs_probe_passed: bool,
     init_launched_shell: bool,
@@ -77,6 +80,8 @@ impl NormalBootProgress {
         self.block_device_ready |= line.contains(NORMAL_BOOT_BLOCK_DEVICE_MARKER);
         self.nullfs_partition_discovered |= line.contains(NORMAL_BOOT_NULLFS_DISCOVERY_MARKER);
         self.nullfs_partition_verified |= line.contains(NORMAL_BOOT_NULLFS_PARTITION_MARKER);
+        self.writable_nullfs_partition_verified |=
+            line.contains(NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER);
         self.nullfs_service_ready |= line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
         self.nullfs_probe_passed |= line.contains(NORMAL_BOOT_NULLFS_PROBE_MARKER);
         self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
@@ -88,6 +93,7 @@ impl NormalBootProgress {
             && self.block_device_ready
             && self.nullfs_partition_discovered
             && self.nullfs_partition_verified
+            && self.writable_nullfs_partition_verified
             && self.nullfs_service_ready
             && self.nullfs_probe_passed
             && self.init_launched_shell
@@ -512,7 +518,7 @@ mod tests {
         NORMAL_BOOT_MODE_MARKER, NORMAL_BOOT_NULLFS_DISCOVERY_MARKER,
         NORMAL_BOOT_NULLFS_PARTITION_MARKER, NORMAL_BOOT_NULLFS_PROBE_MARKER,
         NORMAL_BOOT_NULLFS_SERVICE_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
-        NormalBootProgress,
+        NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER, NormalBootProgress,
     };
 
     #[test]
@@ -525,6 +531,7 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_BLOCK_DEVICE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_DISCOVERY_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_PARTITION_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_PROBE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_SHELL_MARKER));

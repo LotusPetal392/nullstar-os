@@ -168,19 +168,27 @@ builder, inspector, checker, FUSE adapter, and NullStar service.
 
 The host implementation supports format version 1.2, authoritative allocation maps,
 bounded redo recovery, persistent orphan recovery, writable host operation, and
-deterministic crash testing. The NullStar block endpoint currently grants checked,
-partition-relative read access.
+deterministic crash testing. The kernel exposes checked, partition-relative read-only
+endpoints for discovered filesystem candidates and a separately generated writable
+endpoint only for discovered NullFS partitions. PID 1 alone acquires those objects and
+delegates ordinary send-only endpoint handles; endpoint identity, not path, discovery,
+or UID, carries raw write authority.
 
-A supervised read-only `nullfs-service` mounts the deterministic partition at
-`/Volumes/NULLSTAR_DATA`. Ordinary `stat`, `open`, `read`, `fstat`, `seek`,
-`read_directory`, and `chdir` work through the mount; mutation attempts are denied.
-Open nodes and requests remain scoped to their service session and generation. On
-replacement, old in-flight operations fail, old descriptors remain stale, and old close
-tickets are not sent to the new service.
+PID 1 gives the supervised `nullfs-service` the writable raw NullFS endpoint. The service
+requires `READ | WRITE | FLUSH` device metadata but deliberately wraps the adapter in
+`ReadOnlyBlockDevice`, so its generic filesystem protocol and VFS mount at
+`/Volumes/NULLSTAR_DATA` remain read-only. Ordinary `stat`, `open`, `read`, `fstat`,
+`seek`, `read_directory`, and `chdir` work through the mount; mutation attempts are
+denied, and no writable NullFS filesystem syscalls are enabled. Open nodes and requests
+remain scoped to their service session and generation. On replacement, old in-flight
+operations fail, old descriptors remain stale, and old close tickets are not sent to the
+new service.
 
-Writable service authority, namespace bindings, and transition to the planned
-`/Volumes/NullStar` backing volume remain future work described in the
-[NullFS roadmap](filesystems/nullfs-roadmap.md).
+Normal boot exercises the raw path with a reversible free-sector
+write/flush/readback/restore probe while retaining the previous read-only and
+mutation-denial probes. Writable filesystem-service operations, namespace bindings, and
+transition to the planned `/Volumes/NullStar` backing volume remain future work described
+in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
 

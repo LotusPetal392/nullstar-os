@@ -64,13 +64,14 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         Ok(info) => info,
         Err(_) => fail(21, b"nullfs: block-device info query failed\n"),
     };
-    if !info.is_read_only()
-        || !info.supports(protocol::features::READ)
-        || info.supports(protocol::features::WRITE)
+    if info.is_read_only()
+        || !info.supports(
+            protocol::features::READ | protocol::features::WRITE | protocol::features::FLUSH,
+        )
     {
         fail(
             22,
-            b"nullfs: block device must be read-only with READ and without WRITE\n",
+            b"nullfs: block device must be writable with READ, WRITE, and FLUSH\n",
         );
     }
 

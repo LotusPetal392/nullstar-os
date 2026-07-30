@@ -11,10 +11,11 @@ accepted logical namespace and boot direction is defined in
 
 The shared format and core implementation now support writable version 1.2 images,
 recovery, checking, deterministic image creation, and an explicitly enabled writable
-FUSE adapter. NullStar currently exposes a separately supervised **read-only** service
-mounted at `/Volumes/NULLSTAR_DATA`. Writable NullStar service authority, namespace
-bindings, offline repair policy, and adoption as the primary backing volume remain
-future work.
+FUSE adapter. NullStar now implements narrowly scoped raw writable block-device
+authority for discovered NullFS partitions. The separately supervised filesystem service
+still deliberately mounts through a read-only adapter at `/Volumes/NULLSTAR_DATA`;
+writable filesystem-service operations, namespace bindings, offline repair policy, and
+adoption as the primary backing volume remain future work.
 
 ## Status summary
 
@@ -24,7 +25,7 @@ future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | Planned |
+| 5 | Writable service and namespace adoption | In progress; raw writable block authority implemented |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -237,8 +238,10 @@ The service currently implements:
 - `CLOSE_NODE` accounting;
 - session, request, provider-generation, and stale-handle validation.
 
-Canonical mutations return `PERMISSION` because writable service authority is not yet
-granted.
+PID 1 now delegates a writable raw NullFS endpoint to the service, which requires
+`READ | WRITE | FLUSH` metadata and then deliberately wraps the adapter in
+`ReadOnlyBlockDevice`. Canonical filesystem mutations therefore still return
+`PERMISSION`; raw block authority alone does not enable writable filesystem operations.
 
 PID 1 registers `nullfs-service` independently of tmpfs as a generation-scoped kernel
 filesystem proxy. The VFS currently mounts it at `/Volumes/NULLSTAR_DATA`. The proxy
@@ -275,15 +278,48 @@ cargo run --locked --quiet -- --nullfs-restart-check
 ```
 
 The current FAT bootstrap path and `/Volumes/NULLSTAR_DATA` mount remain until Phase 5
-has writable protocol parity, namespace-binding support, persistence coverage, and an
-independent recovery path.
+has writable filesystem-protocol parity, namespace-binding support, persistence coverage,
+and an independent recovery path.
 
-## Phase 5: writable service and namespace adoption — planned
+## Phase 5: writable service and namespace adoption — in progress
 
 Phase 5 moves from a read-only test mount to the accepted persistent-volume and
-synthetic-namespace architecture.
+synthetic-namespace architecture. Its raw block-authority milestone is implemented; the
+filesystem-service and namespace work remains.
 
-### Writable service authority
+### Raw writable block authority — implemented
+
+Syscall 52 retains its original read-only partition-endpoint contract. A separate ABI 1.9
+syscall acquires writable authority, and only PID 1 may call either operation. Writable
+acquisition currently succeeds only on a disk without an extended partition, for a
+nonzero-start primary MBR `PartitionKind::NullFs` partition that does not overlap another
+discovered partition and
+contains a valid decoded NullFS superblock. Logical/extended MBR, GPT, and superfloppy
+writable grants remain disabled until their reserved disk-metadata ranges are modeled
+explicitly.
+Read-only and writable access are distinct endpoint objects and generations, both
+delegated through ordinary endpoint `SEND` rights. Paths, discovery, provider
+registration, and UID cannot manufacture write authority.
+
+Read-only `INFO` advertises `READ` plus `READ_ONLY`. Writable `INFO` advertises
+`READ | WRITE | FLUSH` without `READ_ONLY`, and the userspace NullFS block-device adapter
+rejects writable metadata unless both `WRITE` and `FLUSH` are present. Writes are bounded
+to complete registered-buffer blocks, at most 4096 bytes, within both partition-relative
+and current disk bounds. The kernel copies the complete source to scratch before issuing
+AHCI writes and reports `transferred_blocks` only when every block succeeds. A failed
+multi-block write may nevertheless have changed earlier physical blocks, so filesystem
+recovery—not blind partial-write retry—is required. Writable `FLUSH` maps to the AHCI
+cache flush; read-only `WRITE` and `FLUSH` retain `READ_ONLY` and `NOT_SUPPORTED`.
+
+Normal boot performs a reversible write/flush/readback/restore probe on a known free
+sector in the deterministic NullFS fixture. An exact marker left by interruption is
+restored and verified on the next boot before testing resumes. All previous read-only and
+mutation-denial probes remain active. PID 1
+then delegates the writable raw endpoint to `nullfs-service`, but the service deliberately
+wraps it in `ReadOnlyBlockDevice`. The filesystem protocol and VFS mount at
+`/Volumes/NULLSTAR_DATA` therefore remain read-only in this milestone.
+
+### Writable filesystem-service operations — next
 
 The generic filesystem protocol and service adapter must gain bounded, validated
 support for:
@@ -296,10 +332,10 @@ support for:
 - writable mount negotiation and feature reporting;
 - cancellation and failure semantics for partially completed operations.
 
-PID 1 or another policy authority grants a filesystem service access only to its
-partition-scoped block capability and an explicit writable-service capability. Merely
-finding a volume, running as UID 0, or registering a filesystem provider must not
-manufacture write authority.
+The implemented PID 1 path grants a filesystem service only its partition-scoped block
+capability. Enabling mutations must additionally require explicit writable-filesystem
+service policy. Merely finding a volume, running as UID 0, or registering a filesystem
+provider must not manufacture either authority.
 
 Writable integration must preserve the existing generation rules. Retrying an operation
 after provider failure is allowed only when the protocol can prove that doing so is

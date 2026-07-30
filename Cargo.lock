@@ -285,6 +285,7 @@ dependencies = [
  "bootloader_api",
  "lazy_static",
  "noto-sans-mono-bitmap",
+ "nullfs-format",
  "pc-keyboard",
  "pic8259",
  "spin 0.10.1",

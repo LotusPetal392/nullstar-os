@@ -229,7 +229,18 @@ pub fn set_process_group(
 }
 
 pub fn open_block_device_endpoint(partition_index: u32) -> Result<FileDescriptor> {
-    let mut result = syscall::OPEN_BLOCK_DEVICE_ENDPOINT;
+    open_partition_endpoint(syscall::OPEN_BLOCK_DEVICE_ENDPOINT, partition_index)
+}
+
+pub fn open_writable_block_device_endpoint(partition_index: u32) -> Result<FileDescriptor> {
+    open_partition_endpoint(
+        syscall::OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT,
+        partition_index,
+    )
+}
+
+fn open_partition_endpoint(number: u64, partition_index: u32) -> Result<FileDescriptor> {
+    let mut result = number;
     unsafe {
         asm!(
             "int 0x80",

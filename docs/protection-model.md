@@ -18,7 +18,8 @@ filesystem responsibilities across userspace service boundaries:
 - the userspace tmpfs service is the active `/tmp` backend;
 - a separately supervised VFS service owns the versioned longest-prefix namespace table;
 - a separately supervised read-only NullFS service is mounted through a kernel proxy;
-- PID 1 delegates endpoint and block-device authority to those services;
+- PID 1 delegates endpoint authority, including a narrowly scoped writable raw NullFS
+  block endpoint, to those services;
 - provider generation, protocol session, request, and stale-handle checks protect
   replacement boundaries.
 
@@ -104,6 +105,31 @@ The VFS and kernel proxies validate:
 Open-file descriptions retain generation-scoped service nodes. When a provider is
 replaced, old in-flight requests fail deterministically, old descriptors remain stale,
 and close records from old generations are not sent to the replacement service.
+
+## Raw block-device authority
+
+Only PID 1 may acquire a discovered partition endpoint. The existing acquisition syscall
+remains permanently read-only; a separate syscall requests writable access and succeeds
+only on a disk without an extended partition, for a nonzero-start, non-overlapping
+primary MBR `PartitionKind::NullFs` partition with a valid decoded NullFS superblock. Logical/extended MBR, GPT, and superfloppy
+writable grants remain disabled until their reserved disk-metadata ranges are modeled
+explicitly. Read-only and writable access to the same partition are distinct endpoint
+objects with distinct generations, but both use ordinary endpoint rights and are
+delegated to children with `SEND`. The object's kernel-selected access mode—not a path,
+partition discovery, provider registration, UID, or a different endpoint rights mask—is
+the raw write authority.
+
+Writable requests remain partition-relative and bounded to complete registered-buffer
+blocks of at most 4096 bytes. The kernel stages the complete source before AHCI writes and
+reports `transferred_blocks` only after all blocks succeed. A failure can still follow
+physical modification of earlier blocks, so possession of the capability does not make
+blind retry safe; the filesystem must provide ordering and recovery. Writable flushes
+reach the AHCI cache flush.
+
+PID 1 gives `nullfs-service` this writable raw endpoint, but the service deliberately
+wraps it in `ReadOnlyBlockDevice`. The filesystem protocol and VFS mount at
+`/Volumes/NULLSTAR_DATA` remain read-only, demonstrating that raw device authority and
+writable filesystem policy are separate layers.
 
 ## Security boundaries and limitations
 
