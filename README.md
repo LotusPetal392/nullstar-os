@@ -21,7 +21,8 @@ experimentation, not production use or untrusted workloads.
 - a host-testable NullFS 1.2 stack with explicit little-endian records,
   authoritative allocation maps, bounded redo recovery, deterministic crash
   testing, formatter, image, inspection, and read-only checking tools, plus a
-  userspace service with explicitly negotiated direct writable sessions
+  userspace service with negotiated direct writable sessions and bounded public
+  VFS writes
 - ELF64 ring-3 processes, file descriptors, pipes, `fork` with copy-on-write,
   transactional `exec`, parent/child waiting, environments, process groups,
   terminal ownership, and a focused signal implementation
@@ -167,11 +168,13 @@ images, and launches QEMU.
   names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
   NullFS supports host-side writable images and recovery. PID 1 launches
   `nullfs-service --writable` with a partition-scoped raw `READ | WRITE | FLUSH`
-  endpoint; the service mounts read-write and explicit direct clients can
-  negotiate writable filesystem sessions. The kernel proxy still negotiates a
-  read-only session, so `/Volumes/NULLSTAR_DATA` and ordinary VFS mutation remain
-  read-only. Namespace adoption, writable VFS syscalls, and offline repair remain
-  future work.
+  endpoint. The kernel proxy negotiates exactly `WRITE`, requires the returned
+  `WRITE` session feature, and exposes bounded create, write, truncate, append,
+  and unlink through `/Volumes/NULLSTAR_DATA`; stat, read, open, `fstat`, seek,
+  directory reads, and `chdir` also remain available. Direct flags-zero sessions
+  stay read-only, and raw block authority, session authority, and public VFS
+  policy remain separate. Public `mkdir`, `rmdir`, rename, broader namespace
+  adoption, and offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`

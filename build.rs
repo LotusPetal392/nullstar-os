@@ -298,10 +298,26 @@ fn build_nullfs_fixture() -> Vec<u8> {
         .create_file(
             docs,
             "readme.txt",
-            b"This volume is prepared for read-only Phase 4 service integration.\n",
+            b"This volume is a deterministic NullFS integration fixture.\n",
             0o644,
         )
         .expect("failed to create NullFS fixture nested file");
+    image
+        .create_file(
+            1,
+            "unmanaged.txt",
+            b"This entry verifies that boot probes preserve non-reserved data.\n",
+            0o644,
+        )
+        .expect("failed to create unmanaged NullFS fixture file");
+    image
+        .create_file(
+            docs,
+            "unmanaged-note.txt",
+            b"Nested non-reserved data must not invalidate boot probes.\n",
+            0o644,
+        )
+        .expect("failed to create nested unmanaged NullFS fixture file");
     image
         .finish()
         .expect("failed to finalize NullFS fixture")

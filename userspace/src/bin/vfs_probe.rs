@@ -18,15 +18,24 @@ userspace::panic_handler!();
 const SERVICE_HANDLE: u64 = 1;
 const RESTART_CONTROL_HANDLE: u64 = 2;
 const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
-const NULLFS_RESTART_READY: &[u8] = b"nullfs-restart: live descriptor ready";
+const NULLFS_RESTART_READY: &[u8] =
+    b"nullfs-restart: live descriptor and persistent mutation ready";
 const NULLFS_RESTART_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
 const NULLFS_MOUNT: &[u8] = b"/Volumes/NULLSTAR_DATA";
 const NULLFS_DOCS: &[u8] = b"/Volumes/NULLSTAR_DATA/docs";
 const NULLFS_WELCOME: &[u8] = b"/Volumes/NULLSTAR_DATA/welcome.txt";
 const NULLFS_README: &[u8] = b"/Volumes/NULLSTAR_DATA/docs/readme.txt";
 const NULLFS_MISSING: &[u8] = b"/Volumes/NULLSTAR_DATA/missing";
+const NULLFS_PUBLIC_PROBE: &[u8] = b"/Volumes/NULLSTAR_DATA/nullstar-vfs-probe-v1.bin";
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
-const README: &[u8] = b"This volume is prepared for read-only Phase 4 service integration.\n";
+const README: &[u8] = b"This volume is a deterministic NullFS integration fixture.\n";
+const INITIAL_BYTES: &[u8] = b"NullStar public VFS";
+const APPEND_PREFIX: &[u8] = b" ";
+const APPEND_SUFFIX: &[u8] = b"append";
+const PREFIXED_BYTES: &[u8] = b"NullStar public VFS ";
+const COMBINED_BYTES: &[u8] = b"NullStar public VFS append";
+const TRUNCATED_BYTES: &[u8] = b"short";
+const OPEN_UNLINKED_BYTES: &[u8] = b"alive";
 
 const CASES: &[(&[u8], u32, u16, u16)] = &[
     (
@@ -350,7 +359,7 @@ fn probe_mounted_nullfs() {
         != Some(file::Stat {
             kind: file::KIND_FILE,
             size: WELCOME.len() as u64,
-            flags: file::FLAG_READ_ONLY,
+            flags: 0,
         })
     {
         syscall::exit(26);
@@ -380,31 +389,14 @@ fn probe_mounted_nullfs() {
         syscall::exit(31);
     }
 
-    entries[0] = platform::DirectoryEntry::EMPTY;
-    if platform::read_directory(NULLFS_MOUNT, 0, &mut entries).ok() != Some(1)
-        || !directory_entry_matches(&entries[0], b"docs", file::KIND_DIRECTORY)
-    {
+    if !recover_public_probe_artifact() {
+        syscall::exit(58);
+    }
+    if !nullfs_root_is_valid() {
         syscall::exit(33);
     }
-    entries[0] = platform::DirectoryEntry::EMPTY;
-    if platform::read_directory(NULLFS_MOUNT, 1, &mut entries).ok() != Some(1)
-        || !directory_entry_matches(&entries[0], b"welcome.txt", file::KIND_FILE)
-    {
-        syscall::exit(34);
-    }
-    entries[0] = platform::DirectoryEntry::EMPTY;
-    if platform::read_directory(NULLFS_MOUNT, 2, &mut entries).ok() != Some(0) {
-        syscall::exit(35);
-    }
-    entries[0] = platform::DirectoryEntry::EMPTY;
-    if platform::read_directory(NULLFS_DOCS, 0, &mut entries).ok() != Some(1)
-        || !directory_entry_matches(&entries[0], b"readme.txt", file::KIND_FILE)
-    {
+    if !nullfs_docs_is_valid() {
         syscall::exit(36);
-    }
-    entries[0] = platform::DirectoryEntry::EMPTY;
-    if platform::read_directory(NULLFS_DOCS, 1, &mut entries).ok() != Some(0) {
-        syscall::exit(37);
     }
 
     let mut cwd = [0_u8; 64];
@@ -440,47 +432,19 @@ fn probe_mounted_nullfs() {
     ) {
         syscall::exit(46);
     }
-    if !syscall_failed_with(
-        syscall::open(NULLFS_WELCOME, syscall::OpenFlags::WRITE),
-        errno::READ_ONLY,
-    ) {
-        syscall::exit(47);
-    }
-    if !syscall_failed_with(
-        syscall::open(
-            b"/Volumes/NULLSTAR_DATA/denied",
-            syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
-        ),
-        errno::READ_ONLY,
-    ) {
-        syscall::exit(48);
-    }
-    if !syscall_failed_with(
-        syscall::open(
-            NULLFS_WELCOME,
-            syscall::OpenFlags::WRITE | syscall::OpenFlags::TRUNCATE,
-        ),
-        errno::READ_ONLY,
-    ) {
-        syscall::exit(49);
-    }
-    if !syscall_failed_with(
-        syscall::open(
-            NULLFS_WELCOME,
-            syscall::OpenFlags::WRITE | syscall::OpenFlags::APPEND,
-        ),
-        errno::READ_ONLY,
-    ) {
-        syscall::exit(50);
-    }
-    if !platform_failed_with(platform::unlink(NULLFS_WELCOME), errno::READ_ONLY) {
-        syscall::exit(51);
-    }
     if syscall::close(relative_readme).is_err()
         || syscall::close(readme).is_err()
         || syscall::close(welcome).is_err()
     {
         syscall::exit(52);
+    }
+
+    probe_public_nullfs_mutation();
+    if !nullfs_root_is_valid() {
+        syscall::exit(89);
+    }
+    if !fixture_files_are_exact() {
+        syscall::exit(59);
     }
 
     for _ in 0..4 {
@@ -505,6 +469,128 @@ fn probe_mounted_nullfs() {
     }
 }
 
+fn probe_public_nullfs_mutation() {
+    let created = open_with_retry(
+        NULLFS_PUBLIC_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
+    )
+    .unwrap_or_else(|| syscall::exit(71));
+    if !descriptor_stat_matches(created, 0) {
+        syscall::exit(72);
+    }
+    if !write_all_with_retry(created, INITIAL_BYTES) {
+        syscall::exit(73);
+    }
+    if !descriptor_stat_matches(created, INITIAL_BYTES.len() as u64)
+        || !stat_matches(
+            NULLFS_PUBLIC_PROBE,
+            file::KIND_FILE,
+            INITIAL_BYTES.len() as u64,
+        )
+        || syscall::seek(created, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(created, INITIAL_BYTES)
+    {
+        syscall::exit(74);
+    }
+    if syscall::close(created).is_err() {
+        syscall::exit(75);
+    }
+
+    let observer = open_with_retry(
+        NULLFS_PUBLIC_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
+    )
+    .unwrap_or_else(|| syscall::exit(76));
+    let append = open_with_retry(
+        NULLFS_PUBLIC_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::APPEND,
+    )
+    .unwrap_or_else(|| syscall::exit(77));
+    if syscall::seek(observer, syscall::SeekFrom::End(0)).ok() != Some(INITIAL_BYTES.len() as u64)
+        || !write_all_with_retry(observer, APPEND_PREFIX)
+        || !descriptor_stat_matches(append, PREFIXED_BYTES.len() as u64)
+        || !write_all_with_retry(append, APPEND_SUFFIX)
+        || syscall::seek(append, syscall::SeekFrom::Current(0)).ok()
+            != Some(COMBINED_BYTES.len() as u64)
+        || !descriptor_stat_matches(observer, COMBINED_BYTES.len() as u64)
+        || syscall::seek(observer, syscall::SeekFrom::End(0)).ok()
+            != Some(COMBINED_BYTES.len() as u64)
+        || !stat_matches(
+            NULLFS_PUBLIC_PROBE,
+            file::KIND_FILE,
+            COMBINED_BYTES.len() as u64,
+        )
+        || syscall::seek(append, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(append, COMBINED_BYTES)
+    {
+        syscall::exit(78);
+    }
+    if syscall::close(append).is_err() {
+        syscall::exit(79);
+    }
+
+    let truncated = open_with_retry(
+        NULLFS_PUBLIC_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::TRUNCATE,
+    )
+    .unwrap_or_else(|| syscall::exit(80));
+    if !descriptor_stat_matches(truncated, 0)
+        || !descriptor_stat_matches(observer, 0)
+        || syscall::seek(observer, syscall::SeekFrom::End(0)).ok() != Some(0)
+        || !stat_matches(NULLFS_PUBLIC_PROBE, file::KIND_FILE, 0)
+    {
+        syscall::exit(81);
+    }
+    if !write_all_with_retry(truncated, TRUNCATED_BYTES)
+        || !descriptor_stat_matches(truncated, TRUNCATED_BYTES.len() as u64)
+        || !descriptor_stat_matches(observer, TRUNCATED_BYTES.len() as u64)
+        || syscall::seek(observer, syscall::SeekFrom::End(0)).ok()
+            != Some(TRUNCATED_BYTES.len() as u64)
+        || syscall::seek(truncated, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(truncated, TRUNCATED_BYTES)
+    {
+        syscall::exit(82);
+    }
+
+    let surviving = platform::dup(truncated).unwrap_or_else(|_| syscall::exit(83));
+    if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
+        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+    {
+        syscall::exit(84);
+    }
+    if syscall::close(truncated).is_err() {
+        syscall::exit(85);
+    }
+    if !descriptor_stat_matches(surviving, TRUNCATED_BYTES.len() as u64)
+        || syscall::seek(surviving, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(surviving, TRUNCATED_BYTES)
+    {
+        syscall::exit(86);
+    }
+    if syscall::seek(surviving, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !write_all_with_retry(surviving, OPEN_UNLINKED_BYTES)
+        || !descriptor_stat_matches(observer, OPEN_UNLINKED_BYTES.len() as u64)
+        || syscall::seek(observer, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(observer, OPEN_UNLINKED_BYTES)
+        || syscall::seek(surviving, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(surviving, OPEN_UNLINKED_BYTES)
+    {
+        syscall::exit(87);
+    }
+    if syscall::close(surviving).is_err() {
+        syscall::exit(88);
+    }
+    if syscall::seek(observer, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(observer, OPEN_UNLINKED_BYTES)
+        || syscall::close(observer).is_err()
+    {
+        syscall::exit(90);
+    }
+    for _ in 0..2 {
+        syscall::yield_now().unwrap_or_else(|_| syscall::exit(91));
+    }
+}
+
 fn probe_nullfs_restart() -> ! {
     if !matches!(
         ipc::wait_for_handle(SERVICE_HANDLE),
@@ -513,82 +599,232 @@ fn probe_nullfs_restart() -> ! {
         ipc::wait_for_handle(RESTART_CONTROL_HANDLE),
         Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
     ) {
-        syscall::exit(60);
+        syscall::exit(90);
+    }
+    if !recover_public_probe_artifact() {
+        syscall::exit(91);
     }
 
-    let stale = match open_with_retry(NULLFS_WELCOME, syscall::OpenFlags::READ) {
-        Some(descriptor) => descriptor,
-        None => syscall::exit(61),
-    };
-    if platform::fstat(stale).ok()
-        != Some(file::Stat {
-            kind: file::KIND_FILE,
-            size: WELCOME.len() as u64,
-            flags: file::FLAG_READ_ONLY,
-        })
-        || ipc::send(SERVICE_HANDLE, NULLFS_RESTART_READY, None).is_err()
+    let stale = open_with_retry(
+        NULLFS_PUBLIC_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
+    )
+    .unwrap_or_else(|| syscall::exit(92));
+    if !descriptor_stat_matches(stale, 0) {
+        syscall::exit(93);
+    }
+    if !write_all_with_retry(stale, COMBINED_BYTES)
+        || !descriptor_stat_matches(stale, COMBINED_BYTES.len() as u64)
+        || syscall::seek(stale, syscall::SeekFrom::Start(0)).ok() != Some(0)
     {
-        syscall::exit(62);
+        syscall::exit(94);
+    }
+    if ipc::send(SERVICE_HANDLE, NULLFS_RESTART_READY, None).is_err() {
+        syscall::exit(95);
     }
 
     let mut control = [0_u8; 64];
     let message = match ipc::receive(RESTART_CONTROL_HANDLE, &mut control) {
         Ok(message) => message,
-        Err(_) => syscall::exit(63),
+        Err(_) => syscall::exit(96),
     };
     if message.sender_process_id != 1
         || message.capability.is_some()
         || message.bytes != NULLFS_RESTART_BEGIN_READ.len()
         || &control[..message.bytes] != NULLFS_RESTART_BEGIN_READ
     {
-        syscall::exit(64);
+        syscall::exit(97);
     }
 
-    let mut bytes = [0_u8; WELCOME.len()];
+    let mut bytes = [0_u8; COMBINED_BYTES.len()];
     if syscall::read(stale, &mut bytes) != Err(syscall::Errno::IO)
         || !platform_failed_with(platform::fstat(stale), errno::IO)
         || syscall::seek(stale, syscall::SeekFrom::Start(0)) != Err(syscall::Errno::IO)
         || syscall::seek(stale, syscall::SeekFrom::Current(0)) != Err(syscall::Errno::IO)
         || syscall::seek(stale, syscall::SeekFrom::End(0)) != Err(syscall::Errno::IO)
     {
-        syscall::exit(65);
+        syscall::exit(98);
     }
 
-    let replacement = match open_after_restart(NULLFS_WELCOME) {
-        Some(descriptor) => descriptor,
-        None => syscall::exit(66),
-    };
-    if syscall::read(replacement, &mut bytes).ok() != Some(WELCOME.len()) || bytes != WELCOME {
-        syscall::exit(67);
+    for _ in 0..128 {
+        syscall::yield_now().unwrap_or_else(|_| syscall::exit(99));
     }
-    if syscall::close(stale).is_err() {
-        syscall::exit(68);
+    let replacement = open_with_retry(
+        NULLFS_PUBLIC_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
+    )
+    .unwrap_or_else(|| syscall::exit(100));
+    if !descriptor_stat_matches(replacement, COMBINED_BYTES.len() as u64)
+        || !read_matches(replacement, COMBINED_BYTES)
+    {
+        syscall::exit(101);
+    }
+    if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
+        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+    {
+        syscall::exit(102);
+    }
+    if syscall::seek(replacement, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(replacement, COMBINED_BYTES)
+    {
+        syscall::exit(103);
+    }
+    if !nullfs_root_is_valid() {
+        syscall::exit(104);
+    }
+    if syscall::close(stale).is_err() || syscall::close(replacement).is_err() {
+        syscall::exit(105);
     }
     for _ in 0..8 {
-        syscall::yield_now().unwrap_or_else(|_| syscall::exit(69));
+        syscall::yield_now().unwrap_or_else(|_| syscall::exit(106));
     }
-    bytes.fill(0);
-    if syscall::seek(replacement, syscall::SeekFrom::Start(0)).ok() != Some(0)
-        || syscall::read(replacement, &mut bytes).ok() != Some(WELCOME.len())
-        || bytes != WELCOME
-        || syscall::close(replacement).is_err()
+    if !fixture_files_are_exact()
+        || !nullfs_root_is_valid()
+        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
     {
-        syscall::exit(70);
+        syscall::exit(107);
     }
     syscall::exit(0)
 }
 
-fn open_after_restart(path: &[u8]) -> Option<syscall::FileDescriptor> {
-    for _ in 0..128 {
-        match syscall::open(path, syscall::OpenFlags::READ) {
-            Ok(descriptor) => return Some(descriptor),
-            Err(error) if error == syscall::Errno::TRY_AGAIN || error == syscall::Errno::IO => {
-                syscall::yield_now().ok()?;
-            }
-            Err(_) => return None,
-        }
+fn recover_public_probe_artifact() -> bool {
+    let stat = match platform::stat(NULLFS_PUBLIC_PROBE) {
+        Ok(stat) => stat,
+        Err(error) if error == platform::Errno::NO_ENTRY => return true,
+        Err(_) => return false,
+    };
+    if stat.kind != file::KIND_FILE || stat.flags != 0 {
+        return false;
     }
-    None
+    let expected = if stat.size == 0 {
+        &[]
+    } else if stat.size == INITIAL_BYTES.len() as u64 {
+        INITIAL_BYTES
+    } else if stat.size == PREFIXED_BYTES.len() as u64 {
+        PREFIXED_BYTES
+    } else if stat.size == COMBINED_BYTES.len() as u64 {
+        COMBINED_BYTES
+    } else if stat.size == TRUNCATED_BYTES.len() as u64 {
+        TRUNCATED_BYTES
+    } else {
+        return false;
+    };
+    let Some(descriptor) = open_with_retry(NULLFS_PUBLIC_PROBE, syscall::OpenFlags::READ) else {
+        return false;
+    };
+    if !read_matches(descriptor, expected)
+        || !unlink_with_retry(NULLFS_PUBLIC_PROBE)
+        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+    {
+        let _ = syscall::close(descriptor);
+        return false;
+    }
+    syscall::close(descriptor).is_ok()
+}
+
+fn nullfs_root_is_valid() -> bool {
+    let mut start_index = 0;
+    let mut found_docs = false;
+    let mut found_welcome = false;
+
+    for _ in 0..128 {
+        let mut entries = [platform::DirectoryEntry::EMPTY; 2];
+        let Some(count) = read_directory_with_retry(NULLFS_MOUNT, start_index, &mut entries) else {
+            return false;
+        };
+        for entry in &entries[..count] {
+            if !valid_directory_entry(entry) {
+                return false;
+            }
+            if entry.name() == b"docs" {
+                if found_docs || entry.kind != file::KIND_DIRECTORY {
+                    return false;
+                }
+                found_docs = true;
+            } else if entry.name() == b"welcome.txt" {
+                if found_welcome || entry.kind != file::KIND_FILE {
+                    return false;
+                }
+                found_welcome = true;
+            } else if entry.name() == b"nullstar-vfs-probe-v1.bin" {
+                return false;
+            }
+        }
+        if count < entries.len() {
+            return found_docs && found_welcome;
+        }
+        let Some(next_index) = start_index.checked_add(count) else {
+            return false;
+        };
+        start_index = next_index;
+    }
+    false
+}
+
+fn valid_directory_entry(entry: &platform::DirectoryEntry) -> bool {
+    let Ok(name_length) = usize::try_from(entry.name_length) else {
+        return false;
+    };
+    name_length != 0
+        && name_length <= entry.name.len()
+        && matches!(entry.kind, file::KIND_FILE | file::KIND_DIRECTORY)
+        && entry.flags == 0
+        && !entry.name[..name_length].contains(&b'/')
+        && !entry.name[..name_length].contains(&0)
+        && entry.name[name_length..].iter().all(|byte| *byte == 0)
+}
+
+fn nullfs_docs_is_valid() -> bool {
+    let mut start_index = 0;
+    let mut found_readme = false;
+
+    for _ in 0..128 {
+        let mut entries = [platform::DirectoryEntry::EMPTY; 2];
+        let Some(count) = read_directory_with_retry(NULLFS_DOCS, start_index, &mut entries) else {
+            return false;
+        };
+        for entry in &entries[..count] {
+            if !valid_directory_entry(entry) {
+                return false;
+            }
+            if entry.name() == b"readme.txt" {
+                if found_readme || entry.kind != file::KIND_FILE {
+                    return false;
+                }
+                found_readme = true;
+            }
+        }
+        if count < entries.len() {
+            return found_readme;
+        }
+        let Some(next_index) = start_index.checked_add(count) else {
+            return false;
+        };
+        start_index = next_index;
+    }
+    false
+}
+
+fn fixture_files_are_exact() -> bool {
+    path_contents_match(NULLFS_WELCOME, WELCOME) && path_contents_match(NULLFS_README, README)
+}
+
+fn path_contents_match(path: &[u8], expected: &[u8]) -> bool {
+    let Some(descriptor) = open_with_retry(path, syscall::OpenFlags::READ) else {
+        return false;
+    };
+    let matches = descriptor_stat_matches(descriptor, expected.len() as u64)
+        && read_matches(descriptor, expected);
+    syscall::close(descriptor).is_ok() && matches
+}
+
+fn descriptor_stat_matches(descriptor: syscall::FileDescriptor, size: u64) -> bool {
+    platform::fstat(descriptor).ok()
+        == Some(file::Stat {
+            kind: file::KIND_FILE,
+            size,
+            flags: 0,
+        })
 }
 
 fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
@@ -596,12 +832,8 @@ fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
         == Some(file::Stat {
             kind,
             size,
-            flags: file::FLAG_READ_ONLY,
+            flags: 0,
         })
-}
-
-fn directory_entry_matches(entry: &platform::DirectoryEntry, name: &[u8], kind: u64) -> bool {
-    entry.name() == name && entry.kind == kind && entry.flags == file::FLAG_READ_ONLY
 }
 
 fn syscall_failed_with<T>(result: syscall::Result<T>, expected: i64) -> bool {
@@ -621,6 +853,99 @@ fn open_with_retry(path: &[u8], flags: syscall::OpenFlags) -> Option<syscall::Fi
         match syscall::open(path, flags) {
             Ok(descriptor) => return Some(descriptor),
             Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                syscall::yield_now().ok()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn write_all_with_retry(descriptor: syscall::FileDescriptor, mut bytes: &[u8]) -> bool {
+    for _ in 0..64 {
+        if bytes.is_empty() {
+            return true;
+        }
+        match syscall::write(descriptor, bytes) {
+            Ok(0) => return false,
+            Ok(written) if written <= bytes.len() => bytes = &bytes[written..],
+            Ok(_) => return false,
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    bytes.is_empty()
+}
+
+fn read_matches(descriptor: syscall::FileDescriptor, expected: &[u8]) -> bool {
+    if expected.len() > README.len() {
+        return false;
+    }
+    let mut actual = [0_u8; README.len()];
+    let mut offset = 0;
+    for _ in 0..64 {
+        if offset == expected.len() {
+            break;
+        }
+        match syscall::read(descriptor, &mut actual[offset..expected.len()]) {
+            Ok(0) => return false,
+            Ok(read) if read <= expected.len() - offset => offset += read,
+            Ok(_) => return false,
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    if offset != expected.len() || &actual[..offset] != expected {
+        return false;
+    }
+    let mut extra = [0_u8; 1];
+    for _ in 0..8 {
+        match syscall::read(descriptor, &mut extra) {
+            Ok(0) => return true,
+            Ok(_) => return false,
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn unlink_with_retry(path: &[u8]) -> bool {
+    for _ in 0..8 {
+        match platform::unlink(path) {
+            Ok(()) => return true,
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn read_directory_with_retry(
+    path: &[u8],
+    start_index: usize,
+    entries: &mut [platform::DirectoryEntry],
+) -> Option<usize> {
+    for _ in 0..8 {
+        match platform::read_directory(path, start_index, entries) {
+            Ok(count) => return Some(count),
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
                 syscall::yield_now().ok()?;
             }
             Err(_) => return None,

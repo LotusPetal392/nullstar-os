@@ -910,7 +910,18 @@ impl<D: BlockDevice> FilesystemServer<D> {
             self.filesystem.write(node, offset, &bytes[..requested])
         };
         match self.finish_core_mutation(result, reply) {
-            Ok(written) if written <= requested => reply.value = written as u64,
+            Ok(written) if written <= requested => {
+                let Ok(completed) = u64::try_from(written) else {
+                    reply.status = protocol::status::OUTCOME_UNKNOWN;
+                    return true;
+                };
+                let Some(resulting_offset) = offset.checked_add(completed) else {
+                    reply.status = protocol::status::OUTCOME_UNKNOWN;
+                    return true;
+                };
+                reply.value = completed;
+                protocol::encode_write_reply_offset(reply, resulting_offset);
+            }
             Ok(_) => {
                 reply.status = protocol::status::OUTCOME_UNKNOWN;
                 return true;

@@ -635,9 +635,8 @@ pub fn valid_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool
             canonical_node_reply(reply, None)
         }
         protocol::operation::GET_ATTRIBUTES => canonical_attributes_reply(request, reply),
-        protocol::operation::READ | protocol::operation::WRITE => {
-            canonical_count_reply(request, reply)
-        }
+        protocol::operation::READ => canonical_count_reply(request, reply),
+        protocol::operation::WRITE => canonical_write_reply(request, reply),
         protocol::operation::READ_DIRECTORY => canonical_directory_reply(request, reply),
         protocol::operation::CREATE_FILE => {
             canonical_node_reply(reply, Some(protocol::node_kind::FILE))
@@ -729,6 +728,25 @@ fn canonical_attributes_reply(request: &protocol::Request, reply: &protocol::Rep
 
 fn canonical_count_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
     canonical_empty_payload(reply) && reply.value <= request.bulk.length
+}
+
+fn canonical_write_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
+    if reply.flags != 0
+        || reply.node_id != protocol::INVALID_ID
+        || reply.node_kind != protocol::node_kind::UNKNOWN
+        || reply.value > request.bulk.length
+    {
+        return false;
+    }
+    let Some(resulting_offset) = protocol::decode_write_reply_offset(reply) else {
+        return false;
+    };
+
+    match request.flags {
+        0 => request.file_offset.checked_add(reply.value) == Some(resulting_offset),
+        protocol::request_flags::APPEND => resulting_offset.checked_sub(reply.value).is_some(),
+        _ => false,
+    }
 }
 
 fn canonical_directory_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
@@ -1257,27 +1275,120 @@ mod tests {
     }
 
     #[test]
-    fn read_and_write_counts_are_bounded_and_payload_free() {
+    fn read_counts_are_bounded_and_payload_free() {
         let session = session();
         let bulk = protocol::BulkBuffer {
             buffer_id: 1,
             offset: 0,
             length: 64,
         };
-        for request in [
-            session.read(30, Node::root(session), 0, bulk).unwrap(),
-            session.write(31, Node::root(session), 0, bulk, 0).unwrap(),
-        ] {
-            let mut reply = reply_for(&request);
-            reply.value = bulk.length;
-            assert!(valid_reply(&request, &reply));
+        let request = session.read(30, Node::root(session), 0, bulk).unwrap();
+        let mut reply = reply_for(&request);
+        reply.value = bulk.length;
+        assert!(valid_reply(&request, &reply));
 
-            reply.value += 1;
-            assert!(!valid_reply(&request, &reply));
-            reply.value = bulk.length;
-            reply.node_id = 42;
-            assert!(!valid_reply(&request, &reply));
-        }
+        reply.value += 1;
+        assert!(!valid_reply(&request, &reply));
+        reply.value = bulk.length;
+        protocol::encode_write_reply_offset(&mut reply, bulk.length);
+        assert!(!valid_reply(&request, &reply));
+    }
+
+    #[test]
+    fn non_append_write_replies_require_exact_offset_payload_and_bounded_count() {
+        let session = session();
+        let bulk = protocol::BulkBuffer {
+            buffer_id: 1,
+            offset: 0,
+            length: 64,
+        };
+        let request = session
+            .write(31, Node::root(session), 100, bulk, 0)
+            .unwrap();
+        let mut reply = reply_for(&request);
+        reply.value = 16;
+        protocol::encode_write_reply_offset(&mut reply, 116);
+        assert!(valid_reply(&request, &reply));
+        assert_eq!(
+            &reply.data[..protocol::WRITE_REPLY_OFFSET_BYTES],
+            &116_u64.to_le_bytes()
+        );
+        assert!(
+            reply.data[protocol::WRITE_REPLY_OFFSET_BYTES..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+
+        reply.data_length = (protocol::WRITE_REPLY_OFFSET_BYTES - 1) as u16;
+        assert!(!valid_reply(&request, &reply));
+        reply.data_length = (protocol::WRITE_REPLY_OFFSET_BYTES + 1) as u16;
+        assert!(!valid_reply(&request, &reply));
+        reply.data_length = protocol::WRITE_REPLY_OFFSET_BYTES as u16;
+        reply.data[protocol::WRITE_REPLY_OFFSET_BYTES] = 1;
+        assert!(!valid_reply(&request, &reply));
+
+        protocol::encode_write_reply_offset(&mut reply, 117);
+        assert!(!valid_reply(&request, &reply));
+
+        reply.value = bulk.length + 1;
+        let oversized_resulting_offset = request.file_offset + reply.value;
+        protocol::encode_write_reply_offset(&mut reply, oversized_resulting_offset);
+        assert!(!valid_reply(&request, &reply));
+
+        let overflow_request = session
+            .write(32, Node::root(session), u64::MAX, bulk, 0)
+            .unwrap();
+        let mut overflow_reply = reply_for(&overflow_request);
+        overflow_reply.value = 1;
+        protocol::encode_write_reply_offset(&mut overflow_reply, u64::MAX);
+        assert!(!valid_reply(&overflow_request, &overflow_reply));
+    }
+
+    #[test]
+    fn append_write_replies_carry_a_sane_resulting_offset() {
+        let session = session();
+        let bulk = protocol::BulkBuffer {
+            buffer_id: 1,
+            offset: 0,
+            length: 64,
+        };
+        let request = session
+            .write(
+                33,
+                Node::root(session),
+                u64::MAX,
+                bulk,
+                protocol::request_flags::APPEND,
+            )
+            .unwrap();
+        let mut reply = reply_for(&request);
+        reply.value = 16;
+        protocol::encode_write_reply_offset(&mut reply, 1_016);
+        assert!(valid_reply(&request, &reply));
+        assert_eq!(protocol::decode_write_reply_offset(&reply), Some(1_016));
+
+        let invalid_resulting_offset = reply.value - 1;
+        protocol::encode_write_reply_offset(&mut reply, invalid_resulting_offset);
+        assert!(!valid_reply(&request, &reply));
+    }
+
+    #[test]
+    fn write_errors_remain_canonical_empty_replies() {
+        let session = session();
+        let bulk = protocol::BulkBuffer {
+            buffer_id: 1,
+            offset: 0,
+            length: 64,
+        };
+        let request = session
+            .write(34, Node::root(session), 100, bulk, 0)
+            .unwrap();
+        let mut reply = reply_for(&request);
+        reply.status = protocol::status::OUTCOME_UNKNOWN;
+        assert!(valid_reply(&request, &reply));
+
+        protocol::encode_write_reply_offset(&mut reply, 100);
+        assert!(!valid_reply(&request, &reply));
     }
 
     #[test]

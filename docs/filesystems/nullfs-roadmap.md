@@ -13,10 +13,10 @@ The shared format and core implementation now support writable version 1.2 image
 recovery, checking, deterministic image creation, and an explicitly enabled writable
 FUSE adapter. NullStar implements narrowly scoped raw writable block-device authority and
 a separately supervised service that mounts `nullfs-core` read-write and offers explicitly
-negotiated writable protocol sessions. The kernel proxy still uses a read-only session, so
-the public `/Volumes/NULLSTAR_DATA` VFS mount remains read-only. Namespace bindings,
-ordinary VFS mutation, offline repair policy, and adoption as the primary backing volume
-remain future work.
+negotiated writable protocol sessions. PR C added a bounded writable kernel proxy and
+public create, write, truncate, append, and unlink at `/Volumes/NULLSTAR_DATA`. Namespace
+identity and bindings, public `mkdir`/`rmdir`/rename, offline repair policy, and adoption as
+the primary backing volume remain future work.
 
 ## Status summary
 
@@ -26,7 +26,7 @@ remain future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority and writable service operation implemented, namespace adoption next |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, and bounded public mutation implemented; namespace identity and bindings next |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -49,9 +49,9 @@ NullFS service -> shared NullFS core -> block-device adapter
 ```
 
 The current generated image contains a deterministic NullFS partition labelled
-`NULLSTAR_DATA`. Its service mounts the core read-write, but the kernel proxy negotiates a
-read-only session and exposes a read-only VFS mount at `/Volumes/NULLSTAR_DATA`. That path
-describes implemented behavior, not the final human-facing layout.
+`NULLSTAR_DATA`. Its service mounts the core read-write, and the kernel proxy negotiates
+exactly `WRITE` and exposes a bounded writable VFS mount at `/Volumes/NULLSTAR_DATA`. That
+path describes implemented behavior, not the final human-facing layout.
 
 The accepted long-term direction is:
 
@@ -245,16 +245,19 @@ At the Phase 4 milestone, PID 1 delegated a writable raw NullFS endpoint to the 
 which required `READ | WRITE | FLUSH` metadata and deliberately wrapped the adapter in
 `ReadOnlyBlockDevice`. Canonical filesystem mutations therefore returned `PERMISSION`;
 that historical behavior demonstrated that raw block authority alone did not enable
-writable filesystem operations. Phase 5 has superseded the adapter and service-operation
-parts of this description: the service now mounts read-write and supports explicitly
-writable sessions, while the public VFS client remains read-only.
+writable filesystem operations. Phase 5 superseded the adapter and service-operation
+parts of this description: the service mounted read-write and supported explicitly
+writable sessions while the public VFS client remained read-only at that submilestone.
+PR C later superseded the public-client restriction without changing the historical
+Phase 4 behavior recorded here.
 
 PID 1 registers `nullfs-service` independently of tmpfs as a generation-scoped kernel
 filesystem proxy. The VFS currently mounts it at `/Volumes/NULLSTAR_DATA`. The proxy
-creates its own protocol session and registers one kernel-owned 4 KiB shared-memory
-buffer for file and directory transfers. Through the public descriptor and filesystem
-ABI, the mount supports ordinary `stat`, read-only `open`, `read`, `fstat`, `seek`,
-`read_directory`, and `chdir` operations.
+negotiates exactly `WRITE`, requires `session_features::WRITE`, and registers one
+kernel-owned 4 KiB shared-memory buffer. Through the public descriptor and filesystem ABI,
+the mount supports ordinary stat/read/open plus writable, create, truncate, and append
+open, descriptor write, unlink, `fstat`, seek, `read_directory`, and `chdir`. Public
+`mkdir`, `rmdir`, and rename remain outside this bounded surface.
 
 Successful opens retain opaque, generation- and session-scoped service nodes in kernel
 open-file descriptions. Descriptor duplication and inheritance share the description,
@@ -283,16 +286,17 @@ cargo run --locked --quiet -- --nullfs-restart-check
 ./scripts/check-local.sh
 ```
 
-The current FAT bootstrap path and read-only public `/Volumes/NULLSTAR_DATA` mount remain
-until Phase 5 adds namespace-binding support, ordinary VFS mutation and persistence
-coverage, and an independent recovery path.
+The current FAT bootstrap path and development mount at `/Volumes/NULLSTAR_DATA` remain
+until Phase 5 adds stable volume identity and namespace bindings. Its bounded public
+mutation surface is implemented; broader namespace mutation and an independent recovery
+path remain future work.
 
 ## Phase 5: writable service and namespace adoption — in progress
 
 Phase 5 moves from a read-only public test mount to the accepted persistent-volume and
-synthetic-namespace architecture. Its raw block-authority and writable
-filesystem-service-operation submilestones are implemented. Namespace adoption and
-ordinary VFS mutation remain next (PR C).
+synthetic-namespace architecture. Raw block authority, writable filesystem-service
+operations, and PR C's bounded public writable proxy are implemented. Stable volume
+identity and namespace bindings are next.
 
 ### Raw writable block authority — implemented
 
@@ -360,10 +364,33 @@ session, exercises the mutation surface, and cleans its namespace. After interru
 recognizes and safely removes only the exact reserved artifact forms that the probe itself
 can leave behind.
 
-The kernel NullFS proxy deliberately still connects with flags `0`. Kernel mutation
-guards and the public `/Volumes/NULLSTAR_DATA` VFS mount therefore remain read-only.
-Exposing ordinary VFS mutation is part of namespace adoption/PR C, not this implemented
-service-operation submilestone.
+Direct flags-zero sessions remain read-only. PR C changes only the kernel proxy's exact
+session request and public VFS policy; it does not merge raw block authority, filesystem
+session authority, and public path authority.
+
+### Public writable proxy (PR C) — implemented and bounded
+
+For each service generation, the kernel proxy requests exactly `WRITE` and requires the
+canonical `CONNECT` reply to include `session_features::WRITE`. The public
+`/Volumes/NULLSTAR_DATA` mount supports ordinary stat/read/open plus writable, create,
+truncate, and append open, descriptor write, unlink, `fstat`, seek, `read_directory`, and
+`chdir`. Public `mkdir`, `rmdir`, rename, and broader namespace adoption remain future.
+
+The proxy reserves its single request before staging at most 4 KiB of write data. On
+success, generic `WRITE` keeps the byte count in `value` and returns the exact authoritative
+resulting offset as eight little-endian inline bytes, including append's service-selected
+EOF. Canonical reply validation treats `OUTCOME_UNKNOWN`, malformed replies, and post-send
+mutation uncertainty as `IO`, quarantines the generation, and never automatically retries
+an uncertain mutation. These rules rely on, and do not extend, the existing NullFS
+transaction and recovery semantics.
+
+Open descriptions for the same generation-, session-, and node-bound file share size
+state, preserving append, truncate, cross-handle `fstat`/`SEEK_END`, and open-unlinked
+coherence. Replacement
+leaves old descriptors stale and neither replays mutations nor rebinds descriptions.
+Public probes cover create, write, independent stale append, cross-handle `fstat` and
+`SEEK_END`, truncate, duplication, unlink while open, open-unlinked read/write, cleanup,
+persistence across service restart, and stale old descriptors.
 
 ### Primary volume identity and layout
 
@@ -409,16 +436,15 @@ commits it durably, atomically selects it, retains a known-good previous generat
 and mirrors the selected artifacts to the firmware-readable bootstrap partition.
 Direct NullFS loading by the bootloader is not required for Phase 5.
 
-### Phase 5 acceptance
+### Remaining Phase 5 acceptance
 
-Phase 5 is complete only when integrated tests demonstrate:
+PR C supplies bounded writable public-ABI and replacement coverage. Phase 5 is complete
+only when the remaining integrated work demonstrates:
 
-- writable generic-protocol operations through the service and public VFS ABI;
 - crash injection and remount recovery for service-backed mutations;
 - deterministic out-of-space and block-device-loss behavior;
 - clean shutdown ordering and dirty-start recovery;
 - namespace binding, canonical-path, and file-identity behavior;
-- provider replacement without silent stale-handle rebinding;
 - continued access to the bootstrap and recovery environment when the primary volume
   cannot mount;
 - normal boot loading non-bootstrap programs and service definitions through
