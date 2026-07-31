@@ -20,6 +20,7 @@ authoritative when it differs from a future design.
 - [Memory management](memory-management.md)
 - [Memory hardening](memory-hardening.md)
 - [Userspace architecture](userspace-architecture.md)
+- [Capability-based application sandboxing](application-sandboxing.md)
 - [Executable loading and linking](executable-loading.md)
 - [Magnetar package and deployment management](package-management.md)
 - [Filesystem namespace and boot](filesystem-namespace.md)
