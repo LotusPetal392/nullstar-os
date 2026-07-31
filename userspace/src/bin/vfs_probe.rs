@@ -836,8 +836,6 @@ fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
         })
 }
 
-
-
 fn syscall_failed_with<T>(result: syscall::Result<T>, expected: i64) -> bool {
     result
         .err()
