@@ -46,14 +46,14 @@ const NORMAL_BOOT_NULLFS_PARTITION_MARKER: &str =
     "userspace init: read-only NullFS partition probe passed";
 const NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER: &str =
     "userspace init: writable NullFS partition probe passed";
-const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str =
-    "userspace init: writable NullFS service ready; VFS mount remains read-only";
+const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str = "userspace init: writable NullFS service ready";
 const NORMAL_BOOT_NULLFS_PROBE_MARKER: &str = "userspace init: userspace NullFS probe passed";
+const NORMAL_BOOT_VFS_PROBE_MARKER: &str = "userspace init: userspace vfs probe passed";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
 const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-test";
 const NULLFS_RESTART_PASSED_MARKER: &str =
-    "userspace init: NullFS restart and stale descriptors verified";
+    "userspace init: NullFS restart persistent VFS mutation and stale descriptors verified";
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
 const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -69,6 +69,7 @@ struct NormalBootProgress {
     writable_nullfs_partition_verified: bool,
     nullfs_service_ready: bool,
     nullfs_probe_passed: bool,
+    vfs_probe_passed: bool,
     init_launched_shell: bool,
     shell_ready: bool,
 }
@@ -85,6 +86,7 @@ impl NormalBootProgress {
             line.contains(NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER);
         self.nullfs_service_ready |= line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
         self.nullfs_probe_passed |= line.contains(NORMAL_BOOT_NULLFS_PROBE_MARKER);
+        self.vfs_probe_passed |= line.contains(NORMAL_BOOT_VFS_PROBE_MARKER);
         self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
         self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
 
@@ -97,6 +99,7 @@ impl NormalBootProgress {
             && self.writable_nullfs_partition_verified
             && self.nullfs_service_ready
             && self.nullfs_probe_passed
+            && self.vfs_probe_passed
             && self.init_launched_shell
             && self.shell_ready
     }
@@ -179,7 +182,9 @@ fn print_usage() {
     println!("Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check]");
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!("  --boot-check  Verify that PID 1 launches the userspace shell");
-    println!("  --nullfs-restart-check  Verify NullFS service replacement with a live descriptor");
+    println!(
+        "  --nullfs-restart-check  Verify NullFS replacement, persistent VFS mutation, and stale descriptors"
+    );
     println!(
         "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, process environments, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
     );
@@ -519,7 +524,8 @@ mod tests {
         NORMAL_BOOT_MODE_MARKER, NORMAL_BOOT_NULLFS_DISCOVERY_MARKER,
         NORMAL_BOOT_NULLFS_PARTITION_MARKER, NORMAL_BOOT_NULLFS_PROBE_MARKER,
         NORMAL_BOOT_NULLFS_SERVICE_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
-        NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER, NormalBootProgress,
+        NORMAL_BOOT_VFS_PROBE_MARKER, NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER,
+        NormalBootProgress,
     };
 
     #[test]
@@ -535,6 +541,7 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_PROBE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_VFS_PROBE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_SHELL_MARKER));
         assert!(progress.observe(NORMAL_BOOT_SHELL_MARKER));
     }

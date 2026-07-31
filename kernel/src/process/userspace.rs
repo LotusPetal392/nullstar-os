@@ -2,7 +2,7 @@ use alloc::{
     boxed::Box,
     collections::VecDeque,
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
     vec,
     vec::Vec,
 };
@@ -12,7 +12,6 @@ use core::{
     mem::{align_of, size_of},
     ptr, slice, str,
 };
-
 
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -180,8 +179,7 @@ const ERR_READ_ONLY: i64 = abi::errno::READ_ONLY;
 const ERR_BROKEN_PIPE: i64 = abi::errno::BROKEN_PIPE;
 const ERR_NOT_IMPLEMENTED: i64 = abi::errno::NOT_IMPLEMENTED;
 
-static PROCESS_MANAGER: PreemptMutex<ProcessManager> =
-    PreemptMutex::new(ProcessManager::new());
+static PROCESS_MANAGER: PreemptMutex<ProcessManager> = PreemptMutex::new(ProcessManager::new());
 
 #[derive(Debug, Clone, Copy)]
 struct SharedFrameReference {
@@ -875,6 +873,7 @@ struct OpenFileState {
     writable: bool,
     append: bool,
     size: u64,
+    nullfs_size: Option<Arc<PreemptMutex<u64>>>,
     backend: OpenFileBackend,
 }
 
@@ -938,6 +937,8 @@ enum PendingTmpfsProxyOperation {
     Write {
         handle: OpenFileHandle,
         offset: u64,
+        initial_offset: u64,
+        append: bool,
         length: usize,
     },
     Stat {
@@ -973,8 +974,10 @@ enum PendingNullfsProxyOperation {
     Open {
         path: String,
         descriptor: u64,
+        readable: bool,
+        writable: bool,
+        append: bool,
         close_on_exec: bool,
-        node_id: u64,
         generation: u32,
         session_id: u64,
         session_generation: u64,
@@ -982,6 +985,14 @@ enum PendingNullfsProxyOperation {
     Read {
         handle: OpenFileHandle,
         address: u64,
+        initial_offset: u64,
+        length: usize,
+    },
+    Write {
+        handle: OpenFileHandle,
+        offset: u64,
+        initial_offset: u64,
+        append: bool,
         length: usize,
     },
     ReadDirectory {
@@ -993,18 +1004,35 @@ enum PendingNullfsProxyOperation {
         records: Vec<abi::file::DirectoryEntry>,
         cookie: u64,
     },
+    Unlink,
+}
+
+struct NullfsNodeSize {
+    generation: u32,
+    session_id: u64,
+    session_generation: u64,
+    node_id: u64,
+    size: Weak<PreemptMutex<u64>>,
 }
 
 #[derive(Clone)]
 enum NullfsPathPurpose {
-    Stat { address: u64, length: u64 },
-    Open { descriptor: u64, close_on_exec: bool },
+    Stat {
+        address: u64,
+        length: u64,
+    },
+    Open {
+        options: vfs::OpenOptions,
+        descriptor: u64,
+        close_on_exec: bool,
+    },
     ReadDirectory {
         start_index: usize,
         records_address: u64,
         capacity: usize,
     },
     Chdir,
+    Unlink,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1032,6 +1060,7 @@ struct TmpfsProxyState {
     session_reply_endpoint: Option<CapabilityObjectRef>,
     session_id: u64,
     session_generation: u64,
+    session_features: u64,
     bulk_buffer: Option<CapabilityObjectRef>,
     bulk_buffer_attached: bool,
     next_request_id: u64,
@@ -1048,6 +1077,7 @@ impl TmpfsProxyState {
             session_reply_endpoint: None,
             session_id: filesystem_protocol::INVALID_ID,
             session_generation: 0,
+            session_features: 0,
             bulk_buffer: None,
             bulk_buffer_attached: false,
             next_request_id: 3,
@@ -1075,6 +1105,7 @@ static NULLFS_CLOSE_QUEUE: PreemptMutex<VecDeque<PendingTmpfsClose>> =
     PreemptMutex::new(VecDeque::new());
 static NULLFS_ABANDONED_REQUEST: PreemptMutex<Option<PendingNullfsProxyRequest>> =
     PreemptMutex::new(None);
+static NULLFS_NODE_SIZES: PreemptMutex<Vec<NullfsNodeSize>> = PreemptMutex::new(Vec::new());
 
 #[derive(Clone, Copy)]
 struct VfsRouteState {
@@ -3282,8 +3313,16 @@ impl Runtime {
                         return Ok(None);
                     };
                 if !matches!(&kind, InterruptedWait::VfsRequest(_)) {
+                    let error = match &kind {
+                        InterruptedWait::NullfsProxy(pending)
+                            if nullfs_proxy_request_is_mutating(pending) =>
+                        {
+                            ERR_IO
+                        }
+                        _ => ERR_INTERRUPTED,
+                    };
                     let registers = unsafe { &mut *(stack_pointer as *mut SavedRegisters) };
-                    registers.rax = error_return(ERR_INTERRUPTED);
+                    registers.rax = error_return(error);
                 }
                 process.make_runnable();
                 process.signal_interrupted_syscall_count =
@@ -3987,7 +4026,11 @@ impl Runtime {
                     if reply.status == vfs_protocol::status::OK
                         && reply.backend == vfs_protocol::backend::NULLFS =>
                 {
-                    Some(ControlOutcome::Ready(error_return(ERR_READ_ONLY)))
+                    Some(nullfs_proxy_unlink(
+                        process_id,
+                        &pending.path,
+                        pending.stack_pointer,
+                    ))
                 }
                 (_, Ok(reply)) if reply.backend == vfs_protocol::backend::NULLFS => {
                     Some(ControlOutcome::Ready(error_return(ERR_IO)))
@@ -3999,278 +4042,278 @@ impl Runtime {
             } else {
                 scheduler::with_process_address_space(process_id, || {
                     match (&pending.operation, reply) {
-                    (
-                        PendingVfsOperation::Stat {
-                            stat_address,
-                            stat_length,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::TMPFS =>
-                    {
-                        tmpfs_proxy_stat(
-                            process_id,
-                            &pending.path,
-                            *stat_address,
-                            *stat_length,
-                            pending.stack_pointer,
-                        )
-                    }
+                        (
+                            PendingVfsOperation::Stat {
+                                stat_address,
+                                stat_length,
+                            },
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::TMPFS =>
+                        {
+                            tmpfs_proxy_stat(
+                                process_id,
+                                &pending.path,
+                                *stat_address,
+                                *stat_length,
+                                pending.stack_pointer,
+                            )
+                        }
 
-                    (
-                        PendingVfsOperation::Stat {
-                            stat_address,
-                            stat_length,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
-                    {
-                        let result = match vfs::metadata(&pending.path) {
-                            Ok(metadata) => platform_write_value(
+                        (
+                            PendingVfsOperation::Stat {
+                                stat_address,
+                                stat_length,
+                            },
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                        {
+                            let result = match vfs::metadata(&pending.path) {
+                                Ok(metadata) => platform_write_value(
+                                    process_id,
+                                    *stat_address,
+                                    *stat_length,
+                                    platform_stat_from_metadata(&metadata),
+                                ),
+                                Err(error) => error_return(platform_vfs_errno(&error)),
+                            };
+                            ControlOutcome::Ready(result)
+                        }
+                        (
+                            PendingVfsOperation::Stat {
+                                stat_address,
+                                stat_length,
+                            },
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::NAMESPACE
+                            && usize::from(reply.prefix_length) == pending.path.len() =>
+                        {
+                            ControlOutcome::Ready(platform_write_value(
                                 process_id,
                                 *stat_address,
                                 *stat_length,
-                                platform_stat_from_metadata(&metadata),
-                            ),
-                            Err(error) => error_return(platform_vfs_errno(&error)),
-                        };
-                        ControlOutcome::Ready(result)
-                    }
-                    (
-                        PendingVfsOperation::Stat {
-                            stat_address,
-                            stat_length,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::NAMESPACE
-                        && usize::from(reply.prefix_length) == pending.path.len() =>
-                    {
-                        ControlOutcome::Ready(platform_write_value(
-                            process_id,
-                            *stat_address,
-                            *stat_length,
-                            abi::file::Stat {
-                                kind: abi::file::KIND_DIRECTORY,
-                                size: 0,
-                                flags: if pending.path == "/System"
-                                    || pending.path.starts_with("/System/")
-                                {
-                                    abi::file::FLAG_SYSTEM
-                                } else {
-                                    0
+                                abi::file::Stat {
+                                    kind: abi::file::KIND_DIRECTORY,
+                                    size: 0,
+                                    flags: if pending.path == "/System"
+                                        || pending.path.starts_with("/System/")
+                                    {
+                                        abi::file::FLAG_SYSTEM
+                                    } else {
+                                        0
+                                    },
                                 },
+                            ))
+                        }
+                        (PendingVfsOperation::Stat { .. }, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                        {
+                            ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                        }
+                        (
+                            PendingVfsOperation::ReadDirectory {
+                                start_index,
+                                records_address,
+                                capacity,
                             },
-                        ))
-                    }
-                    (PendingVfsOperation::Stat { .. }, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
-                    {
-                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
-                    }
-                    (
-                        PendingVfsOperation::ReadDirectory {
-                            start_index,
-                            records_address,
-                            capacity,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::TMPFS =>
-                    {
-                        tmpfs_proxy_read_directory(
-                            process_id,
-                            &pending.path,
-                            *start_index,
-                            *records_address,
-                            *capacity,
-                            pending.stack_pointer,
-                        )
-                    }
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::TMPFS =>
+                        {
+                            tmpfs_proxy_read_directory(
+                                process_id,
+                                &pending.path,
+                                *start_index,
+                                *records_address,
+                                *capacity,
+                                pending.stack_pointer,
+                            )
+                        }
 
-                    (
-                        PendingVfsOperation::ReadDirectory {
-                            start_index,
-                            records_address,
-                            capacity,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
-                    {
-                        vfs_routed_boot_directory(
-                            &pending.path,
-                            *start_index,
-                            *records_address,
-                            *capacity,
-                        )
-                    }
-                    (
-                        PendingVfsOperation::ReadDirectory {
-                            start_index,
-                            records_address,
-                            capacity,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::NAMESPACE
-                        && usize::from(reply.prefix_length) == pending.path.len() =>
-                    {
-                        vfs_routed_namespace_directory(
-                            &pending.path,
-                            *start_index,
-                            *records_address,
-                            *capacity,
-                        )
-                    }
-                    (PendingVfsOperation::ReadDirectory { .. }, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
-                    {
-                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
-                    }
-                    (PendingVfsOperation::Chdir, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && reply.backend == vfs_protocol::backend::TMPFS
-                            && pending.path == "/tmp" =>
-                    {
-                        ControlOutcome::Ready(
-                            match platform_set_working_directory(process_id, &pending.path) {
-                                Ok(()) => 0,
-                                Err(error) => error_return(error),
+                        (
+                            PendingVfsOperation::ReadDirectory {
+                                start_index,
+                                records_address,
+                                capacity,
                             },
-                        )
-                    }
-
-                    (PendingVfsOperation::Chdir, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
                             && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
-                    {
-                        let result = match vfs::metadata(&pending.path) {
-                            Ok(metadata) if metadata.is_directory() => {
-                                platform_set_working_directory(process_id, &metadata.path)
-                            }
-                            Ok(_) => Err(abi::errno::NOT_DIRECTORY),
-                            Err(error) => Err(platform_vfs_errno(&error)),
-                        };
-                        ControlOutcome::Ready(match result {
-                            Ok(()) => 0,
-                            Err(error) => error_return(error),
-                        })
-                    }
-                    (PendingVfsOperation::Chdir, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
+                        {
+                            vfs_routed_boot_directory(
+                                &pending.path,
+                                *start_index,
+                                *records_address,
+                                *capacity,
+                            )
+                        }
+                        (
+                            PendingVfsOperation::ReadDirectory {
+                                start_index,
+                                records_address,
+                                capacity,
+                            },
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
                             && reply.backend == vfs_protocol::backend::NAMESPACE
                             && usize::from(reply.prefix_length) == pending.path.len() =>
-                    {
-                        ControlOutcome::Ready(
-                            match platform_set_working_directory(process_id, &pending.path) {
+                        {
+                            vfs_routed_namespace_directory(
+                                &pending.path,
+                                *start_index,
+                                *records_address,
+                                *capacity,
+                            )
+                        }
+                        (PendingVfsOperation::ReadDirectory { .. }, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                        {
+                            ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                        }
+                        (PendingVfsOperation::Chdir, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::TMPFS
+                                && pending.path == "/tmp" =>
+                        {
+                            ControlOutcome::Ready(
+                                match platform_set_working_directory(process_id, &pending.path) {
+                                    Ok(()) => 0,
+                                    Err(error) => error_return(error),
+                                },
+                            )
+                        }
+
+                        (PendingVfsOperation::Chdir, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                        {
+                            let result = match vfs::metadata(&pending.path) {
+                                Ok(metadata) if metadata.is_directory() => {
+                                    platform_set_working_directory(process_id, &metadata.path)
+                                }
+                                Ok(_) => Err(abi::errno::NOT_DIRECTORY),
+                                Err(error) => Err(platform_vfs_errno(&error)),
+                            };
+                            ControlOutcome::Ready(match result {
                                 Ok(()) => 0,
                                 Err(error) => error_return(error),
+                            })
+                        }
+                        (PendingVfsOperation::Chdir, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::NAMESPACE
+                                && usize::from(reply.prefix_length) == pending.path.len() =>
+                        {
+                            ControlOutcome::Ready(
+                                match platform_set_working_directory(process_id, &pending.path) {
+                                    Ok(()) => 0,
+                                    Err(error) => error_return(error),
+                                },
+                            )
+                        }
+                        (PendingVfsOperation::Chdir, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && (reply.backend == vfs_protocol::backend::NAMESPACE
+                                    || reply.backend == vfs_protocol::backend::TMPFS) =>
+                        {
+                            ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                        }
+                        (PendingVfsOperation::Open { .. }, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                        {
+                            ControlOutcome::Ready(
+                                if usize::from(reply.prefix_length) == pending.path.len() {
+                                    error_return(ERR_IS_DIRECTORY)
+                                } else {
+                                    error_return(abi::errno::NO_ENTRY)
+                                },
+                            )
+                        }
+                        (PendingVfsOperation::Open { .. }, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::TMPFS
+                                && pending.path == "/tmp" =>
+                        {
+                            ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
+                        }
+                        (
+                            PendingVfsOperation::Open {
+                                options,
+                                close_on_exec,
+                                descriptor,
                             },
-                        )
-                    }
-                    (PendingVfsOperation::Chdir, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && (reply.backend == vfs_protocol::backend::NAMESPACE
-                                || reply.backend == vfs_protocol::backend::TMPFS) =>
-                    {
-                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
-                    }
-                    (PendingVfsOperation::Open { .. }, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
-                    {
-                        ControlOutcome::Ready(
-                            if usize::from(reply.prefix_length) == pending.path.len() {
-                                error_return(ERR_IS_DIRECTORY)
-                            } else {
-                                error_return(abi::errno::NO_ENTRY)
-                            },
-                        )
-                    }
-                    (PendingVfsOperation::Open { .. }, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && reply.backend == vfs_protocol::backend::TMPFS
-                            && pending.path == "/tmp" =>
-                    {
-                        ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
-                    }
-                    (
-                        PendingVfsOperation::Open {
-                            options,
-                            close_on_exec,
-                            descriptor,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::TMPFS =>
-                    {
-                        tmpfs_proxy_open(
-                            process_id,
-                            &pending.path,
-                            *options,
-                            *close_on_exec,
-                            *descriptor,
-                            pending.stack_pointer,
-                        )
-                    }
-
-                    (
-                        PendingVfsOperation::Open {
-                            options,
-                            close_on_exec,
-                            descriptor,
-                        },
-                        Ok(reply),
-                    ) if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
-                    {
-                        ControlOutcome::Ready(vfs_complete_boot_open(
-                            process_id,
-                            &pending.path,
-                            *options,
-                            *close_on_exec,
-                            *descriptor,
-                        ))
-                    }
-                    (PendingVfsOperation::Unlink, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && reply.backend == vfs_protocol::backend::TMPFS
-                            && pending.path == "/tmp" =>
-                    {
-                        ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
-                    }
-                    (PendingVfsOperation::Unlink, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
                             && reply.backend == vfs_protocol::backend::TMPFS =>
-                    {
-                        tmpfs_proxy_unlink(process_id, &pending.path, pending.stack_pointer)
-                    }
+                        {
+                            tmpfs_proxy_open(
+                                process_id,
+                                &pending.path,
+                                *options,
+                                *close_on_exec,
+                                *descriptor,
+                                pending.stack_pointer,
+                            )
+                        }
 
-                    (PendingVfsOperation::Unlink, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
-                            && reply.backend == vfs_protocol::backend::NAMESPACE =>
-                    {
-                        ControlOutcome::Ready(
-                            if usize::from(reply.prefix_length) == pending.path.len() {
-                                error_return(ERR_IS_DIRECTORY)
-                            } else {
-                                error_return(abi::errno::NO_ENTRY)
+                        (
+                            PendingVfsOperation::Open {
+                                options,
+                                close_on_exec,
+                                descriptor,
                             },
-                        )
-                    }
-                    (PendingVfsOperation::Unlink, Ok(reply))
-                        if reply.status == vfs_protocol::status::OK
+                            Ok(reply),
+                        ) if reply.status == vfs_protocol::status::OK
                             && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
-                    {
-                        ControlOutcome::Ready(error_return(ERR_NOT_IMPLEMENTED))
-                    }
-                    (_, Ok(reply)) if reply.status == vfs_protocol::status::NOT_FOUND => {
-                        ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
-                    }
+                        {
+                            ControlOutcome::Ready(vfs_complete_boot_open(
+                                process_id,
+                                &pending.path,
+                                *options,
+                                *close_on_exec,
+                                *descriptor,
+                            ))
+                        }
+                        (PendingVfsOperation::Unlink, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::TMPFS
+                                && pending.path == "/tmp" =>
+                        {
+                            ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
+                        }
+                        (PendingVfsOperation::Unlink, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::TMPFS =>
+                        {
+                            tmpfs_proxy_unlink(process_id, &pending.path, pending.stack_pointer)
+                        }
+
+                        (PendingVfsOperation::Unlink, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::NAMESPACE =>
+                        {
+                            ControlOutcome::Ready(
+                                if usize::from(reply.prefix_length) == pending.path.len() {
+                                    error_return(ERR_IS_DIRECTORY)
+                                } else {
+                                    error_return(abi::errno::NO_ENTRY)
+                                },
+                            )
+                        }
+                        (PendingVfsOperation::Unlink, Ok(reply))
+                            if reply.status == vfs_protocol::status::OK
+                                && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM =>
+                        {
+                            ControlOutcome::Ready(error_return(ERR_NOT_IMPLEMENTED))
+                        }
+                        (_, Ok(reply)) if reply.status == vfs_protocol::status::NOT_FOUND => {
+                            ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY))
+                        }
                         _ => ControlOutcome::Ready(error_return(ERR_IO)),
                     }
                 })
@@ -4389,6 +4432,14 @@ impl Runtime {
             return Ok(());
         }
         let request_id = pending.request_id;
+        let quarantine = nullfs_proxy_request_is_mutating(&pending)
+            && match &reply {
+                Ok(reply) => reply.status == filesystem_protocol::status::OUTCOME_UNKNOWN,
+                Err(_) => true,
+            };
+        if quarantine {
+            nullfs_proxy_quarantine(&pending);
+        }
         let result = match reply {
             Ok(reply) if reply.status == filesystem_protocol::status::OK => {
                 nullfs_proxy_complete_success(
@@ -4398,12 +4449,14 @@ impl Runtime {
                     self.physical_memory_offset,
                 )
             }
-            Ok(reply) => nullfs_proxy_finish_process(request_id,
+            Ok(reply) => nullfs_proxy_finish_process(
+                request_id,
                 process_id,
                 pending.stack_pointer,
                 error_return(nullfs_proxy_status_errno(reply.status)),
             ),
-            Err(error) => nullfs_proxy_finish_process(request_id,
+            Err(error) => nullfs_proxy_finish_process(
+                request_id,
                 process_id,
                 pending.stack_pointer,
                 error_return(error),
@@ -5155,6 +5208,7 @@ fn vfs_complete_boot_open(
         writable: options.write,
         append: options.append,
         size: metadata.size,
+        nullfs_size: None,
         backend: OpenFileBackend::Vfs,
     }));
     let mut manager = PROCESS_MANAGER.lock();
@@ -7149,7 +7203,7 @@ fn syscall_write(
         let handle = handle.clone();
         let backend = handle.lock().backend;
         if matches!(backend, OpenFileBackend::NullfsProxy { .. }) {
-            return WriteOutcome::Ready(error_return(ERR_READ_ONLY));
+            return nullfs_proxy_write(process_id, handle, bytes, current_stack_pointer);
         }
         if matches!(backend, OpenFileBackend::TmpfsProxy { .. }) {
             return tmpfs_proxy_write(process_id, handle, bytes, current_stack_pointer);
@@ -7365,6 +7419,7 @@ fn tmpfs_proxy_begin_connect(
         state.session_reply_endpoint = None;
         state.session_id = filesystem_protocol::INVALID_ID;
         state.session_generation = 0;
+        state.session_features = 0;
         state.bulk_buffer = None;
         state.bulk_buffer_attached = false;
         state.active_request_id = filesystem_protocol::INVALID_ID;
@@ -7431,6 +7486,7 @@ fn tmpfs_proxy_service_connect() -> bool {
             && reply.generation == u64::from(state.generation)
             && reply.node_id == filesystem_protocol::ROOT_NODE_ID
             && reply.node_kind == filesystem_protocol::node_kind::DIRECTORY
+            && reply.value == 0
             && reply.data_length == 0
             && reply.reserved == [0; 2]
             && {
@@ -7440,6 +7496,7 @@ fn tmpfs_proxy_service_connect() -> bool {
                     proxy.session_reply_endpoint = Some(reply_endpoint);
                     proxy.session_id = reply.session_id;
                     proxy.session_generation = reply.generation;
+                    proxy.session_features = reply.value;
                     true
                 } else {
                     false
@@ -7454,12 +7511,14 @@ fn tmpfs_proxy_service_connect() -> bool {
             proxy.connect_reply_endpoint = None;
             proxy.session_id = filesystem_protocol::INVALID_ID;
             proxy.session_generation = 0;
+            proxy.session_features = 0;
         }
     }
     if !valid {
         tmpfs_proxy_release_reply_endpoint(reply_endpoint);
     } else if tmpfs_proxy_begin_attach().is_err() {
         let mut proxy = TMPFS_PROXY.lock();
+        proxy.session_features = 0;
         proxy.bulk_buffer = None;
         proxy.bulk_buffer_attached = false;
     }
@@ -7662,7 +7721,6 @@ fn tmpfs_proxy_decode_filesystem_reply(
             } else {
                 0
             }
-        || reply.data_length != 0
         || reply.reserved != [0; 2]
         || reply.status == filesystem_protocol::status::OK
             && matches!(
@@ -7674,6 +7732,16 @@ fn tmpfs_proxy_decode_filesystem_reply(
     {
         return Err(ERR_IO);
     }
+    let write_resulting_offset = if reply.status == filesystem_protocol::status::OK
+        && pending.request_operation == filesystem_protocol::operation::WRITE
+    {
+        Some(filesystem_protocol::decode_write_reply_offset(&reply).ok_or(ERR_IO)?)
+    } else {
+        if reply.data_length != 0 || reply.data != [0; filesystem_protocol::MAX_INLINE_DATA_BYTES] {
+            return Err(ERR_IO);
+        }
+        None
+    };
     let value = u32::try_from(reply.value).map_err(|_| abi::errno::RANGE)?;
     let mut compatibility = tmpfs_protocol::Reply::EMPTY;
     compatibility.operation = match pending.operation {
@@ -7714,8 +7782,31 @@ fn tmpfs_proxy_decode_filesystem_reply(
             tmpfs_proxy_bulk_read(&mut compatibility.data[..count])?;
             compatibility.data_length = count as u16;
         }
-        PendingTmpfsProxyOperation::Write { length, .. } if value as usize > *length => {
-            return Err(ERR_IO);
+        PendingTmpfsProxyOperation::Write {
+            offset,
+            append,
+            length,
+            ..
+        } => {
+            if value as usize > *length {
+                return Err(ERR_IO);
+            }
+            if reply.status == filesystem_protocol::status::OK {
+                let Some(resulting_offset) = write_resulting_offset else {
+                    return Err(ERR_IO);
+                };
+                let valid = if *append {
+                    resulting_offset.checked_sub(u64::from(value)).is_some()
+                } else {
+                    offset.checked_add(u64::from(value)) == Some(resulting_offset)
+                };
+                if !valid {
+                    return Err(ERR_IO);
+                }
+                compatibility.data[..size_of::<u64>()]
+                    .copy_from_slice(&resulting_offset.to_le_bytes());
+                compatibility.data_length = size_of::<u64>() as u16;
+            }
         }
         PendingTmpfsProxyOperation::ReadDirectory { .. } => {
             tmpfs_proxy_translate_directory_entries(
@@ -8228,6 +8319,7 @@ fn tmpfs_proxy_complete_operation(
                 writable,
                 append,
                 size,
+                nullfs_size: None,
                 backend: OpenFileBackend::TmpfsProxy {
                     generation,
                     session_id,
@@ -8275,18 +8367,23 @@ fn tmpfs_proxy_complete_operation(
         }
         PendingTmpfsProxyOperation::Write {
             handle,
-            offset,
+            initial_offset,
             length,
+            ..
         } => {
             let count = reply.value as usize;
-            if count > length {
+            if count > length || usize::from(reply.data_length) != size_of::<u64>() {
                 return Ok(error_return(ERR_IO));
             }
-            let new_offset = offset.saturating_add(count as u64);
+            let mut offset_bytes = [0_u8; size_of::<u64>()];
+            offset_bytes.copy_from_slice(&reply.data[..size_of::<u64>()]);
+            let resulting_offset = u64::from_le_bytes(offset_bytes);
             {
                 let mut file = handle.lock();
-                file.offset = new_offset;
-                file.size = file.size.max(new_offset);
+                if file.offset == initial_offset {
+                    file.offset = resulting_offset;
+                }
+                file.size = file.size.max(resulting_offset);
             }
             process.write_count = process.write_count.saturating_add(1);
             process.bytes_written = process.bytes_written.saturating_add(count as u64);
@@ -8537,7 +8634,7 @@ fn tmpfs_proxy_write(
     bytes: &[u8],
     stack_pointer: usize,
 ) -> WriteOutcome {
-    let (offset, generation, session_id, session_generation, node_id, append) = {
+    let (offset, initial_offset, generation, session_id, session_generation, node_id, append) = {
         let file = handle.lock();
         if !file.writable {
             return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
@@ -8554,6 +8651,7 @@ fn tmpfs_proxy_write(
         let offset = if file.append { file.size } else { file.offset };
         (
             offset,
+            file.offset,
             generation,
             session_id,
             session_generation,
@@ -8599,6 +8697,8 @@ fn tmpfs_proxy_write(
     let operation = PendingTmpfsProxyOperation::Write {
         handle,
         offset,
+        initial_offset,
+        append,
         length: count,
     };
     match tmpfs_proxy_begin_filesystem_request(process_id, request, operation, stack_pointer) {
@@ -8722,10 +8822,59 @@ fn nullfs_proxy_state() -> Option<TmpfsProxyState> {
         && state.bulk_buffer_attached
         && state.session_id != filesystem_protocol::INVALID_ID
         && state.session_generation != 0
+        && state.session_features == filesystem_protocol::session_features::WRITE
     {
         Some(state)
     } else {
         None
+    }
+}
+
+fn nullfs_proxy_node_size(
+    generation: u32,
+    session_id: u64,
+    session_generation: u64,
+    node_id: u64,
+    observed_size: u64,
+) -> Arc<PreemptMutex<u64>> {
+    let mut sizes = NULLFS_NODE_SIZES.lock();
+    sizes.retain(|entry| entry.size.strong_count() != 0);
+    if let Some(size) = sizes
+        .iter()
+        .find(|entry| {
+            entry.generation == generation
+                && entry.session_id == session_id
+                && entry.session_generation == session_generation
+                && entry.node_id == node_id
+        })
+        .and_then(|entry| entry.size.upgrade())
+    {
+        *size.lock() = observed_size;
+        return size;
+    }
+
+    let size = Arc::new(PreemptMutex::new(observed_size));
+    sizes.push(NullfsNodeSize {
+        generation,
+        session_id,
+        session_generation,
+        node_id,
+        size: Arc::downgrade(&size),
+    });
+    size
+}
+
+fn open_file_size(file: &OpenFileState) -> u64 {
+    file.nullfs_size
+        .as_ref()
+        .map_or(file.size, |size| *size.lock())
+}
+
+fn update_open_file_size(file: &mut OpenFileState, size: u64) {
+    if let Some(shared_size) = &file.nullfs_size {
+        *shared_size.lock() = size;
+    } else {
+        file.size = size;
     }
 }
 
@@ -8768,6 +8917,7 @@ fn nullfs_proxy_begin_connect(
     let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
     let mut request = filesystem_protocol::Request::EMPTY;
     request.operation = filesystem_protocol::operation::CONNECT;
+    request.flags = filesystem_protocol::connect_flags::WRITE;
     request.request_id = 1;
     if let Err(error) = nullfs_proxy_push_request(
         request_endpoint,
@@ -8795,6 +8945,7 @@ fn nullfs_proxy_begin_connect(
         state.session_reply_endpoint = None;
         state.session_id = filesystem_protocol::INVALID_ID;
         state.session_generation = 0;
+        state.session_features = 0;
         state.bulk_buffer = None;
         state.bulk_buffer_attached = false;
         state.active_request_id = filesystem_protocol::INVALID_ID;
@@ -8872,6 +9023,7 @@ fn nullfs_proxy_service_connect() -> bool {
         if state.session_reply_endpoint.is_some()
             && state.session_id != filesystem_protocol::INVALID_ID
             && state.session_generation != 0
+            && state.session_features == filesystem_protocol::session_features::WRITE
         {
             return nullfs_proxy_begin_attach().is_ok();
         }
@@ -8907,7 +9059,7 @@ fn nullfs_proxy_service_connect() -> bool {
             && reply.generation == u64::from(state.generation)
             && reply.node_id == filesystem_protocol::ROOT_NODE_ID
             && reply.node_kind == filesystem_protocol::node_kind::DIRECTORY
-            && reply.value == 0
+            && reply.value == filesystem_protocol::session_features::WRITE
             && reply.data_length == 0
             && reply.reserved == [0; 2]
             && reply.data == [0; filesystem_protocol::MAX_INLINE_DATA_BYTES]
@@ -8918,6 +9070,7 @@ fn nullfs_proxy_service_connect() -> bool {
                     proxy.session_reply_endpoint = Some(reply_endpoint);
                     proxy.session_id = reply.session_id;
                     proxy.session_generation = reply.generation;
+                    proxy.session_features = reply.value;
                     true
                 } else {
                     false
@@ -8932,11 +9085,13 @@ fn nullfs_proxy_service_connect() -> bool {
             proxy.connect_reply_endpoint = None;
             proxy.session_id = filesystem_protocol::INVALID_ID;
             proxy.session_generation = 0;
+            proxy.session_features = 0;
         }
         drop(proxy);
         tmpfs_proxy_release_reply_endpoint(reply_endpoint);
     } else if nullfs_proxy_begin_attach().is_err() {
         let mut proxy = NULLFS_PROXY.lock();
+        proxy.session_features = 0;
         proxy.bulk_buffer = None;
         proxy.bulk_buffer_attached = false;
     }
@@ -9051,6 +9206,7 @@ fn nullfs_proxy_service_attach(state: TmpfsProxyState) -> bool {
     {
         proxy.bulk_buffer_attached = valid;
         if !valid {
+            proxy.session_features = 0;
             let buffer = proxy.bulk_buffer.take();
             drop(proxy);
             if let Some(buffer) = buffer {
@@ -9063,13 +9219,34 @@ fn nullfs_proxy_service_attach(state: TmpfsProxyState) -> bool {
     true
 }
 
+fn nullfs_proxy_stage_write(
+    buffer: CapabilityObjectRef,
+    bulk: filesystem_protocol::BulkBuffer,
+    source: &[u8],
+) -> Result<(), i64> {
+    let offset = usize::try_from(bulk.offset).map_err(|_| abi::errno::RANGE)?;
+    let length = usize::try_from(bulk.length).map_err(|_| abi::errno::RANGE)?;
+    if bulk.buffer_id != 1 || length != source.len() {
+        return Err(abi::errno::RANGE);
+    }
+    let end = offset.checked_add(length).ok_or(abi::errno::RANGE)?;
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let index = registry.object_index(buffer).ok_or(ERR_IO)?;
+    let CapabilityObjectData::SharedMemory(memory) = &mut registry.objects[index].data else {
+        return Err(ERR_IO);
+    };
+    let destination = memory.bytes.get_mut(offset..end).ok_or(abi::errno::RANGE)?;
+    destination.copy_from_slice(source);
+    Ok(())
+}
+
 fn nullfs_proxy_begin_request(
     process_id: u64,
     request: filesystem_protocol::Request,
     operation: PendingNullfsProxyOperation,
     stack_pointer: usize,
 ) -> Result<(), i64> {
-    nullfs_proxy_submit_request(process_id, request, operation, stack_pointer, None)
+    nullfs_proxy_submit_request(process_id, request, operation, stack_pointer, None, None)
 }
 
 fn nullfs_proxy_submit_request(
@@ -9078,87 +9255,99 @@ fn nullfs_proxy_submit_request(
     mut operation: PendingNullfsProxyOperation,
     stack_pointer: usize,
     previous_request_id: Option<u64>,
+    staged_bytes: Option<&[u8]>,
 ) -> Result<(), i64> {
     let request_endpoint = cpu_interrupts::without_interrupts(|| -> Result<_, i64> {
         let mut state = NULLFS_PROXY.lock();
         if !state.bulk_buffer_attached {
-        return Err(ERR_TRY_AGAIN);
-    }
-    match previous_request_id {
-        Some(previous_request_id) if state.active_request_id != previous_request_id => {
-            return Err(ERR_IO);
-        }
-        None if state.active_request_id != filesystem_protocol::INVALID_ID => {
             return Err(ERR_TRY_AGAIN);
         }
-        _ => {}
-    }
-    let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
-    let reply_endpoint = state.session_reply_endpoint.ok_or(ERR_IO)?;
-    if state.session_id == filesystem_protocol::INVALID_ID || state.session_generation == 0 {
-        return Err(ERR_IO);
-    }
-    let request_id = state.next_request_id;
-    state.next_request_id = state
-        .next_request_id
-        .checked_add(1)
-        .filter(|id| *id != filesystem_protocol::INVALID_ID)
-        .ok_or(ERR_IO)?;
-    state.active_request_id = request_id;
-    request.request_id = request_id;
-    request.session_id = state.session_id;
-    request.generation = state.session_generation;
-    if let PendingNullfsProxyOperation::Open {
-        session_id,
-        session_generation,
-        ..
-    } = &mut operation
-    {
-        *session_id = state.session_id;
-        *session_generation = state.session_generation;
-    }
-    let pending = PendingNullfsProxyRequest {
-        reply_endpoint,
-        request_operation: request.operation,
-        request_generation: state.generation,
-        request_id,
-        operation,
-        stack_pointer,
-    };
-    let previous_process_state = {
-        let mut manager = PROCESS_MANAGER.lock();
-        let Some(process) = manager.process_mut(process_id) else {
-            state.active_request_id = filesystem_protocol::INVALID_ID;
-            return Err(ERR_NO_PROCESS);
-        };
-        if process.pending_nullfs_proxy.is_some()
-            || process.pending_tmpfs_proxy.is_some()
-            || process.pending_vfs_request.is_some()
-        {
-            state.active_request_id = filesystem_protocol::INVALID_ID;
+        match previous_request_id {
+            Some(previous_request_id) if state.active_request_id != previous_request_id => {
+                return Err(ERR_IO);
+            }
+            None if state.active_request_id != filesystem_protocol::INVALID_ID => {
+                return Err(ERR_TRY_AGAIN);
+            }
+            _ => {}
+        }
+        let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
+        let reply_endpoint = state.session_reply_endpoint.ok_or(ERR_IO)?;
+        if state.session_id == filesystem_protocol::INVALID_ID || state.session_generation == 0 {
             return Err(ERR_IO);
         }
-        let previous_state = process.state;
-        process.pending_nullfs_proxy = Some(pending);
-        process.state = ProcessState::Blocked;
-        previous_state
-    };
-    if let Err(error) = nullfs_proxy_push_request(request_endpoint, &request, None) {
-        let mut manager = PROCESS_MANAGER.lock();
-        if let Some(process) = manager.process_mut(process_id)
-            && process
-                .pending_nullfs_proxy
-                .as_ref()
-                .is_some_and(|pending| pending.request_id == request_id)
+        let request_id = state.next_request_id;
+        state.next_request_id = state
+            .next_request_id
+            .checked_add(1)
+            .filter(|id| *id != filesystem_protocol::INVALID_ID)
+            .ok_or(ERR_IO)?;
+        state.active_request_id = request_id;
+        request.request_id = request_id;
+        request.session_id = state.session_id;
+        request.generation = state.session_generation;
+        if let PendingNullfsProxyOperation::Open {
+            generation,
+            session_id,
+            session_generation,
+            ..
+        } = &mut operation
         {
-            process.pending_nullfs_proxy = None;
-            process.state = previous_process_state;
+            *generation = state.generation;
+            *session_id = state.session_id;
+            *session_generation = state.session_generation;
         }
-        if state.active_request_id == request_id {
-            state.active_request_id = filesystem_protocol::INVALID_ID;
+        let pending = PendingNullfsProxyRequest {
+            reply_endpoint,
+            request_operation: request.operation,
+            request_generation: state.generation,
+            request_id,
+            operation,
+            stack_pointer,
+        };
+        let previous_process_state = {
+            let mut manager = PROCESS_MANAGER.lock();
+            let Some(process) = manager.process_mut(process_id) else {
+                state.active_request_id = filesystem_protocol::INVALID_ID;
+                return Err(ERR_NO_PROCESS);
+            };
+            if process.pending_nullfs_proxy.is_some()
+                || process.pending_tmpfs_proxy.is_some()
+                || process.pending_vfs_request.is_some()
+            {
+                state.active_request_id = filesystem_protocol::INVALID_ID;
+                return Err(ERR_IO);
+            }
+            let previous_state = process.state;
+            process.pending_nullfs_proxy = Some(pending);
+            process.state = ProcessState::Blocked;
+            previous_state
+        };
+        let submitted = if let Some(source) = staged_bytes {
+            state
+                .bulk_buffer
+                .ok_or(ERR_IO)
+                .and_then(|buffer| nullfs_proxy_stage_write(buffer, request.bulk, source))
+                .and_then(|()| nullfs_proxy_push_request(request_endpoint, &request, None))
+        } else {
+            nullfs_proxy_push_request(request_endpoint, &request, None)
+        };
+        if let Err(error) = submitted {
+            let mut manager = PROCESS_MANAGER.lock();
+            if let Some(process) = manager.process_mut(process_id)
+                && process
+                    .pending_nullfs_proxy
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+            {
+                process.pending_nullfs_proxy = None;
+                process.state = previous_process_state;
+            }
+            if state.active_request_id == request_id {
+                state.active_request_id = filesystem_protocol::INVALID_ID;
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
         drop(state);
         Ok(request_endpoint)
     })?;
@@ -9231,12 +9420,14 @@ fn nullfs_proxy_decode_reply(
                 && reply.data == [0; filesystem_protocol::MAX_INLINE_DATA_BYTES]
         }
         filesystem_protocol::operation::OPEN => {
-            let valid = matches!(
-                &pending.operation,
-                PendingNullfsProxyOperation::Open { node_id, .. }
-                    if reply.node_id == *node_id
-                        && reply.node_kind == filesystem_protocol::node_kind::FILE
-            ) && reply.flags == 0
+            let valid = matches!(&pending.operation, PendingNullfsProxyOperation::Open { .. })
+                && reply.flags == 0
+                && reply.node_id != filesystem_protocol::INVALID_ID
+                && matches!(
+                    reply.node_kind,
+                    filesystem_protocol::node_kind::FILE
+                        | filesystem_protocol::node_kind::DIRECTORY
+                )
                 && reply.data_length == 0
                 && reply.data == [0; filesystem_protocol::MAX_INLINE_DATA_BYTES];
             if !valid
@@ -9263,6 +9454,29 @@ fn nullfs_proxy_decode_reply(
                 && reply.data_length == 0
                 && reply.data == [0; filesystem_protocol::MAX_INLINE_DATA_BYTES]
         }
+        filesystem_protocol::operation::WRITE => {
+            matches!(
+                &pending.operation,
+                PendingNullfsProxyOperation::Write {
+                    offset,
+                    append,
+                    length,
+                    ..
+                } if reply.value <= *length as u64
+                    && filesystem_protocol::decode_write_reply_offset(&reply).is_some_and(
+                        |resulting_offset| if *append {
+                            resulting_offset.checked_sub(reply.value).is_some()
+                        } else {
+                            offset.checked_add(reply.value) == Some(resulting_offset)
+                        }
+                    )
+            ) && reply.flags == 0
+                && reply.node_id == filesystem_protocol::INVALID_ID
+                && reply.node_kind == filesystem_protocol::node_kind::UNKNOWN
+        }
+        filesystem_protocol::operation::UNLINK => {
+            matches!(&pending.operation, PendingNullfsProxyOperation::Unlink) && canonical_error
+        }
         filesystem_protocol::operation::READ_DIRECTORY => {
             reply.node_id == filesystem_protocol::INVALID_ID
                 && reply.node_kind == filesystem_protocol::node_kind::UNKNOWN
@@ -9278,6 +9492,23 @@ fn nullfs_proxy_release_request(request_id: u64) {
     let mut state = NULLFS_PROXY.lock();
     if state.active_request_id == request_id {
         state.active_request_id = filesystem_protocol::INVALID_ID;
+    }
+}
+
+fn nullfs_proxy_request_is_mutating(pending: &PendingNullfsProxyRequest) -> bool {
+    matches!(
+        &pending.operation,
+        PendingNullfsProxyOperation::Open { writable: true, .. }
+            | PendingNullfsProxyOperation::Write { .. }
+            | PendingNullfsProxyOperation::Unlink
+    )
+}
+
+fn nullfs_proxy_quarantine(pending: &PendingNullfsProxyRequest) {
+    let mut state = NULLFS_PROXY.lock();
+    if state.generation == pending.request_generation {
+        state.bulk_buffer_attached = false;
+        state.session_features = 0;
     }
 }
 
@@ -9336,16 +9567,47 @@ fn nullfs_proxy_complete_abandoned(
     abandoned: PendingNullfsProxyRequest,
     reply: Result<filesystem_protocol::Reply, i64>,
 ) {
-    if let (PendingNullfsProxyOperation::Open { .. }, Ok(reply)) = (&abandoned.operation, reply)
-        && reply.status == filesystem_protocol::status::OK
-        && reply.node_id != filesystem_protocol::INVALID_ID
-    {
-        nullfs_proxy_enqueue_close(
-            abandoned.request_generation,
-            reply.session_id,
-            reply.generation,
-            reply.node_id,
-        );
+    let quarantine = nullfs_proxy_request_is_mutating(&abandoned)
+        && match &reply {
+            Ok(reply) => reply.status == filesystem_protocol::status::OUTCOME_UNKNOWN,
+            Err(_) => true,
+        };
+    if quarantine {
+        nullfs_proxy_quarantine(&abandoned);
+    }
+    match (abandoned.operation, reply) {
+        (PendingNullfsProxyOperation::Open { .. }, Ok(reply))
+            if reply.status == filesystem_protocol::status::OK
+                && reply.node_id != filesystem_protocol::INVALID_ID =>
+        {
+            nullfs_proxy_enqueue_close(
+                abandoned.request_generation,
+                reply.session_id,
+                reply.generation,
+                reply.node_id,
+            );
+        }
+        (
+            PendingNullfsProxyOperation::Write {
+                handle,
+                initial_offset,
+                length,
+                ..
+            },
+            Ok(reply),
+        ) if reply.status == filesystem_protocol::status::OK && reply.value <= length as u64 => {
+            let Some(resulting_offset) = filesystem_protocol::decode_write_reply_offset(&reply)
+            else {
+                return;
+            };
+            let mut file = handle.lock();
+            let size = open_file_size(&file).max(resulting_offset);
+            update_open_file_size(&mut file, size);
+            if file.offset == initial_offset {
+                file.offset = resulting_offset;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -9495,6 +9757,7 @@ fn nullfs_proxy_fail_close(active: ActiveTmpfsClose) {
     if state.active_close == Some(active) {
         state.active_close = None;
         state.active_request_id = filesystem_protocol::INVALID_ID;
+        state.session_features = 0;
         state.bulk_buffer_attached = false;
     }
 }
@@ -9518,6 +9781,9 @@ fn nullfs_proxy_status_is_known(status: i32) -> bool {
             | filesystem_protocol::status::IO
             | filesystem_protocol::status::NOT_SUPPORTED
             | filesystem_protocol::status::CANCELLED
+            | filesystem_protocol::status::NOT_EMPTY
+            | filesystem_protocol::status::WOULD_CYCLE
+            | filesystem_protocol::status::OUTCOME_UNKNOWN
     )
 }
 
@@ -9531,6 +9797,7 @@ fn nullfs_proxy_status_errno(status: i32) -> i64 {
         filesystem_protocol::status::NO_SPACE => ERR_NO_SPACE,
         filesystem_protocol::status::RANGE => abi::errno::RANGE,
         filesystem_protocol::status::TRY_AGAIN => ERR_TRY_AGAIN,
+        filesystem_protocol::status::OUTCOME_UNKNOWN => ERR_IO,
         _ => ERR_IO,
     }
 }
@@ -9586,6 +9853,7 @@ fn nullfs_proxy_continue(
         operation,
         stack_pointer,
         Some(previous_request_id),
+        None,
     ) {
         Ok(()) => Ok(()),
         Err(error) => nullfs_proxy_finish_owned_process(
@@ -9649,6 +9917,66 @@ fn nullfs_proxy_directory_request(node_id: u64, cookie: u64) -> filesystem_proto
     request
 }
 
+fn nullfs_proxy_named_operation(
+    path: &str,
+    parent: u64,
+    name: &str,
+    purpose: NullfsPathPurpose,
+) -> Result<(filesystem_protocol::Request, PendingNullfsProxyOperation), i64> {
+    let mut request = filesystem_protocol::Request::EMPTY;
+    request.node_id = parent;
+    request.name_length = name.len() as u16;
+    request.name[..name.len()].copy_from_slice(name.as_bytes());
+    let operation = match purpose {
+        NullfsPathPurpose::Open {
+            options,
+            descriptor,
+            close_on_exec,
+        } => {
+            request.operation = filesystem_protocol::operation::OPEN;
+            if options.read {
+                request.flags |= filesystem_protocol::request_flags::READ;
+            }
+            if options.write {
+                request.flags |= filesystem_protocol::request_flags::WRITE;
+            }
+            if options.create {
+                request.flags |= filesystem_protocol::request_flags::CREATE;
+            }
+            if options.truncate {
+                request.flags |= filesystem_protocol::request_flags::TRUNCATE;
+            }
+            if options.append {
+                request.flags |= filesystem_protocol::request_flags::APPEND;
+            }
+            PendingNullfsProxyOperation::Open {
+                path: String::from(path),
+                descriptor,
+                readable: options.read,
+                writable: options.write,
+                append: options.append,
+                close_on_exec,
+                generation: 0,
+                session_id: filesystem_protocol::INVALID_ID,
+                session_generation: 0,
+            }
+        }
+        NullfsPathPurpose::Unlink => {
+            request.operation = filesystem_protocol::operation::UNLINK;
+            PendingNullfsProxyOperation::Unlink
+        }
+        _ => return Err(ERR_IO),
+    };
+    Ok((request, operation))
+}
+
+fn nullfs_proxy_resolves_parent(purpose: &NullfsPathPurpose) -> bool {
+    matches!(
+        purpose,
+        NullfsPathPurpose::Open { .. } | NullfsPathPurpose::Unlink
+    )
+}
+
 fn nullfs_proxy_start_path(
     process_id: u64,
     path: &str,
@@ -9672,11 +10000,11 @@ fn nullfs_proxy_start_path(
                     abi::file::Stat {
                         kind: abi::file::KIND_DIRECTORY,
                         size: 0,
-                        flags: abi::file::FLAG_READ_ONLY,
+                        flags: 0,
                     },
                 ))
             }
-            NullfsPathPurpose::Open { .. } => {
+            NullfsPathPurpose::Open { .. } | NullfsPathPurpose::Unlink => {
                 ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
             }
             NullfsPathPurpose::Chdir => ControlOutcome::Ready(
@@ -9690,10 +10018,7 @@ fn nullfs_proxy_start_path(
                 records_address,
                 capacity,
             } => {
-                let request = nullfs_proxy_directory_request(
-                    filesystem_protocol::ROOT_NODE_ID,
-                    0,
-                );
+                let request = nullfs_proxy_directory_request(filesystem_protocol::ROOT_NODE_ID, 0);
                 let operation = PendingNullfsProxyOperation::ReadDirectory {
                     node_id: filesystem_protocol::ROOT_NODE_ID,
                     start_index,
@@ -9703,27 +10028,34 @@ fn nullfs_proxy_start_path(
                     records: Vec::new(),
                     cookie: 0,
                 };
-                match nullfs_proxy_begin_request(
-                    process_id,
-                    request,
-                    operation,
-                    stack_pointer,
-                ) {
+                match nullfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
                     Ok(()) => ControlOutcome::Blocked,
                     Err(error) => ControlOutcome::Ready(error_return(error)),
                 }
             }
         };
     }
-    let request = nullfs_proxy_lookup_request(
-        filesystem_protocol::ROOT_NODE_ID,
-        &components[0],
-    );
-    let operation = PendingNullfsProxyOperation::Lookup {
-        path: String::from(path),
-        components,
-        next_component: 1,
-        purpose,
+    let named_root_operation = nullfs_proxy_resolves_parent(&purpose) && components.len() == 1;
+    let (request, operation) = if named_root_operation {
+        match nullfs_proxy_named_operation(
+            path,
+            filesystem_protocol::ROOT_NODE_ID,
+            &components[0],
+            purpose,
+        ) {
+            Ok(operation) => operation,
+            Err(error) => return ControlOutcome::Ready(error_return(error)),
+        }
+    } else {
+        (
+            nullfs_proxy_lookup_request(filesystem_protocol::ROOT_NODE_ID, &components[0]),
+            PendingNullfsProxyOperation::Lookup {
+                path: String::from(path),
+                components,
+                next_component: 1,
+                purpose,
+            },
+        )
     };
     match nullfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
         Ok(()) => ControlOutcome::Blocked,
@@ -9754,13 +10086,11 @@ fn nullfs_proxy_open(
     descriptor: u64,
     stack_pointer: usize,
 ) -> ControlOutcome {
-    if options.write || options.create || options.truncate || options.append {
-        return ControlOutcome::Ready(error_return(ERR_READ_ONLY));
-    }
     nullfs_proxy_start_path(
         process_id,
         path,
         NullfsPathPurpose::Open {
+            options,
             descriptor,
             close_on_exec,
         },
@@ -9789,12 +10119,11 @@ fn nullfs_proxy_read_directory(
 }
 
 fn nullfs_proxy_chdir(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
-    nullfs_proxy_start_path(
-        process_id,
-        path,
-        NullfsPathPurpose::Chdir,
-        stack_pointer,
-    )
+    nullfs_proxy_start_path(process_id, path, NullfsPathPurpose::Chdir, stack_pointer)
+}
+
+fn nullfs_proxy_unlink(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
+    nullfs_proxy_start_path(process_id, path, NullfsPathPurpose::Unlink, stack_pointer)
 }
 
 fn nullfs_proxy_read(
@@ -9849,11 +10178,91 @@ fn nullfs_proxy_read(
     let operation = PendingNullfsProxyOperation::Read {
         handle,
         address,
+        initial_offset: offset,
         length: count,
     };
     match nullfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
         Ok(()) => ReadOutcome::Blocked,
         Err(error) => ReadOutcome::Ready(error_return(error)),
+    }
+}
+
+fn nullfs_proxy_write(
+    process_id: u64,
+    handle: OpenFileHandle,
+    bytes: &[u8],
+    stack_pointer: usize,
+) -> WriteOutcome {
+    let (offset, initial_offset, generation, session_id, session_generation, node_id, append) = {
+        let file = handle.lock();
+        if !file.writable {
+            return WriteOutcome::Ready(error_return(ERR_BAD_FILE_DESCRIPTOR));
+        }
+        let OpenFileBackend::NullfsProxy {
+            generation,
+            session_id,
+            session_generation,
+            node_id,
+        } = file.backend
+        else {
+            return WriteOutcome::Ready(error_return(ERR_IO));
+        };
+        (
+            if file.append {
+                open_file_size(&file)
+            } else {
+                file.offset
+            },
+            file.offset,
+            generation,
+            session_id,
+            session_generation,
+            node_id,
+            file.append,
+        )
+    };
+    if nullfs_proxy_state().is_none_or(|state| {
+        state.generation != generation
+            || state.session_id != session_id
+            || state.session_generation != session_generation
+    }) {
+        return WriteOutcome::Ready(error_return(ERR_IO));
+    }
+    let count = bytes.len().min(FILESYSTEM_PROXY_BULK_BYTES);
+    if count == 0 {
+        return WriteOutcome::Ready(0);
+    }
+    let mut request = filesystem_protocol::Request::EMPTY;
+    request.operation = filesystem_protocol::operation::WRITE;
+    request.flags = if append {
+        filesystem_protocol::request_flags::APPEND
+    } else {
+        0
+    };
+    request.node_id = node_id;
+    request.file_offset = offset;
+    request.bulk = filesystem_protocol::BulkBuffer {
+        buffer_id: 1,
+        offset: 0,
+        length: count as u64,
+    };
+    let operation = PendingNullfsProxyOperation::Write {
+        handle,
+        offset,
+        initial_offset,
+        append,
+        length: count,
+    };
+    match nullfs_proxy_submit_request(
+        process_id,
+        request,
+        operation,
+        stack_pointer,
+        None,
+        Some(&bytes[..count]),
+    ) {
+        Ok(()) => WriteOutcome::Blocked,
+        Err(error) => WriteOutcome::Ready(error_return(error)),
     }
 }
 
@@ -9903,24 +10312,59 @@ fn nullfs_proxy_complete_success(
             purpose,
         } => {
             if next_component > components.len() {
-                return nullfs_proxy_finish_process(request_id,
+                return nullfs_proxy_finish_process(
+                    request_id,
                     process_id,
                     stack_pointer,
                     error_return(ERR_IO),
                 );
             }
-            if next_component < components.len() {
+            if nullfs_proxy_resolves_parent(&purpose)
+                && next_component == components.len().saturating_sub(1)
+            {
                 if reply.node_kind != filesystem_protocol::node_kind::DIRECTORY {
-                    return nullfs_proxy_finish_process(request_id,
+                    return nullfs_proxy_finish_process(
+                        request_id,
                         process_id,
                         stack_pointer,
                         error_return(abi::errno::NOT_DIRECTORY),
                     );
                 }
-                let request = nullfs_proxy_lookup_request(
+                let (request, operation) = match nullfs_proxy_named_operation(
+                    &path,
                     reply.node_id,
                     &components[next_component],
+                    purpose,
+                ) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return nullfs_proxy_finish_process(
+                            request_id,
+                            process_id,
+                            stack_pointer,
+                            error_return(error),
+                        );
+                    }
+                };
+                return nullfs_proxy_continue(
+                    process_id,
+                    request_id,
+                    request,
+                    operation,
+                    stack_pointer,
                 );
+            }
+            if next_component < components.len() {
+                if reply.node_kind != filesystem_protocol::node_kind::DIRECTORY {
+                    return nullfs_proxy_finish_process(
+                        request_id,
+                        process_id,
+                        stack_pointer,
+                        error_return(abi::errno::NOT_DIRECTORY),
+                    );
+                }
+                let request =
+                    nullfs_proxy_lookup_request(reply.node_id, &components[next_component]);
                 return nullfs_proxy_continue(
                     process_id,
                     request_id,
@@ -9937,7 +10381,8 @@ fn nullfs_proxy_complete_success(
             match purpose {
                 NullfsPathPurpose::Stat { address, length } => {
                     let Some(kind) = nullfs_proxy_node_kind(reply.node_kind) else {
-                        return nullfs_proxy_finish_process(request_id,
+                        return nullfs_proxy_finish_process(
+                            request_id,
                             process_id,
                             stack_pointer,
                             error_return(ERR_IO),
@@ -9950,57 +10395,17 @@ fn nullfs_proxy_complete_success(
                         abi::file::Stat {
                             kind,
                             size: reply.value,
-                            flags: abi::file::FLAG_READ_ONLY,
+                            flags: 0,
                         },
                     );
                     nullfs_proxy_finish_process(request_id, process_id, stack_pointer, result)
                 }
-                NullfsPathPurpose::Open {
-                    descriptor,
-                    close_on_exec,
-                } => {
-                    if reply.node_kind == filesystem_protocol::node_kind::DIRECTORY {
-                        return nullfs_proxy_finish_process(request_id,
-                            process_id,
-                            stack_pointer,
-                            error_return(ERR_IS_DIRECTORY),
-                        );
-                    }
-                    if reply.node_kind != filesystem_protocol::node_kind::FILE {
-                        return nullfs_proxy_finish_process(request_id,
-                            process_id,
-                            stack_pointer,
-                            error_return(ERR_IO),
-                        );
-                    }
-                    let state = match nullfs_proxy_state() {
-                        Some(state) => state,
-                        None => {
-                            return nullfs_proxy_finish_process(request_id,
-                                process_id,
-                                stack_pointer,
-                                error_return(ERR_IO),
-                            );
-                        }
-                    };
-                    let mut request = filesystem_protocol::Request::EMPTY;
-                    request.operation = filesystem_protocol::operation::OPEN;
-                    request.flags = filesystem_protocol::request_flags::READ;
-                    request.node_id = reply.node_id;
-                    nullfs_proxy_continue(
-                        process_id,
+                NullfsPathPurpose::Open { .. } | NullfsPathPurpose::Unlink => {
+                    nullfs_proxy_finish_process(
                         request_id,
-                        request,
-                        PendingNullfsProxyOperation::Open {
-                            path,
-                            descriptor,
-                            close_on_exec,
-                            node_id: reply.node_id,
-                            generation: state.generation,
-                            session_id: filesystem_protocol::INVALID_ID,
-                            session_generation: 0,
-                        },
+                        process_id,
                         stack_pointer,
+                        error_return(ERR_IO),
                     )
                 }
                 NullfsPathPurpose::ReadDirectory {
@@ -10009,7 +10414,8 @@ fn nullfs_proxy_complete_success(
                     capacity,
                 } => {
                     if reply.node_kind != filesystem_protocol::node_kind::DIRECTORY {
-                        return nullfs_proxy_finish_process(request_id,
+                        return nullfs_proxy_finish_process(
+                            request_id,
                             process_id,
                             stack_pointer,
                             error_return(abi::errno::NOT_DIRECTORY),
@@ -10034,7 +10440,8 @@ fn nullfs_proxy_complete_success(
                 }
                 NullfsPathPurpose::Chdir => {
                     if reply.node_kind != filesystem_protocol::node_kind::DIRECTORY {
-                        return nullfs_proxy_finish_process(request_id,
+                        return nullfs_proxy_finish_process(
+                            request_id,
                             process_id,
                             stack_pointer,
                             error_return(abi::errno::NOT_DIRECTORY),
@@ -10051,32 +10458,51 @@ fn nullfs_proxy_complete_success(
         PendingNullfsProxyOperation::Open {
             path,
             descriptor,
+            readable,
+            writable,
+            append,
             close_on_exec,
-            node_id,
             generation,
             session_id,
             session_generation,
         } => {
-            if reply.node_id != node_id
-                || reply.node_kind != filesystem_protocol::node_kind::FILE
-            {
-                return nullfs_proxy_finish_process(request_id,
+            if reply.node_kind == filesystem_protocol::node_kind::DIRECTORY {
+                nullfs_proxy_enqueue_close(
+                    generation,
+                    session_id,
+                    session_generation,
+                    reply.node_id,
+                );
+                return nullfs_proxy_finish_process(
+                    request_id,
                     process_id,
                     stack_pointer,
-                    error_return(if reply.node_kind == filesystem_protocol::node_kind::DIRECTORY {
-                        ERR_IS_DIRECTORY
-                    } else {
-                        ERR_IO
-                    }),
+                    error_return(ERR_IS_DIRECTORY),
                 );
             }
+            if reply.node_kind != filesystem_protocol::node_kind::FILE {
+                return nullfs_proxy_finish_process(
+                    request_id,
+                    process_id,
+                    stack_pointer,
+                    error_return(ERR_IO),
+                );
+            }
+            let shared_size = nullfs_proxy_node_size(
+                generation,
+                session_id,
+                session_generation,
+                reply.node_id,
+                reply.value,
+            );
             let handle = Arc::new(PreemptMutex::new(OpenFileState {
                 path,
-                offset: 0,
-                readable: true,
-                writable: false,
-                append: false,
+                offset: if append { reply.value } else { 0 },
+                readable,
+                writable,
+                append,
                 size: reply.value,
+                nullfs_size: Some(shared_size),
                 backend: OpenFileBackend::NullfsProxy {
                     generation,
                     session_id,
@@ -10112,12 +10538,14 @@ fn nullfs_proxy_complete_success(
         PendingNullfsProxyOperation::Read {
             handle,
             address,
+            initial_offset,
             length,
         } => {
             let count = match usize::try_from(reply.value) {
                 Ok(count) if count <= length => count,
                 _ => {
-                    return nullfs_proxy_finish_process(request_id,
+                    return nullfs_proxy_finish_process(
+                        request_id,
                         process_id,
                         stack_pointer,
                         error_return(ERR_IO),
@@ -10126,7 +10554,8 @@ fn nullfs_proxy_complete_success(
             };
             let mut bytes = vec![0_u8; count];
             if count != 0 && nullfs_proxy_bulk_read_at(0, &mut bytes).is_err() {
-                return nullfs_proxy_finish_process(request_id,
+                return nullfs_proxy_finish_process(
+                    request_id,
                     process_id,
                     stack_pointer,
                     error_return(ERR_IO),
@@ -10138,13 +10567,8 @@ fn nullfs_proxy_complete_success(
                     return Ok(());
                 };
                 let copied = count == 0
-                    || write_user_bytes(
-                        address,
-                        &bytes,
-                        physical_memory_offset,
-                        &process.pages,
-                    )
-                    .is_ok();
+                    || write_user_bytes(address, &bytes, physical_memory_offset, &process.pages)
+                        .is_ok();
                 if copied {
                     process.read_count = process.read_count.saturating_add(1);
                     process.bytes_read = process.bytes_read.saturating_add(count as u64);
@@ -10152,16 +10576,68 @@ fn nullfs_proxy_complete_success(
                 copied
             };
             if !copied {
-                return nullfs_proxy_finish_process(request_id,
+                return nullfs_proxy_finish_process(
+                    request_id,
                     process_id,
                     stack_pointer,
                     error_return(ERR_IO),
                 );
             }
             let mut file = handle.lock();
-            file.offset = file.offset.saturating_add(count as u64);
+            if file.offset == initial_offset {
+                file.offset = initial_offset.saturating_add(count as u64);
+            }
             drop(file);
             nullfs_proxy_finish_process(request_id, process_id, stack_pointer, count as u64)
+        }
+        PendingNullfsProxyOperation::Write {
+            handle,
+            initial_offset,
+            length,
+            ..
+        } => {
+            let count = match usize::try_from(reply.value) {
+                Ok(count) if count <= length => count,
+                _ => {
+                    return nullfs_proxy_finish_process(
+                        request_id,
+                        process_id,
+                        stack_pointer,
+                        error_return(ERR_IO),
+                    );
+                }
+            };
+            let Some(resulting_offset) = filesystem_protocol::decode_write_reply_offset(&reply)
+            else {
+                return nullfs_proxy_finish_process(
+                    request_id,
+                    process_id,
+                    stack_pointer,
+                    error_return(ERR_IO),
+                );
+            };
+            {
+                let mut file = handle.lock();
+                let size = open_file_size(&file).max(resulting_offset);
+                update_open_file_size(&mut file, size);
+                if file.offset == initial_offset {
+                    file.offset = resulting_offset;
+                }
+            }
+            {
+                let mut manager = PROCESS_MANAGER.lock();
+                if let Some(process) = manager.process_mut(process_id) {
+                    process.write_count = process.write_count.saturating_add(1);
+                    process.bytes_written = process.bytes_written.saturating_add(count as u64);
+                    process.file_write_count = process.file_write_count.saturating_add(1);
+                    process.file_bytes_written =
+                        process.file_bytes_written.saturating_add(count as u64);
+                }
+            }
+            nullfs_proxy_finish_process(request_id, process_id, stack_pointer, count as u64)
+        }
+        PendingNullfsProxyOperation::Unlink => {
+            nullfs_proxy_finish_process(request_id, process_id, stack_pointer, 0)
         }
         PendingNullfsProxyOperation::ReadDirectory {
             node_id,
@@ -10177,7 +10653,8 @@ fn nullfs_proxy_complete_success(
             let count = match usize::try_from(reply.value) {
                 Ok(count) if count <= maximum => count,
                 _ => {
-                    return nullfs_proxy_finish_process(request_id,
+                    return nullfs_proxy_finish_process(
+                        request_id,
                         process_id,
                         stack_pointer,
                         error_return(ERR_IO),
@@ -10188,20 +10665,20 @@ fn nullfs_proxy_complete_success(
             for index in 0..count {
                 let mut bytes = [0_u8; size_of::<filesystem_protocol::DirectoryEntry>()];
                 if nullfs_proxy_bulk_read_at(index * entry_size, &mut bytes).is_err() {
-                    return nullfs_proxy_finish_process(request_id,
+                    return nullfs_proxy_finish_process(
+                        request_id,
                         process_id,
                         stack_pointer,
                         error_return(ERR_IO),
                     );
                 }
                 let entry = unsafe {
-                    ptr::read_unaligned(
-                        bytes.as_ptr() as *const filesystem_protocol::DirectoryEntry,
-                    )
+                    ptr::read_unaligned(bytes.as_ptr() as *const filesystem_protocol::DirectoryEntry)
                 };
                 let name_length = usize::from(entry.name_length);
                 let Some(kind) = nullfs_proxy_node_kind(entry.kind) else {
-                    return nullfs_proxy_finish_process(request_id,
+                    return nullfs_proxy_finish_process(
+                        request_id,
                         process_id,
                         stack_pointer,
                         error_return(ERR_IO),
@@ -10217,7 +10694,8 @@ fn nullfs_proxy_complete_success(
                     || entry.name[name_length..].iter().any(|byte| *byte != 0)
                     || name_length > abi::file::MAX_DIRECTORY_ENTRY_NAME_BYTES
                 {
-                    return nullfs_proxy_finish_process(request_id,
+                    return nullfs_proxy_finish_process(
+                        request_id,
                         process_id,
                         stack_pointer,
                         error_return(ERR_IO),
@@ -10228,7 +10706,7 @@ fn nullfs_proxy_complete_success(
                     let mut record = abi::file::DirectoryEntry {
                         kind,
                         size: 0,
-                        flags: abi::file::FLAG_READ_ONLY,
+                        flags: 0,
                         name_length: name_length as u64,
                         name: [0; abi::file::DIRECTORY_ENTRY_NAME_CAPACITY],
                     };
@@ -10244,14 +10722,13 @@ fn nullfs_proxy_complete_success(
                     .enumerate()
                     .map(|(index, record)| {
                         records_address
-                            .checked_add(
-                                (index * size_of::<abi::file::DirectoryEntry>()) as u64,
-                            )
+                            .checked_add((index * size_of::<abi::file::DirectoryEntry>()) as u64)
                             .map(|destination| (destination, record))
                     })
                     .collect::<Option<Vec<_>>>();
                 let Some(destinations) = destinations else {
-                    return nullfs_proxy_finish_process(request_id,
+                    return nullfs_proxy_finish_process(
+                        request_id,
                         process_id,
                         stack_pointer,
                         error_return(abi::errno::RANGE),
@@ -10276,7 +10753,8 @@ fn nullfs_proxy_complete_success(
                         .is_ok()
                     })
                 };
-                return nullfs_proxy_finish_process(request_id,
+                return nullfs_proxy_finish_process(
+                    request_id,
                     process_id,
                     stack_pointer,
                     if copied {
@@ -10287,7 +10765,8 @@ fn nullfs_proxy_complete_success(
                 );
             }
             if count == 0 {
-                return nullfs_proxy_finish_process(request_id,
+                return nullfs_proxy_finish_process(
+                    request_id,
                     process_id,
                     stack_pointer,
                     error_return(ERR_IO),
@@ -10366,6 +10845,7 @@ fn syscall_open(process_id: u64, address: u64, length: u64, flags: u64) -> u64 {
         writable: options.write,
         append: options.append,
         size: metadata.size,
+        nullfs_size: None,
         backend: OpenFileBackend::Vfs,
     }));
     let mut m = PROCESS_MANAGER.lock();
@@ -10831,7 +11311,7 @@ fn syscall_seek(process_id: u64, descriptor: u64, offset: u64, whence: u64) -> u
             SEEK_CURRENT => i128::from(f.offset),
             SEEK_END => match f.backend {
                 OpenFileBackend::TmpfsProxy { .. } => i128::from(f.size),
-                OpenFileBackend::NullfsProxy { .. } => i128::from(f.size),
+                OpenFileBackend::NullfsProxy { .. } => i128::from(open_file_size(&f)),
                 OpenFileBackend::Vfs => match vfs::metadata(&f.path) {
                     Ok(md) => i128::from(md.size),
                     Err(e) => return error_return(vfs_errno(&e)),

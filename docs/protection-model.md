@@ -18,7 +18,8 @@ filesystem responsibilities across userspace service boundaries:
 - the userspace tmpfs service is the active `/tmp` backend;
 - a separately supervised VFS service owns the versioned longest-prefix namespace table;
 - a separately supervised NullFS service mounts its core read-write and offers explicitly
-  negotiated writable sessions, while its kernel proxy and public mount stay read-only;
+  negotiated writable sessions; its kernel proxy also negotiates bounded public write
+  authority for `/Volumes/NULLSTAR_DATA`;
 - PID 1 delegates endpoint authority, including a narrowly scoped writable raw NullFS
   block endpoint, to those services;
 - provider generation, protocol session, request, and stale-handle checks protect
@@ -105,22 +106,31 @@ The VFS and kernel proxies validate:
 - session and request identity;
 - operation and reserved fields;
 - transferred capability type and rights;
-- buffer identifiers, offsets, lengths, and reply byte counts.
+- buffer identifiers, offsets, lengths, reply byte counts, and authoritative resulting
+  write offsets.
 
-Open-file descriptions retain generation-scoped service nodes. When a provider is
-replaced, old in-flight requests fail deterministically, old descriptors remain stale,
-and close records from old generations are not sent to the replacement service.
+Open-file descriptions retain shared generation-, session-, node-, and size-bound state.
+This keeps append, truncate, cross-handle `fstat`/`SEEK_END`, and open-unlinked access
+coherent across descriptor aliases. When a provider is replaced, old in-flight requests
+fail, old descriptors remain stale, and neither mutations, descriptions, nor old close
+records are replayed or rebound to the replacement.
 
 For writable NullFS operations, the service copies each complete write of at most 4 KiB
-from shared memory into private storage before entering the core. Open-unlinked access
-requires the actual matching session-owned open handle. Unlink is rejected if a read-only
-session owns an open whose later close could reclaim storage; open-directory removal and
-unsafe rename replacement are also restricted.
+from shared memory into private storage before entering the core. The public proxy first
+reserves its single request and only then stages at most 4 KiB. A successful generic
+`WRITE` reply retains its byte count in `value` and carries the exact resulting offset as
+eight little-endian inline bytes, allowing append to report its service-selected EOF.
+Open-unlinked access requires the actual matching session-owned open handle. Unlink is
+rejected if a read-only session owns an open whose later close could reclaim storage;
+open-directory removal and unsafe rename replacement are also restricted.
 
 If a mutation's durable outcome is uncertain or the core is poisoned, the service sends
 `OUTCOME_UNKNOWN` and fail-stops. Its supervisor replaces it, causing a fresh mount and
-recovery before readiness. Automatic retry is forbidden because neither a lost reply nor
-service replacement proves that the prior mutation did not commit.
+recovery before readiness. The public proxy also maps `OUTCOME_UNKNOWN`, malformed
+replies, and post-send mutation uncertainty to `IO`, quarantines the generation, and never
+automatically retries. Neither a lost reply nor service replacement proves that the prior
+mutation did not commit; durability remains limited to NullFS's transaction and recovery
+semantics.
 
 ## Raw block-device authority
 
@@ -154,10 +164,11 @@ layers:
 3. the public VFS path is writable only if its kernel proxy and mount policy grant that
    authority.
 
-The current kernel NullFS proxy connects with flags `0`, and its mutation guards keep
-`/Volumes/NULLSTAR_DATA` read-only. Explicit direct clients can negotiate writable service
-sessions, but neither they nor the service's raw endpoint make ordinary VFS syscalls
-writable.
+The kernel NullFS proxy connects with exactly `WRITE` and requires the returned
+`session_features::WRITE`. Its public policy permits writable/create/truncate/append open,
+descriptor write, and unlink at `/Volumes/NULLSTAR_DATA`, but not public `mkdir`, `rmdir`,
+or rename. Direct flags-zero sessions remain read-only. Neither the service's raw endpoint
+nor a different client's writable session manufactures public VFS authority.
 
 ## Security boundaries and limitations
 

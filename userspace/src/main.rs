@@ -36,8 +36,7 @@ const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service --writable";
 const NULLFS_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const NULLFS_SERVICE_STARTING: &[u8] = b"userspace init: starting NullFS service\n";
 const NULLFS_SERVICE_RESTARTING: &[u8] = b"userspace init: NullFS service exited; restarting\n";
-const NULLFS_SERVICE_READY: &[u8] =
-    b"userspace init: writable NullFS service ready; VFS mount remains read-only\n";
+const NULLFS_SERVICE_READY: &[u8] = b"userspace init: writable NullFS service ready\n";
 const NULLFS_SERVICE_FAILED: &[u8] = b"userspace init: NullFS service exhausted restart budget\n";
 const NULLFS_SERVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to grant NullFS capabilities\n";
@@ -68,10 +67,11 @@ const VFS_PROBE_COMMAND: &[u8] = b"/vfs-probe";
 const VFS_PROBE_FAILED: &[u8] = b"userspace init: userspace vfs probe failed\n";
 const VFS_PROBE_PASSED: &[u8] = b"userspace init: userspace vfs probe passed\n";
 const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
-const NULLFS_RESTART_PROBE_READY: &[u8] = b"nullfs-restart: live descriptor ready";
+const NULLFS_RESTART_PROBE_READY: &[u8] =
+    b"nullfs-restart: live descriptor and persistent mutation ready";
 const NULLFS_RESTART_PROBE_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
 const NULLFS_RESTART_PROBE_PASSED: &[u8] =
-    b"userspace init: NullFS restart and stale descriptors verified\n";
+    b"userspace init: NullFS restart persistent VFS mutation and stale descriptors verified\n";
 const NULLFS_RESTART_PROBE_FAILED: &[u8] = b"userspace init: NullFS restart probe failed\n";
 const BOOT_MODE_PATH: &[u8] = b"/BOOTMODE";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";

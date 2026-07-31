@@ -298,7 +298,7 @@ fn build_nullfs_fixture() -> Vec<u8> {
         .create_file(
             docs,
             "readme.txt",
-            b"This volume is prepared for read-only Phase 4 service integration.\n",
+            b"This volume is a deterministic NullFS integration fixture.\n",
             0o644,
         )
         .expect("failed to create NullFS fixture nested file");

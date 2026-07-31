@@ -8,6 +8,7 @@
 pub const VERSION: u16 = 1;
 pub const MAX_NAME_BYTES: usize = 96;
 pub const MAX_INLINE_DATA_BYTES: usize = 64;
+pub const WRITE_REPLY_OFFSET_BYTES: usize = 8;
 pub const ROOT_NODE_ID: u64 = 1;
 pub const INVALID_ID: u64 = 0;
 
@@ -203,6 +204,26 @@ impl Reply {
         reserved: [0; 2],
         data: [0; MAX_INLINE_DATA_BYTES],
     };
+}
+
+pub fn encode_write_reply_offset(reply: &mut Reply, resulting_offset: u64) {
+    reply.data_length = WRITE_REPLY_OFFSET_BYTES as u16;
+    reply.data = [0; MAX_INLINE_DATA_BYTES];
+    reply.data[..WRITE_REPLY_OFFSET_BYTES].copy_from_slice(&resulting_offset.to_le_bytes());
+}
+
+pub fn decode_write_reply_offset(reply: &Reply) -> Option<u64> {
+    if usize::from(reply.data_length) != WRITE_REPLY_OFFSET_BYTES
+        || reply.data[WRITE_REPLY_OFFSET_BYTES..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return None;
+    }
+
+    let mut bytes = [0; WRITE_REPLY_OFFSET_BYTES];
+    bytes.copy_from_slice(&reply.data[..WRITE_REPLY_OFFSET_BYTES]);
+    Some(u64::from_le_bytes(bytes))
 }
 
 #[repr(C)]

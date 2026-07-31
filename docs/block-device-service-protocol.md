@@ -159,10 +159,10 @@ PID 1 also registers each `nullfs-service` process as an independent,
 generation-scoped kernel filesystem proxy, while the VFS statically mounts the
 backend at `/Volumes/NULLSTAR_DATA`. The filesystem proxy's own kernel-registered
 4 KiB buffer is distinct from the service's block-device session window. The
-proxy still connects with flags `0`, allowing ordinary `stat`, read-only `open`,
-`read`, `fstat`, `seek`, `read_directory`, and `chdir` traffic—including
-cwd-relative routing—to reach the service. Kernel mutation guards and public
-filesystem mutation denial remain active.
+proxy connects with exactly `WRITE`, requires `session_features::WRITE`, and
+permits ordinary stat/read/open plus writable, create, truncate, and append open,
+descriptor write, unlink, `fstat`, seek, `read_directory`, and `chdir`. Public
+`mkdir`, `rmdir`, rename, and broader namespace adoption remain future.
 
 ## Writable authority
 
@@ -173,10 +173,19 @@ read-write core mount, but raw authority remains distinct from both writable
 filesystem-session authority and public VFS authority.
 
 Explicit direct filesystem clients can negotiate the `WRITE` session feature
-and use the service's bounded mutation operations. The kernel NullFS proxy does
-not: it requests flags `0`, and `/Volumes/NULLSTAR_DATA` remains read-only.
-Ordinary writable filesystem syscalls and namespace adoption remain the next
-integration step, not an implication of raw block access.
+and use the service's bounded mutation operations; flags-zero direct sessions
+remain read-only. The kernel NullFS proxy separately negotiates exactly `WRITE`
+and applies bounded public VFS policy at `/Volumes/NULLSTAR_DATA`. Its write path
+reserves the single proxy request before staging at most 4 KiB and validates the
+generic reply's byte count plus exact eight-byte little-endian resulting offset.
+That offset records append's service-selected EOF.
+
+Malformed replies, `OUTCOME_UNKNOWN`, and post-send mutation uncertainty map to
+`IO`, quarantine the filesystem generation, and are never automatically retried.
+Descriptors share generation/session/node size state, while replacement leaves
+old descriptors stale without replay or rebinding. Public `mkdir`, `rmdir`,
+rename, and namespace identity/bindings remain future; none are implied by raw
+block access.
 
 A failed raw write can have modified storage despite reporting no completed
 blocks. At the filesystem layer, poisoned or otherwise uncertain mutation

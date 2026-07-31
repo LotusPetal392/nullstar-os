@@ -3,10 +3,10 @@
 NullStar OS is migrating from filesystem-specific kernel routing to a common
 userspace filesystem-service contract defined in
 `shared/filesystem_protocol.rs`. Generic sessions, opaque node handles, and
-registered bulk buffers are active for tmpfs and NullFS. NullFS additionally
-supports explicitly negotiated direct writable sessions, while its kernel proxy
-and public VFS mount remain read-only. The public file-descriptor ABI remains
-unchanged while kernel proxies bridge the migration.
+registered bulk buffers are active for tmpfs and NullFS. NullFS supports
+explicitly negotiated direct writable sessions and a bounded writable public VFS
+proxy. The public file-descriptor ABI remains unchanged while kernel proxies
+bridge the migration.
 
 ## Design goals
 
@@ -75,7 +75,12 @@ Generic tmpfs reads and writes now use these registered windows. For `READ`, the
 service copies file bytes into the selected shared-memory range; for `WRITE`, it
 copies bytes from the range into the file. Both operations validate the session,
 node ID, buffer ID, buffer bounds, file offset, file capacity, and append flags
-before accessing either object. Replies return the completed byte count.
+before accessing either object.
+
+A successful generic `WRITE` reply returns the completed byte count in `value`
+and the exact authoritative resulting file offset as eight little-endian bytes
+in the inline payload. The offset is authoritative even for append, where the
+service selects the current EOF rather than trusting a client-supplied offset.
 
 Directory iteration uses fixed-size `DirectoryEntry` records in a registered
 window. Each record carries a node ID, kind, component name, and continuation
@@ -224,9 +229,9 @@ overloading generic flags or inline data.
    broader open-file ownership migration remains)
 5. Put FAT behind the same protocol.
 6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
-   service. (read-write service mount and explicitly writable direct sessions
-   complete; static public VFS mount remains read-only pending namespace
-   adoption and ordinary VFS mutation routing)
+   service. (read-write service mount, explicitly writable direct sessions, and
+   bounded public VFS create/write/truncate/append/unlink complete; namespace
+   identity and bindings remain)
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
 
@@ -323,45 +328,42 @@ when a close fails. PID 1 registers it independently of tmpfs as a
 generation-scoped kernel filesystem proxy. The VFS has a static longest-prefix
 route for `/Volumes/NULLSTAR_DATA`, and its `/Volumes` listing exposes that mount.
 
-The NullFS proxy performs `CONNECT` with flags `0` for each registered service
-generation and attaches one kernel-owned 4 KiB shared-memory buffer. It therefore
-receives a read-only session even though the service's core mount is writable.
-The proxy translates ordinary `stat`, read-only `open`, `read`, `fstat`, `seek`,
-`read_directory`, and `chdir` behavior without adding a NullFS-specific
-application ABI. Canonical path resolution happens before VFS routing, so after
-`chdir` enters the mounted volume, relative directory changes and opens are
-routed back to NullFS. Kernel mutation guards continue to reject write, create,
-truncate, append, unlink, and other mutation intent with the public read-only
-error. Direct clients can explicitly negotiate `WRITE`; public
-`/Volumes/NULLSTAR_DATA` VFS users cannot.
+The NullFS proxy performs `CONNECT` with exactly `WRITE` for each registered
+service generation, requires `session_features::WRITE` in the canonical reply,
+and attaches one kernel-owned 4 KiB shared-memory buffer. Direct clients that
+connect with flags `0` still receive read-only sessions; raw block authority,
+filesystem-session authority, and public VFS policy remain separate.
+
+Without adding a NullFS-specific application ABI, `/Volumes/NULLSTAR_DATA`
+supports ordinary public `stat`, read, open, `fstat`, seek, `read_directory`, and
+`chdir`, plus writable, create, truncate, and append opens, descriptor `write`,
+and unlink. Canonical path resolution happens before VFS routing, so cwd-relative
+operations continue to reach the mount. Public `mkdir`, `rmdir`, rename, and
+broader namespace adoption remain future work.
+
+Before copying a public write's source bytes, the proxy reserves its sole
+outstanding request; it then stages at most 4 KiB in the registered window. A
+successful reply must contain the byte count in `value` and the exact resulting
+offset as eight little-endian inline bytes. This lets append use the service's
+selected EOF. Malformed replies, `OUTCOME_UNKNOWN`, and any post-send mutation
+uncertainty map to `IO`, quarantine the generation, and are never automatically
+retried.
 
 The kernel maps successful `OPEN` references to open-file descriptions rather
 than descriptor numbers. `dup`, `dup2`, fork inheritance, and file-backed
-standard streams share the same description, so closing one alias cannot close
-the service node early. The description's final destruction—through explicit
-close, close-on-exec, or process reap—queues one generation- and session-bound
-`CLOSE_NODE`. The serialized request slot remains owned through reply payload
-validation and shared-buffer consumption, and multi-stage lookup or directory
-operations replace the active request ID atomically before sending their next
-stage. Accepted close requests are not blindly replayed because a lost or failed
-reply cannot prove whether the service already decremented the reference;
-explicit `TRY_AGAIN` is the only retryable close status, while failed or
-malformed replies leave the proxy fail-stopped until service replacement rather
-than risking a leaked or duplicate close.
+standard streams share the same generation-, session-, node-, and size-bound
+state, so append, truncate, cross-handle `fstat`/`SEEK_END`, and open-unlinked
+access remain coherent and one alias cannot close the service node early. Final
+destruction queues one generation- and session-bound `CLOSE_NODE`.
 
-When PID 1 supervises a replacement, it registers a higher proxy generation.
-The kernel releases the previous endpoint, session reply endpoint, and bulk
-buffer, fails old in-flight requests with I/O, and refuses to rebind existing
-open-file descriptions; subsequent NullFS I/O through those old descriptors
-therefore fails with I/O. Close tickets carry the old proxy generation, session
-ID, and session generation and are discarded rather than sent to the
-replacement service. The direct service probe preserves protocol lookup, reads,
-directory cookies,
-read-only-session mutation denial, and close/disconnect accounting. It also
-opens an explicit writable session, tests create, directory creation, write,
-append, truncate, rename, unlink, `rmdir`, and sync, and cleans the probe
-namespace. If a prior run was interrupted, recovery recognizes and removes only
-the exact reserved artifact forms the probe can leave behind. The normal-boot
-VFS probe continues to cover the read-only mounted syscall path, including
-cwd-relative routing; the dedicated restart test covers replacement with live
-descriptors.
+When PID 1 registers a replacement, the kernel releases the previous endpoint,
+session reply endpoint, and bulk buffer and fails old in-flight requests with
+`IO`. It never replays mutations or rebinds existing descriptions; old
+descriptors remain stale, and old-generation close tickets are discarded.
+
+The direct service probe preserves read-only-session denial and exercises the
+service's broader writable protocol surface, including directory creation,
+`rmdir`, and rename. Public probes separately cover create, write, independent
+stale append, cross-handle `fstat` and `SEEK_END`, truncate, duplication, unlink
+while open, open-unlinked read/write, cleanup, persistence across service
+restart, and stale old descriptors.

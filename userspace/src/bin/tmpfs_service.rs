@@ -805,6 +805,7 @@ fn write_node_from_buffer(
             file.data[file_offset..end].copy_from_slice(&bytes[..requested]);
             file.length = file.length.max(end);
             reply.value = requested as u64;
+            filesystem_protocol::encode_write_reply_offset(reply, end as u64);
         }
         _ => reply.status = filesystem_protocol::status::IO,
     }

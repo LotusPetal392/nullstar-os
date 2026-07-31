@@ -16,11 +16,12 @@ const SERVICE_HANDLE: u64 = 1;
 const BUFFER_ID: u64 = 1;
 const BUFFER_BYTES: usize = 4096;
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
-const README: &[u8] = b"This volume is prepared for read-only Phase 4 service integration.\n";
+const README: &[u8] = b"This volume is a deterministic NullFS integration fixture.\n";
 const WRITABLE_DIRECTORY_A: &[u8] = b"nullfs-probe-a";
 const WRITABLE_DIRECTORY_B: &[u8] = b"nullfs-probe-b";
 const WRITABLE_FILE: &[u8] = b"payload.bin";
 const RENAMED_FILE: &[u8] = b"renamed.bin";
+const PUBLIC_VFS_PROBE_FILE: &[u8] = b"nullstar-vfs-probe-v1.bin";
 const INITIAL_BYTES: &[u8] = b"NullStar writable";
 const APPEND_BYTES: &[u8] = b" probe";
 const COMPLETE_BYTES: &[u8] = b"NullStar writable probe";
@@ -31,7 +32,7 @@ const READBACK_OFFSET: usize = 256;
 const RENAME_OFFSET: usize = 512;
 const DIRECTORY_OFFSET: usize = 1024;
 const RECOVERY_READ_OFFSET: usize = 2048;
-const ROOT_ENTRY_CAPACITY: usize = 4;
+const ROOT_ENTRY_CAPACITY: usize = 5;
 const RECOVERY_ENTRY_CAPACITY: usize = 2;
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
@@ -571,6 +572,7 @@ fn directory_contains_fixture(
     let mut found_welcome = false;
     let mut found_directory_a = false;
     let mut found_directory_b = false;
+    let mut found_public_vfs_probe = false;
     for index in 0..batch.count {
         let Some(record) = read_directory_record(shared_memory, index) else {
             return false;
@@ -603,6 +605,11 @@ fn directory_contains_fixture(
                 return false;
             }
             found_directory_b = true;
+        } else if name == PUBLIC_VFS_PROBE_FILE {
+            if found_public_vfs_probe || record.kind != protocol::node_kind::FILE {
+                return false;
+            }
+            found_public_vfs_probe = true;
         } else {
             return false;
         }

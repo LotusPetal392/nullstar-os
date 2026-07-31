@@ -54,7 +54,7 @@ Initialization proceeds in dependency order:
    or PIT fallback.
 4. Enumerate PCIe through MCFG/ECAM, initialize AHCI, and discover MBR or GPT partitions.
 5. Mount the first supported FAT volume at `/`, then establish the service-backed
-   namespace including `/tmp` and the read-only NullFS mount.
+   namespace including `/tmp` and the bounded writable NullFS mount.
 6. Initialize scheduling and select normal, smoke-test, or targeted service-fault
    behavior.
 7. Create `/init` as PID 1. Init launches and supervises `/ush`; if init cannot start or
@@ -142,9 +142,10 @@ registered shared-memory windows. The userspace tmpfs service is the active `/tm
 path. A separately supervised VFS service owns the longest-prefix namespace table and
 validates the layout during boot.
 
-`stat`, path-based `read_directory`, `chdir`, descriptor-producing `open`, and `unlink`
-cross the VFS routing boundary. Service-backed open-file descriptions retain exactly one
-generation- and session-bound node reference until their final shared owner disappears.
+`stat`, path-based `read_directory`, `chdir`, descriptor-producing `open`, descriptor
+`read` and `write`, and `unlink` cross the VFS routing boundary. Service-backed open-file
+descriptions retain exactly one generation- and session-bound node reference until their
+final shared owner disappears.
 
 The rooted namespace currently includes synthetic `/dev`, service-backed `/tmp`, the
 system hierarchy under `/System`, homes under `/Users`, applications under
@@ -198,20 +199,33 @@ accepted only through an actual matching open handle. Unlink is rejected when a 
 session owns an open whose later close would reclaim storage, and open-directory `rmdir`
 and unsafe rename replacement remain restricted.
 
-The kernel NullFS proxy still connects with flags `0`, and the public
-`/Volumes/NULLSTAR_DATA` mount remains read-only. Ordinary `stat`, read-only `open`,
-`read`, `fstat`, `seek`, `read_directory`, and `chdir` work through the mount; the
-kernel's mutation guards still reject write, create, truncate, append, unlink, and other
-mutation intent before it can become public VFS authority. Open nodes and requests remain
-scoped to their service session and generation. On replacement, old in-flight operations
-fail, old descriptors remain stale, and old close tickets are not sent to the new service.
+The kernel NullFS proxy requests exactly `WRITE` and accepts a service generation only
+when `CONNECT` returns `session_features::WRITE`. The public `/Volumes/NULLSTAR_DATA`
+mount supports ordinary `stat`, read, open, `fstat`, seek, directory reads, and `chdir`,
+plus writable, create, truncate, and append opens, descriptor writes, and unlink. Public
+`mkdir`, `rmdir`, rename, and broader namespace adoption remain future work; direct
+flags-zero sessions remain read-only.
+
+The proxy reserves its single request before staging at most 4 KiB for a write. A
+successful generic `WRITE` reply retains the byte count in `value` and carries the exact
+authoritative resulting offset as eight little-endian inline bytes, including the EOF
+selected by append. Open descriptions for the same generation-, session-, and node-bound
+file share size state, preserving append, truncate, cross-handle `fstat`/`SEEK_END`, and
+open-unlinked coherence. Service replacement never replays or rebinds old descriptions;
+they remain stale.
+
+The public proxy validates canonical replies. `OUTCOME_UNKNOWN`, a malformed reply, or
+post-send uncertainty about a mutation maps to `IO`, quarantines that service generation,
+and is never automatically retried. These rules do not add durability beyond NullFS's
+existing transaction and recovery semantics.
 
 Normal boot retains raw read-only and reversible write/flush/readback/restore coverage.
-The direct filesystem probe also verifies read-only denial, exercises the writable
-mutation surface, cleans its namespace, and recognizes and safely removes only exact
-reserved artifacts left by an interrupted prior probe. Namespace bindings, ordinary VFS
-mutation, and transition to the planned `/Volumes/NullStar` backing volume remain the
-next integration work described in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
+Public probes cover create, write, independent stale append, cross-handle `fstat` and
+`SEEK_END`, truncate, descriptor duplication, unlink while open, open-unlinked read and
+write, cleanup, persistence across service restart, and stale old descriptors. Namespace
+identity and bindings, including transition to the planned `/Volumes/NullStar` backing
+volume, are the next integration work described in the
+[NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
 

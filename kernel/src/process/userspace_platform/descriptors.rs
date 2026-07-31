@@ -43,17 +43,14 @@ fn platform_fstat(process_id: u64, descriptor: u64, stat_address: u64, stat_leng
                     session_generation,
                     ..
                 } => {
-                    if !nullfs_proxy_backend_is_current(
-                        generation,
-                        session_id,
-                        session_generation,
-                    ) {
+                    if !nullfs_proxy_backend_is_current(generation, session_id, session_generation)
+                    {
                         return error_return(ERR_IO);
                     }
                     abi::file::Stat {
                         kind: abi::file::KIND_FILE,
-                        size: file.size,
-                        flags: abi::file::FLAG_READ_ONLY,
+                        size: open_file_size(&file),
+                        flags: 0,
                     }
                 }
                 OpenFileBackend::Vfs => {
