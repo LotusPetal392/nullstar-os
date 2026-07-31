@@ -18,6 +18,7 @@ authoritative when it differs from a future design.
 
 - [Kernel, IPC, and scheduling](kernel-ipc-scheduling.md)
 - [Memory management](memory-management.md)
+- [Memory hardening](memory-hardening.md)
 - [Userspace architecture](userspace-architecture.md)
 - [Executable loading and linking](executable-loading.md)
 - [Magnetar package and deployment management](package-management.md)
