@@ -303,6 +303,14 @@ fn build_nullfs_fixture() -> Vec<u8> {
         )
         .expect("failed to create NullFS fixture nested file");
     image
+        .create_file(
+            1,
+            "unmanaged.txt",
+            b"This entry verifies that boot probes preserve non-reserved data.\n",
+            0o644,
+        )
+        .expect("failed to create unmanaged NullFS fixture file");
+    image
         .finish()
         .expect("failed to finalize NullFS fixture")
         .bytes()

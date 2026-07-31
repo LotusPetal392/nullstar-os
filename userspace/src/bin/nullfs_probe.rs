@@ -32,7 +32,7 @@ const READBACK_OFFSET: usize = 256;
 const RENAME_OFFSET: usize = 512;
 const DIRECTORY_OFFSET: usize = 1024;
 const RECOVERY_READ_OFFSET: usize = 2048;
-const ROOT_ENTRY_CAPACITY: usize = 5;
+const ROOT_ENTRY_CAPACITY: usize = 2;
 const RECOVERY_ENTRY_CAPACITY: usize = 2;
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
@@ -560,61 +560,80 @@ fn directory_contains_fixture(
         offset: DIRECTORY_OFFSET as u64,
         length: (ROOT_ENTRY_CAPACITY * entry_bytes) as u64,
     };
-    let Ok(batch) = session.read_directory_to_shared_buffer(request_id, root, 0, bulk) else {
-        return false;
-    };
-    if !batch.end || batch.count > ROOT_ENTRY_CAPACITY {
-        return false;
-    }
-
     let mut cookie = 0;
     let mut found_docs = false;
     let mut found_welcome = false;
     let mut found_directory_a = false;
     let mut found_directory_b = false;
     let mut found_public_vfs_probe = false;
-    for index in 0..batch.count {
-        let Some(record) = read_directory_record(shared_memory, index) else {
+
+    for _ in 0..128 {
+        let Ok(batch) = session.read_directory_to_shared_buffer(request_id, root, cookie, bulk)
+        else {
             return false;
         };
-        if record.node_id == protocol::INVALID_ID || record.next_cookie <= cookie {
+        if batch.count > ROOT_ENTRY_CAPACITY || batch.count == 0 && !batch.end {
             return false;
         }
-        cookie = record.next_cookie;
 
-        let Some(name) = entry_name(&record) else {
-            return false;
-        };
-        if name == b"docs" {
-            if found_docs || record.kind != protocol::node_kind::DIRECTORY {
+        for index in 0..batch.count {
+            let Some(record) = read_directory_record(shared_memory, index) else {
+                return false;
+            };
+            if record.node_id == protocol::INVALID_ID || record.next_cookie <= cookie {
                 return false;
             }
-            found_docs = true;
-        } else if name == b"welcome.txt" {
-            if found_welcome || record.kind != protocol::node_kind::FILE {
+            cookie = record.next_cookie;
+
+            let Some(name) = entry_name(&record) else {
+                return false;
+            };
+            if name == b"docs" {
+                if found_docs || record.kind != protocol::node_kind::DIRECTORY {
+                    return false;
+                }
+                found_docs = true;
+            } else if name == b"welcome.txt" {
+                if found_welcome || record.kind != protocol::node_kind::FILE {
+                    return false;
+                }
+                found_welcome = true;
+            } else if name == WRITABLE_DIRECTORY_A {
+                if !allow_probe_artifacts
+                    || found_directory_a
+                    || record.kind != protocol::node_kind::DIRECTORY
+                {
+                    return false;
+                }
+                found_directory_a = true;
+            } else if name == WRITABLE_DIRECTORY_B {
+                if !allow_probe_artifacts
+                    || found_directory_b
+                    || record.kind != protocol::node_kind::DIRECTORY
+                {
+                    return false;
+                }
+                found_directory_b = true;
+            } else if name == PUBLIC_VFS_PROBE_FILE {
+                if found_public_vfs_probe || record.kind != protocol::node_kind::FILE {
+                    return false;
+                }
+                found_public_vfs_probe = true;
+            } else if !matches!(
+                record.kind,
+                protocol::node_kind::FILE
+                    | protocol::node_kind::DIRECTORY
+                    | protocol::node_kind::SYMBOLIC_LINK
+            ) {
                 return false;
             }
-            found_welcome = true;
-        } else if allow_probe_artifacts && name == WRITABLE_DIRECTORY_A {
-            if found_directory_a || record.kind != protocol::node_kind::DIRECTORY {
-                return false;
-            }
-            found_directory_a = true;
-        } else if allow_probe_artifacts && name == WRITABLE_DIRECTORY_B {
-            if found_directory_b || record.kind != protocol::node_kind::DIRECTORY {
-                return false;
-            }
-            found_directory_b = true;
-        } else if name == PUBLIC_VFS_PROBE_FILE {
-            if found_public_vfs_probe || record.kind != protocol::node_kind::FILE {
-                return false;
-            }
-            found_public_vfs_probe = true;
-        } else {
-            return false;
+        }
+
+        if batch.end {
+            return found_docs && found_welcome;
         }
     }
-    found_docs && found_welcome
+    false
 }
 
 fn read_directory_record(shared_memory: u64, index: usize) -> Option<protocol::DirectoryEntry> {
@@ -636,6 +655,8 @@ fn entry_name(entry: &protocol::DirectoryEntry) -> Option<&[u8]> {
     (length != 0
         && length <= protocol::MAX_NAME_BYTES
         && entry.reserved == 0
+        && !entry.name[..length].contains(&b'/')
+        && !entry.name[..length].contains(&0)
         && entry.name[length..].iter().all(|byte| *byte == 0))
     .then_some(&entry.name[..length])
 }

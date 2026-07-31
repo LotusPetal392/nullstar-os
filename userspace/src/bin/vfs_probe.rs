@@ -392,7 +392,7 @@ fn probe_mounted_nullfs() {
     if !recover_public_probe_artifact() {
         syscall::exit(58);
     }
-    if !nullfs_root_is_exact() {
+    if !nullfs_root_is_valid() {
         syscall::exit(33);
     }
     entries[0] = platform::DirectoryEntry::EMPTY;
@@ -447,7 +447,7 @@ fn probe_mounted_nullfs() {
     }
 
     probe_public_nullfs_mutation();
-    if !nullfs_root_is_exact() {
+    if !nullfs_root_is_valid() {
         syscall::exit(89);
     }
     if !fixture_files_are_exact() {
@@ -676,7 +676,7 @@ fn probe_nullfs_restart() -> ! {
     {
         syscall::exit(103);
     }
-    if !nullfs_root_is_exact() {
+    if !nullfs_root_is_valid() {
         syscall::exit(104);
     }
     if syscall::close(stale).is_err() || syscall::close(replacement).is_err() {
@@ -686,7 +686,7 @@ fn probe_nullfs_restart() -> ! {
         syscall::yield_now().unwrap_or_else(|_| syscall::exit(106));
     }
     if !fixture_files_are_exact()
-        || !nullfs_root_is_exact()
+        || !nullfs_root_is_valid()
         || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
     {
         syscall::exit(107);
@@ -729,19 +729,56 @@ fn recover_public_probe_artifact() -> bool {
     syscall::close(descriptor).is_ok()
 }
 
-fn nullfs_root_is_exact() -> bool {
-    let mut entries = [platform::DirectoryEntry::EMPTY; 1];
-    read_directory_with_retry(NULLFS_MOUNT, 0, &mut entries) == Some(1)
-        && directory_entry_matches(&entries[0], b"docs", file::KIND_DIRECTORY)
-        && {
-            entries[0] = platform::DirectoryEntry::EMPTY;
-            read_directory_with_retry(NULLFS_MOUNT, 1, &mut entries) == Some(1)
-                && directory_entry_matches(&entries[0], b"welcome.txt", file::KIND_FILE)
+fn nullfs_root_is_valid() -> bool {
+    let mut start_index = 0;
+    let mut found_docs = false;
+    let mut found_welcome = false;
+
+    for _ in 0..128 {
+        let mut entries = [platform::DirectoryEntry::EMPTY; 2];
+        let Some(count) = read_directory_with_retry(NULLFS_MOUNT, start_index, &mut entries) else {
+            return false;
+        };
+        for entry in &entries[..count] {
+            if !valid_directory_entry(entry) {
+                return false;
+            }
+            if entry.name() == b"docs" {
+                if found_docs || entry.kind != file::KIND_DIRECTORY {
+                    return false;
+                }
+                found_docs = true;
+            } else if entry.name() == b"welcome.txt" {
+                if found_welcome || entry.kind != file::KIND_FILE {
+                    return false;
+                }
+                found_welcome = true;
+            } else if entry.name() == b"nullstar-vfs-probe-v1.bin" {
+                return false;
+            }
         }
-        && {
-            entries[0] = platform::DirectoryEntry::EMPTY;
-            read_directory_with_retry(NULLFS_MOUNT, 2, &mut entries) == Some(0)
+        if count < entries.len() {
+            return found_docs && found_welcome;
         }
+        let Some(next_index) = start_index.checked_add(count) else {
+            return false;
+        };
+        start_index = next_index;
+    }
+    false
+}
+
+fn valid_directory_entry(entry: &platform::DirectoryEntry) -> bool {
+    let Ok(name_length) = usize::try_from(entry.name_length) else {
+        return false;
+    };
+    name_length != 0
+        && name_length <= entry.name.len()
+        && matches!(entry.kind, file::KIND_FILE | file::KIND_DIRECTORY)
+        && entry.flags == 0
+        && !entry.name[..name_length].contains(&b'/')
+        && !entry.name[..name_length].contains(&0)
+        && entry.name[name_length..].iter().all(|byte| *byte == 0)
 }
 
 fn fixture_files_are_exact() -> bool {
