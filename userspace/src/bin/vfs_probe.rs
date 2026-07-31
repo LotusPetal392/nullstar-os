@@ -395,15 +395,8 @@ fn probe_mounted_nullfs() {
     if !nullfs_root_is_valid() {
         syscall::exit(33);
     }
-    entries[0] = platform::DirectoryEntry::EMPTY;
-    if platform::read_directory(NULLFS_DOCS, 0, &mut entries).ok() != Some(1)
-        || !directory_entry_matches(&entries[0], b"readme.txt", file::KIND_FILE)
-    {
+    if !nullfs_docs_is_valid() {
         syscall::exit(36);
-    }
-    entries[0] = platform::DirectoryEntry::EMPTY;
-    if platform::read_directory(NULLFS_DOCS, 1, &mut entries).ok() != Some(0) {
-        syscall::exit(37);
     }
 
     let mut cwd = [0_u8; 64];
@@ -781,6 +774,37 @@ fn valid_directory_entry(entry: &platform::DirectoryEntry) -> bool {
         && entry.name[name_length..].iter().all(|byte| *byte == 0)
 }
 
+fn nullfs_docs_is_valid() -> bool {
+    let mut start_index = 0;
+    let mut found_readme = false;
+
+    for _ in 0..128 {
+        let mut entries = [platform::DirectoryEntry::EMPTY; 2];
+        let Some(count) = read_directory_with_retry(NULLFS_DOCS, start_index, &mut entries) else {
+            return false;
+        };
+        for entry in &entries[..count] {
+            if !valid_directory_entry(entry) {
+                return false;
+            }
+            if entry.name() == b"readme.txt" {
+                if found_readme || entry.kind != file::KIND_FILE {
+                    return false;
+                }
+                found_readme = true;
+            }
+        }
+        if count < entries.len() {
+            return found_readme;
+        }
+        let Some(next_index) = start_index.checked_add(count) else {
+            return false;
+        };
+        start_index = next_index;
+    }
+    false
+}
+
 fn fixture_files_are_exact() -> bool {
     path_contents_match(NULLFS_WELCOME, WELCOME) && path_contents_match(NULLFS_README, README)
 }
@@ -812,9 +836,7 @@ fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
         })
 }
 
-fn directory_entry_matches(entry: &platform::DirectoryEntry, name: &[u8], kind: u64) -> bool {
-    entry.name() == name && entry.kind == kind && entry.flags == 0
-}
+
 
 fn syscall_failed_with<T>(result: syscall::Result<T>, expected: i64) -> bool {
     result
