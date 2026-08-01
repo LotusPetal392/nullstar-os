@@ -22,6 +22,8 @@ authoritative when it differs from future design.
 - [Memory management](memory-management.md)
 - [Memory hardening](memory-hardening.md)
 - [Userspace architecture](userspace-architecture.md)
+- [Native application runtime, SDK, and service IDL](application-runtime-sdk-and-idl.md)
+- [NSIDL and the NullStar Wire Protocol](nsidl-and-wire-protocol.md)
 - [Service, session, and application lifecycle](service-and-session-lifecycle.md)
 - [Service management and command line](service-management-and-cli.md)
 - [Capability-based application sandboxing](application-sandboxing.md)
@@ -52,6 +54,10 @@ authoritative when it differs from future design.
 - Keep PID 1 small and move ordinary service policy into restartable userspace.
 - Treat stable service identity separately from disposable process incarnations.
 - Construct every managed process with explicit startup handles before it runs.
+- Use versioned, language-neutral service protocols as the durable userspace
+  compatibility boundary rather than Rust's compiler-private ABI.
+- Keep every wire message, dynamic value, handle set, and decode allocation explicitly
+  bounded and validate complete messages before dispatch.
 - Sandbox every application bundle regardless of installation location.
 - Deploy applications as verified immutable generations and keep mutable data outside
   their bundles.
