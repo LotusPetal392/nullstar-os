@@ -25,6 +25,7 @@ authoritative when it differs from future design.
 - [Service, session, and application lifecycle](service-and-session-lifecycle.md)
 - [Service management and command line](service-management-and-cli.md)
 - [Capability-based application sandboxing](application-sandboxing.md)
+- [Application bundles, signing, and deployment](application-bundles-and-deployment.md)
 - [Executable loading and linking](executable-loading.md)
 - [Magnetar package and deployment management](package-management.md)
 - [Filesystem namespace and boot](filesystem-namespace.md)
@@ -52,6 +53,8 @@ authoritative when it differs from future design.
 - Treat stable service identity separately from disposable process incarnations.
 - Construct every managed process with explicit startup handles before it runs.
 - Sandbox every application bundle regardless of installation location.
+- Deploy applications as verified immutable generations and keep mutable data outside
+  their bundles.
 - Preserve a practical compatibility path without making Unix conventions the
   foundation of the native system.
 - Translate privileged compatibility interfaces through native policy and portals.
