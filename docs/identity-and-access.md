@@ -11,6 +11,9 @@ group membership may authorize a broker or filesystem operation, but cannot crea
 authority that the deciding service does not possess and cannot forge a kernel
 capability.
 
+The process and session lifecycle used here is specified in
+[Service, session, and application lifecycle](design/service-and-session-lifecycle.md).
+
 ## Goals
 
 The identity system should:
@@ -44,7 +47,7 @@ The initial numeric namespace should reserve:
 
 UID and GID are separate namespaces. The precise upper bound and sentinel values must be
 fixed in the shared ABI before implementation. IDs must not be silently reused while
-files, audit records, or durable policy still depend on their meaning.
+files, audit records, grants, or durable policy still depend on their meaning.
 
 A regular account should normally have a private primary group with the same name and a
 bounded list of direct supplementary memberships. Nested groups should be omitted
@@ -74,13 +77,13 @@ imply UID 0.
 
 An authorization broker should verify membership, perform any configured authentication
 or presence check, evaluate the requested semantic operation, and delegate only the
-one-shot action or narrow capability required.
+one-shot action, ticket, or narrow capability required.
 
 ### Regular users
 
-Regular users receive unique UIDs, private primary groups, homes under
-`/Users/<name>`, and only the capabilities required for their session and applications.
-Sharing uses explicit group membership and filesystem policy.
+Regular users receive unique UIDs, private primary groups, homes under `/Users/<name>`,
+and only the capabilities required for their session and applications. Sharing uses
+explicit group membership and filesystem policy.
 
 The accepted managed-data layout is:
 
@@ -96,8 +99,8 @@ The accepted managed-data layout is:
 
 `Profile/runtime` is the logical location for per-login ephemeral state. Its contents
 must be private, created and owned by the session manager, and removed or invalidated
-when the session ends. Applications should receive runtime directory handles or paths
-from the runtime rather than constructing them blindly. See
+when the session ends. Applications receive runtime directory capabilities or projected
+paths from the runtime rather than constructing them blindly. See
 [Userspace architecture](design/userspace-architecture.md).
 
 ## Process credentials
@@ -108,6 +111,7 @@ least:
 - real and effective UID/GID;
 - a bounded, duplicate-free supplementary-group set;
 - login-session identity;
+- service, application, or component identity where applicable;
 - authentication or elevation context where applicable.
 
 Credentials must not be writable through ordinary process memory. `fork` inherits a
@@ -115,41 +119,47 @@ snapshot. `exec` preserves credentials unless an authorized process manager supp
 checked transition. Initial implementations should omit set-user-ID and set-group-ID
 execution.
 
-Only PID 1, a session manager, or a narrowly authorized identity broker should create a
-process under another identity. Such transitions must also filter inherited descriptors
-and capabilities; changing UID without reducing inherited authority is not a security
-boundary.
+Only the root bootstrap supervisor, system service manager, session or application
+manager acting within its delegated subtree, or a narrowly authorized identity broker
+should create a process under another identity. Such transitions must also filter
+handles, descriptors, namespace routes, and job policy; changing UID without reducing
+inherited authority is not a security boundary.
 
-A process may query its own identity. Inspecting or changing another process requires
-explicit process-management authority and policy approval.
+A process may query its own identity. Inspecting or changing another process requires an
+explicit process-management capability and policy approval.
 
 ## Authentication and sessions
 
 Authentication proves an account claim; it does not grant arbitrary kernel authority.
-A future login flow should be:
+The accepted login flow is:
 
 ```text
-login client
+trusted login UI
     -> authentication service verifies credentials
-    -> session manager creates a session identity
-    -> policy selects initial capabilities and namespace bindings
-    -> process manager launches the user environment with checked credentials
+    -> system service manager creates a login-session job
+    -> policy assigns immutable user, seat, and session identity
+    -> session manager receives a bounded session capability set
+    -> session manager launches the compositor, shell, services, and applications
 ```
 
 Authentication must go through a dedicated service rather than exposing password
-verifiers to applications. Passwords must never be stored in plaintext. Account records
-should name a versioned password-hash scheme and bounded work parameters so hashes can
-be upgraded after successful login. Passwords, hashes, recovery data, and tokens must
-not appear in logs or process arguments.
+verifiers to applications or the login UI. Passwords must never be stored in plaintext.
+Account records should name a versioned password-hash scheme and bounded work parameters
+so hashes can be upgraded after successful login. Passwords, hashes, recovery data, and
+tokens must not appear in logs or process arguments.
 
 The first implementation can support local password authentication. Public keys,
 hardware-backed authentication, recovery credentials, lockout policy, and remote login
 can be added later through versioned mechanisms.
 
-A login session owns its seat or terminal, initial process group, session-scoped
-services, runtime namespace, and delegated capabilities. Logout must terminate or
-reparent processes according to policy and revoke or close broker-owned session grants
-where supported.
+A login session owns its seat or terminal, session job, session-scoped services, runtime
+namespace, and delegated capabilities. Logout requests orderly shutdown and then
+terminates the complete session-job subtree. Broker-owned session grants and leases are
+revoked or invalidated where supported.
+
+The lock screen is a trusted session component backed by compositor policy. Ordinary
+applications cannot draw above it, capture it, synthesize unlock input, or inspect its
+authentication traffic.
 
 ## Account and group storage
 
@@ -172,9 +182,9 @@ mandatory fields, and references outside the configured namespace. Updates shoul
 atomic and preserve either the old complete database or the new complete database after
 interruption.
 
-Public lookup must expose only fields needed for display and ownership resolution.
-Password hashes, recovery material, and broker policy are never returned through
-ordinary enumeration.
+Public lookup exposes only fields needed for display and ownership resolution. Password
+hashes, recovery material, and broker policy are never returned through ordinary
+enumeration.
 
 ## Filesystem ownership and permissions
 
@@ -184,7 +194,7 @@ or GID values supplied as ordinary client payload fields.
 
 An ordinary check should:
 
-1. apply mount-level, immutable, and read-only restrictions;
+1. apply mount-level, immutable, read-only, and directory-capability restrictions;
 2. select owner, group, or other mode bits;
 3. apply a narrowly specified UID 0 override if enabled;
 4. require the filesystem service and VFS route to possess the capabilities needed to
@@ -197,6 +207,10 @@ effective UID and GID. `umask` may remove requested bits but never add them.
 NullFS should persist native UID/GID/mode metadata. Filesystems lacking equivalent
 metadata need explicit synthesized ownership or mount policy rather than silently making
 everything universally writable.
+
+Identity and mode checks do not let a sandboxed application escape a directory
+capability. Both the capability root and discretionary access check must permit the
+operation.
 
 ## Capabilities and identity policy
 
@@ -211,7 +225,8 @@ Rules include:
 - root and admin status cannot forge or amplify capabilities;
 - transferring a capability does not change credentials;
 - credential transitions must filter capabilities inappropriate to the new identity;
-- paths, names, PIDs, UIDs, and GIDs are not capabilities.
+- paths, names, PIDs, UIDs, GIDs, application IDs, and service names are not
+  capabilities.
 
 ## Brokered elevation
 
@@ -220,27 +235,48 @@ Administrative tools send structured, versioned requests to an authorization bro
 The broker should:
 
 1. authenticate the caller and session context;
-2. resolve immutable credentials itself;
+2. resolve immutable credentials and verified application or service identity itself;
 3. verify root identity or admin eligibility;
 4. apply operation-specific policy and optional reauthentication;
-5. perform the operation or return a narrowly attenuated capability;
+5. perform the operation or return a narrow, expiring, preferably single-use ticket;
 6. emit a structured audit decision with a stable request identity.
 
-Requests should name semantic operations, not arbitrary shell command strings. If an
-elevated process must be launched, the process manager constructs a sanitized
-environment, explicit argument vector, filtered descriptor table, reduced capability
-set, and auditable credential transition.
+Requests name semantic operations, not arbitrary shell command strings. A ticket should
+be bound to caller, target service, operation, normalized parameters or digest, user,
+session, expiration, and nonce.
+
+If an elevated process must be launched, the authorized process manager constructs a
+sanitized environment, explicit argument vector, filtered descriptors and handles,
+restricted namespace, non-relaxable job policy, and auditable credential transition.
 
 ## Service identities
 
 Long-running services should not all run as root. Stable core services may use reserved
-IDs, while installed services can use managed identities under a later allocation
-policy. Service definitions declare intended identity and requested capabilities; PID 1
-resolves both against trusted policy.
+IDs, while installed services use managed identities under a later allocation policy.
+Service definitions declare intended identity and requested capabilities; the system
+service manager resolves both against trusted package, signing, and machine policy.
 
-Restarting a service preserves configured credentials but issues fresh
-generation-scoped endpoints and capabilities. Services must rely on authenticated peer
-context, not peer-supplied PIDs or usernames.
+Restarting a service preserves configured credentials but issues a fresh generation and
+fresh endpoints. Services rely on broker- or kernel-authenticated peer context, not
+peer-supplied PIDs or usernames.
+
+Session services receive user and login-session identity plus only the capabilities
+routed into that session. They cannot control unrelated users merely because the same
+executable implements several instances.
+
+## Application identity and permissions
+
+A stable signed application identity is separate from UID. Several applications may run
+as one user while receiving different capabilities, private storage, network policy, and
+permission grants.
+
+Permission records bind to application identity, user identity, resource identity,
+rights, scope, and current policy. They authorize a trusted provider to recreate a
+capability; they are not live handles and cannot be claimed by supplying another
+application's identifier.
+
+See [Capability-based application sandboxing](design/application-sandboxing.md) for
+application signing lineage, profiles, portals, leases, and administrative tickets.
 
 ## Device and privileged-service policy
 
@@ -256,30 +292,30 @@ done.
 
 ## Logging and auditing
 
-Identity, authentication, and authorization components should emit structured records
-to the accepted logging and audit architecture rather than appending directly to an
+Identity, authentication, and authorization components emit structured records to the
+accepted logging and audit architecture rather than appending directly to an
 application-managed `/System/var/log` file.
 
 Security-relevant events include:
 
 - successful and failed authentication;
 - account, group, and credential changes;
-- session creation and termination;
+- session creation, lock, unlock, and termination;
 - elevation requests and decisions;
 - privileged ownership or permission changes;
-- sensitive device or service opens;
-- service launches under configured identities.
+- sensitive device, grant, or service opens;
+- service and application launches under configured identities.
 
 Records should include stable event and request IDs, monotonic time and trusted wall time
-when available, caller and session identity, target, operation, decision, and policy
-generation. They must omit passwords, hashes, tokens, raw capability contents, and
-unrelated user data.
+when available, caller, application or service, session, target, operation, decision,
+and policy generation. They must omit passwords, hashes, tokens, document contents, raw
+capability contents, and unrelated user data.
 
 The centralized [logging design](design/logging.md) owns retention, access control,
 rotation, privacy classification, and storage policy. Audit data may use a stronger
-retention or tamper-evidence class, but callers should use the service API rather than
-assuming a physical journal path. Audit-storage exhaustion requires an explicit
-operation-specific fail-open or fail-closed policy.
+retention or tamper-evidence class, but callers use the service API rather than assuming
+a physical journal path. Audit-storage exhaustion requires an explicit operation-
+specific fail-open or fail-closed policy.
 
 ## Recommended milestones
 
@@ -287,16 +323,19 @@ operation-specific fail-open or fail-closed policy.
    the current root session.
 2. Add native ownership and mode metadata plus shared access-check tests to tmpfs and
    NullFS.
-3. Implement read-only account/group lookup.
-4. Add service identities and PID 1 credential/capability filtering.
-5. Introduce local authentication, login sessions, private homes, terminal ownership,
-   and session-managed `Profile/runtime`.
+3. Implement read-only account and group lookup.
+4. Add service identities and checked credential, handle, and namespace filtering in the
+   system lifecycle manager.
+5. Introduce a dedicated authentication service, trusted login UI, login-session jobs,
+   private homes, terminal ownership, and session-managed `Profile/runtime`.
 6. Add supplementary groups and shared-file workflows.
-7. Implement brokered elevation with structured auditing.
-8. Integrate identity policy with devfs and other privileged brokers.
-9. Harden updates, hash upgrades, recovery, rate limiting, log access, and adversarial
-   denial-path tests.
+7. Implement semantic brokered elevation with single-use authorization and structured
+   auditing.
+8. Integrate identity policy with application permissions, devfs, network, packages, and
+   other privileged brokers.
+9. Harden updates, hash upgrades, recovery, rate limiting, log access, key rotation, and
+   adversarial denial-path tests.
 
 Multiuser mode should not be described as secure until credentials, filesystem checks,
-capability filtering, session isolation, account storage, authorization brokers, and
-audit behavior have been validated together.
+capability filtering, session isolation, account storage, application policy,
+authorization brokers, and audit behavior have been validated together.
