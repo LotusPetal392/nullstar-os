@@ -1,0 +1,585 @@
+# Service, session, and application lifecycle
+
+## Status
+
+A small root userspace bootstrap process, a separate declarative system service
+manager, hierarchical jobs, stable service identities, readiness-based supervision,
+per-login session managers, and per-application jobs are **accepted direction**.
+
+Exact service-definition syntax, process names, watchdog intervals, restart budgets,
+activation queue limits, and whether some bootstrap and service-manager code initially
+share one binary remain **tentative design**.
+
+This document defines the lifecycle architecture that uses the native
+[IPC and object model](ipc-and-object-model.md). Command-line administration and
+service-definition locations are described in
+[Service management and command-line direction](service-management-and-cli.md).
+
+It describes future architecture. The implemented system still uses a hard-coded PID 1
+that directly launches the current services and shell; see
+[NullStar OS architecture](../architecture.md).
+
+## Design goals
+
+The lifecycle model should:
+
+- keep PID 1 small enough to audit and recover;
+- make services restartable without making process IDs stable identities;
+- construct every process with explicit capabilities before its first instruction;
+- contain failures and resource exhaustion in jobs;
+- support demand activation without global pathname or socket namespaces;
+- separate machine services, login sessions, and application instances;
+- provide deterministic startup, readiness, shutdown, and failure behavior;
+- keep login, lock, authentication, drivers, and privileged brokers isolated;
+- preserve an independently usable recovery path.
+
+## Userspace hierarchy
+
+The intended hierarchy is:
+
+```text
+Kernel
+└── Root job
+    ├── Root bootstrap process (PID 1)
+    ├── Core system job
+    │   └── System service manager
+    │       ├── Storage and filesystem services
+    │       ├── Device manager and driver jobs
+    │       ├── Network, logging, policy, and package services
+    │       ├── Login and authentication services
+    │       └── Other machine-wide services
+    ├── Login-session jobs
+    │   └── Per-user session manager
+    │       ├── Compositor and desktop shell
+    │       ├── User-session services
+    │       └── Per-application jobs
+    └── Recovery job
+        └── Minimal diagnostics and repair environment
+```
+
+The kernel understands jobs, processes, threads, handles, address spaces, scheduling,
+and resource policy. It does not understand desktop sessions, application bundles,
+service dependencies, login screens, or package activation.
+
+## Root bootstrap process
+
+The kernel launches exactly one initial userspace process. It is PID 1, but it should
+not become the permanent implementation of every machine policy.
+
+Its accepted responsibilities are deliberately narrow:
+
+- establish the root job and initial child-job hierarchy;
+- create the bootstrap service namespace and emergency logging path;
+- start the system service manager with the capabilities required to manage its subtree;
+- supervise and, within bounded policy, restart the system service manager;
+- retain only the emergency authorities needed for recovery or final shutdown;
+- enter a minimal recovery path when normal userspace cannot be established;
+- reap or delegate ownership of orphaned processes according to kernel rules.
+
+PID 1 should not directly implement networking, device policy, package management,
+identity databases, desktop sessions, logging storage, or ordinary service dependency
+resolution.
+
+During migration, PID 1 and the service manager may be built from one package or share
+some code, but their authority and lifecycle roles should remain conceptually separate.
+The long-term system must be able to replace or restart the service-manager process
+without replacing the kernel or silently transferring unrelated authority.
+
+## Job hierarchy and containment
+
+A job is a hierarchical lifecycle, policy, and resource container. It owns processes and
+child jobs, and policy becomes no more permissive down the tree.
+
+Useful top-level jobs include:
+
+```text
+Root job
+├── Bootstrap job
+├── Core-system job
+├── Driver job
+├── Session root job
+└── Recovery job
+```
+
+A job may impose:
+
+- process, thread, child-job, and handle limits;
+- committed-memory and mapped-memory limits;
+- IPC queue-memory limits;
+- CPU scheduling class and budget;
+- I/O priority and bandwidth policy;
+- executable-memory and debugging policy;
+- device, interrupt, DMA, and namespace restrictions;
+- crash, restart, and descendant-termination policy.
+
+Job policy is defense in depth. Normal authority still comes from handles. A job may
+forbid a class of resource even if a buggy service attempts to transfer an otherwise
+valid handle into the subtree.
+
+Terminating a job eventually terminates its complete descendant process tree and closes
+its handles. This makes logout, application cleanup, driver quarantine, and recovery
+transitions deterministic.
+
+## System service manager
+
+The system service manager owns machine-wide lifecycle policy beneath the core-system
+job. Its responsibilities are:
+
+- load and validate versioned declarative service definitions;
+- resolve dependency and activation graphs;
+- create service jobs and processes;
+- assemble startup capabilities and restricted service namespaces;
+- track activation, startup, readiness, health, degradation, and shutdown;
+- apply restart policy, rate limits, backoff, and escalation;
+- account CPU, memory, handles, IPC, and other resources;
+- coordinate logging, crash records, configuration, and administrative control;
+- supervise demand-activated and device-activated services;
+- coordinate orderly machine shutdown and recovery escalation.
+
+The service manager must not absorb unrelated service implementations. DNS, logging,
+timers, device management, package management, and network configuration remain
+separate protocols and services even when the manager activates them.
+
+## Stable service identity
+
+A service has a stable canonical identity independent of process ID or incarnation, for
+example:
+
+```text
+filesystem.vfs
+filesystem.nullfs
+device.manager
+network.stack
+network.policy
+logging
+media.graph
+desktop.login
+```
+
+A process ID identifies one implementation process. A **service generation** identifies
+one supervised incarnation. Neither should be cached as the durable way to reconnect.
+
+The service manager and broker own the mapping:
+
+```text
+stable service identity
+        -> current service generation
+        -> activation and connection endpoints
+```
+
+Logs, crash records, resource usage, and client failures should include both stable
+identity and generation so a replacement is never confused with its predecessor.
+
+## Service definitions
+
+A declarative service definition should eventually include:
+
+- canonical service identity and description;
+- executable identity, argument array, environment, and working-directory authority;
+- service class and job policy;
+- capabilities consumed, provided, and offered to children;
+- required service protocols and device-class resources;
+- dependencies and ordering constraints;
+- activation mode and queued-endpoint limits;
+- startup, readiness, health, and shutdown contracts;
+- restart condition, rate limit, backoff, and escalation;
+- CPU, memory, handle, IPC, I/O, and realtime budgets;
+- logging, configuration, audit, and crash-report policy.
+
+Commands are structured argument arrays, not shell strings. Unknown mandatory fields
+must fail validation. Merely writing a manifest does not grant capability routes,
+restricted identities, or a privileged service class.
+
+## Process construction and startup
+
+A managed service is constructed before it becomes runnable:
+
+1. validate its definition, package identity, executable, and allowed service class;
+2. create a service job with non-relaxable resource and security policy;
+3. create the process and address space in a suspended state;
+4. map its verified executable and runtime;
+5. create one bootstrap channel in the known initial handle slot;
+6. assemble the explicit startup-capability set;
+7. send a versioned startup message through the bootstrap channel;
+8. start the initial thread;
+9. wait for the declared readiness contract;
+10. publish or release activation endpoints only as policy permits.
+
+A startup message may include:
+
+- service identity and generation;
+- configuration and schema handles;
+- structured logging and lifecycle channels;
+- a restricted service namespace;
+- job and process-self handles with reduced rights;
+- device, storage, network, or other resource capabilities;
+- pre-created activation endpoints;
+- launch arguments and environment data.
+
+Pathnames and environment variables remain data. They are never substitutes for the
+resource handles needed to use a path, service, device, or namespace.
+
+## Lifecycle states
+
+The lifecycle protocol should distinguish desired state from observed state. A useful
+observed state machine is:
+
+```text
+DEFINED
+   |
+   v
+ACTIVATING
+   |
+   v
+STARTING ---- failure or timeout ----> FAILED
+   |
+   v
+READY <-----> DEGRADED
+   |
+   v
+STOPPING ---- timeout ----> TERMINATING
+   |
+   v
+STOPPED
+```
+
+`FAILED` may transition back to `ACTIVATING` under restart policy. A separate
+`QUARANTINED` state is appropriate when repeated failures or a security violation make
+automatic restart unsafe.
+
+A process existing is not readiness. A service must satisfy an explicit readiness
+contract, such as:
+
+- sending `READY` on its lifecycle channel;
+- completing a provider registration handshake;
+- proving that required recovery or validation has completed;
+- accepting a manager-created health request through its normal dispatch loop.
+
+Dependent capabilities should not be released until required providers are ready.
+
+## Dependency semantics
+
+The definition language should distinguish:
+
+- **requires**: the service cannot operate without the dependency;
+- **wants**: the dependency is useful but optional;
+- **after**: ordering only, with no runtime authority implication;
+- **capability requirement**: a protocol or resource route that any authorized provider
+  may satisfy.
+
+Capability dependencies are preferable when the consumer needs a service class or
+device resource rather than one named process. Ordering never grants authority.
+
+Dependency graphs must be cycle checked. Synchronous runtime dependency chains should
+remain shallow even when startup dependencies are deeper.
+
+## Channel-based activation
+
+NullStar should use channel activation rather than a global pathname or listening-socket
+namespace as its native mechanism.
+
+A broker or service manager can create a channel pair before starting the provider:
+
+```text
+client endpoint <------------------------> provider endpoint
+      |                                      |
+returned after policy                delivered at startup
+```
+
+Requests may queue within strict limits while the service starts. This provides
+race-free demand activation and avoids requiring the provider to bind a privileged
+global name.
+
+Activation state belongs to the manager or broker, not the disposable service process.
+It may preserve:
+
+- the stable service identity;
+- queued connection requests;
+- restart counters and backoff state;
+- definition and configuration references;
+- client-visible restarting or unavailable state.
+
+It must not blindly replay non-idempotent application operations after a crash.
+
+## Restart and failure policy
+
+Recommended restart conditions are:
+
+```text
+never
+on-failure
+on-abnormal-exit
+on-watchdog
+always
+```
+
+Every automatic restart policy requires a rate limit, sliding window, and bounded
+backoff. A service that repeatedly fails must enter a visible failed or quarantined state
+rather than creating a restart storm.
+
+Escalation may include:
+
+```text
+restart one service
+restart a dependent service subtree
+restart one driver family
+restart one user session
+enter recovery mode
+reboot only when recovery is impossible
+```
+
+Examples of intended containment are:
+
+- compositor crash: restart the affected graphical session;
+- network service crash: restart networking and notify clients;
+- ordinary application crash: terminate that application job only;
+- noncritical driver crash: mark the device offline, restart, and re-enumerate;
+- storage-manager failure with uncertain writes: fail closed and enter recovery policy;
+- system service-manager crash: PID 1 applies bounded restart or recovery policy.
+
+## Client behavior across failure
+
+A client must observe distinct transport outcomes such as:
+
+```text
+PEER_CLOSED
+SERVICE_UNAVAILABLE
+SERVICE_RESTARTING
+TIMED_OUT
+CANCELED
+```
+
+The userspace runtime may automatically reconnect only for protocols that explicitly
+permit it. Automatic reconnection is reasonable for settings notifications, clipboard,
+logging, or other restart-safe services. It is unsafe by default for file mutations,
+package installation, firmware update, authentication, and other non-repeatable work.
+
+Protocol definitions should mark requests as idempotent, retry-safe, or non-repeatable
+and define the fate of in-flight operations across a provider generation change.
+
+## Health checks and watchdogs
+
+A watchdog should exercise the service's real dispatch path. A detached heartbeat
+thread can remain responsive while the primary event loop is deadlocked and is
+therefore insufficient by itself.
+
+Health contracts may include:
+
+- lifecycle-channel round trips;
+- provider-specific invariants;
+- bounded queue progress;
+- deadline and latency observations;
+- device or storage recovery state;
+- memory or handle-pressure conditions.
+
+A health failure can produce `DEGRADED` before restart. Watchdog authority and intervals
+are service policy, not application-controlled realtime privilege.
+
+## Graceful shutdown
+
+Machine shutdown is coordinated in stages:
+
+1. stop accepting new login and application launches;
+2. notify applications and user services;
+3. stop session managers and compositor sessions;
+4. stop nonessential machine services;
+5. flush filesystem and storage services in dependency order;
+6. stop networking and device services where safe;
+7. preserve final logs and generation state;
+8. request final kernel power transition.
+
+Each service receives a stop request with an absolute deadline. It may report readiness
+or request a bounded extension, but the manager eventually terminates an unresponsive
+job. Critical storage operations must define whether shutdown may proceed, enter
+recovery, or fail closed after an uncertain outcome.
+
+## User login sessions
+
+Successful authentication creates a dedicated login-session job:
+
+```text
+User-session job
+├── Session manager
+├── Compositor
+├── Desktop shell
+├── Audio-session service
+├── Clipboard service
+├── Notification service
+├── User settings and secret brokers
+└── Application jobs
+```
+
+The session job carries immutable user, login-session, seat, and policy identity. It owns
+`Profile/runtime`, session-scoped service routes, and session capabilities. Logout
+performs orderly shutdown and then terminates the complete job subtree.
+
+The system service manager creates and supervises the top-level session job, but a
+per-session manager owns the desktop and application lifecycle within it.
+
+## Session manager
+
+A session manager is responsible for one logged-in environment:
+
+- start the compositor, desktop shell, and user-session services;
+- construct the session-scoped service namespace;
+- launch and supervise application jobs;
+- coordinate screen locking, logout, and session restoration;
+- broker application permission requests through trusted policy services;
+- track foreground, background, and user-visible application state;
+- contain and recover from session-service failures.
+
+The session manager is not a second unrestricted root service manager. Its capabilities
+are bounded to one user and session.
+
+## Application jobs and launch
+
+Each application instance receives its own job:
+
+```text
+Application job
+├── Main component
+├── Declared helper components
+├── Renderer or decoder workers
+├── Plugin hosts
+└── Application crash helper
+```
+
+The job carries process, memory, handle, IPC, CPU, background, executable-memory,
+debugging, and sandbox policy. Helpers receive only explicitly selected handles. When
+the application exits or is terminated, its entire subtree is cleaned up.
+
+A native application launch is:
+
+1. desktop shell asks the application manager to launch a verified application identity;
+2. application manager validates bundle, signature, manifest, and requested profile;
+3. current user and administrator policy are loaded;
+4. an application job is created;
+5. baseline and restored capabilities are assembled;
+6. the process is created but not started;
+7. executable and runtime are mapped;
+8. one bootstrap channel and startup message are installed;
+9. the initial thread starts;
+10. the application reports readiness and may create visible surfaces.
+
+The capability and permission rules are specified in
+[Capability-based application sandboxing](application-sandboxing.md).
+
+## Login, authentication, and lock separation
+
+The login UI must not run as an ordinary user application. A trusted login environment
+uses narrowly scoped compositor surfaces and a private authentication-service channel.
+The UI never receives password databases, verifier secrets, or unrestricted session
+authority.
+
+The authentication service owns credential verification, rate limiting, token handling,
+and security audit events. On success, a separate session-creation operation issues the
+identity and capabilities needed to construct the user-session job.
+
+The lock screen is a trusted session component with compositor support. Ordinary
+applications must not draw above it, capture it, synthesize unlock input, or inspect its
+authentication traffic. Unlocking restores an existing session; it does not hand
+application processes authentication secrets.
+
+## Driver lifecycle
+
+Userspace drivers follow the same supervision model with stronger job restrictions. A
+driver host should receive only:
+
+- its matched device capability;
+- required MMIO, interrupt, and DMA objects;
+- a device-manager control channel;
+- logging, lifecycle, configuration, and firmware-broker endpoints;
+- class-protocol activation endpoints.
+
+A driver must not enumerate all PCI devices, map arbitrary physical memory, or gain
+unrelated device authority. On crash, the device manager advances the provider
+generation, marks old sessions stale, applies reset policy, restarts or quarantines the
+driver, and notifies clients.
+
+Storage and other stateful drivers require stricter handling because an interrupted
+operation may have an uncertain durable outcome and cannot be replayed blindly.
+
+## Logging and configuration
+
+Managed processes receive structured logging endpoints at startup. Records include
+stable service or application identity, process and thread identity, generation,
+severity, category, trace identity, and bounded structured fields. Sensitive payloads
+and secrets are not logged by default.
+
+Configuration should be supplied through scoped, typed configuration handles or
+services. A service definition names the configuration it may read or modify; it does
+not gain ambient write access to every configuration file.
+
+Broker-owned lifecycle state, persistent service configuration, and disposable process
+state remain separate so a crash does not erase policy or silently preserve unsafe
+in-process state.
+
+## Recovery environment
+
+PID 1 must retain a path to an independently available recovery environment requiring
+as little normal userspace as practical. It should provide:
+
+```text
+service and job inspection
+crash and boot-log viewing
+service disable or quarantine
+system-generation rollback
+filesystem inspection and repair
+driver disablement
+log export
+controlled reboot or shutdown
+```
+
+Recovery tools must not depend on the active dynamic linker, ordinary desktop session,
+network service, or writable primary system namespace merely to diagnose a failed boot.
+
+## Administration
+
+The native `sv` client communicates with the appropriate system or session manager over
+a versioned protocol. It requests semantic lifecycle transitions rather than searching
+for PIDs or sending arbitrary signals.
+
+Observation and control are separate rights. Administrative operations pass through the
+authorization broker and result in a narrowly scoped request or one-shot authorization
+ticket, not an ambient “become root” state.
+
+## Implementation sequence
+
+The accepted model can be introduced incrementally:
+
+1. formalize process termination observation and basic job containment around the
+   current PID 1 supervisor;
+2. introduce the one-bootstrap-channel startup contract and explicit startup handles;
+3. define stable service identity, generation, lifecycle state, readiness, and control
+   protocols;
+4. extract dependency, restart, and resource policy into a separate system service
+   manager while retaining minimal PID 1 recovery supervision;
+5. add declarative definitions, bounded activation queues, service-broker integration,
+   logging, and configuration handles;
+6. add restart backoff, watchdogs, failure escalation, and recovery controls;
+7. create login-session jobs and per-session managers;
+8. create per-application jobs, mandatory application launch mediation, and permission
+   brokers;
+9. move userspace drivers into restricted driver jobs with generation-safe recovery;
+10. add richer session restoration, background policy, and multi-seat support after the
+    lifecycle boundaries are reliable.
+
+## Required invariants
+
+> PID 1 remains a minimal bootstrap and recovery supervisor. Ordinary dependency,
+> activation, and service policy belongs to a separately restartable system service
+> manager.
+
+> A service identity is stable; a process ID and service generation identify disposable
+> implementations.
+
+> Every managed process receives its authority through explicit startup handles before
+> it runs. Startup order, pathname, package location, identity, and process parentage do
+> not manufacture capabilities.
+
+> Jobs provide hierarchical lifecycle and resource containment. Session logout,
+> application termination, driver quarantine, and recovery can clean up complete
+> subtrees deterministically.
+
+> Readiness, timeout, cancellation, restart, and uncertain outcomes are explicit parts
+> of service protocols rather than inferred from process existence.
