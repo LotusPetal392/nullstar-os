@@ -17,7 +17,7 @@ use userspace::{
     args::Args,
     block_device::{self, protocol},
     ipc::{self, ObjectKind, Rights},
-    syscall,
+    nullfs_primary_volume, syscall,
 };
 
 userspace::entry!(rust_main);
@@ -28,11 +28,6 @@ const BLOCK_HANDLE: u64 = 3;
 const READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const SHARED_BUFFER_BYTES: usize = 4096;
 const SHARED_BUFFER_ID: u64 = 1;
-const EXPECTED_LABEL: &str = "NULLSTAR_DATA";
-const EXPECTED_UUID: [u8; 16] = [
-    0x4e, 0x75, 0x6c, 0x6c, 0x53, 0x74, 0x61, 0x72, 0x2d, 0x4e, 0x75, 0x6c, 0x6c, 0x46, 0x53, 0x01,
-];
-const EXPECTED_CAPACITY_BLOCKS: u64 = 256;
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     allocator::init();
@@ -105,10 +100,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     };
 
     let superblock = filesystem.superblock();
-    if superblock.label() != EXPECTED_LABEL
-        || superblock.filesystem_uuid != EXPECTED_UUID
-        || superblock.capacity_blocks != EXPECTED_CAPACITY_BLOCKS
-    {
+    if superblock.filesystem_uuid != nullfs_primary_volume::FILESYSTEM_UUID {
         fail(27, b"nullfs: mounted volume identity mismatch\n");
     }
 

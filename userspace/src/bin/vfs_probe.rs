@@ -8,7 +8,7 @@ use userspace::{
     abi::{errno, file},
     args::Args,
     ipc::{self, ObjectKind, Rights, Transfer},
-    platform, syscall,
+    nullfs_primary_volume, platform, syscall,
     vfs::protocol,
 };
 
@@ -21,12 +21,12 @@ const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
 const NULLFS_RESTART_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
 const NULLFS_RESTART_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
-const NULLFS_MOUNT: &[u8] = b"/Volumes/NULLSTAR_DATA";
-const NULLFS_DOCS: &[u8] = b"/Volumes/NULLSTAR_DATA/docs";
-const NULLFS_WELCOME: &[u8] = b"/Volumes/NULLSTAR_DATA/welcome.txt";
-const NULLFS_README: &[u8] = b"/Volumes/NULLSTAR_DATA/docs/readme.txt";
-const NULLFS_MISSING: &[u8] = b"/Volumes/NULLSTAR_DATA/missing";
-const NULLFS_PUBLIC_PROBE: &[u8] = b"/Volumes/NULLSTAR_DATA/nullstar-vfs-probe-v1.bin";
+const NULLFS_MOUNT: &[u8] = nullfs_primary_volume::MOUNT_PATH.as_bytes();
+const NULLFS_DOCS: &[u8] = b"/Volumes/NullStar/docs";
+const NULLFS_WELCOME: &[u8] = b"/Volumes/NullStar/welcome.txt";
+const NULLFS_README: &[u8] = b"/Volumes/NullStar/docs/readme.txt";
+const NULLFS_MISSING: &[u8] = b"/Volumes/NullStar/missing";
+const NULLFS_PUBLIC_PROBE: &[u8] = b"/Volumes/NullStar/nullstar-vfs-probe-v1.bin";
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
 const README: &[u8] = b"This volume is a deterministic NullFS integration fixture.\n";
 const INITIAL_BYTES: &[u8] = b"NullStar public VFS";
@@ -117,16 +117,16 @@ const CASES: &[(&[u8], u32, u16, u16)] = &[
         13,
     ),
     (
-        b"/Volumes/NULLSTAR_DATA",
-        protocol::route::NULLSTAR_DATA,
+        b"/Volumes/NullStar",
+        protocol::route::NULLSTAR_VOLUME,
         protocol::backend::NULLFS,
-        22,
+        17,
     ),
     (
-        b"/Volumes/NULLSTAR_DATA/docs/readme.txt",
-        protocol::route::NULLSTAR_DATA,
+        b"/Volumes/NullStar/docs/readme.txt",
+        protocol::route::NULLSTAR_VOLUME,
         protocol::backend::NULLFS,
-        22,
+        17,
     ),
     (
         b"/Volumes/Disk",
@@ -326,7 +326,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
 fn probe_mounted_nullfs() {
     let mut entries = [platform::DirectoryEntry::EMPTY; 1];
     if platform::read_directory(b"/Volumes", 0, &mut entries).ok() != Some(1)
-        || entries[0].name() != b"NULLSTAR_DATA"
+        || entries[0].name() != nullfs_primary_volume::DISPLAY_NAME.as_bytes()
         || entries[0].kind != file::KIND_DIRECTORY
     {
         syscall::exit(19);
@@ -334,6 +334,9 @@ fn probe_mounted_nullfs() {
 
     if !stat_matches(NULLFS_MOUNT, file::KIND_DIRECTORY, 0) {
         syscall::exit(20);
+    }
+    if !directory_contains(NULLFS_MOUNT, &[b"System", b"Applications", b"Users"]) {
+        syscall::exit(58);
     }
     if !stat_matches(NULLFS_DOCS, file::KIND_DIRECTORY, BLOCK_SIZE as u64) {
         syscall::exit(21);
@@ -942,7 +945,7 @@ fn read_directory_with_retry(
     start_index: usize,
     entries: &mut [platform::DirectoryEntry],
 ) -> Option<usize> {
-    for _ in 0..8 {
+    for _ in 0..256 {
         match platform::read_directory(path, start_index, entries) {
             Ok(count) => return Some(count),
             Err(error) if error == platform::Errno::TRY_AGAIN => {
@@ -959,7 +962,7 @@ fn directory_contains(path: &[u8], names: &[&[u8]]) -> bool {
     let mut offset = 0usize;
     loop {
         let mut entries = [platform::DirectoryEntry::EMPTY; 8];
-        let Ok(count) = platform::read_directory(path, offset, &mut entries) else {
+        let Some(count) = read_directory_with_retry(path, offset, &mut entries) else {
             return false;
         };
         for entry in &entries[..count] {

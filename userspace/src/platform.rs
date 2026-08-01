@@ -232,11 +232,19 @@ pub fn open_block_device_endpoint(partition_index: u32) -> Result<FileDescriptor
     open_partition_endpoint(syscall::OPEN_BLOCK_DEVICE_ENDPOINT, partition_index)
 }
 
-pub fn open_writable_block_device_endpoint(partition_index: u32) -> Result<FileDescriptor> {
-    open_partition_endpoint(
-        syscall::OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT,
-        partition_index,
-    )
+pub fn open_writable_nullfs_block_device_endpoint(
+    filesystem_uuid: &[u8; 16],
+) -> Result<FileDescriptor> {
+    let mut result = syscall::OPEN_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") filesystem_uuid.as_ptr() as u64,
+            in("rsi") filesystem_uuid.len() as u64,
+        );
+    }
+    decode(result)
 }
 
 fn open_partition_endpoint(number: u64, partition_index: u32) -> Result<FileDescriptor> {

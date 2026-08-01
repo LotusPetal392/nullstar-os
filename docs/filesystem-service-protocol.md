@@ -326,7 +326,7 @@ sizes its identity map from the mounted volume's inode capacity, drains duplicat
 opens one reference at a time, and preserves both protocol and core accounting
 when a close fails. PID 1 registers it independently of tmpfs as a
 generation-scoped kernel filesystem proxy. The VFS has a static longest-prefix
-route for `/Volumes/NULLSTAR_DATA`, and its `/Volumes` listing exposes that mount.
+route for `/Volumes/NullStar`, and its `/Volumes` listing exposes that mount.
 
 The NullFS proxy performs `CONNECT` with exactly `WRITE` for each registered
 service generation, requires `session_features::WRITE` in the canonical reply,
@@ -334,7 +334,7 @@ and attaches one kernel-owned 4 KiB shared-memory buffer. Direct clients that
 connect with flags `0` still receive read-only sessions; raw block authority,
 filesystem-session authority, and public VFS policy remain separate.
 
-Without adding a NullFS-specific application ABI, `/Volumes/NULLSTAR_DATA`
+Without adding a NullFS-specific application ABI, `/Volumes/NullStar`
 supports ordinary public `stat`, read, open, `fstat`, seek, `read_directory`, and
 `chdir`, plus writable, create, truncate, and append opens, descriptor `write`,
 and unlink. Canonical path resolution happens before VFS routing, so cwd-relative

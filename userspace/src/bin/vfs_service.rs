@@ -5,7 +5,7 @@ use core::{mem::size_of, slice};
 
 use userspace::{
     ipc::{self, ObjectKind, Rights},
-    syscall,
+    nullfs_primary_volume, syscall,
     vfs::protocol,
 };
 
@@ -69,8 +69,8 @@ const ROUTES: &[Route] = &[
         backend: protocol::backend::NAMESPACE,
     },
     Route {
-        path: b"/Volumes/NULLSTAR_DATA",
-        id: protocol::route::NULLSTAR_DATA,
+        path: nullfs_primary_volume::MOUNT_PATH.as_bytes(),
+        id: protocol::route::NULLSTAR_VOLUME,
         backend: protocol::backend::NULLFS,
     },
     Route {

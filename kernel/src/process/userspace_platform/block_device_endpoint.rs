@@ -59,6 +59,7 @@ struct BlockDeviceSession {
 struct BlockDeviceEndpoint {
     partition: BlockDevicePartition,
     access: BlockDeviceAccess,
+    filesystem_uuid: Option<[u8; 16]>,
     endpoint: Option<CapabilityObjectRef>,
     generation: u64,
     next_session_id: u64,
@@ -126,19 +127,25 @@ pub fn configure_block_device_endpoints(inventory: &crate::partition::Inventory)
         state.devices.push(BlockDeviceEndpoint {
             partition: partition_snapshot,
             access: BlockDeviceAccess::ReadOnly,
+            filesystem_uuid: None,
             endpoint: None,
             generation: 0,
             next_session_id: 1,
             sessions: Vec::new(),
         });
-        if matches!(partition.kind, crate::partition::PartitionKind::NullFs)
+        let nullfs_uuid = if matches!(partition.kind, crate::partition::PartitionKind::NullFs)
             && block_device_partition_avoids_disk_metadata(inventory, partition)
             && block_device_partition_is_exclusive(inventory, partition)
-            && block_device_partition_has_valid_nullfs(partition_snapshot)
         {
+            block_device_partition_nullfs_uuid(partition_snapshot)
+        } else {
+            None
+        };
+        if let Some(filesystem_uuid) = nullfs_uuid {
             state.devices.push(BlockDeviceEndpoint {
                 partition: partition_snapshot,
                 access: BlockDeviceAccess::Writable,
+                filesystem_uuid: Some(filesystem_uuid),
                 endpoint: None,
                 generation: 0,
                 next_session_id: 1,
@@ -191,52 +198,41 @@ fn block_device_partitions_overlap(
     left.start_lba < right_end && right.start_lba < left_end
 }
 
-fn block_device_partition_has_valid_nullfs(partition: BlockDevicePartition) -> bool {
+fn block_device_partition_nullfs_uuid(partition: BlockDevicePartition) -> Option<[u8; 16]> {
     let block_size = partition.logical_block_size;
     if block_size == 0
         || !nullfs_format::BLOCK_SIZE.is_multiple_of(block_size)
         || !nullfs_format::SUPERBLOCK_OFFSET.is_multiple_of(block_size as u64)
     {
-        return false;
+        return None;
     }
     let first_relative_lba = nullfs_format::SUPERBLOCK_OFFSET / block_size as u64;
     let protocol_blocks = nullfs_format::BLOCK_SIZE / block_size;
-    let Ok(protocol_blocks_u64) = u64::try_from(protocol_blocks) else {
-        return false;
-    };
-    let Some(end_relative_lba) = first_relative_lba.checked_add(protocol_blocks_u64) else {
-        return false;
-    };
+    let protocol_blocks_u64 = u64::try_from(protocol_blocks).ok()?;
+    let end_relative_lba = first_relative_lba.checked_add(protocol_blocks_u64)?;
     if end_relative_lba > partition.block_count {
-        return false;
+        return None;
     }
 
     let mut encoded = [0_u8; nullfs_format::BLOCK_SIZE];
     for relative in 0..protocol_blocks {
-        let Some(lba) = partition
+        let lba = partition
             .start_lba
-            .checked_add(first_relative_lba)
-            .and_then(|first| first.checked_add(relative as u64))
-        else {
-            return false;
-        };
+            .checked_add(first_relative_lba)?
+            .checked_add(relative as u64)?;
         let offset = relative * block_size;
-        if crate::ahci::read_block(lba, &mut encoded[offset..offset + block_size]).is_err() {
-            return false;
-        }
+        crate::ahci::read_block(lba, &mut encoded[offset..offset + block_size]).ok()?;
     }
-    let Some(device_bytes) = partition
+    let device_bytes = partition
         .block_count
-        .checked_mul(partition.logical_block_size as u64)
-    else {
-        return false;
-    };
-    nullfs_format::Superblock::decode(
+        .checked_mul(partition.logical_block_size as u64)?;
+    let superblock = nullfs_format::Superblock::decode(
         &encoded,
         Some(device_bytes),
         nullfs_format::MountMode::ReadOnly,
     )
-    .is_ok()
+    .ok()?;
+    Some(superblock.filesystem_uuid)
 }
 
 fn block_device_endpoint_counts(state: &BlockDeviceEndpointState) -> (usize, usize) {
@@ -251,6 +247,56 @@ fn block_device_endpoint_counts(state: &BlockDeviceEndpointState) -> (usize, usi
         .filter(|device| device.access == BlockDeviceAccess::Writable)
         .count();
     (read_only, writable)
+}
+
+
+
+fn open_writable_nullfs_block_device_endpoint(
+    process_id: u64,
+    uuid_address: u64,
+    uuid_length: u64,
+) -> u64 {
+    if process_id != INIT_PROCESS_ID {
+        return error_return(abi::errno::PERMISSION);
+    }
+    if uuid_length != 16 {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    if !user_range_allows(process_id, uuid_address, 16, false) {
+        return error_return(ERR_BAD_ADDRESS);
+    }
+    let filesystem_uuid = unsafe { ptr::read_unaligned(uuid_address as *const [u8; 16]) };
+    if filesystem_uuid == [0; 16] {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    let partition_index = {
+        let state = BLOCK_DEVICE_ENDPOINTS.lock();
+        let candidates = state.devices.iter().filter_map(|device| {
+            if device.access != BlockDeviceAccess::Writable {
+                return None;
+            }
+            device
+                .filesystem_uuid
+                .map(|uuid| (device.partition.index, uuid))
+        });
+        match crate::nullfs_volume_selection::select_unique_partition_by_uuid(
+            candidates,
+            filesystem_uuid,
+        ) {
+            Ok(index) => index,
+            Err(crate::nullfs_volume_selection::SelectionError::Missing) => {
+                return error_return(ERR_NO_ENTRY);
+            }
+            Err(crate::nullfs_volume_selection::SelectionError::Ambiguous) => {
+                return error_return(ERR_INVALID_ARGUMENT);
+            }
+        }
+    };
+    open_block_device_endpoint(
+        process_id,
+        u64::from(partition_index),
+        BlockDeviceAccess::Writable,
+    )
 }
 
 fn open_block_device_endpoint(

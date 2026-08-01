@@ -76,6 +76,14 @@ mod vfs_protocol {
     ));
 }
 
+#[allow(dead_code)]
+mod nullfs_primary_volume {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/nullfs_primary_volume.rs"
+    ));
+}
+
 pub const SYSCALL_VECTOR: u8 = abi::SYSCALL_VECTOR;
 pub const INIT_PROCESS_ID: u64 = abi::INIT_PROCESS_ID;
 
@@ -155,7 +163,7 @@ const SIGNAL_UNBLOCKABLE_MASK: u64 = abi::signal::UNBLOCKABLE_MASK;
 const SIGNAL_RED_ZONE_BYTES: u64 = 128;
 pub const MAX_PROCESS_SLOTS: usize = 64;
 const MAX_PENDING_TMPFS_CLOSES: usize = MAX_PROCESS_SLOTS * (MAX_OPEN_FILES + 3) + 1;
-const NULLFS_MOUNT_PATH: &str = "/Volumes/NULLSTAR_DATA";
+const NULLFS_MOUNT_PATH: &str = nullfs_primary_volume::MOUNT_PATH;
 const FILESYSTEM_PROXY_BULK_BYTES: usize = 4096;
 const PROCESS_HISTORY_LIMIT: usize = 128;
 // PID zero is reserved for the kernel reaper. Children assigned to it have no
@@ -5085,7 +5093,7 @@ fn vfs_routed_namespace_directory(
         | "/System/Applications"
         | "/Users"
         | "/Applications" => &[],
-        "/Volumes" => &["NULLSTAR_DATA"],
+        "/Volumes" => &[nullfs_primary_volume::DISPLAY_NAME],
         _ => return ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY)),
     };
     let records: Vec<_> = names
@@ -5403,10 +5411,10 @@ fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
             vfs_protocol::route::APPLICATIONS,
             vfs_protocol::backend::NAMESPACE,
         )
-    } else if vfs_path_has_prefix(path, "/Volumes/NULLSTAR_DATA") {
+    } else if vfs_path_has_prefix(path, nullfs_primary_volume::MOUNT_PATH) {
         (
-            "/Volumes/NULLSTAR_DATA",
-            vfs_protocol::route::NULLSTAR_DATA,
+            nullfs_primary_volume::MOUNT_PATH,
+            vfs_protocol::route::NULLSTAR_VOLUME,
             vfs_protocol::backend::NULLFS,
         )
     } else if vfs_path_has_prefix(path, "/Volumes") {

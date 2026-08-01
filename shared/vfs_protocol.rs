@@ -40,7 +40,7 @@ pub mod route {
     pub const APPLICATIONS: u32 = 13;
     pub const VOLUMES: u32 = 14;
     pub const SYSTEM_VAR: u32 = 15;
-    pub const NULLSTAR_DATA: u32 = 16;
+    pub const NULLSTAR_VOLUME: u32 = 16;
 }
 
 #[repr(C)]
