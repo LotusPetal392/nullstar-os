@@ -1,18 +1,79 @@
 # Architecture design roadmap
 
 This roadmap separates implemented work from future architectural direction. It does
-not replace milestone-specific plans elsewhere in the repository.
+not replace milestone-specific plans elsewhere in the repository. Current implementation
+documents remain authoritative for behavior that exists today.
 
-## Near-term foundations
+## IPC and kernel-object foundations
 
-- Formalize kernel object ownership and typed handle usage.
-- Separate process, thread, address-space, and future job abstractions.
-- Evolve shared-memory objects from bounded copies to mapped pages.
-- Add authoritative virtual-memory region tracking and guarded stacks.
-- Define channel transfer, cancellation, and multi-object waiting semantics.
-- Add scheduler tracing for wakeup latency and priority inversion.
-- Stabilize the userspace startup block and safe platform wrappers.
-- Introduce a named, versioned service-broker contract.
+The current system already has bounded process-local capability tables, rights-reduced
+copying, endpoints, counted notifications, copied shared memory, endpoint waiting, and
+direct-child bootstrap grants. The next architecture stages are:
+
+1. formalize common kernel-object ownership, typed handles, immutable rights, object
+   signals, close, duplicate, replace, inspection, and diagnostic object identity;
+2. separate process, thread, address-space, and hierarchical job abstractions;
+3. introduce channel pairs with peer closure, bounded queues, atomic move-transfer of
+   multiple rights-reduced handles, and explicit backpressure accounting;
+4. add general one- and many-object waiting with absolute monotonic deadlines;
+5. evolve shared-memory objects from bounded copies to mapped pages with protection,
+   sealing, W^X integration, and job accounting;
+6. add cancellation and a bounded synchronous call/reply path with priority donation;
+7. add persistent event ports or wait sets for IPC, timers, process exit, file and
+   network completion, display, device, and media events;
+8. build safe handle types, an asynchronous IPC runtime, typed service bindings,
+   tracing, and protocol conformance tests;
+9. introduce an IDL only after stable wire and lifecycle conventions have survived real
+   services.
+
+The detailed contract is in
+[IPC, kernel object, and handle model](ipc-and-object-model.md).
+
+## Process startup and service lifecycle
+
+1. replace broad ambient startup assumptions with one bootstrap channel carrying a
+   versioned startup message and explicit handles;
+2. add process-exit observation and basic hierarchical job containment around the
+   current supervisor;
+3. define stable service identity, service generation, lifecycle state, readiness,
+   control, and failure protocols;
+4. keep PID 1 as a minimal bootstrap and recovery supervisor while moving ordinary
+   dependency, activation, restart, and resource policy into a separately restartable
+   system service manager;
+5. add declarative definitions, dependency validation, capability requirements,
+   channel activation, restart budgets, watchdogs, resource limits, and quarantine;
+6. integrate structured logging, configuration handles, administrative authorization,
+   service inspection, and recovery controls;
+7. create per-login session jobs and session managers;
+8. create per-application jobs and explicit component-role launches;
+9. move userspace drivers into restricted driver jobs with provider-generation recovery;
+10. add richer session restoration, background policy, and multi-seat support only after
+    lifecycle containment is reliable.
+
+See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
+[Service management and command line](service-management-and-cli.md).
+
+## Application isolation and permissions
+
+1. require every graphical bundle to launch through the application manager regardless
+   of installation path;
+2. establish stable signed application identity and technical sandbox profiles;
+3. provide private bundle, data, cache, temporary, and runtime capabilities plus a
+   restricted service namespace;
+4. implement file, save, directory, drag-and-drop, and share portals with persistent
+   resource identities and permission records;
+5. add microphone, camera, screen-capture, contextual clipboard, and trusted active-use
+   indicators;
+6. add provider-controlled leases, expiration, revocation, and reduced child delegation;
+7. route outbound networking, local-network discovery, listeners, and device access
+   through application-attributed brokers;
+8. add explicit multi-process component roles, application-exported services, isolated
+   plugin hosts, and application groups;
+9. add visible background leases and start-at-login controls;
+10. add operation-specific administrative tickets, compatibility profiles, policy
+    linting, and capability-graph inspection.
+
+See [Capability-based application sandboxing](application-sandboxing.md).
 
 ## Namespace and persistent storage
 
@@ -20,8 +81,8 @@ not replace milestone-specific plans elsewhere in the repository.
 - Give the primary NullFS volume a stable UUID and human-facing `/Volumes/NullStar`
   identity.
 - Populate `System`, `Applications`, and `Users` trees on the primary volume.
-- Define namespace bindings that project those trees into canonical `/System`,
-  `/Applications`, and `/Users` paths without symbolic links.
+- Project those trees into canonical `/System`, `/Applications`, and `/Users` paths
+  through namespace bindings rather than symbolic links.
 - Preserve canonical file identity across logical bindings and administrative backing
   views.
 - Add writable NullStar filesystem-service authority, shutdown ordering, recovery, and
@@ -32,7 +93,7 @@ not replace milestone-specific plans elsewhere in the repository.
 - Retain an independent bootstrap and recovery environment whenever persistent bindings
   are unavailable.
 
-## Driver and service evolution
+## Driver and device evolution
 
 - Define common device identity, ownership generation, reset, and discovery records.
 - Add verified driver manifests, deterministic matching, and a supervised device
@@ -41,96 +102,114 @@ not replace milestone-specific plans elsewhere in the repository.
 - Introduce constrained PCI configuration, MMIO, IRQ, pinned DMA, and later IOMMU-domain
   capabilities.
 - Move a queue-oriented virtual block or network driver to userspace first.
-- Separate controller drivers from block, network, input, audio, and display class
-  policy.
+- Separate controller drivers from block, network, input, audio, display, radio, and
+  other class policy.
 - Add hotplug, firmware brokerage, suspend/resume, crash recovery, quarantine, and
   driver rollback.
-- Define the service-manager control protocol and state machine.
-- Implement `sv list`, `status`, `start`, `stop`, `restart`, and `logs` against the
-  evolving supervisor.
-- Add versioned service definitions, readiness, dependency validation, restart budgets,
-  resource limits, capability grants, enablement, and local overrides.
+- Keep raw device enumeration and transfer separate from higher-level device-class
+  services and application portals.
 
-## Desktop kernel evolution
+## Desktop scheduler evolution
 
 - Add multilevel feedback scheduling with interactive wakeup preemption.
 - Add priority inheritance for locks and bounded synchronous IPC.
-- Introduce restricted, budgeted realtime scheduling.
+- Introduce restricted, admitted, and budgeted realtime scheduling.
 - Move scheduler state and preemption accounting to per-CPU structures.
 - Add SMP, per-CPU run queues, affinity, and bounded load balancing.
 - Evolve timers toward deadline-driven tickless operation.
-- Add job-level resource accounting and limits.
+- Add job-level CPU accounting and limits.
+- Trace wakeup latency, donation chains, budget exhaustion, and deadline misses.
 
 ## Memory evolution
 
-- Introduce anonymous, shared, executable-image, device, and COW memory objects.
-- Add lazy zero-fill, mapping protection changes, and W^X enforcement.
+- Introduce anonymous, shared, executable-image, device, and copy-on-write memory
+  objects.
+- Add lazy zero-fill, mapping-protection changes, and W^X enforcement.
 - Add page ownership and commitment accounting.
 - Add slab caches and bounded pools for latency-sensitive work.
 - Define pager-backed file mappings and unified page-cache behavior.
-- Add memory-pressure notification and job-level OOM containment.
+- Add memory-pressure notification and job-level out-of-memory containment.
+- Add replaceable shared buffers for revocable media and capture sessions.
+- Keep generic shared memory separate from pinned, device-visible DMA buffers.
 - Defer compressed memory, swap, huge pages, NUMA, and hibernation until reclaim and
   failure semantics are reliable.
 
 ## Userspace and command-line evolution
 
-- Build raw ABI, safe handle, runtime, and service-client layers.
-- Define application, service, driver, and package manifests.
+- Build raw ABI, safe handle, runtime, asynchronous IPC, and service-client layers.
+- Define application, service, driver, package, and protocol manifests.
 - Adopt `/Users/<name>/Profile/{config,cache,state,data,logs,runtime}`.
 - Add system-managed filesystem metadata so graphical tools may hide `Profile` without
   dot-prefix naming.
-- Add application jobs, sandbox policy, and portal-style brokers.
 - Add threads and futex-like synchronization.
 - Expand the native Rust utility set for boot, recovery, and ordinary shell use.
-- Grow `ush` scripting while documenting its native behavior separately from future
-  POSIX `sh` compatibility.
+- Grow `ush` scripting while documenting native behavior separately from future POSIX
+  `sh` compatibility.
 - Map XDG base-directory compatibility to `Profile` without making Unix paths native.
 - Add libc and POSIX compatibility after native contracts stabilize.
 - Use external utility suites and eventually GNU coreutils as compatibility workloads,
   not boot dependencies.
 - Keep bootstrap, recovery, and early services statically linked while loader and
   deployment ABIs evolve.
-- Introduce shared libraries only through versioned, verified deployments and
-  controlled loader policy.
+- Introduce shared libraries only through versioned, verified deployments and controlled
+  loader policy.
 
 ## Executable and linking evolution
 
 1. Keep the native kernel, services, drivers, recovery environment, executables, and
    machine-code libraries x86-64-only.
 2. Harden static ELF64 program-header validation, segment bounds, zero-fill, entry-point
-   checks, and final W^X page permissions.
+   checks, and final W^X permissions.
 3. Add build IDs, separate debug-symbol packages, non-executable stacks, and versioned
-   NullStar ELF notes whose identity is verified against package metadata.
-4. Add static PIE, a bounded relocation subset, and ASLR for executable, stack, heap, and
-   mapping bases.
+   NullStar ELF notes verified against package metadata.
+4. Add static PIE, a bounded relocation subset, and ASLR for executable, stack, heap,
+   and mapping bases.
 5. Define a stable platform-library ABI rather than exposing Rust's compiler-private ABI.
 6. Add a versioned dynamic loader, immediate relocation, shared objects, TLS,
    constructors, RELRO, application-private libraries, and controlled search policy.
-7. Keep bootstrap, recovery, and critical repair utilities statically linked permanently.
+7. Keep bootstrap, recovery, and critical repair utilities statically linked.
 8. Defer ELF32/i386 execution, 32-bit libraries, and legacy plugin hosts to an optional
    compatibility deployment after the 64-bit platform is mature.
 
 ## Magnetar package and deployment evolution
 
-1. Define deterministic `.nspkg` archives, canonical package IDs, version comparison,
-   architecture fields, file classes, and signed manifests.
-2. Implement local install and verification, repository snapshots, a trusted key store,
+1. Define deterministic `.nspkg` archives, canonical package and application identities,
+   version comparison, architecture fields, file classes, and signed manifests.
+2. Define authenticated publisher-key lineage so application updates may preserve
+   identity without silently accepting an unrelated signer.
+3. Implement local install and verification, repository snapshots, a trusted key store,
    mirror ranking and history, configurable parallel downloads, and package queries.
-3. Add dependency solving, minimum-version and ABI requirements, conflicts, providers,
+4. Add dependency solving, minimum-version and ABI requirements, conflicts, providers,
    manual/automatic tracking, removal, and generation-aware pruning.
-4. Import verified immutable content into a content-addressed object store and record
-   embedded static components for vulnerability auditing.
-5. Construct complete application generations and atomically switch application bundles.
-6. Construct complete system and boot generations, preserve the previous healthy
+5. Import verified immutable content into a content-addressed store and record embedded
+   static components for vulnerability auditing.
+6. Construct complete application generations and atomically switch application bundles
+   without changing grants solely because a path changed.
+7. Construct complete system and boot generations, preserve the previous healthy
    generation, and allow selection from the independent bootstrap environment.
-7. Add staged, pending, healthy, failed, superseded, and pinned generation states plus
-   bounded failed-boot fallback.
-8. Separate package defaults from mutable configuration and state; define schema-aware
+8. Add staged, pending, healthy, failed, superseded, and pinned states plus bounded
+   failed-boot fallback.
+9. Separate package defaults from mutable configuration and state; define schema-aware
    merge, migration, snapshot, and rollback-compatibility rules.
-9. Coordinate services, drivers, namespace bindings, health checks, and reboots through
-   declarative activation rather than unrestricted package scripts.
-10. Add generation-aware garbage collection, offline transaction bundles, repair,
+10. Coordinate services, drivers, namespace bindings, health checks, and reboots through
+    declarative activation rather than unrestricted package scripts.
+11. Add generation-aware garbage collection, offline transaction bundles, repair,
     provenance, repository-key rotation, and recovery tooling.
+
+## Identity, login, and authorization
+
+- Define bounded UID/GID and immutable process credential types without treating them as
+  capabilities.
+- Add native ownership and mode metadata to tmpfs, NullFS, VFS, and service requests.
+- Add read-only account and group lookup and isolated credential-verifier storage.
+- Add service identities and checked identity/capability filtering at launch.
+- Implement a dedicated authentication service and trusted login UI.
+- Create login-session jobs, private runtime namespaces, compositor lock integration,
+  and deterministic logout cleanup.
+- Add supplementary groups and shared-file workflows.
+- Add narrow semantic authorization requests and single-use administrative tickets.
+- Add stronger audit records, denial-path tests, rate limiting, recovery, and credential
+  upgrade policy.
 
 ## Logging and diagnostics
 
@@ -144,22 +223,24 @@ not replace milestone-specific plans elsewhere in the repository.
   and configurable retention classes.
 - Add rate limits, drop summaries, field-level privacy, crash-report links, and a
   stronger audit stream.
-- Add syslog, legacy text-file rotation, and remote forwarding only as compatibility
-  or optional services.
+- Add IPC, object, handle, capability-route, service-generation, and wait-chain
+  diagnostic tools.
+- Add syslog, legacy text-file rotation, and remote forwarding only as compatibility or
+  optional services.
 
 ## Networking and policy
 
 - Route sockets through a userspace network service and attach immutable caller
-  identity.
+  application, service, user, and session identity.
 - Record connection and listener address, port, protocol, state, interface, and byte
   counts.
 - Add per-application connect and listen rules plus `netctl connections` and rule
   explanations.
 - Add a native resolver with domain-to-connection attribution and domain policy.
-- Distinguish internet, local-network, discovery, listener, raw, VPN, and DNS-provider
-  capabilities.
-- Add user-scoped history, graphical policy controls, application profiles, and
-  explicit privacy retention.
+- Distinguish outbound internet, local-network discovery, listener, raw, packet-capture,
+  VPN, and DNS-provider capabilities.
+- Add user-scoped history, graphical policy controls, application profiles, and explicit
+  privacy retention.
 - Add verified malware and tracker lists with isolated parsing, immutable compiled
   snapshots, exceptions, explanations, and rollback.
 - Add VPN awareness, per-application routing, rate limits, and a bounded packet-layer
@@ -171,16 +252,18 @@ not replace milestone-specific plans elsewhere in the repository.
 2. Build a software-composited single-output session over the existing framebuffer.
 3. Add isolated toplevels, dialogs, popups, focus, clipboard offers, and accessibility
    foundations.
-4. Add a nested panel compositor with process-isolated applets and service-manager
+4. Add a nested panel compositor with process-isolated applets and session-manager
    supervision.
 5. Support panel, dock, or neither on every screen edge, including work-area reservation,
    auto-hide, and popup forwarding.
-6. Add capture, file-transfer, global-shortcut, sensitive-input, and permission portals.
+6. Add file-transfer, clipboard, global-shortcut, screen-capture, sensitive-input, and
+   permission portals.
 7. Add compositor-owned backdrop blur and materials without exposing underlying pixels.
-8. Add accelerated buffers, explicit synchronization, modesetting, color management,
+8. Add trusted microphone, camera, and capture indicators with immediate stop actions.
+9. Add accelerated buffers, explicit synchronization, modesetting, color management,
    multiple outputs, and protected-content handling.
-9. Add a Wayland compatibility frontend beginning with core protocol and `xdg-shell`.
-10. Add freedesktop application metadata, MIME, icon, notification, portal, settings,
+10. Add a Wayland compatibility frontend beginning with core protocol and `xdg-shell`.
+11. Add freedesktop application metadata, MIME, icons, notifications, portals, settings,
     Secret Service, D-Bus session, and tray compatibility in measured stages.
 
 ## Native renderer and toolkit evolution
@@ -190,8 +273,8 @@ not replace milestone-specific plans elsewhere in the repository.
 2. Define a safe SVG asset profile, symbolic icon roles, and scalable cursor metadata.
 3. Implement a Rust widget toolkit with row, column, stack, scroll, common controls,
    input, focus, and accessibility identities.
-4. Specify NullStar Style Sheets with variables, type/class/ID selectors, stable widget
-   parts, pseudo-states, borders, radii, spacing, gradients, text, and shadows.
+4. Specify NullStar Style Sheets with variables, selectors, stable widget parts,
+   pseudo-states, borders, radii, spacing, gradients, text, and shadows.
 5. Add live themes, high contrast, reduced motion, animation, and compositor backdrop
    material requests.
 6. Add damage tracking, retained scene fragments, glyph and image caches, and a GPU
@@ -203,8 +286,8 @@ not replace milestone-specific plans elsewhere in the repository.
 
 1. Fixed-format playback through one output, software mixing, per-stream volume, and
    shared-memory transport.
-2. Capture permissions, hotplug, multiple devices, sample-rate and sample-format
-   conversion, and channel mapping.
+2. Capture permissions, trusted active-use indicators, hotplug, multiple devices,
+   sample-rate and sample-format conversion, and channel mapping.
 3. Arbitrary routing, virtual devices, processing nodes, graph inspection, and saved
    routes.
 4. Multiple clock domains, adaptive resampling, latency negotiation, MIDI, automation,
