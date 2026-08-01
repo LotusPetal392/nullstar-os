@@ -7,23 +7,32 @@ implemented. The current-system description remains in
 Each design document distinguishes among:
 
 - **Accepted direction**: a project-level design decision that should guide future work.
-- **Tentative design**: the current preferred approach, subject to implementation experience.
+- **Tentative design**: the current preferred approach, subject to implementation
+  experience.
 - **Open question**: an area that still needs investigation or measurement.
 - **Distant goal**: intentionally outside the early-system implementation sequence.
 
 The documents here are not stable ABI specifications. Implemented behavior remains
-authoritative when it differs from a future design.
+authoritative when it differs from future design.
 
 ## System foundations
 
 - [Kernel, IPC, and scheduling](kernel-ipc-scheduling.md)
+- [IPC, kernel object, and handle model](ipc-and-object-model.md)
 - [Memory management](memory-management.md)
+- [Memory hardening](memory-hardening.md)
 - [Userspace architecture](userspace-architecture.md)
+- [Native application runtime, SDK, and service IDL](application-runtime-sdk-and-idl.md)
+- [NSIDL and the NullStar Wire Protocol](nsidl-and-wire-protocol.md)
+- [NSWP packet header and protocol identifiers](nswp-header-and-protocol-identifiers.md)
+- [Service, session, and application lifecycle](service-and-session-lifecycle.md)
+- [Service management and command line](service-management-and-cli.md)
+- [Capability-based application sandboxing](application-sandboxing.md)
+- [Application bundles, signing, and deployment](application-bundles-and-deployment.md)
 - [Executable loading and linking](executable-loading.md)
 - [Magnetar package and deployment management](package-management.md)
 - [Filesystem namespace and boot](filesystem-namespace.md)
 - [Driver model](driver-model.md)
-- [Service management and command line](service-management-and-cli.md)
 - [Logging, journal, and rotation](logging.md)
 - [Network policy and firewall](network-policy.md)
 
@@ -43,13 +52,25 @@ authoritative when it differs from a future design.
 
 - Keep mechanism in the kernel and policy in userspace where practical.
 - Prefer explicit capabilities over ambient authority.
+- Keep PID 1 small and move ordinary service policy into restartable userspace.
+- Treat stable service identity separately from disposable process incarnations.
+- Construct every managed process with explicit startup handles before it runs.
+- Use versioned, language-neutral service protocols as the durable userspace
+  compatibility boundary rather than Rust's compiler-private ABI.
+- Bind one negotiated protocol to each service channel and use explicit UUIDv4 protocol
+  family identities without treating identifiers as authority.
+- Keep every wire message, dynamic value, handle set, and decode allocation explicitly
+  bounded and validate complete messages before dispatch.
+- Sandbox every application bundle regardless of installation location.
+- Deploy applications as verified immutable generations and keep mutable data outside
+  their bundles.
 - Preserve a practical compatibility path without making Unix conventions the
   foundation of the native system.
 - Translate privileged compatibility interfaces through native policy and portals.
 - Optimize desktop behavior for predictable latency rather than unlimited priority.
 - Keep the logical namespace independent from physical storage layout.
-- Prevent one application, applet, plugin, driver, or service failure from exposing or
-  destabilizing unrelated processes.
+- Prevent one application, applet, plugin, driver, session, or service failure from
+  exposing or destabilizing unrelated jobs.
 - Use descriptive filesystem and service names that do not require historical Unix
   knowledge.
 - Keep current implementation documentation separate from future architectural intent.

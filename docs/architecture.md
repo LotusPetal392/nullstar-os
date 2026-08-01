@@ -45,8 +45,8 @@ Generated images use `/BOOTMODE` to select among:
 ## Boot sequence
 
 The kernel enters through `bootloader_api` with a framebuffer, memory map,
-physical-memory mapping, kernel stack, and optional ACPI RSDP address.
-Initialization proceeds in dependency order:
+physical-memory mapping, kernel stack, and optional ACPI RSDP address. Initialization
+proceeds in dependency order:
 
 1. Create the page-table mapper and physical-frame allocator, then map the kernel heap.
 2. Parse ACPI data and initialize the framebuffer console.
@@ -97,19 +97,28 @@ ownership, signals, and completion state. `exec` constructs and validates a repl
 image before committing it, and `fork` initially shares read-only pages before copying
 on write.
 
-### Future service manager
+### Future service and session lifecycle
 
-The current init sequence is explicitly coded. Its accepted successor is a native,
-declarative PID 1 service manager with named units, dependencies, readiness, restart
-policy, resource limits, capability delegation, structured logging, observable state,
-and a versioned control protocol used by the planned `sv` client.
+The current init sequence and service launch policy are explicitly coded into PID 1. The
+accepted successor separates two roles:
+
+- a small PID 1 bootstrap and recovery supervisor that establishes the root job, starts
+  and monitors the service manager, and retains only emergency authority;
+- a separately restartable system service manager that owns ordinary definitions,
+  dependencies, channel activation, readiness, restart policy, resource limits,
+  capability routing, structured logging integration, and top-level session creation.
 
 Packaged definitions belong under `/System/services`; machine enablement and overrides
 belong under `/System/config/services`. Commands remain structured argument arrays, not
-shell strings. Bootstrap services needed to make `/System/services` available must
-remain in a small independently available set.
+shell strings. Bootstrap services needed to make `/System/services` available remain in
+a small independently available set.
 
-See [Service management and command-line direction](design/service-management-and-cli.md)
+Successful login eventually creates a dedicated session job managed by a per-session
+manager. The session manager, rather than PID 1, owns that user's compositor, desktop
+shell, session services, application jobs, logout, and lock lifecycle.
+
+See [Service, session, and application lifecycle](design/service-and-session-lifecycle.md)
+and [Service management and command-line direction](design/service-management-and-cli.md)
 for the accepted design rather than treating this current-system document as its full
 specification.
 
@@ -195,11 +204,11 @@ directories use modes `0644` and `0755`. Every mutation rechecks the session's w
 feature.
 
 Mutation failures whose durable outcome cannot be proven return `OUTCOME_UNKNOWN`; the
-service then fail-stops so supervision can restart it and remount through normal recovery.
-Clients must not automatically retry an uncertain operation. Open-unlinked access is
-accepted only through an actual matching open handle. Unlink is rejected when a read-only
-session owns an open whose later close would reclaim storage, and open-directory `rmdir`
-and unsafe rename replacement remain restricted.
+service then fail-stops so supervision can restart it and remount through normal
+recovery. Clients must not automatically retry an uncertain operation. Open-unlinked
+access is accepted only through an actual matching open handle. Unlink is rejected when
+a read-only session owns an open whose later close would reclaim storage, and open-
+directory `rmdir` and unsafe rename replacement remain restricted.
 
 The kernel NullFS proxy requests exactly `WRITE` and accepts a service generation only
 when `CONNECT` returns `session_features::WRITE`. The public `/Volumes/NullStar`
@@ -217,9 +226,9 @@ open-unlinked coherence. Service replacement never replays or rebinds old descri
 they remain stale.
 
 The public proxy validates canonical replies. `OUTCOME_UNKNOWN`, a malformed reply, or
-post-send uncertainty about a mutation maps to `IO`, quarantines that service generation,
-and is never automatically retried. These rules do not add durability beyond NullFS's
-existing transaction and recovery semantics.
+post-send uncertainty about a mutation maps to `IO`, quarantines that service
+generation, and is never automatically retried. These rules do not add durability beyond
+NullFS's existing transaction and recovery semantics.
 
 Normal boot retains raw read-only coverage plus non-destructive writable-endpoint
 identity, bounds, and flush checks. Filesystem-level probes provide durable mutation
