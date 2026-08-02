@@ -9,6 +9,8 @@ extern crate alloc;
 use alloc::{boxed::Box, vec, vec::Vec};
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::{alloc::Layout, panic::PanicInfo};
+use kernel::early_log;
+use nswp_logging::{EventId, LogSeverity, PrivacyClass};
 use x86_64::VirtAddr;
 
 mod arch;
@@ -37,6 +39,61 @@ const BOOTLOADER_MINIMUM_PHYSICAL_MAPPING_END: u64 = 0x1_0000_0000;
 // bootloader's 80 KiB default.
 const BOOTSTRAP_KERNEL_STACK_SIZE: u64 = 256 * 1024;
 
+const KERNEL_ENTRY_EVENT_ID: EventId = match EventId::from_bytes([
+    0xac, 0x95, 0xb7, 0x92, 0xf9, 0x3f, 0x47, 0x3c, 0xae, 0x52, 0x9b, 0xe6, 0xaa, 0x3f, 0xd8, 0x1e,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-entry event ID must be canonical"),
+};
+const KERNEL_ACPI_INIT_FAILED_EVENT_ID: EventId = match EventId::from_bytes([
+    0x7d, 0x47, 0x53, 0xa1, 0x6d, 0xc3, 0x47, 0x6a, 0x9b, 0x2e, 0xb9, 0x4e, 0x0c, 0x49, 0x6c, 0x34,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-ACPI-init-failed event ID must be canonical"),
+};
+const KERNEL_ACPI_UNAVAILABLE_EVENT_ID: EventId = match EventId::from_bytes([
+    0xaf, 0x08, 0x7d, 0x18, 0xbc, 0x37, 0x4f, 0xfd, 0x98, 0xbc, 0x3e, 0xaf, 0xb3, 0x1d, 0x20, 0xdc,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-ACPI-unavailable event ID must be canonical"),
+};
+const KERNEL_INTERRUPTS_READY_EVENT_ID: EventId = match EventId::from_bytes([
+    0xf0, 0x5c, 0x63, 0xdf, 0x9b, 0xd8, 0x47, 0x2d, 0xb9, 0x76, 0xce, 0x58, 0xb9, 0xe9, 0xd1, 0x80,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-interrupts-ready event ID must be canonical"),
+};
+const KERNEL_STORAGE_READY_EVENT_ID: EventId = match EventId::from_bytes([
+    0xd2, 0xed, 0xa2, 0x28, 0x00, 0x99, 0x46, 0x70, 0xae, 0xe2, 0x45, 0x64, 0x8d, 0x14, 0x18, 0x16,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-storage-ready event ID must be canonical"),
+};
+const KERNEL_USERSPACE_INIT_STARTED_EVENT_ID: EventId = match EventId::from_bytes([
+    0x9b, 0xa3, 0xf4, 0x2b, 0x1a, 0x9a, 0x48, 0xee, 0x99, 0x0e, 0xc4, 0xfe, 0x16, 0x05, 0xa9, 0xcb,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-userspace-init-started event ID must be canonical"),
+};
+const KERNEL_USERSPACE_INIT_FAILED_EVENT_ID: EventId = match EventId::from_bytes([
+    0x8f, 0x34, 0xc4, 0x5c, 0xd0, 0xd7, 0x4e, 0x83, 0xbf, 0x34, 0x50, 0xd7, 0x26, 0x8c, 0x26, 0x6e,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-userspace-init-failed event ID must be canonical"),
+};
+const KERNEL_ALLOCATION_FAILURE_EVENT_ID: EventId = match EventId::from_bytes([
+    0xb1, 0x88, 0xfb, 0xda, 0x1b, 0x94, 0x4c, 0x5d, 0x81, 0x84, 0x47, 0x1c, 0x27, 0xb0, 0xc2, 0x01,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-allocation-failure event ID must be canonical"),
+};
+const KERNEL_PANIC_EVENT_ID: EventId = match EventId::from_bytes([
+    0x65, 0xcf, 0xdd, 0x9e, 0x3a, 0x89, 0x47, 0x17, 0xbb, 0x5f, 0xdb, 0xa9, 0x74, 0x51, 0x51, 0x3b,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("kernel-panic event ID must be canonical"),
+};
+
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
@@ -47,6 +104,16 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    let _ = early_log::initialize_kernel_early_log(early_log::BootIdentity::Unavailable);
+    record_kernel_event(
+        KERNEL_ENTRY_EVENT_ID,
+        LogSeverity::Info,
+        PrivacyClass::Public,
+        early_log::EarlySource::KERNEL,
+        "kernel.boot",
+        "kernel entry reached",
+    );
+
     let Some(physical_memory_offset) = boot_info.physical_memory_offset.into_option() else {
         serial_println!("no physical memory mapping was provided by the bootloader");
         hlt_loop();
@@ -111,12 +178,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     Some(info)
                 }
                 Err(error) => {
+                    record_kernel_event(
+                        KERNEL_ACPI_INIT_FAILED_EVENT_ID,
+                        LogSeverity::Warning,
+                        PrivacyClass::Public,
+                        early_log::EarlySource::KERNEL,
+                        "kernel.arch",
+                        "ACPI initialization failed",
+                    );
                     serial_println!("ACPI initialization failed: {error:?}");
                     None
                 }
             }
         }
         None => {
+            record_kernel_event(
+                KERNEL_ACPI_UNAVAILABLE_EVENT_ID,
+                LogSeverity::Warning,
+                PrivacyClass::Public,
+                early_log::EarlySource::KERNEL,
+                "kernel.arch",
+                "ACPI RSDP unavailable",
+            );
             serial_println!("ACPI unavailable: bootloader did not provide an RSDP");
             None
         }
@@ -144,6 +227,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         interrupt_controller.kind,
         interrupt_controller.timer_source,
         interrupts::timer_ticks()
+    );
+    record_kernel_event(
+        KERNEL_INTERRUPTS_READY_EVENT_ID,
+        LogSeverity::Info,
+        PrivacyClass::Public,
+        early_log::EarlySource {
+            cpu_id: interrupt_controller.local_apic_id.map(u32::from),
+            process_id: None,
+            thread_id: None,
+        },
+        "kernel.arch",
+        "interrupt controller and timer ready",
     );
     let pci_inventory = match acpi_info.as_ref().and_then(|info| info.mcfg.as_ref()) {
         Some(mcfg) => match pci::enumerate(mcfg, physical_memory_offset, physical_memory_end) {
@@ -202,6 +297,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             physical_memory_end,
         ) {
             Ok(info) => {
+                record_kernel_event(
+                    KERNEL_STORAGE_READY_EVENT_ID,
+                    LogSeverity::Info,
+                    PrivacyClass::Public,
+                    early_log::EarlySource::KERNEL,
+                    "kernel.storage",
+                    "AHCI storage ready",
+                );
                 serial_println!(
                     "AHCI storage verified: controller={}, port={}, model=`{}`, serial=`{}`, firmware=`{}`, blocks={}, block_size={}, capacity_bytes={}, lba48={}, dma64={}, abar={:#x}, sector0_signature={:#06x}, sector0_checksum={:#010x}",
                     info.controller_location,
@@ -437,6 +540,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler_initial.quantum_ticks,
         boot_mode.description()
     );
+    if let Ok(snapshot) = early_log::try_kernel_early_log_stats() {
+        serial_println!(
+            "kernel early log ready: capacity={}, retained={}, overwritten={}, dropped={}, rejected={}, busy_drops={}, boot_id={}",
+            snapshot.stats.capacity,
+            snapshot.stats.retained,
+            snapshot.stats.overwritten,
+            snapshot.stats.dropped,
+            snapshot.stats.rejected,
+            snapshot.busy_drops,
+            if matches!(snapshot.stats.boot_identity, early_log::BootIdentity::Id(_)) {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
+    }
 
     if !boot_mode.is_smoke_test() {
         let userspace_runtime =
@@ -2498,6 +2617,14 @@ fn enter_userspace(system_info: shell::SystemInfo, mut userspace_runtime: usersp
     let init = match userspace_runtime.spawn_foreground("/init", &[]) {
         Ok(init) => init,
         Err(error) => {
+            record_kernel_event(
+                KERNEL_USERSPACE_INIT_FAILED_EVENT_ID,
+                LogSeverity::Error,
+                PrivacyClass::Public,
+                early_log::EarlySource::KERNEL,
+                "kernel.process",
+                "userspace init failed to start",
+            );
             serial_println!("failed to start userspace init: {error}");
             println!("Userspace init failed to start.");
             println!("Entering the emergency kernel shell.");
@@ -2512,6 +2639,14 @@ fn enter_userspace(system_info: shell::SystemInfo, mut userspace_runtime: usersp
         );
         hlt_loop();
     }
+    record_kernel_event(
+        KERNEL_USERSPACE_INIT_STARTED_EVENT_ID,
+        LogSeverity::Notice,
+        PrivacyClass::Public,
+        early_log::EarlySource::KERNEL,
+        "kernel.process",
+        "userspace init started",
+    );
     serial_println!(
         "userspace init started: pid={}, group={}, task={}, path={}, entry={:#018x}",
         init.process_id,
@@ -2763,6 +2898,30 @@ fn heap_allocation_self_test() {
     );
 }
 
+fn record_kernel_event(
+    event_id: EventId,
+    severity: LogSeverity,
+    privacy: PrivacyClass,
+    source: early_log::EarlySource,
+    subsystem: &str,
+    message: &str,
+) {
+    let monotonic_time_ns = interrupts::timer_ticks().saturating_mul(
+        1_000_000_000_u64
+            .checked_div(interrupts::TIMER_HZ)
+            .unwrap_or(0),
+    );
+    let _ = early_log::try_record_kernel_early_log(early_log::EarlyLogInput {
+        event_id,
+        severity,
+        privacy,
+        monotonic_time_ns,
+        source,
+        subsystem,
+        message,
+    });
+}
+
 fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
@@ -2771,12 +2930,28 @@ fn hlt_loop() -> ! {
 
 #[alloc_error_handler]
 fn allocation_error(layout: Layout) -> ! {
+    record_kernel_event(
+        KERNEL_ALLOCATION_FAILURE_EVENT_ID,
+        LogSeverity::Emergency,
+        PrivacyClass::Public,
+        early_log::EarlySource::KERNEL,
+        "kernel.memory",
+        "kernel allocation failure",
+    );
     serial_println!("KERNEL ALLOCATION ERROR: {layout:?}");
     hlt_loop();
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    record_kernel_event(
+        KERNEL_PANIC_EVENT_ID,
+        LogSeverity::Emergency,
+        PrivacyClass::Public,
+        early_log::EarlySource::KERNEL,
+        "kernel.panic",
+        "kernel panic",
+    );
     serial_println!("KERNEL PANIC: {info}");
     hlt_loop();
 }
