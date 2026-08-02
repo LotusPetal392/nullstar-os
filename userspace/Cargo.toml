@@ -8,10 +8,24 @@ build = "build.rs"
 
 [dependencies]
 nullfs-format = { path = "../crates/nullfs-format" }
+nswp-logging = { path = "../crates/nswp-logging" }
+nswp-runtime = { path = "../crates/nswp-runtime" }
 
 [[bin]]
 name = "init"
 path = "src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "logging_service"
+path = "src/bin/logging_service.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "logging_probe"
+path = "src/bin/logging_probe.rs"
 test = false
 bench = false
 

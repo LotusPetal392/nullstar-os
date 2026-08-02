@@ -17,6 +17,21 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const INIT_READY: &[u8] = b"userspace init ready: pid=1\n";
+const LOGGING_SERVICE_COMMAND: &[u8] = b"/logging-service";
+const LOGGING_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: logging";
+const LOGGING_SERVICE_STARTING: &[u8] = b"userspace init: starting logging service\n";
+const LOGGING_SERVICE_RESTARTING: &[u8] = b"userspace init: logging service exited; restarting\n";
+const LOGGING_SERVICE_READY: &[u8] = b"userspace init: logging service ready\n";
+const LOGGING_SERVICE_FAILED: &[u8] = b"userspace init: logging service exhausted restart budget\n";
+const LOGGING_SERVICE_BOOTSTRAP_FAILED: &[u8] =
+    b"userspace init: failed to grant logging capabilities\n";
+const LOGGING_SERVICE_PROTOCOL_FAILED: &[u8] =
+    b"userspace init: invalid logging readiness message\n";
+const LOGGING_PROBE_COMMAND: &[u8] = b"/logging-probe";
+const LOGGING_PROBE_RECORD_DECODED: &[u8] = b"logging-probe: record decoded";
+const LOGGING_PROBE_MAX_YIELDS: u32 = 65_536;
+const LOGGING_PROBE_FAILED: &[u8] = b"userspace init: native NSWP logging probe failed\n";
+const LOGGING_PROBE_PASSED: &[u8] = b"userspace init: native NSWP logging probe passed\n";
 const BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe";
 const BLOCK_DEVICE_PROBE_FAILED: &[u8] = b"userspace init: read-only block-device probe failed\n";
 const BLOCK_DEVICE_PROBE_PASSED: &[u8] = b"userspace init: read-only block-device probe passed\n";
@@ -90,7 +105,16 @@ const SHELL_FOREGROUND_FAILED: &[u8] =
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
+const LOGGING_RESPONSE_HANDLE: u64 = 3;
 
+const LOGGING_SERVICE: ServiceSpec = ServiceSpec {
+    name: b"logging",
+    command: LOGGING_SERVICE_COMMAND,
+    ready_message: LOGGING_SERVICE_READY_MESSAGE,
+    bootstrap_handle: READY_HANDLE,
+    restart_limit: 3,
+    restart_backoff_yields: 32,
+};
 const NULLFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"nullfs",
     command: NULLFS_SERVICE_COMMAND,
@@ -132,6 +156,14 @@ struct BootstrapCapability {
     target_handle: CapabilityHandle,
 }
 
+const LOGGING_MESSAGES: ServiceMessages = ServiceMessages {
+    starting: LOGGING_SERVICE_STARTING,
+    restarting: LOGGING_SERVICE_RESTARTING,
+    ready: LOGGING_SERVICE_READY,
+    failed: LOGGING_SERVICE_FAILED,
+    bootstrap_failed: LOGGING_SERVICE_BOOTSTRAP_FAILED,
+    protocol_failed: LOGGING_SERVICE_PROTOCOL_FAILED,
+};
 const NULLFS_MESSAGES: ServiceMessages = ServiceMessages {
     starting: NULLFS_SERVICE_STARTING,
     restarting: NULLFS_SERVICE_RESTARTING,
@@ -164,6 +196,33 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if syscall::write_all(STDOUT, INIT_READY).is_err() {
         syscall::exit(1);
     }
+
+    let logging_readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let logging_request_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let logging_response_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let mut logging_service = ServiceRuntime::new(LOGGING_SERVICE);
+    let logging_response_capability = BootstrapCapability {
+        source_handle: logging_response_endpoint,
+        rights: Rights::SEND,
+        target_handle: LOGGING_RESPONSE_HANDLE,
+    };
+    start_service(
+        &mut logging_service,
+        logging_readiness_endpoint,
+        logging_request_endpoint,
+        Some(logging_response_capability),
+        &LOGGING_MESSAGES,
+    );
+    run_logging_probe(
+        &logging_service,
+        logging_readiness_endpoint,
+        logging_request_endpoint,
+        logging_response_endpoint,
+    );
+
     let mut missing_nullfs_uuid = nullfs_primary_volume::FILESYSTEM_UUID;
     missing_nullfs_uuid[15] ^= 0xff;
     if platform::open_writable_nullfs_block_device_endpoint(&missing_nullfs_uuid).err()
@@ -307,6 +366,29 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let mut shell_process_id = spawn_shell();
 
     loop {
+        if let Some(service_process_id) = logging_service.process_id() {
+            match syscall::try_wait_child(service_process_id) {
+                Ok(status) => match logging_service.observe_status(status.raw()) {
+                    ServiceStatusDisposition::WaitForNextEvent => {}
+                    ServiceStatusDisposition::Restart { backoff_yields } => {
+                        let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_RESTARTING);
+                        backoff(backoff_yields);
+                        start_service(
+                            &mut logging_service,
+                            logging_readiness_endpoint,
+                            logging_request_endpoint,
+                            Some(logging_response_capability),
+                            &LOGGING_MESSAGES,
+                        );
+                    }
+                    ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
+                },
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+                Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                Err(_) => fail(LOGGING_SERVICE_FAILED),
+            }
+        }
+
         if let Some(service_process_id) = nullfs_service.process_id() {
             match syscall::try_wait_child(service_process_id) {
                 Ok(status) => match nullfs_service.observe_status(status.raw()) {
@@ -710,6 +792,102 @@ fn start_service(
             let _ = syscall::yield_now();
         }
     }
+}
+
+fn run_logging_probe(
+    service: &ServiceRuntime,
+    readiness_endpoint: CapabilityHandle,
+    request_endpoint: CapabilityHandle,
+    response_endpoint: CapabilityHandle,
+) {
+    let service_process_id = service
+        .process_id()
+        .unwrap_or_else(|| fail(LOGGING_PROBE_FAILED));
+    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
+    let probe_process_id = syscall::spawn_command_with_barrier(
+        LOGGING_PROBE_COMMAND,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
+    if ipc::grant_child(
+        probe_process_id,
+        request_endpoint,
+        Rights::SEND,
+        READY_HANDLE,
+    )
+    .ok()
+        != Some(READY_HANDLE)
+        || ipc::grant_child(
+            probe_process_id,
+            response_endpoint,
+            Rights::RECEIVE,
+            REQUEST_HANDLE,
+        )
+        .ok()
+            != Some(REQUEST_HANDLE)
+    {
+        fail(LOGGING_PROBE_FAILED);
+    }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
+
+    let mut probe_exited = false;
+    let mut record_decoded = false;
+    let mut remaining_yields = LOGGING_PROBE_MAX_YIELDS;
+    let mut message_buffer = [0_u8; 64];
+    while !probe_exited || !record_decoded {
+        if !record_decoded {
+            match ipc::try_receive(readiness_endpoint, &mut message_buffer) {
+                Ok(message) => {
+                    if message.sender_process_id != service_process_id
+                        || message.capability.is_some()
+                        || message.bytes != LOGGING_PROBE_RECORD_DECODED.len()
+                        || &message_buffer[..message.bytes] != LOGGING_PROBE_RECORD_DECODED
+                    {
+                        fail(LOGGING_PROBE_FAILED);
+                    }
+                    record_decoded = true;
+                }
+                Err(error) if error == ipc::Error::TRY_AGAIN => {}
+                Err(_) => fail(LOGGING_PROBE_FAILED),
+            }
+        }
+        if !probe_exited {
+            match syscall::try_wait_child(probe_process_id) {
+                Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+                Ok(status) if status.success() => probe_exited = true,
+                Ok(_) => fail(LOGGING_PROBE_FAILED),
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+                Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                Err(_) => fail(LOGGING_PROBE_FAILED),
+            }
+        }
+        match syscall::try_wait_child(service_process_id) {
+            Ok(status) if status.continued() => {}
+            Ok(_) => {
+                let _ = syscall::signal_process_group(probe_process_id, signal::TERMINATE);
+                fail(LOGGING_PROBE_FAILED);
+            }
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(LOGGING_PROBE_FAILED),
+        }
+        if !probe_exited || !record_decoded {
+            if remaining_yields == 0 {
+                let _ = syscall::signal_process_group(probe_process_id, signal::TERMINATE);
+                fail(LOGGING_PROBE_FAILED);
+            }
+            remaining_yields -= 1;
+            syscall::yield_now().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
+        }
+    }
+    let _ = syscall::write_all(STDOUT, LOGGING_PROBE_PASSED);
 }
 
 fn run_tmpfs_probe(request_endpoint: CapabilityHandle) {

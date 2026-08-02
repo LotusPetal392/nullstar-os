@@ -108,24 +108,32 @@ Realtime media, interrupt workers, and low-level drivers must never block on jou
 I/O. They should write to preallocated bounded queues and tolerate loss according to
 severity policy.
 
-### Host-tested NSWP pilot contract
+### Production NSWP logging contract
 
-The first executable protocol pilot lives in `nswp-testkit`; it proves the NSWP runtime
-contract but is not yet a kernel endpoint, production collector, or journal format. It uses
-protocol ID `7db79cd9-c685-400f-b9f1-55d89b8e8a8a`, major version 1, and a client-to-server
-one-way `Emit` method.
+The allocation-free protocol, codec, and producer live in the `no_std` `nswp-logging` crate;
+`nswp-testkit` retains the host collector and deterministic transport fixtures. This contract is
+exercised by the native endpoint pilot but is not yet a production collector or journal format. It
+uses protocol family ID `7db79cd9-c685-400f-b9f1-55d89b8e8a8a`, major version 2, and a
+client-to-server one-way `Emit` method. Major 2 reflects the fixed-layout change from the original
+host pilot.
 
-The 192-byte endpoint profile requires a compact record. The pilot uses a 64-byte fixed
-root containing severity, privacy class, monotonic time, `string<16>` subsystem,
-`string<80>` message, and an extension table. Minor 1 adds an optional wall-clock
-timestamp. Maximum records encode to exactly 160 bytes at minor 0 and 192 bytes at minor
-1; including the NSWP header, the latter is exactly one 256-byte endpoint packet.
+Each record carries a required UUIDv4 `EventId` in RFC byte order. An `EventId` identifies an
+event type: an event definition commits to one stable constant and all occurrences reuse it. It is
+not generated per record, is distinct from the NSWP transport `trace_id`, and is not the future
+collector-assigned `RecordId` used to identify one retained occurrence.
 
-Producer principal, service identity, and producer service generation are not accepted
-from the record body. The launch or service environment binds them to a non-default
-`PeerContextId`, which accompanies the server event. The collector rejects unspecified or
-mismatched contexts. The negotiated `service_generation` remains the logging collector's
-generation and must not be mistaken for the producer generation.
+The 192-byte endpoint profile requires a compact record. The contract uses an 80-byte fixed root
+containing severity, privacy class, monotonic time, the 16-byte event ID, `string<16>` subsystem,
+`string<64>` message, and an extension table. Minor 1 adds an optional wall-clock timestamp.
+Maximum records encode to exactly 160 bytes at minor 0 and 192 bytes at minor 1; including the
+NSWP header, the latter is exactly one 256-byte endpoint packet.
+
+Producer principal, service identity, and producer service generation are not accepted from the
+record body. The host collector models the intended production rule: the launch or service
+environment binds them to a non-default `PeerContextId`, and the collector rejects unspecified or
+mismatched contexts. The native pilot currently relies on delegated endpoint authority and does not
+yet populate that peer context. The negotiated `service_generation` remains the logging
+collector's generation and must not be mistaken for the producer generation.
 
 The producer API exposes two queue-pressure policies:
 
@@ -133,10 +141,29 @@ The producer API exposes two queue-pressure policies:
   journal commit, or durable storage.
 - `BestEffort` drops on queue pressure and increments an observable dropped-record count.
 
-The host collector fixture has a fixed maximum record count. It redacts
-`secret-never-persist` messages before retention. Authorization-aware reads, redaction for
-other privacy classes, rate limiting, suppression summaries, persistence, and journal
+The host collector fixture retains the event-type ID, has a fixed maximum record count, and
+redacts `secret-never-persist` messages before retention. Authorization-aware reads, redaction
+for other privacy classes, rate limiting, suppression summaries, persistence, and journal
 rotation remain work for the production logging service.
+
+### Native endpoint pilot
+
+The first native pilot runs `/logging-probe` and `/logging-service` over the current endpoint ABI.
+Because an endpoint is one FIFO mailbox rather than one side of a duplex channel, the NSWP
+connection uses separate client-to-server and server-to-client endpoint objects. PID 1 delegates
+only `SEND` on the outgoing mailbox and `RECEIVE` on the incoming mailbox to each process. The
+allocation-free userspace transport requires distinct objects, rejects transferred capabilities,
+and pins the sender process ID observed on the first packet.
+
+The probe negotiates the production contract and sends a maximum-size minor-1 record: a 192-byte
+body plus the 64-byte NSWP header, exactly filling one 256-byte endpoint message. PID 1 reports
+success only after the service has dispatched and decoded that record, not merely after the client
+enqueues it.
+
+This remains a transport pilot rather than the production collector. Current endpoint objects do
+not report peer closure, queued messages are not tied to a service generation, and the adapter
+cannot derive a durable principal or service identity from the mailbox. The pilot has one delegated
+producer connection, mirrors accepted records to standard output, and retains no history.
 
 ## Early boot and panic records
 
