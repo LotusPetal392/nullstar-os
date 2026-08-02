@@ -4,6 +4,7 @@
 use core::mem::size_of;
 
 use userspace::{
+    args::Args,
     filesystem::{self, Error, Node, protocol},
     ipc::{self, ObjectKind, Rights},
     syscall,
@@ -13,6 +14,8 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const SERVICE_HANDLE: u64 = 1;
+const READINESS_MODE: &[u8] = b"readiness";
+const FULL_MODE: &[u8] = b"full";
 const BUFFER_ID: u64 = 1;
 const BUFFER_BYTES: usize = 4096;
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
@@ -35,7 +38,14 @@ const RECOVERY_READ_OFFSET: usize = 2048;
 const ROOT_ENTRY_CAPACITY: usize = 2;
 const RECOVERY_ENTRY_CAPACITY: usize = 2;
 
-extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
+extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+    let arguments = unsafe { Args::from_stack(initial_stack) };
+    let readiness = arguments.len() == 2 && arguments.get(1) == Some(READINESS_MODE);
+    let full =
+        arguments.len() == 1 || (arguments.len() == 2 && arguments.get(1) == Some(FULL_MODE));
+    if !readiness && !full {
+        syscall::exit(57);
+    }
     if !matches!(
         ipc::wait_for_handle(SERVICE_HANDLE),
         Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
@@ -86,6 +96,12 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         || welcome_attributes.mode != 0o644
     {
         syscall::exit(9);
+    }
+    if readiness {
+        if session.disconnect(7).is_err() {
+            syscall::exit(10);
+        }
+        syscall::exit(0);
     }
 
     let shared_memory = match ipc::shared_memory_create(BUFFER_BYTES) {
