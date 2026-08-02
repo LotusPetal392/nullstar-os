@@ -10,9 +10,11 @@ pub const PROTOCOL_ID_TEXT_BYTES: usize = 36;
 pub struct ProtocolId([u8; PROTOCOL_ID_BYTES]);
 
 impl ProtocolId {
-    pub fn from_bytes(bytes: [u8; PROTOCOL_ID_BYTES]) -> Result<Self, ProtocolIdError> {
-        validate_bytes(&bytes)?;
-        Ok(Self(bytes))
+    pub const fn from_bytes(bytes: [u8; PROTOCOL_ID_BYTES]) -> Result<Self, ProtocolIdError> {
+        match validate_bytes(&bytes) {
+            Ok(()) => Ok(Self(bytes)),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn parse(text: &str) -> Result<Self, ProtocolIdError> {
@@ -90,11 +92,23 @@ impl fmt::Debug for ProtocolId {
     }
 }
 
-fn validate_bytes(bytes: &[u8; PROTOCOL_ID_BYTES]) -> Result<(), ProtocolIdError> {
-    if *bytes == [0; PROTOCOL_ID_BYTES] {
+const fn validate_bytes(bytes: &[u8; PROTOCOL_ID_BYTES]) -> Result<(), ProtocolIdError> {
+    let mut all_zero = true;
+    let mut all_ones = true;
+    let mut index = 0;
+    while index < PROTOCOL_ID_BYTES {
+        if bytes[index] != 0 {
+            all_zero = false;
+        }
+        if bytes[index] != u8::MAX {
+            all_ones = false;
+        }
+        index += 1;
+    }
+    if all_zero {
         return Err(ProtocolIdError::Nil);
     }
-    if *bytes == [u8::MAX; PROTOCOL_ID_BYTES] {
+    if all_ones {
         return Err(ProtocolIdError::AllOnes);
     }
     if bytes[6] >> 4 != 4 {

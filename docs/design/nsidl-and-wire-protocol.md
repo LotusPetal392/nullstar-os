@@ -496,8 +496,10 @@ Vectors use:
 vector<T, MaximumElements>
 ```
 
-Every vector is bounded. The compiler computes its maximum inline and recursive encoded
-size and rejects a protocol whose maximum exceeds declared transport limits.
+Every vector is bounded. The eventual compiler computes its maximum inline and recursive
+encoded size and rejects a protocol whose maximum exceeds declared transport limits. The
+current handle-free schema codec enforces a handwritten static maximum element count and
+rejects vector descriptors whose element type has a zero-byte inline layout.
 
 ## Optional values
 
@@ -587,12 +589,26 @@ Rules:
 - envelopes are sorted by ordinal;
 - duplicate ordinals are malformed;
 - unknown ordinals are skipped safely;
-- removed ordinals remain reserved forever;
+- removed ordinals remain reserved forever and are rejected at every minor version and
+  feature selection;
 - new fields use new ordinals;
-- fields may be gated by selected minor version or negotiated feature.
+- fields may be gated by selected minor version and by one or more negotiated features.
 
-A required field introduced in minor 1.2 is required only when the selected connection
-version is at least 1.2.
+The current handwritten table descriptor declares `maximum_present_fields` independently
+of the number of fields currently known to that descriptor. It is a nonzero cap on present
+wire envelopes, including future unknown fields; it is not the known-field count or greatest
+ordinal. An intrinsically valid descriptor has room for at least all currently known fields,
+but may reserve additional present-field capacity for evolution. The runtime also applies
+its profile-wide maximum-table-fields limit to the actual present `field_count`.
+
+A known field is active exactly when its `since_minor` is no greater than the selected minor
+and every feature ID in its `required_features` list was negotiated. The descriptor's
+required feature IDs are nonzero, unique, and strictly increasing. A recognized field that
+is present while inactive is malformed. A recognized `@required` field is required only
+while active; its absence is then malformed.
+
+For example, a required field introduced in minor 1.2 is required only when the selected
+connection version is at least 1.2 and all of its required features, if any, are selected.
 
 ```text
 @4
@@ -603,7 +619,10 @@ new_field: u32;
 
 ## Closed enums
 
-A closed enum rejects unknown values.
+A closed enum rejects unknown values. The current static descriptor contains a nonempty,
+strictly increasing list of unique raw values, each representable in the declared integer
+width. Zero is accepted only when raw value zero is explicitly declared; it is not an
+implicit member.
 
 ```text
 enum ColorSpace : u32 {
@@ -614,7 +633,8 @@ enum ColorSpace : u32 {
 
 The encoded numeric value is the member ordinal unless an explicit compatible value is
 provided. Version 1 should prefer the ordinal as the value to avoid two independent
-numbering systems.
+numbering systems. Closed-enum members are fixed for the protocol major and do not carry
+minor-version or required-feature availability gates in the current schema codec.
 
 ## Open enums
 
@@ -637,7 +657,13 @@ An older receiver must not invent semantics for the unknown value.
 
 ## Closed unions
 
-A closed union rejects an unknown alternative ordinal.
+A closed union rejects an unknown alternative ordinal. Its current static descriptor has a
+nonempty list of known alternatives sorted by strictly increasing, unique, nonzero ordinal.
+A unit alternative has no payload descriptor or allocation. A non-unit alternative has a
+nonzero-inline-size payload descriptor and requires one exact payload allocation. The
+selected wire payload shape must match the declared alternative. Closed-union alternatives,
+like closed-enum members, are fixed for the protocol major rather than minor-version or
+feature gated.
 
 It is appropriate where every alternative changes safety-critical interpretation and an
 older implementation cannot continue safely without understanding the value.
@@ -1401,12 +1427,18 @@ minor version exactly, and renegotiation on the same channel is prohibited.
 ## Body arena
 
 The byte-region, canonical-placement, table, and depth rules in this section define the
-precise but still tentative target for the current **handle-free** body-codec milestone.
-They do not stabilize the body format. The first implementation slice covers primitive
-and fixed-structure roots, strings and byte sequences, tables, and closed results. Generic
-`vector<T>`, optionals, enums, general closed unions, handle references, handle domains,
-canonical handle ordering, and unknown open-union alternatives remain separate tentative
-work and are not required by this implementation slice.
+precise but still tentative target for the current **handle-free** schema-codec milestone.
+They do not stabilize the body format.
+
+The current implementation slice covers primitives, fixed structures, strings and byte
+sequences, generic bounded vectors, optionals, tables, closed enums, general closed unions,
+and the ordinal-1/ordinal-2 closed-result specialization. It uses handwritten static schema
+descriptors, validates table-field minor/feature availability, and separates complete
+validation from explicit materialization through an opaque validated-body token.
+
+Handle references and domains, canonical handle ordering, handle adoption, and open unions
+remain deferred tentative work. This slice also does not implement the NSIDL parser,
+compiler, canonical `.nsproto` format, or generated application bindings.
 
 NSWP bodies use a relocatable, self-relative, eight-byte-aligned arena. The root semantic
 value starts at body offset zero. Out-of-line values use relative references. No wire
@@ -1476,9 +1508,34 @@ The first `count` bytes are the value; remaining bytes are zero alignment paddin
 string has no implicit terminator. A counted `00` byte may encode U+0000 and is data,
 whereas any bytes after `count` are padding.
 
-For vectors, `region_bytes` includes the inline element array, padding of that inline
-array to eight bytes, all out-of-line descendants of those elements, and any required
-trailing alignment padding.
+## Vector encoding
+
+For a vector element descriptor:
+
+```text
+stride = align_up(element inline bytes, element alignment)
+```
+
+The descriptor's element alignment is one, two, four, or eight. A zero-sized vector element
+descriptor is malformed, even when a particular wire vector is empty; consequently a
+nonempty vector of zero-sized elements cannot be represented by this implementation.
+
+An empty vector uses the all-zero slice reference. For a nonempty vector, the target region
+is laid out in this exact order:
+
+1. the complete inline element array of `count * stride` bytes;
+2. zero tail padding from the end of that array to the next eight-byte boundary;
+3. every out-of-line element descendant, in ascending element-index order and canonical
+   field order within each element.
+
+Within each stride, bytes after the element's declared inline footprint are zero array
+padding. The full inline array, including all per-element stride padding and its eight-byte
+tail padding, precedes every descendant. Each element's complete descendant subtree
+precedes the next element's descendants.
+
+`region_bytes` includes that inline array, its zero padding, and all element descendants.
+It must be a nonzero multiple of eight and must be consumed exactly: no gap may precede or
+separate descendants, and no unaccounted tail may remain after the last descendant.
 
 ## Table reference
 
@@ -1599,16 +1656,30 @@ all-zero envelope = None
 ordinal 1 = Some
 ```
 
-No other ordinal is valid in NSWP 1.
+`None` requires every byte of the envelope to be zero, not merely ordinal zero. No other
+ordinal is valid in NSWP 1. `Some(unit)` uses ordinal 1 with no payload allocation. For any
+non-unit `T`, `Some(T)` requires one payload whose declared allocation is present, begins at
+the canonical cursor, validates completely as `T`, and is consumed exactly.
+
+## Closed-union encoding
+
+A closed union uses one envelope. The selected ordinal must be one of the descriptor's
+sorted, nonzero known ordinals; an unknown ordinal, including zero, is rejected. A declared
+unit alternative has no payload allocation, while a declared non-unit alternative requires
+one exact payload allocation and rejects a missing payload. Conversely, a unit alternative
+rejects any payload allocation.
 
 ## Result encoding
 
-A result uses one envelope:
+A closed result is the closed-union specialization:
 
 ```text
 ordinal 1 = Success
 ordinal 2 = Error
 ```
+
+The selected success or error type follows the same unit-versus-non-unit payload-shape and
+exact-consumption rules as every other closed union.
 
 ## Root and envelope payload padding
 
@@ -1818,6 +1889,11 @@ exceed the negotiated profile's maximum nesting depth. Unknown table-field paylo
 remain opaque and therefore consume one field-payload depth level but are not traversed
 for additional semantic depth.
 
+Runtime depth and container-count limits apply to semantic values actually present on the
+wire. Declared but absent table fields, an absent optional, and elements of an empty vector
+do not consume runtime depth or count budgets. Static descriptor-graph validation has its
+own fixed traversal guards and does not spend these runtime wire-value limits.
+
 ## Table validation
 
 A decoder validates a table in this order:
@@ -1848,6 +1924,41 @@ A sender must not emit a field whose:
 - `@since` version exceeds the selected minor;
 - required feature was not negotiated;
 - ordinal is reserved.
+
+`maximum_present_fields` limits the total number of present envelopes, including unknown
+future fields. It remains distinct from the descriptor's current known-field count; both
+known and unknown present fields also count against the runtime profile limit. Reservations
+are permanent: a reserved ordinal is rejected even if the receiver does not otherwise know
+that field.
+
+## Current handle-free schema validation flow
+
+The current milestone uses handwritten `&'static` Rust descriptor graphs and static slices;
+it does not allocate or load descriptors at runtime. The schema path proceeds strictly:
+
+1. require the schema protocol-family ID and protocol major to match the bound connection,
+   and require the supplied body slice not to exceed the negotiated body bound;
+2. require the body-level alignment and basic runtime limit preconditions;
+3. validate the descriptor graph intrinsically, including layouts, sorted/unique descriptor
+   members and ranges, feature-ID lists, and cycle rejection;
+4. perform complete descriptor-driven validation of the body, including canonical placement,
+   value constraints, availability, runtime limits, and exact region/body consumption;
+5. return an opaque `ValidatedBody` proof token without constructing the application view;
+6. only on an explicit materialization call, invoke the schema's materializer over validated
+   value tokens.
+
+Malformed or cyclic descriptors fail as descriptors before materialization. Descriptor
+nesting and visit guards are separate from wire-value runtime depth and count limits, so a
+large static schema shape does not by itself consume runtime depth or table-field budgets;
+those limits apply only to values and fields present in the body.
+
+The closure-based traversal entry points in the low-level body codec remain codec-only
+mechanisms, not application-defined callbacks. They do not replace the descriptor-driven
+whole-body validation step, and application or service code is not invoked until after a
+validated token is explicitly materialized.
+
+This validates only handle-free bodies. It does not validate or adopt kernel handles, and it
+does not add open-union behavior.
 
 ## Request packets
 
@@ -2617,11 +2728,12 @@ complete byte and attachment consumption
 The decoder uses bounded memory and bounded recursion or an explicit bounded work stack.
 
 It must not invoke application-defined decode callbacks before complete validation.
-Low-level body-reader closures are schema traversal and validation code, not application
-callbacks: they must be deterministic and side-effect-free. The runtime completes the
-entire structural and schema-specific validation pass before constructing application-visible
-values or invoking service code. Table envelope structure and outer payload accounting are
-validated in a complete pre-pass before even low-level field traversal begins.
+Low-level body traversal closures are codec implementation mechanisms, not application
+callbacks and not substitutes for whole-body schema validation. The runtime completes the
+entire structural and schema-specific validation pass, returns a validated proof token, and
+only then permits an explicit materialization step to construct application-visible values
+or invoke service code. Table envelope structure and outer payload accounting are validated
+in a complete pre-pass before known-field payload traversal begins.
 
 ## Protocol security invariants
 

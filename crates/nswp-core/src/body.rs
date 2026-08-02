@@ -50,6 +50,17 @@ pub enum BodyError {
     MissingPayload,
     UnexpectedPayload,
     IncompleteTable,
+    IncompleteVector,
+    InvalidElementLayout,
+    InvalidDescriptor,
+    ProtocolMismatch,
+    UnknownEnumValue,
+    UnknownUnionOrdinal,
+    InvalidOptionalOrdinal,
+    ReservedOrdinal,
+    MissingRequiredField,
+    FieldUnavailable,
+    MaterializationMismatch,
     Poisoned,
 }
 
@@ -866,6 +877,96 @@ impl<'a> ValueEncoder<'a> {
         self.bytes(offset, maximum, value.as_bytes())
     }
 
+    pub fn vector<F>(
+        &mut self,
+        offset: usize,
+        count: u32,
+        maximum_elements: u32,
+        element_inline_bytes: usize,
+        element_alignment: usize,
+        encode: F,
+    ) -> Result<(), BodyError>
+    where
+        F: FnOnce(&mut VectorEncoder<'_>) -> Result<(), BodyError>,
+    {
+        let stride = element_stride(element_inline_bytes, element_alignment)?;
+        self.inline_mut(offset, SLICE_REF_BYTES, 4)?;
+        if count > maximum_elements {
+            return Err(BodyError::LimitExceeded);
+        }
+
+        let target = self.next_child;
+        let count_usize = usize::try_from(count).map_err(|_| BodyError::ArithmeticOverflow)?;
+        let array_bytes = count_usize
+            .checked_mul(stride)
+            .ok_or(BodyError::ArithmeticOverflow)?;
+        let array_end = target
+            .checked_add(array_bytes)
+            .ok_or(BodyError::ArithmeticOverflow)?;
+        let descendants_start = align_up(array_end, BODY_ALIGNMENT)?;
+        if descendants_start > self.limit {
+            return Err(BodyError::OutputTooSmall);
+        }
+
+        self.output[target..descendants_start].fill(0);
+        let vector_result = {
+            let mut vector = VectorEncoder {
+                output: self.output,
+                array_start: target,
+                element_inline_bytes,
+                stride,
+                count,
+                index: 0,
+                descendants_cursor: descendants_start,
+                limit: self.limit,
+                parent_depth: self.depth,
+                limits: self.limits,
+                poisoned: false,
+            };
+            encode(&mut vector)
+                .and_then(|_| vector.finish())
+                .map(|_| vector.descendants_cursor)
+        };
+        let vector_end = match vector_result {
+            Ok(vector_end) => vector_end,
+            Err(error) => {
+                self.output[target..self.limit].fill(0);
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+
+        if count == 0 {
+            self.inline_mut(offset, SLICE_REF_BYTES, 4)?.fill(0);
+            return Ok(());
+        }
+
+        let commit = (|| {
+            let reference_start = self
+                .start
+                .checked_add(offset)
+                .ok_or(BodyError::ArithmeticOverflow)?;
+            let region_bytes = vector_end
+                .checked_sub(target)
+                .ok_or(BodyError::ArithmeticOverflow)?;
+            let relative_offset = relative_u32(reference_start, target)?;
+            let region_bytes =
+                u32::try_from(region_bytes).map_err(|_| BodyError::ArithmeticOverflow)?;
+            let reference = self.inline_mut(offset, SLICE_REF_BYTES, 4)?;
+            put_u32(reference, 0, relative_offset);
+            put_u32(reference, 4, count);
+            put_u32(reference, 8, region_bytes);
+            Ok(())
+        })();
+        if let Err(error) = commit {
+            self.output[target..self.limit].fill(0);
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.next_child = vector_end;
+        Ok(())
+    }
+
     pub fn table<F>(
         &mut self,
         offset: usize,
@@ -952,7 +1053,28 @@ impl<'a> ValueEncoder<'a> {
         Ok(())
     }
 
-    pub fn closed_result<F>(
+    pub fn optional_none(&mut self, offset: usize) -> Result<(), BodyError> {
+        self.inline_mut(offset, ENVELOPE_BYTES, 4)?.fill(0);
+        Ok(())
+    }
+
+    pub fn optional_some<F>(
+        &mut self,
+        offset: usize,
+        payload_inline_bytes: usize,
+        encode: F,
+    ) -> Result<(), BodyError>
+    where
+        F: FnOnce(&mut ValueEncoder<'_>) -> Result<(), BodyError>,
+    {
+        self.closed_union(offset, 1, payload_inline_bytes, encode)
+    }
+
+    pub fn optional_some_unit(&mut self, offset: usize) -> Result<(), BodyError> {
+        self.closed_union_unit(offset, 1)
+    }
+
+    pub fn closed_union<F>(
         &mut self,
         offset: usize,
         ordinal: u32,
@@ -962,8 +1084,8 @@ impl<'a> ValueEncoder<'a> {
     where
         F: FnOnce(&mut ValueEncoder<'_>) -> Result<(), BodyError>,
     {
-        if ordinal != 1 && ordinal != 2 {
-            return Err(BodyError::UnknownResultOrdinal);
+        if ordinal == 0 {
+            return Err(BodyError::InvalidOrdinal);
         }
         self.inline_mut(offset, ENVELOPE_BYTES, 4)?;
         let payload_start = self.next_child;
@@ -988,6 +1110,7 @@ impl<'a> ValueEncoder<'a> {
             }
         };
         if payload_end == payload_start {
+            self.output[payload_start..self.limit].fill(0);
             self.poisoned = true;
             return Err(BodyError::MissingPayload);
         }
@@ -1012,17 +1135,44 @@ impl<'a> ValueEncoder<'a> {
         Ok(())
     }
 
-    pub fn closed_result_unit(&mut self, offset: usize, ordinal: u32) -> Result<(), BodyError> {
-        if ordinal != 1 && ordinal != 2 {
-            return Err(BodyError::UnknownResultOrdinal);
+    pub fn closed_union_unit(&mut self, offset: usize, ordinal: u32) -> Result<(), BodyError> {
+        if ordinal == 0 {
+            return Err(BodyError::InvalidOrdinal);
         }
-        next_depth(self.depth, self.limits)?;
         self.inline_mut(offset, ENVELOPE_BYTES, 4)?;
+        next_depth(self.depth, self.limits)?;
         let envelope_start = self
             .start
             .checked_add(offset)
             .ok_or(BodyError::ArithmeticOverflow)?;
-        encode_envelope(self.output, envelope_start, ordinal, None)
+        if let Err(error) = encode_envelope(self.output, envelope_start, ordinal, None) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn closed_result<F>(
+        &mut self,
+        offset: usize,
+        ordinal: u32,
+        payload_inline_bytes: usize,
+        encode: F,
+    ) -> Result<(), BodyError>
+    where
+        F: FnOnce(&mut ValueEncoder<'_>) -> Result<(), BodyError>,
+    {
+        if ordinal != 1 && ordinal != 2 {
+            return Err(BodyError::UnknownResultOrdinal);
+        }
+        self.closed_union(offset, ordinal, payload_inline_bytes, encode)
+    }
+
+    pub fn closed_result_unit(&mut self, offset: usize, ordinal: u32) -> Result<(), BodyError> {
+        if ordinal != 1 && ordinal != 2 {
+            return Err(BodyError::UnknownResultOrdinal);
+        }
+        self.closed_union_unit(offset, ordinal)
     }
 
     fn inline_mut(
@@ -1063,6 +1213,91 @@ impl<'a> ValueEncoder<'a> {
         }
         if self.next_child != self.limit {
             return Err(BodyError::TrailingBytes);
+        }
+        Ok(())
+    }
+}
+
+pub struct VectorEncoder<'a> {
+    output: &'a mut [u8],
+    array_start: usize,
+    element_inline_bytes: usize,
+    stride: usize,
+    count: u32,
+    index: u32,
+    descendants_cursor: usize,
+    limit: usize,
+    parent_depth: u8,
+    limits: BodyLimits,
+    poisoned: bool,
+}
+
+impl<'a> VectorEncoder<'a> {
+    pub const fn element_count(&self) -> u32 {
+        self.count
+    }
+
+    pub const fn next_index(&self) -> u32 {
+        self.index
+    }
+
+    pub fn element<F>(&mut self, encode: F) -> Result<(), BodyError>
+    where
+        F: FnOnce(&mut ValueEncoder<'_>) -> Result<(), BodyError>,
+    {
+        if self.poisoned {
+            return Err(BodyError::Poisoned);
+        }
+        let element_result = (|| {
+            if self.index >= self.count {
+                return Err(BodyError::IncompleteVector);
+            }
+            let index = usize::try_from(self.index).map_err(|_| BodyError::ArithmeticOverflow)?;
+            let element_offset = index
+                .checked_mul(self.stride)
+                .ok_or(BodyError::ArithmeticOverflow)?;
+            let element_start = self
+                .array_start
+                .checked_add(element_offset)
+                .ok_or(BodyError::ArithmeticOverflow)?;
+            let inline_end = element_start
+                .checked_add(self.element_inline_bytes)
+                .ok_or(BodyError::ArithmeticOverflow)?;
+            if inline_end > self.descendants_cursor {
+                return Err(BodyError::OutputTooSmall);
+            }
+            let depth = next_depth(self.parent_depth, self.limits)?;
+            let mut element = ValueEncoder {
+                output: self.output,
+                start: element_start,
+                inline_end,
+                next_child: self.descendants_cursor,
+                limit: self.limit,
+                depth,
+                limits: self.limits,
+                poisoned: false,
+            };
+            encode(&mut element).and_then(|_| element.finish_nested())
+        })();
+        match element_result {
+            Ok(descendants_cursor) => {
+                self.descendants_cursor = descendants_cursor;
+                self.index += 1;
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn finish(&self) -> Result<(), BodyError> {
+        if self.poisoned {
+            return Err(BodyError::Poisoned);
+        }
+        if self.index != self.count {
+            return Err(BodyError::IncompleteVector);
         }
         Ok(())
     }
@@ -1219,24 +1454,29 @@ fn encode_envelope(
     let envelope_end = envelope_start
         .checked_add(ENVELOPE_BYTES)
         .ok_or(BodyError::ArithmeticOverflow)?;
-    let envelope = output
-        .get_mut(envelope_start..envelope_end)
-        .ok_or(BodyError::OutputTooSmall)?;
-    put_u32(envelope, 0, ordinal);
-    if let Some(payload) = payload {
+    let encoded_payload = if let Some(payload) = payload {
         let offset_field = envelope_start
             .checked_add(8)
             .ok_or(BodyError::ArithmeticOverflow)?;
-        put_u32(envelope, 8, relative_u32(offset_field, payload.start)?);
+        let relative_offset = relative_u32(offset_field, payload.start)?;
         let payload_bytes = payload
             .end
             .checked_sub(payload.start)
             .ok_or(BodyError::ArithmeticOverflow)?;
-        put_u32(
-            envelope,
-            12,
-            u32::try_from(payload_bytes).map_err(|_| BodyError::ArithmeticOverflow)?,
-        );
+        let payload_bytes =
+            u32::try_from(payload_bytes).map_err(|_| BodyError::ArithmeticOverflow)?;
+        Some((relative_offset, payload_bytes))
+    } else {
+        None
+    };
+    let envelope = output
+        .get_mut(envelope_start..envelope_end)
+        .ok_or(BodyError::OutputTooSmall)?;
+    envelope.fill(0);
+    put_u32(envelope, 0, ordinal);
+    if let Some((relative_offset, payload_bytes)) = encoded_payload {
+        put_u32(envelope, 8, relative_offset);
+        put_u32(envelope, 12, payload_bytes);
     }
     Ok(())
 }
@@ -1247,6 +1487,17 @@ fn next_depth(depth: u8, limits: BodyLimits) -> Result<u8, BodyError> {
         return Err(BodyError::LimitExceeded);
     }
     Ok(depth)
+}
+
+fn element_stride(inline_bytes: usize, alignment: usize) -> Result<usize, BodyError> {
+    if inline_bytes == 0
+        || alignment == 0
+        || alignment > BODY_ALIGNMENT
+        || !alignment.is_power_of_two()
+    {
+        return Err(BodyError::InvalidElementLayout);
+    }
+    align_up(inline_bytes, alignment)
 }
 
 fn align_up(value: usize, alignment: usize) -> Result<usize, BodyError> {
