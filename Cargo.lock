@@ -397,6 +397,21 @@ name = "nswp-core"
 version = "0.1.0"
 
 [[package]]
+name = "nswp-runtime"
+version = "0.1.0"
+dependencies = [
+ "nswp-core",
+]
+
+[[package]]
+name = "nswp-testkit"
+version = "0.1.0"
+dependencies = [
+ "nswp-core",
+ "nswp-runtime",
+]
+
+[[package]]
 name = "nullfs-blockdev"
 version = "0.1.0"
 

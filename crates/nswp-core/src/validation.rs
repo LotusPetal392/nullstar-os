@@ -278,6 +278,7 @@ fn validate_transaction(
         },
         PacketKind::Cancel => match transaction {
             TransactionState::Outstanding(expected) => match_transaction(header, expected),
+            TransactionState::Unknown => Ok(()),
             _ => Err(DecodeError::TransactionMismatch),
         },
         PacketKind::NegotiateRequest

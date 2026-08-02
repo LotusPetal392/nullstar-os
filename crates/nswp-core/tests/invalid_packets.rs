@@ -251,6 +251,32 @@ fn direction_version_and_transaction_state_are_enforced() {
             })
             .is_ok()
     );
+
+    let mut cancel = header;
+    cancel.kind = PacketKind::Cancel;
+    cancel.body_bytes = 0;
+    assert!(
+        cancel
+            .validate_context(&ValidationContext {
+                direction: Direction::ClientToServer,
+                connection: &state,
+                transport_bytes: NSWP_HEADER_BYTES,
+                attached_handles: 0,
+                transaction: TransactionState::Unknown,
+            })
+            .is_ok()
+    );
+
+    assert_eq!(
+        response.validate_context(&ValidationContext {
+            direction: Direction::ServerToClient,
+            connection: &state,
+            transport_bytes: NSWP_HEADER_BYTES + response.body_bytes as usize,
+            attached_handles: 0,
+            transaction: TransactionState::Unknown,
+        }),
+        Err(DecodeError::TransactionMismatch)
+    );
 }
 
 #[test]
