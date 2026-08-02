@@ -38,6 +38,7 @@ const USER_TMPFS_TEST_MARKER: &str = "userspace tmpfs redirection verified:";
 const USER_SIGNAL_TEST_MARKER: &str = "userspace process groups and signals verified:";
 const USER_SIGNAL_HANDLER_TEST_MARKER: &str = "userspace handled signals verified:";
 const NORMAL_BOOT_MODE_MARKER: &str = "boot mode selected: normal";
+const NORMAL_BOOT_EARLY_LOG_MARKER: &str = "kernel early log ready: capacity=64, retained=3, overwritten=0, dropped=0, rejected=0, busy_drops=0";
 const NORMAL_BOOT_READY_MARKER: &str = "normal boot ready:";
 const NORMAL_BOOT_INIT_MARKER: &str = "userspace init ready: pid=1";
 const NORMAL_BOOT_LOGGING_SERVICE_MARKER: &str = "userspace init: logging service ready";
@@ -63,6 +64,7 @@ const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Debug, Default)]
 struct NormalBootProgress {
     mode_selected: bool,
+    early_log_ready: bool,
     kernel_ready: bool,
     init_ready: bool,
     logging_service_ready: bool,
@@ -80,6 +82,7 @@ struct NormalBootProgress {
 impl NormalBootProgress {
     fn observe(&mut self, line: &str) -> bool {
         self.mode_selected |= line.contains(NORMAL_BOOT_MODE_MARKER);
+        self.early_log_ready |= line.contains(NORMAL_BOOT_EARLY_LOG_MARKER);
         self.kernel_ready |= line.contains(NORMAL_BOOT_READY_MARKER);
         self.init_ready |= line.contains(NORMAL_BOOT_INIT_MARKER);
         self.logging_service_ready |= line.contains(NORMAL_BOOT_LOGGING_SERVICE_MARKER);
@@ -95,6 +98,7 @@ impl NormalBootProgress {
         self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
 
         self.mode_selected
+            && self.early_log_ready
             && self.kernel_ready
             && self.init_ready
             && self.logging_service_ready
@@ -527,12 +531,13 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_INIT_MARKER, NORMAL_BOOT_INIT_SHELL_MARKER,
-        NORMAL_BOOT_LOGGING_PROBE_MARKER, NORMAL_BOOT_LOGGING_SERVICE_MARKER,
-        NORMAL_BOOT_MODE_MARKER, NORMAL_BOOT_NULLFS_DISCOVERY_MARKER,
-        NORMAL_BOOT_NULLFS_READINESS_MARKER, NORMAL_BOOT_NULLFS_SERVICE_MARKER,
-        NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER, NORMAL_BOOT_VFS_READINESS_MARKER,
-        NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER, NormalBootProgress,
+        NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER, NORMAL_BOOT_INIT_MARKER,
+        NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGGING_PROBE_MARKER,
+        NORMAL_BOOT_LOGGING_SERVICE_MARKER, NORMAL_BOOT_MODE_MARKER,
+        NORMAL_BOOT_NULLFS_DISCOVERY_MARKER, NORMAL_BOOT_NULLFS_READINESS_MARKER,
+        NORMAL_BOOT_NULLFS_SERVICE_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
+        NORMAL_BOOT_VFS_READINESS_MARKER, NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER,
+        NormalBootProgress,
     };
 
     #[test]
@@ -540,6 +545,7 @@ mod tests {
         let mut progress = NormalBootProgress::default();
 
         assert!(!progress.observe(NORMAL_BOOT_MODE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_EARLY_LOG_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_READY_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_LOGGING_SERVICE_MARKER));
@@ -559,6 +565,7 @@ mod tests {
         let mut progress = NormalBootProgress::default();
 
         assert!(!progress.observe(NORMAL_BOOT_MODE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_EARLY_LOG_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_READY_MARKER));
         assert!(!progress.observe("Interactive shell ready"));
     }

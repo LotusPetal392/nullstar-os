@@ -198,6 +198,33 @@ When the userspace logging service starts, it imports the ring with the active b
 A previous-boot crash record should remain available from a small crash-safe store where
 hardware and durability support make that reliable.
 
+### Initial kernel ring
+
+The kernel now has an allocation-free 64-record structured early-log ring. Records use the same
+stable event IDs, severity values, privacy classes, and 16-byte subsystem/64-byte message bounds as
+the production NSWP logging contract, but the ring remains kernel-local in this milestone. Each
+retained record receives a nonzero boot-scoped sequence number. The ring overwrites its oldest
+record when full, preserves chronological snapshot order, saturates accounting counters, and never
+reuses a sequence after exhaustion.
+
+The global write path disables local interrupts around the nonblocking lock attempt and bounded
+mutation; contention drops the new record rather than spinning. A separate best-effort contention counter exposes these
+drops. Serial output remains independent and is never performed while the ring lock is held. Panic
+and allocation-failure paths attempt a fixed structured record before using the existing serial
+fallback, but guaranteed panic capture still requires a future lock-independent emergency slot.
+
+`secret-never-persist` messages are replaced before caller message bytes enter fixed storage.
+Oversized subsystems and non-secret messages are rejected rather than truncated. CPU, process, and
+thread source attribution can be represented when known; current bootstrap records correctly leave
+unknown source fields absent. A zero monotonic time explicitly means the timer was not ready, and
+sequence numbers remain authoritative for ordering.
+
+The ring accepts an immutable UUIDv4 boot ID, but the current bootstrap marks boot identity
+unavailable because NullStar does not yet have a reviewed early entropy source. It does not invent a
+supposedly unique identifier from addresses or timer ticks. The next handoff milestone must add an
+authorized snapshot interface and a trustworthy boot-ID source before the userspace collector can
+import these records.
+
 Useful queries include:
 
 ```text
