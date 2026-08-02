@@ -37,9 +37,12 @@ const NULLFS_SERVICE_FAILED: &[u8] = b"userspace init: NullFS service exhausted 
 const NULLFS_SERVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to grant NullFS capabilities\n";
 const NULLFS_SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid NullFS readiness message\n";
-const NULLFS_PROBE_COMMAND: &[u8] = b"/nullfs-probe";
-const NULLFS_PROBE_FAILED: &[u8] = b"userspace init: userspace NullFS probe failed\n";
-const NULLFS_PROBE_PASSED: &[u8] = b"userspace init: userspace NullFS probe passed\n";
+const NULLFS_READINESS_PROBE_COMMAND: &[u8] = b"/nullfs-probe readiness";
+const NULLFS_READINESS_PROBE_FAILED: &[u8] = b"userspace init: NullFS readiness failed\n";
+const NULLFS_READINESS_PROBE_PASSED: &[u8] = b"userspace init: NullFS readiness passed\n";
+const NULLFS_FULL_PROBE_COMMAND: &[u8] = b"/nullfs-probe full";
+const NULLFS_FULL_PROBE_FAILED: &[u8] = b"userspace init: full NullFS probe failed\n";
+const NULLFS_FULL_PROBE_PASSED: &[u8] = b"userspace init: full NullFS probe passed\n";
 const SERVICE_COMMAND: &[u8] = b"/tmpfs-service";
 const SERVICE_READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
 const SERVICE_STARTING: &[u8] = b"userspace init: starting tmpfs service\n";
@@ -59,9 +62,12 @@ const VFS_SERVICE_READY: &[u8] = b"userspace init: vfs service ready\n";
 const VFS_SERVICE_FAILED: &[u8] = b"userspace init: vfs service exhausted restart budget\n";
 const VFS_SERVICE_BOOTSTRAP_FAILED: &[u8] = b"userspace init: failed to grant vfs capabilities\n";
 const VFS_SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid vfs readiness message\n";
-const VFS_PROBE_COMMAND: &[u8] = b"/vfs-probe";
-const VFS_PROBE_FAILED: &[u8] = b"userspace init: userspace vfs probe failed\n";
-const VFS_PROBE_PASSED: &[u8] = b"userspace init: userspace vfs probe passed\n";
+const VFS_READINESS_PROBE_COMMAND: &[u8] = b"/vfs-probe readiness";
+const VFS_READINESS_PROBE_FAILED: &[u8] = b"userspace init: vfs readiness failed\n";
+const VFS_READINESS_PROBE_PASSED: &[u8] = b"userspace init: vfs readiness passed\n";
+const VFS_FULL_PROBE_COMMAND: &[u8] = b"/vfs-probe full";
+const VFS_FULL_PROBE_FAILED: &[u8] = b"userspace init: full vfs probe failed\n";
+const VFS_FULL_PROBE_PASSED: &[u8] = b"userspace init: full vfs probe passed\n";
 const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
 const NULLFS_RESTART_PROBE_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
@@ -236,10 +242,10 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &NULLFS_MESSAGES,
     );
     run_probe(
-        NULLFS_PROBE_COMMAND,
+        NULLFS_READINESS_PROBE_COMMAND,
         nullfs_request_endpoint,
-        NULLFS_PROBE_FAILED,
-        NULLFS_PROBE_PASSED,
+        NULLFS_READINESS_PROBE_FAILED,
+        NULLFS_READINESS_PROBE_PASSED,
     );
     register_nullfs_proxy(&nullfs_service, nullfs_request_endpoint);
 
@@ -270,18 +276,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &VFS_MESSAGES,
     );
     register_vfs_router(&vfs_service, vfs_request_endpoint);
-    run_probe(
-        VFS_PROBE_COMMAND,
-        vfs_request_endpoint,
-        VFS_PROBE_FAILED,
-        VFS_PROBE_PASSED,
-    );
-    if nullfs_restart_test_boot() {
+    let nullfs_restart_test = nullfs_restart_test_boot();
+    if nullfs_restart_test {
+        run_probe(
+            NULLFS_FULL_PROBE_COMMAND,
+            nullfs_request_endpoint,
+            NULLFS_FULL_PROBE_FAILED,
+            NULLFS_FULL_PROBE_PASSED,
+        );
+        run_probe(
+            VFS_FULL_PROBE_COMMAND,
+            vfs_request_endpoint,
+            VFS_FULL_PROBE_FAILED,
+            VFS_FULL_PROBE_PASSED,
+        );
         run_nullfs_restart_probe(
             &mut nullfs_service,
             nullfs_readiness_endpoint,
             &mut nullfs_request_endpoint,
             nullfs_block_capability,
+        );
+    } else {
+        run_probe(
+            VFS_READINESS_PROBE_COMMAND,
+            vfs_request_endpoint,
+            VFS_READINESS_PROBE_FAILED,
+            VFS_READINESS_PROBE_PASSED,
         );
     }
     let mut shell_process_id = spawn_shell();

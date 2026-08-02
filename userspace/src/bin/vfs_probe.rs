@@ -17,6 +17,8 @@ userspace::panic_handler!();
 
 const SERVICE_HANDLE: u64 = 1;
 const RESTART_CONTROL_HANDLE: u64 = 2;
+const READINESS_MODE: &[u8] = b"readiness";
+const FULL_MODE: &[u8] = b"full";
 const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
 const NULLFS_RESTART_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
@@ -141,7 +143,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_RESTART_MODE) {
         probe_nullfs_restart();
     }
-    if arguments.len() != 1 {
+    let readiness = arguments.len() == 2 && arguments.get(1) == Some(READINESS_MODE);
+    let full =
+        arguments.len() == 1 || (arguments.len() == 2 && arguments.get(1) == Some(FULL_MODE));
+    if !readiness && !full {
         syscall::exit(57);
     }
     if !matches!(
@@ -149,6 +154,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
     ) {
         syscall::exit(1);
+    }
+    if readiness {
+        probe_readiness();
+        syscall::exit(0);
     }
     for (index, &(path, route_id, backend, prefix_length)) in CASES.iter().enumerate() {
         let reply = match query(path, index as u32 + 1) {
@@ -321,6 +330,47 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
 
     probe_mounted_nullfs();
     syscall::exit(0)
+}
+
+fn probe_readiness() {
+    const READINESS_CASES: &[(&[u8], u32, u16, u16)] = &[
+        (
+            b"/",
+            protocol::route::ROOT,
+            protocol::backend::BOOT_FILESYSTEM,
+            1,
+        ),
+        (b"/tmp", protocol::route::TMP, protocol::backend::TMPFS, 4),
+        (
+            b"/Volumes/NullStar",
+            protocol::route::NULLSTAR_VOLUME,
+            protocol::backend::NULLFS,
+            17,
+        ),
+    ];
+    for (index, &(path, route_id, backend, prefix_length)) in READINESS_CASES.iter().enumerate() {
+        let Some(reply) = query(path, index as u32 + 1) else {
+            syscall::exit(100);
+        };
+        if reply.status != protocol::status::OK
+            || reply.route_id != route_id
+            || reply.backend != backend
+            || reply.prefix_length != prefix_length
+        {
+            syscall::exit(101);
+        }
+    }
+    for path in [b"/".as_slice(), b"/tmp", NULLFS_MOUNT] {
+        if platform::stat(path).ok().map(|stat| stat.kind) != Some(file::KIND_DIRECTORY) {
+            syscall::exit(102);
+        }
+    }
+    let descriptor = syscall::open(b"/hello.txt", syscall::OpenFlags::READ)
+        .unwrap_or_else(|_| syscall::exit(103));
+    let mut byte = [0_u8; 1];
+    if syscall::read(descriptor, &mut byte).ok() != Some(1) || syscall::close(descriptor).is_err() {
+        syscall::exit(104);
+    }
 }
 
 fn probe_mounted_nullfs() {
