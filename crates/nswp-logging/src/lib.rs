@@ -26,6 +26,7 @@ pub const LOGGING_PROTOCOL_MAJOR: u16 = 2;
 pub const LOGGING_PROTOCOL_MINOR_BASE: u16 = 0;
 pub const LOGGING_PROTOCOL_MINOR_WALL_TIME: u16 = 1;
 pub const LOGGING_PROTOCOL_MINOR_COLLECTOR_READS: u16 = 2;
+pub const LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY: u16 = 3;
 pub const LOGGING_EMIT_ORDINAL: u32 = 1;
 pub const LOGGING_GET_COLLECTOR_STATS_ORDINAL: u32 = 2;
 pub const LOGGING_READ_HISTORY_ORDINAL: u32 = 3;
@@ -99,6 +100,68 @@ impl fmt::Display for EventId {
 impl fmt::Debug for EventId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "EventId({self})")
+    }
+}
+
+/// UUIDv4 identifier for the kernel boot that produced a retained history record.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BootId([u8; EVENT_ID_BYTES]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootIdError {
+    Nil,
+    InvalidVersion,
+    InvalidVariant,
+}
+
+impl BootId {
+    /// Constructs a boot identifier from UUID bytes in RFC/network byte order.
+    pub const fn from_bytes(bytes: [u8; EVENT_ID_BYTES]) -> Result<Self, BootIdError> {
+        let mut all_zero = true;
+        let mut index = 0;
+        while index < EVENT_ID_BYTES {
+            if bytes[index] != 0 {
+                all_zero = false;
+            }
+            index += 1;
+        }
+        if all_zero {
+            return Err(BootIdError::Nil);
+        }
+        if bytes[6] >> 4 != 4 {
+            return Err(BootIdError::InvalidVersion);
+        }
+        if bytes[8] & 0xc0 != 0x80 {
+            return Err(BootIdError::InvalidVariant);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; EVENT_ID_BYTES] {
+        &self.0
+    }
+
+    pub const fn into_bytes(self) -> [u8; EVENT_ID_BYTES] {
+        self.0
+    }
+}
+
+impl fmt::Display for BootId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, byte) in self.0.iter().copied().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                formatter.write_str("-")?;
+            }
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for BootId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "BootId({self})")
     }
 }
 
@@ -413,6 +476,46 @@ impl RecordId {
     }
 }
 
+/// Kernel-global sequence number assigned by the kernel logging source.
+///
+/// This identity is independent of collector-assigned [`RecordId`] values and event-type
+/// [`EventId`] values.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KernelSequence(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelSequenceError {
+    Zero,
+}
+
+impl KernelSequence {
+    pub const fn new(value: u64) -> Result<Self, KernelSequenceError> {
+        if value == 0 {
+            Err(KernelSequenceError::Zero)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistorySource {
+    Process {
+        process_id: u64,
+        wall_time_unix_ns: Option<u64>,
+        trace_id: [u8; 16],
+    },
+    Kernel {
+        sequence: KernelSequence,
+        boot_id: Option<BootId>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollectorStats {
     pub received_records: u64,
@@ -652,15 +755,13 @@ impl WireSchema for HistoryReadRequestSchema {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryRecordView<'wire> {
     pub record_id: RecordId,
-    pub source_process_id: u64,
+    pub source: HistorySource,
     pub event_id: EventId,
     pub severity: LogSeverity,
     pub privacy: PrivacyClass,
     pub monotonic_time_ns: u64,
     pub subsystem: &'wire str,
     pub message: &'wire str,
-    pub wall_time_unix_ns: Option<u64>,
-    pub trace_id: [u8; 16],
 }
 
 impl WireSchema for HistoryReadResponseSchema {
@@ -675,14 +776,11 @@ impl WireSchema for HistoryReadResponseSchema {
         let record_id = RecordId::new(required_structure_field(record, 0)?.u64()?)
             .map_err(|_| BodyError::MaterializationMismatch)?;
         let monotonic_time_ns = required_structure_field(record, 1)?.u64()?;
-        let wall_time_raw = required_structure_field(record, 2)?.u64()?;
+        let source_value = required_structure_field(record, 2)?.u64()?;
         let source_process_id = required_structure_field(record, 3)?.u64()?;
-        if source_process_id == 0 {
-            return Err(BodyError::MaterializationMismatch);
-        }
         let event_id = EventId::from_bytes(required_structure_field(record, 4)?.id128()?)
             .map_err(|_| BodyError::MaterializationMismatch)?;
-        let trace_id = required_structure_field(record, 5)?.id128()?;
+        let source_identity = required_structure_field(record, 5)?.id128()?;
         let text = required_structure_field(record, 6)?.bytes()?;
         let severity = required_structure_field(record, 7)?
             .enum_raw()?
@@ -699,25 +797,47 @@ impl WireSchema for HistoryReadResponseSchema {
                 .checked_add(message_bytes)
                 .ok_or(BodyError::ArithmeticOverflow)?
                 != text.len()
-            || !has_wall_time && wall_time_raw != 0
         {
             return Err(BodyError::MaterializationMismatch);
         }
+        let source = if source_process_id == 0 {
+            if has_wall_time {
+                return Err(BodyError::MaterializationMismatch);
+            }
+            let sequence = KernelSequence::new(source_value)
+                .map_err(|_| BodyError::MaterializationMismatch)?;
+            let boot_id = if source_identity == [0; EVENT_ID_BYTES] {
+                None
+            } else {
+                Some(
+                    BootId::from_bytes(source_identity)
+                        .map_err(|_| BodyError::MaterializationMismatch)?,
+                )
+            };
+            HistorySource::Kernel { sequence, boot_id }
+        } else {
+            if !has_wall_time && source_value != 0 {
+                return Err(BodyError::MaterializationMismatch);
+            }
+            HistorySource::Process {
+                process_id: source_process_id,
+                wall_time_unix_ns: has_wall_time.then_some(source_value),
+                trace_id: source_identity,
+            }
+        };
         let subsystem =
             str::from_utf8(&text[..subsystem_bytes]).map_err(|_| BodyError::InvalidUtf8)?;
         let message =
             str::from_utf8(&text[subsystem_bytes..]).map_err(|_| BodyError::InvalidUtf8)?;
         Ok(Some(HistoryRecordView {
             record_id,
-            source_process_id,
+            source,
             event_id,
             severity,
             privacy,
             monotonic_time_ns,
             subsystem,
             message,
-            wall_time_unix_ns: has_wall_time.then_some(wall_time_raw),
-            trace_id,
         }))
     }
 }
@@ -871,8 +991,14 @@ pub fn encode_history_read_response(
     let body_bytes = match record {
         None => 24,
         Some(record) => {
-            if record.source_process_id == 0 {
-                return Err(BodyError::MaterializationMismatch);
+            match record.source {
+                HistorySource::Process { process_id: 0, .. } => {
+                    return Err(BodyError::MaterializationMismatch);
+                }
+                HistorySource::Kernel { .. } if minor < LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY => {
+                    return Err(BodyError::FieldUnavailable);
+                }
+                _ => {}
             }
             if record.subsystem.len() > LOGGING_MAX_SUBSYSTEM_BYTES
                 || record.message.len() > LOGGING_MAX_MESSAGE_BYTES
@@ -893,13 +1019,32 @@ pub fn encode_history_read_response(
             text[..subsystem_bytes].copy_from_slice(record.subsystem.as_bytes());
             text[subsystem_bytes..subsystem_bytes + message_bytes]
                 .copy_from_slice(record.message.as_bytes());
+            let (source_value, source_process_id, source_identity, has_wall_time) =
+                match record.source {
+                    HistorySource::Process {
+                        process_id,
+                        wall_time_unix_ns,
+                        trace_id,
+                    } => (
+                        wall_time_unix_ns.unwrap_or(0),
+                        process_id,
+                        trace_id,
+                        wall_time_unix_ns.is_some(),
+                    ),
+                    HistorySource::Kernel { sequence, boot_id } => (
+                        sequence.get(),
+                        0,
+                        boot_id.map_or([0; EVENT_ID_BYTES], BootId::into_bytes),
+                        false,
+                    ),
+                };
             encoder.root().optional_some(0, 88, |payload| {
                 payload.write_u64(0, record.record_id.get())?;
                 payload.write_u64(8, record.monotonic_time_ns)?;
-                payload.write_u64(16, record.wall_time_unix_ns.unwrap_or(0))?;
-                payload.write_u64(24, record.source_process_id)?;
+                payload.write_u64(16, source_value)?;
+                payload.write_u64(24, source_process_id)?;
                 payload.write_id128(32, record.event_id.into_bytes())?;
-                payload.write_id128(48, record.trace_id)?;
+                payload.write_id128(48, source_identity)?;
                 payload.bytes(
                     64,
                     LOGGING_MAX_HISTORY_TEXT_BYTES as u32,
@@ -907,7 +1052,7 @@ pub fn encode_history_read_response(
                 )?;
                 payload.write_u8(80, record.severity as u8)?;
                 payload.write_u8(81, record.privacy as u8)?;
-                payload.write_bool(82, record.wall_time_unix_ns.is_some())?;
+                payload.write_bool(82, has_wall_time)?;
                 payload.write_u8(83, subsystem_bytes as u8)?;
                 payload.write_u8(84, message_bytes as u8)
             })?;
@@ -922,8 +1067,19 @@ pub fn decode_history_read_response<'wire>(
     bound: &BoundProtocol<'_>,
 ) -> Result<Option<HistoryRecordView<'wire>>, BodyError> {
     require_collector_reads(bound)?;
-    validate_body::<HistoryReadResponseSchema>(body, bound, BodyLimits::ENDPOINT_PROTOTYPE)?
-        .materialize()
+    let record =
+        validate_body::<HistoryReadResponseSchema>(body, bound, BodyLimits::ENDPOINT_PROTOTYPE)?
+            .materialize()?;
+    if matches!(
+        record,
+        Some(HistoryRecordView {
+            source: HistorySource::Kernel { .. },
+            ..
+        }) if bound.minor() < LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY
+    ) {
+        return Err(BodyError::FieldUnavailable);
+    }
+    Ok(record)
 }
 
 fn body_buf(body: &[u8]) -> Result<BodyBuf, BodyError> {
@@ -1078,6 +1234,18 @@ pub fn respond_history<T: TryTransport>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelLogRecordView<'wire> {
+    pub sequence: KernelSequence,
+    pub boot_id: Option<BootId>,
+    pub event_id: EventId,
+    pub severity: LogSeverity,
+    pub privacy: PrivacyClass,
+    pub monotonic_time_ns: u64,
+    pub subsystem: &'wire str,
+    pub message: &'wire str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollectorError {
     ZeroServiceGeneration,
     ZeroSourceProcessId,
@@ -1103,13 +1271,11 @@ const EMPTY_STORED_EVENT_ID: EventId = match EventId::from_bytes([
 #[derive(Clone, Copy)]
 struct StoredRecord {
     record_id: RecordId,
-    source_process_id: u64,
+    source: HistorySource,
     event_id: EventId,
     severity: LogSeverity,
     privacy: PrivacyClass,
     monotonic_time_ns: u64,
-    wall_time_unix_ns: Option<u64>,
-    trace_id: [u8; 16],
     subsystem: [u8; LOGGING_MAX_SUBSYSTEM_BYTES],
     subsystem_len: u8,
     message: [u8; LOGGING_MAX_MESSAGE_BYTES],
@@ -1119,13 +1285,15 @@ struct StoredRecord {
 impl StoredRecord {
     const EMPTY: Self = Self {
         record_id: RecordId(1),
-        source_process_id: 1,
+        source: HistorySource::Process {
+            process_id: 1,
+            wall_time_unix_ns: None,
+            trace_id: [0; 16],
+        },
         event_id: EMPTY_STORED_EVENT_ID,
         severity: LogSeverity::Trace,
         privacy: PrivacyClass::Public,
         monotonic_time_ns: 0,
-        wall_time_unix_ns: None,
-        trace_id: [0; 16],
         subsystem: [0; LOGGING_MAX_SUBSYSTEM_BYTES],
         subsystem_len: 0,
         message: [0; LOGGING_MAX_MESSAGE_BYTES],
@@ -1137,15 +1305,13 @@ impl StoredRecord {
         let message = str::from_utf8(&self.message[..usize::from(self.message_len)]).ok()?;
         Some(HistoryRecordView {
             record_id: self.record_id,
-            source_process_id: self.source_process_id,
+            source: self.source,
             event_id: self.event_id,
             severity: self.severity,
             privacy: self.privacy,
             monotonic_time_ns: self.monotonic_time_ns,
             subsystem,
             message,
-            wall_time_unix_ns: self.wall_time_unix_ns,
-            trace_id: self.trace_id,
         })
     }
 }
@@ -1193,8 +1359,52 @@ impl<const N: usize> FixedLoggingCollector<N> {
         if source_process_id == 0 {
             return Err(CollectorError::ZeroSourceProcessId);
         }
-        if record.subsystem.len() > LOGGING_MAX_SUBSYSTEM_BYTES
-            || record.message.len() > LOGGING_MAX_MESSAGE_BYTES
+        self.collect_record(
+            HistorySource::Process {
+                process_id: source_process_id,
+                wall_time_unix_ns: record.wall_time_unix_ns,
+                trace_id,
+            },
+            record.event_id,
+            record.severity,
+            record.privacy,
+            record.monotonic_time_ns,
+            record.subsystem,
+            record.message,
+        )
+    }
+
+    pub fn collect_kernel(
+        &mut self,
+        record: KernelLogRecordView<'_>,
+    ) -> Result<CollectDisposition, CollectorError> {
+        self.collect_record(
+            HistorySource::Kernel {
+                sequence: record.sequence,
+                boot_id: record.boot_id,
+            },
+            record.event_id,
+            record.severity,
+            record.privacy,
+            record.monotonic_time_ns,
+            record.subsystem,
+            record.message,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_record(
+        &mut self,
+        source: HistorySource,
+        event_id: EventId,
+        severity: LogSeverity,
+        privacy: PrivacyClass,
+        monotonic_time_ns: u64,
+        subsystem: &str,
+        message: &str,
+    ) -> Result<CollectDisposition, CollectorError> {
+        if subsystem.len() > LOGGING_MAX_SUBSYSTEM_BYTES
+            || message.len() > LOGGING_MAX_MESSAGE_BYTES
         {
             return Err(CollectorError::RecordTooLarge);
         }
@@ -1209,26 +1419,24 @@ impl<const N: usize> FixedLoggingCollector<N> {
         };
         self.next_record_id = record_id.get().checked_add(1).map(RecordId);
 
-        let message = if record.privacy == PrivacyClass::SecretNeverPersist {
+        let message = if privacy == PrivacyClass::SecretNeverPersist {
             COLLECTOR_SECRET_REDACTION
         } else {
-            record.message
+            message
         };
         let mut stored = StoredRecord {
             record_id,
-            source_process_id,
-            event_id: record.event_id,
-            severity: record.severity,
-            privacy: record.privacy,
-            monotonic_time_ns: record.monotonic_time_ns,
-            wall_time_unix_ns: record.wall_time_unix_ns,
-            trace_id,
+            source,
+            event_id,
+            severity,
+            privacy,
+            monotonic_time_ns,
             subsystem: [0; LOGGING_MAX_SUBSYSTEM_BYTES],
-            subsystem_len: record.subsystem.len() as u8,
+            subsystem_len: subsystem.len() as u8,
             message: [0; LOGGING_MAX_MESSAGE_BYTES],
             message_len: message.len() as u8,
         };
-        stored.subsystem[..record.subsystem.len()].copy_from_slice(record.subsystem.as_bytes());
+        stored.subsystem[..subsystem.len()].copy_from_slice(subsystem.as_bytes());
         stored.message[..message.len()].copy_from_slice(message.as_bytes());
 
         let evicted_record_id = if self.len < N {
@@ -1243,7 +1451,7 @@ impl<const N: usize> FixedLoggingCollector<N> {
             self.evicted_records = self.evicted_records.saturating_add(1);
             Some(evicted)
         };
-        if record.privacy == PrivacyClass::SecretNeverPersist {
+        if privacy == PrivacyClass::SecretNeverPersist {
             self.redacted_records = self.redacted_records.saturating_add(1);
         }
         Ok(CollectDisposition::Accepted {
@@ -1275,11 +1483,25 @@ impl<const N: usize> FixedLoggingCollector<N> {
         }
     }
 
+    /// Reads using the current history semantics, including process and kernel records.
     pub fn read_after(&self, after_record_id: Option<RecordId>) -> Option<HistoryRecordView<'_>> {
+        self.read_after_for_minor(after_record_id, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY)
+    }
+
+    /// Reads the next record representable by the negotiated logging protocol minor.
+    ///
+    /// Minor 2 skips retained kernel records while preserving collector record-ID cursor order.
+    pub fn read_after_for_minor(
+        &self,
+        after_record_id: Option<RecordId>,
+        minor: u16,
+    ) -> Option<HistoryRecordView<'_>> {
         let after = encode_optional_record_id(after_record_id);
         for offset in 0..self.len {
             let record = &self.slots[(self.head + offset) % N];
-            if record.record_id.get() > after {
+            let source_is_compatible = minor >= LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY
+                || matches!(record.source, HistorySource::Process { .. });
+            if record.record_id.get() > after && source_is_compatible {
                 return record.view();
             }
         }
@@ -1287,7 +1509,7 @@ impl<const N: usize> FixedLoggingCollector<N> {
     }
 }
 
-static LOGGING_VERSIONS: [MinorVersionProfile; 3] = [
+static LOGGING_VERSIONS: [MinorVersionProfile; 4] = [
     MinorVersionProfile {
         minor: LOGGING_PROTOCOL_MINOR_BASE,
         minimum_body_bytes: 160,
@@ -1300,6 +1522,11 @@ static LOGGING_VERSIONS: [MinorVersionProfile; 3] = [
     },
     MinorVersionProfile {
         minor: LOGGING_PROTOCOL_MINOR_COLLECTOR_READS,
+        minimum_body_bytes: 192,
+        minimum_handles: 0,
+    },
+    MinorVersionProfile {
+        minor: LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
         minimum_body_bytes: 192,
         minimum_handles: 0,
     },
@@ -1333,14 +1560,15 @@ static LOGGING_METHODS: [MethodDescriptor; 3] = [
 ];
 
 pub fn logging_protocol() -> ProtocolDescriptor<'static> {
-    logging_protocol_through(LOGGING_PROTOCOL_MINOR_COLLECTOR_READS)
+    logging_protocol_through(LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY)
 }
 
 pub fn logging_protocol_through(max_minor: u16) -> ProtocolDescriptor<'static> {
-    let max_minor = max_minor.min(LOGGING_PROTOCOL_MINOR_COLLECTOR_READS);
+    let max_minor = max_minor.min(LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY);
     let versions = match max_minor {
         LOGGING_PROTOCOL_MINOR_BASE => &LOGGING_VERSIONS[..1],
         LOGGING_PROTOCOL_MINOR_WALL_TIME => &LOGGING_VERSIONS[..2],
+        LOGGING_PROTOCOL_MINOR_COLLECTOR_READS => &LOGGING_VERSIONS[..3],
         _ => &LOGGING_VERSIONS,
     };
     let methods = if max_minor < LOGGING_PROTOCOL_MINOR_COLLECTOR_READS {

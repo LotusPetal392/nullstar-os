@@ -5,11 +5,12 @@ use nswp_core::{
     MinorVersionProfile, NSWP_HEADER_BYTES, PacketKind, offset,
 };
 use nswp_logging::{
-    CollectorRequest, CollectorStats, EventId, HistoryReadRequest, LOGGING_EMIT_ORDINAL,
-    LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_ID,
-    LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_COLLECTOR_READS,
+    BootId, CollectorRequest, CollectorStats, EventId, HistoryReadRequest, HistoryRecordView,
+    HistorySource, KernelSequence, LOGGING_EMIT_ORDINAL, LOGGING_MAX_MESSAGE_BYTES,
+    LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_ID, LOGGING_PROTOCOL_MINOR_BASE,
+    LOGGING_PROTOCOL_MINOR_COLLECTOR_READS, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
     LOGGING_PROTOCOL_MINOR_WALL_TIME, LogDelivery, LogDisposition, LogRecord, LogSeverity,
-    LoggingProducer, PrivacyClass, decode_collector_request,
+    LoggingProducer, PrivacyClass, RecordId, decode_collector_request,
     decode_collector_stats_client_response, decode_history_read_client_response, decode_log_record,
     encode_log_record, logging_protocol, logging_protocol_through, respond_collector_stats,
     respond_history,
@@ -33,6 +34,12 @@ const EVENT_ID_BYTES: [u8; 16] = [
 const EVENT_ID: EventId = match EventId::from_bytes(EVENT_ID_BYTES) {
     Ok(id) => id,
     Err(_) => panic!("test event ID must be a valid UUIDv4"),
+};
+const BOOT_ID: BootId = match BootId::from_bytes([
+    0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x46, 0x97, 0x88, 0x79, 0x6a, 0x5b, 0x4c, 0x3d, 0x2e, 0x1f,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("test boot ID must be a valid UUIDv4"),
 };
 
 static DEADLINE_VALIDATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -654,6 +661,54 @@ fn minor_two_negotiates_typed_stats_and_history_requests() {
         decode_history_read_client_response(&history_event, history_transaction, &producer_bound,)
             .unwrap(),
         None
+    );
+}
+
+#[test]
+fn minor_three_round_trips_kernel_history_provenance() {
+    let (mut producer, mut server, _, _) =
+        connected::<4>(LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY, 54);
+    assert_eq!(
+        producer.client().bound().unwrap().minor(),
+        LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY
+    );
+
+    let transaction = producer.try_read_history(None, 0, 100, [0x33; 16]).unwrap();
+    let token = match server.poll(0).unwrap().unwrap() {
+        ServerEvent::Request { token, body } => {
+            let server_bound = server.bound().unwrap().view().unwrap();
+            assert_eq!(
+                decode_collector_request(token, body.as_slice(), &server_bound).unwrap(),
+                CollectorRequest::ReadHistory(HistoryReadRequest {
+                    after_record_id: None,
+                })
+            );
+            token
+        }
+        event => panic!("unexpected event: {event:?}"),
+    };
+    let record = HistoryRecordView {
+        record_id: RecordId::new(7).unwrap(),
+        source: HistorySource::Kernel {
+            sequence: KernelSequence::new(99).unwrap(),
+            boot_id: Some(BOOT_ID),
+        },
+        event_id: EVENT_ID,
+        severity: LogSeverity::Critical,
+        privacy: PrivacyClass::Administrator,
+        monotonic_time_ns: 123,
+        subsystem: "kernel",
+        message: "panic handoff",
+    };
+    respond_history(&mut server, token, Some(record)).unwrap();
+
+    let event = producer.poll().unwrap().unwrap();
+    let producer_bound = producer.client().bound().unwrap().view().unwrap();
+    assert_eq!(
+        decode_history_read_client_response(&event, transaction, &producer_bound)
+            .unwrap()
+            .unwrap(),
+        record
     );
 }
 

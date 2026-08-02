@@ -4885,9 +4885,9 @@ fn vfs_route_begin_registration(
                     Ok(())
                 }
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
-                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
-                    Err(ERR_IO)
-                }
+                CapabilityObjectData::Notification(_)
+                | CapabilityObjectData::SharedMemory(_)
+                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -7399,9 +7399,9 @@ fn tmpfs_proxy_begin_connect(
                     Ok(())
                 }
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
-                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
-                    Err(ERR_IO)
-                }
+                CapabilityObjectData::Notification(_)
+                | CapabilityObjectData::SharedMemory(_)
+                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -7586,9 +7586,9 @@ fn tmpfs_proxy_begin_attach() -> Result<(), i64> {
                     Ok(())
                 }
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
-                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
-                    Err(ERR_IO)
-                }
+                CapabilityObjectData::Notification(_)
+                | CapabilityObjectData::SharedMemory(_)
+                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -8234,9 +8234,9 @@ fn tmpfs_proxy_begin_filesystem_request(
                     Ok(())
                 }
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
-                CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
-                    Err(ERR_IO)
-                }
+                CapabilityObjectData::Notification(_)
+                | CapabilityObjectData::SharedMemory(_)
+                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -8904,9 +8904,9 @@ fn nullfs_proxy_push_request(
                 Ok(())
             }
             CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
-            CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
-                Err(ERR_IO)
-            }
+            CapabilityObjectData::Notification(_)
+            | CapabilityObjectData::SharedMemory(_)
+            | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
         },
         None => Err(ERR_IO),
     }

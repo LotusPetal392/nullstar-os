@@ -2,8 +2,8 @@
 #![no_main]
 
 use nswp_logging::{
-    COLLECTOR_SECRET_REDACTION, CollectorStats, EventId, HistoryRecordView,
-    LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_MINOR_COLLECTOR_READS,
+    COLLECTOR_SECRET_REDACTION, CollectorStats, EventId, HistoryRecordView, HistorySource,
+    LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
     LogDelivery, LogDisposition, LogRecord, LogSeverity, LoggingProducer, PrivacyClass, RecordId,
     decode_collector_stats_client_response, decode_history_read_client_response,
 };
@@ -11,6 +11,7 @@ use nswp_runtime::{ClientEvent, RuntimeError};
 use userspace::{
     abi::INIT_PROCESS_ID,
     args::Args,
+    early_log,
     endpoint_transport::EndpointTransport,
     ipc::{self, ObjectKind, Rights},
     syscall,
@@ -26,6 +27,7 @@ const CONTROL_HANDLE: u64 = 4;
 const MAX_YIELDS: u32 = 65_536;
 const QUERY_NOW_NS: u64 = 0;
 const QUERY_DEADLINE_NS: u64 = 1_000_000;
+const EXPECTED_KERNEL_BASELINE_RECORDS: u64 = 4;
 
 const PROBE_SUBSYSTEM: &str = "logging-probe/v1";
 const PROBE_MESSAGE: &str = concat!(
@@ -124,6 +126,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         Ok(process_id) if process_id != 0 => process_id,
         _ => syscall::exit(3),
     };
+    if early_log::open_reader() != Err(early_log::Error::PERMISSION) {
+        syscall::exit(4);
+    }
     if matches!(mode, ProbeMode::CollectorStress) {
         validate_stress_handles();
     }
@@ -155,7 +160,7 @@ fn negotiate(producer: &mut Producer) {
     loop {
         match producer.poll() {
             Ok(Some(ClientEvent::Bound(bound)))
-                if bound.minor() == LOGGING_PROTOCOL_MINOR_COLLECTOR_READS =>
+                if bound.minor() == LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY =>
             {
                 return;
             }
@@ -165,7 +170,80 @@ fn negotiate(producer: &mut Producer) {
     }
 }
 
+fn verify_kernel_baseline(producer: &mut Producer, code: u64) -> RecordId {
+    verify_stats(
+        query_stats(producer, code),
+        ExpectedStats {
+            received: EXPECTED_KERNEL_BASELINE_RECORDS,
+            retained: EXPECTED_KERNEL_BASELINE_RECORDS,
+            capacity: 64,
+            evicted: 0,
+            dropped: 0,
+            redacted: 0,
+            oldest: Some(1),
+            newest: Some(EXPECTED_KERNEL_BASELINE_RECORDS),
+        },
+        code,
+    );
+
+    let mut cursor = None;
+    for expected in 1..=EXPECTED_KERNEL_BASELINE_RECORDS {
+        cursor = Some(expect_kernel_history(producer, cursor, expected, code));
+    }
+    expect_history(producer, cursor, None, code);
+    cursor.unwrap_or_else(|| syscall::exit(code))
+}
+
+fn expect_kernel_history(
+    producer: &mut Producer,
+    after_record_id: Option<RecordId>,
+    expected: u64,
+    code: u64,
+) -> RecordId {
+    let mut remaining = MAX_YIELDS;
+    let transaction = loop {
+        match producer.try_read_history(
+            after_record_id,
+            QUERY_NOW_NS,
+            QUERY_DEADLINE_NS,
+            [0x67; 16],
+        ) {
+            Ok(transaction) => break transaction,
+            Err(RuntimeError::WouldBlock) => yield_bounded(&mut remaining, code),
+            Err(_) => syscall::exit(code),
+        }
+    };
+    let event = wait_for_response(producer, code);
+    let bound = match producer
+        .client()
+        .bound()
+        .and_then(|bound| bound.view().ok())
+    {
+        Some(bound) => bound,
+        None => syscall::exit(code),
+    };
+    let actual = match decode_history_read_client_response(&event, transaction, &bound) {
+        Ok(Some(actual)) => actual,
+        Ok(None) | Err(_) => syscall::exit(code),
+    };
+    let kernel_source = matches!(
+        actual.source,
+        HistorySource::Kernel { sequence, boot_id }
+            if sequence.get() == expected && boot_id.is_none()
+    );
+    if actual.record_id.get() != expected
+        || !kernel_source
+        || actual.privacy != PrivacyClass::Public
+        || !actual.subsystem.starts_with("kernel.")
+        || actual.message.is_empty()
+    {
+        syscall::exit(code);
+    }
+    actual.record_id
+}
+
 fn run_basic(producer: &mut Producer, process_id: u64) {
+    let baseline_last = verify_kernel_baseline(producer, 9);
     let public_trace = [0x11; 16];
     let secret_trace = [0x22; 16];
     send_reliable(
@@ -200,22 +278,22 @@ fn run_basic(producer: &mut Producer, process_id: u64) {
     verify_stats(
         query_stats(producer, 11),
         ExpectedStats {
-            received: 2,
-            retained: 2,
+            received: 6,
+            retained: 6,
             capacity: 64,
             evicted: 0,
             dropped: 0,
             redacted: 1,
             oldest: Some(1),
-            newest: Some(2),
+            newest: Some(6),
         },
         12,
     );
     let first = expect_history(
         producer,
-        None,
+        Some(baseline_last),
         Some(ExpectedHistory {
-            record_id: 1,
+            record_id: 5,
             source_process_id: process_id,
             event_id: PUBLIC_EVENT_TYPE_ID,
             severity: LogSeverity::Info,
@@ -232,7 +310,7 @@ fn run_basic(producer: &mut Producer, process_id: u64) {
         producer,
         first,
         Some(ExpectedHistory {
-            record_id: 2,
+            record_id: 6,
             source_process_id: process_id,
             event_id: SECRET_EVENT_TYPE_ID,
             severity: LogSeverity::Warning,
@@ -252,6 +330,7 @@ fn run_basic(producer: &mut Producer, process_id: u64) {
 }
 
 fn run_collector_stress(producer: &mut Producer, process_id: u64) {
+    let _baseline_last = verify_kernel_baseline(producer, 20);
     if ipc::send(STATUS_HANDLE, BOUND_MARKER, None).is_err() {
         syscall::exit(20);
     }
@@ -286,14 +365,14 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
     verify_stats(
         query_stats(producer, 27),
         ExpectedStats {
-            received: 65,
+            received: 69,
             retained: 64,
             capacity: 64,
-            evicted: 1,
+            evicted: 5,
             dropped: 0,
             redacted: 1,
-            oldest: Some(2),
-            newest: Some(65),
+            oldest: Some(6),
+            newest: Some(69),
         },
         28,
     );
@@ -301,7 +380,7 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
         producer,
         None,
         Some(ExpectedHistory {
-            record_id: 2,
+            record_id: 6,
             source_process_id: process_id,
             event_id: STRESS_EVENT_TYPE_ID,
             severity: LogSeverity::Trace,
@@ -316,9 +395,9 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
     );
     let newest = expect_history(
         producer,
-        Some(record_id(64, 30)),
+        Some(record_id(68, 30)),
         Some(ExpectedHistory {
-            record_id: 65,
+            record_id: 69,
             source_process_id: process_id,
             event_id: STRESS_SECRET_EVENT_TYPE_ID,
             severity: LogSeverity::Warning,
@@ -338,6 +417,7 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
 }
 
 fn run_after_restart(producer: &mut Producer, process_id: u64) {
+    let baseline_last = verify_kernel_baseline(producer, 40);
     send_reliable(
         producer,
         LogRecord {
@@ -355,22 +435,22 @@ fn run_after_restart(producer: &mut Producer, process_id: u64) {
     verify_stats(
         query_stats(producer, 41),
         ExpectedStats {
-            received: 1,
-            retained: 1,
+            received: 5,
+            retained: 5,
             capacity: 64,
             evicted: 0,
             dropped: 0,
             redacted: 0,
             oldest: Some(1),
-            newest: Some(1),
+            newest: Some(5),
         },
         42,
     );
     let first = expect_history(
         producer,
-        None,
+        Some(baseline_last),
         Some(ExpectedHistory {
-            record_id: 1,
+            record_id: 5,
             source_process_id: process_id,
             event_id: RESTART_EVENT_TYPE_ID,
             severity: LogSeverity::Notice,
@@ -517,16 +597,24 @@ fn verify_stats(actual: CollectorStats, expected: ExpectedStats, code: u64) {
 }
 
 fn history_matches(actual: HistoryRecordView<'_>, expected: ExpectedHistory<'_>) -> bool {
+    let source_matches = matches!(
+        actual.source,
+        HistorySource::Process {
+            process_id,
+            wall_time_unix_ns,
+            trace_id,
+        } if process_id == expected.source_process_id
+            && wall_time_unix_ns == expected.wall_time_unix_ns
+            && trace_id == expected.trace_id
+    );
     actual.record_id.get() == expected.record_id
-        && actual.source_process_id == expected.source_process_id
+        && source_matches
         && actual.event_id == expected.event_id
         && actual.severity == expected.severity
         && actual.privacy == expected.privacy
         && actual.monotonic_time_ns == expected.monotonic_time_ns
         && actual.subsystem == expected.subsystem
         && actual.message == expected.message
-        && actual.wall_time_unix_ns == expected.wall_time_unix_ns
-        && actual.trace_id == expected.trace_id
 }
 
 fn validate_stress_handles() {

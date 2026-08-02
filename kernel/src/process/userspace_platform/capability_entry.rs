@@ -47,10 +47,14 @@ struct SharedMemoryObject {
 }
 
 #[derive(Debug)]
+struct KernelEarlyLogReaderObject;
+
+#[derive(Debug)]
 enum CapabilityObjectData {
     Endpoint(EndpointObject),
     Notification(NotificationObject),
     SharedMemory(SharedMemoryObject),
+    KernelEarlyLogReader(KernelEarlyLogReaderObject),
 }
 
 #[derive(Debug)]
@@ -181,7 +185,9 @@ impl CapabilityRegistry {
             .iter()
             .filter_map(|record| match &record.data {
                 CapabilityObjectData::SharedMemory(memory) => Some(memory.bytes.len()),
-                CapabilityObjectData::Endpoint(_) | CapabilityObjectData::Notification(_) => None,
+                CapabilityObjectData::Endpoint(_)
+                | CapabilityObjectData::Notification(_)
+                | CapabilityObjectData::KernelEarlyLogReader(_) => None,
             })
             .sum()
     }
@@ -196,6 +202,7 @@ impl CapabilityRegistry {
             abi::capability::KIND_ENDPOINT => abi::limits::MAX_ENDPOINT_OBJECTS,
             abi::capability::KIND_NOTIFICATION => abi::limits::MAX_NOTIFICATION_OBJECTS,
             abi::capability::KIND_SHARED_MEMORY => abi::limits::MAX_SHARED_MEMORY_OBJECTS,
+            abi::capability::KIND_KERNEL_EARLY_LOG_READER => 1,
             _ => return Err(abi::errno::INVALID_ARGUMENT),
         };
         if self.object_kind_count(kind) >= limit {
@@ -242,7 +249,8 @@ impl CapabilityRegistry {
                             .collect::<Vec<_>>(),
                     ),
                     CapabilityObjectData::Notification(_)
-                    | CapabilityObjectData::SharedMemory(_) => None,
+                    | CapabilityObjectData::SharedMemory(_)
+                    | CapabilityObjectData::KernelEarlyLogReader(_) => None,
                 })
                 .unwrap_or_default();
             for object in transferred {
@@ -267,6 +275,9 @@ fn capability_allowed_rights(kind: u64) -> u64 {
         abi::capability::KIND_ENDPOINT => abi::capability::ENDPOINT_RIGHTS,
         abi::capability::KIND_NOTIFICATION => abi::capability::NOTIFICATION_RIGHTS,
         abi::capability::KIND_SHARED_MEMORY => abi::capability::SHARED_MEMORY_RIGHTS,
+        abi::capability::KIND_KERNEL_EARLY_LOG_READER => {
+            abi::capability::KERNEL_EARLY_LOG_READER_RIGHTS
+        }
         _ => 0,
     }
 }
@@ -325,6 +336,9 @@ fn capability_object_size(record: &CapabilityObjectRecord) -> u64 {
         CapabilityObjectData::Endpoint(endpoint) => endpoint.queue.len() as u64,
         CapabilityObjectData::Notification(notification) => notification.pending,
         CapabilityObjectData::SharedMemory(memory) => memory.bytes.len() as u64,
+        CapabilityObjectData::KernelEarlyLogReader(_) => {
+            crate::early_log::KERNEL_EARLY_LOG_CAPACITY as u64
+        }
     }
 }
 
@@ -677,7 +691,9 @@ fn endpoint_receive(
             Some(message) => (message.bytes.len(), message.capability),
             None => return error_return(abi::errno::TRY_AGAIN),
         },
-        CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
+        CapabilityObjectData::Notification(_)
+        | CapabilityObjectData::SharedMemory(_)
+        | CapabilityObjectData::KernelEarlyLogReader(_) => {
             return error_return(abi::errno::INVALID_ARGUMENT);
         }
     };
@@ -700,7 +716,9 @@ fn endpoint_receive(
             .queue
             .pop_front()
             .expect("endpoint message disappeared during receive"),
-        CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
+        CapabilityObjectData::Notification(_)
+        | CapabilityObjectData::SharedMemory(_)
+        | CapabilityObjectData::KernelEarlyLogReader(_) => {
             return error_return(abi::errno::IO);
         }
     };

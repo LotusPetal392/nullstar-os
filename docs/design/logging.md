@@ -110,10 +110,10 @@ severity policy.
 
 ### Production NSWP logging contract
 
-The allocation-free protocol, codec, and producer live in the `no_std` `nswp-logging` crate;
-`nswp-testkit` retains the host collector and deterministic transport fixtures. This contract is
-exercised by the native endpoint pilot but is not yet a production collector or journal format. It
-uses protocol family ID `7db79cd9-c685-400f-b9f1-55d89b8e8a8a`, major version 2, and a
+The allocation-free protocol, codec, producer, and bounded volatile collector live in the `no_std`
+`nswp-logging` crate; `nswp-testkit` retains deterministic transport fixtures. The contract is
+exercised over native endpoints but is not a persistent journal format. It uses protocol family ID
+`7db79cd9-c685-400f-b9f1-55d89b8e8a8a`, major version 2, and a
 client-to-server one-way `Emit` method. Major 2 reflects the fixed-layout change from the original
 host pilot.
 
@@ -136,6 +136,14 @@ a caller-supplied `after RecordId` cursor. A present history response carries th
 kernel-stamped source PID, event and trace IDs, severity, privacy, timestamps, and packed text in at
 most 192 bytes. An all-zero optional envelope represents the ordinary end of currently retained
 history.
+
+Minor 3 distinguishes process and kernel history without increasing the 192-byte maximum. Process
+records preserve the exact minor-2 encoding. Kernel records use source PID zero, carry their nonzero
+boot-scoped kernel sequence in the wall-time slot, require the wall-time-present flag to be false,
+and use the trace-ID slot for an optional canonical UUIDv4 boot ID. Collector `RecordId`, kernel
+sequence, event ID, transport trace ID, and boot ID remain distinct identities. Minor-2 readers skip
+retained kernel records and continue to receive compatible process records rather than failing the
+connection.
 
 Producer principal, service identity, and producer service generation are not accepted from the
 record body. The host collector models the intended production rule: the launch or service
@@ -167,19 +175,21 @@ only `SEND` on the outgoing mailbox and `RECEIVE` on the incoming mailbox to eac
 allocation-free userspace transport requires distinct objects, rejects transferred capabilities,
 and pins the sender process ID observed on the first packet.
 
-The normal probe negotiates minor 2, sends a maximum-size record whose 192-byte body exactly fills
-one 256-byte endpoint message, submits a secret record, and verifies collector statistics and
-history through actual request/reply packets. PID 1 reports success only after those queries prove
-that the service retained both records, attributed them to the kernel-stamped producer PID, and
-redacted the secret.
+The normal probe negotiates minor 3 and first verifies four imported kernel records with ordered
+kernel sequences through ordinary `ReadHistory` requests. It also proves that a non-PID-1 process
+cannot open kernel early-log authority. The probe then sends a maximum-size process record whose
+192-byte body exactly fills one 256-byte endpoint message, submits a secret record, and verifies
+collector statistics, process attribution, and redaction through actual request/reply packets.
 
 The NullFS restart diagnostic also stops the collector, fills the actual eight-message request
 mailbox, verifies reliable backpressure and one best-effort producer drop, resumes the service, and
 submits 65 records. It checks the 64-record ring wrap, oldest/newest IDs, redaction, and counters,
-then replaces the service on empty mailboxes. A fresh negotiated connection verifies that the new
-collector generation starts with empty volatile history and record ID 1. The kernel nonblocking
-child-wait path treats a signaled-but-not-yet-reaped direct child as pending so this supervised
-restart cannot transiently misreport `NO_CHILD`.
+then replaces the service on empty mailboxes. PID 1 delegates the same read-only early-log reader to
+the replacement, which reimports the kernel snapshot before readiness. A fresh negotiated
+connection verifies the same boot-scoped kernel sequences at collector record IDs 1 through 4
+before accepting a new process record. The kernel nonblocking child-wait path treats a
+signaled-but-not-yet-reaped direct child as pending so this supervised restart cannot transiently
+misreport `NO_CHILD`.
 
 This remains a single delegated connection rather than a general logging broker. Current endpoint
 objects do not report peer closure, queued messages are not tied to a service generation, and the
@@ -200,9 +210,9 @@ hardware and durability support make that reliable.
 
 ### Initial kernel ring
 
-The kernel now has an allocation-free 64-record structured early-log ring. Records use the same
-stable event IDs, severity values, privacy classes, and 16-byte subsystem/64-byte message bounds as
-the production NSWP logging contract, but the ring remains kernel-local in this milestone. Each
+The kernel has an allocation-free 64-record structured early-log ring. Records use the same stable
+event IDs, severity values, privacy classes, and 16-byte subsystem/64-byte message bounds as the
+production NSWP logging contract. Each
 retained record receives a nonzero boot-scoped sequence number. The ring overwrites its oldest
 record when full, preserves chronological snapshot order, saturates accounting counters, and never
 reuses a sequence after exhaustion.
@@ -219,11 +229,27 @@ thread source attribution can be represented when known; current bootstrap recor
 unknown source fields absent. A zero monotonic time explicitly means the timer was not ready, and
 sequence numbers remain authoritative for ordering.
 
+PID 1 opens the singleton kernel early-log reader capability and retains its transferable source
+handle. Each selected logging-service generation receives only `READ` at bootstrap; it cannot
+transfer, duplicate, or manufacture the authority. The dedicated cursor syscall returns one record
+and ring statistics in a fixed 256-byte response from one lock acquisition, reports lock contention
+as `TRY_AGAIN`, and never exposes the private Rust record layout. The userspace decoder rejects
+impossible retained ranges and accounting relationships, including inconsistent submitted,
+retained, overwritten, dropped, and rejected counts. The service pins the first response's retained
+`[oldest, newest]` sequence range, requires exact continuity, and stops at that boundary. Overwrite
+of an unread record is a non-restartable startup failure, so PID 1 cannot mask a detected gap by
+starting a replacement that pins a newer range. Once a generation has reached readiness, ordinary
+supervised replacement remains enabled and the replacement reimports the kernel history before it
+becomes ready. Ordinary producers receive neither the reader nor kernel source-creation authority.
+
+The handoff ABI carries optional CPU, process, and thread source details for future consumers. Minor
+3 collector history currently preserves kernel source, sequence, boot ID, event metadata, and text,
+but does not expose those detailed source fields.
+
 The ring accepts an immutable UUIDv4 boot ID, but the current bootstrap marks boot identity
 unavailable because NullStar does not yet have a reviewed early entropy source. It does not invent a
-supposedly unique identifier from addresses or timer ticks. The next handoff milestone must add an
-authorized snapshot interface and a trustworthy boot-ID source before the userspace collector can
-import these records.
+supposedly unique identifier from addresses or timer ticks. Kernel sequence still permits replay
+recognition within the current boot; a trustworthy boot-ID source remains the next identity step.
 
 Useful queries include:
 

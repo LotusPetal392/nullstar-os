@@ -3,7 +3,8 @@
 
 use userspace::{
     abi::{INIT_PROCESS_ID, signal},
-    ipc::{self, CapabilityHandle, Rights},
+    early_log,
+    ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
     supervisor::{
         ServiceRuntime, ServiceSpec, ServiceStatusDisposition, ShellStatusDisposition,
@@ -118,6 +119,7 @@ const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
 const LOGGING_RESPONSE_HANDLE: u64 = 3;
+const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
 
@@ -128,6 +130,7 @@ const LOGGING_SERVICE: ServiceSpec = ServiceSpec {
     bootstrap_handle: READY_HANDLE,
     restart_limit: 3,
     restart_backoff_yields: 32,
+    fatal_startup_exit_status: Some(early_log::IMPORT_FAILURE_EXIT_STATUS),
 };
 const NULLFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"nullfs",
@@ -136,6 +139,7 @@ const NULLFS_SERVICE: ServiceSpec = ServiceSpec {
     bootstrap_handle: READY_HANDLE,
     restart_limit: 3,
     restart_backoff_yields: 32,
+    fatal_startup_exit_status: None,
 };
 const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"tmpfs",
@@ -144,6 +148,7 @@ const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
     bootstrap_handle: READY_HANDLE,
     restart_limit: 3,
     restart_backoff_yields: 32,
+    fatal_startup_exit_status: None,
 };
 const VFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"vfs",
@@ -152,6 +157,7 @@ const VFS_SERVICE: ServiceSpec = ServiceSpec {
     bootstrap_handle: READY_HANDLE,
     restart_limit: 3,
     restart_backoff_yields: 32,
+    fatal_startup_exit_status: None,
 };
 
 struct ServiceMessages {
@@ -218,17 +224,33 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
     let logging_response_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let logging_early_log_reader =
+        early_log::open_reader().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    if !matches!(
+        ipc::info(logging_early_log_reader),
+        Ok(info)
+            if info.kind == ObjectKind::KernelEarlyLogReader
+                && info.rights == Rights::KERNEL_EARLY_LOG_READER
+    ) {
+        fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
     let mut logging_service = ServiceRuntime::new(LOGGING_SERVICE);
     let logging_response_capability = BootstrapCapability {
         source_handle: logging_response_endpoint,
         rights: Rights::SEND,
         target_handle: LOGGING_RESPONSE_HANDLE,
     };
+    let logging_early_log_capability = BootstrapCapability {
+        source_handle: logging_early_log_reader,
+        rights: Rights::READ,
+        target_handle: LOGGING_EARLY_LOG_HANDLE,
+    };
+    let logging_capabilities = [logging_response_capability, logging_early_log_capability];
     start_service(
         &mut logging_service,
         logging_readiness_endpoint,
         logging_request_endpoint,
-        Some(logging_response_capability),
+        &logging_capabilities,
         &LOGGING_MESSAGES,
     );
     if nullfs_restart_test {
@@ -237,7 +259,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             logging_readiness_endpoint,
             logging_request_endpoint,
             logging_response_endpoint,
-            logging_response_capability,
+            &logging_capabilities,
         );
     } else {
         run_logging_probe(
@@ -323,7 +345,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut nullfs_service,
         nullfs_readiness_endpoint,
         nullfs_request_endpoint,
-        Some(nullfs_block_capability),
+        &[nullfs_block_capability],
         &NULLFS_MESSAGES,
     );
     run_probe(
@@ -343,7 +365,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut service,
         readiness_endpoint,
         request_endpoint,
-        None,
+        &[],
         &TMPFS_MESSAGES,
     );
     register_tmpfs_proxy(request_endpoint);
@@ -357,7 +379,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut vfs_service,
         vfs_readiness_endpoint,
         vfs_request_endpoint,
-        None,
+        &[],
         &VFS_MESSAGES,
     );
     register_vfs_router(&vfs_service, vfs_request_endpoint);
@@ -402,7 +424,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             &mut logging_service,
                             logging_readiness_endpoint,
                             logging_request_endpoint,
-                            Some(logging_response_capability),
+                            &logging_capabilities,
                             &LOGGING_MESSAGES,
                         );
                     }
@@ -425,7 +447,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             &mut nullfs_service,
                             nullfs_readiness_endpoint,
                             nullfs_request_endpoint,
-                            Some(nullfs_block_capability),
+                            &[nullfs_block_capability],
                             &NULLFS_MESSAGES,
                         );
                         register_nullfs_proxy(&nullfs_service, nullfs_request_endpoint);
@@ -449,7 +471,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             &mut service,
                             readiness_endpoint,
                             request_endpoint,
-                            None,
+                            &[],
                             &TMPFS_MESSAGES,
                         );
                         register_tmpfs_proxy(request_endpoint);
@@ -473,7 +495,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             &mut vfs_service,
                             vfs_readiness_endpoint,
                             vfs_request_endpoint,
-                            None,
+                            &[],
                             &VFS_MESSAGES,
                         );
                         register_vfs_router(&vfs_service, vfs_request_endpoint);
@@ -672,7 +694,7 @@ fn run_nullfs_restart_probe(
         service,
         readiness_endpoint,
         replacement_request_endpoint,
-        Some(block_capability),
+        &[block_capability],
         &NULLFS_MESSAGES,
     );
     register_nullfs_proxy(service, replacement_request_endpoint);
@@ -736,7 +758,7 @@ fn start_service(
     service: &mut ServiceRuntime,
     readiness_endpoint: CapabilityHandle,
     request_endpoint: CapabilityHandle,
-    additional_capability: Option<BootstrapCapability>,
+    additional_capabilities: &[BootstrapCapability],
     messages: &ServiceMessages,
 ) {
     loop {
@@ -764,7 +786,7 @@ fn start_service(
             )
             .ok()
                 != Some(REQUEST_HANDLE)
-            || additional_capability.is_some_and(|capability| {
+            || additional_capabilities.iter().copied().any(|capability| {
                 ipc::grant_child(
                     process_id,
                     capability.source_handle,
@@ -850,7 +872,7 @@ fn run_logging_collector_restart_test(
     readiness_endpoint: CapabilityHandle,
     request_endpoint: CapabilityHandle,
     response_endpoint: CapabilityHandle,
-    response_capability: BootstrapCapability,
+    bootstrap_capabilities: &[BootstrapCapability],
 ) {
     let status_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     let control_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
@@ -943,7 +965,7 @@ fn run_logging_collector_restart_test(
         service,
         readiness_endpoint,
         request_endpoint,
-        Some(response_capability),
+        bootstrap_capabilities,
         &LOGGING_MESSAGES,
     );
     if service.process_id() == Some(old_service_process_id) || service.restart_count() != 1 {

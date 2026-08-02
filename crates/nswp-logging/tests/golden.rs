@@ -1,7 +1,7 @@
 use nswp_core::{BoundProtocol, ConnectionLimits};
 use nswp_logging::{
     EventId, LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_ID,
-    LOGGING_PROTOCOL_MAJOR, LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_COLLECTOR_READS,
+    LOGGING_PROTOCOL_MAJOR, LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
     LOGGING_PROTOCOL_MINOR_WALL_TIME, LogRecord, LogSeverity, PrivacyClass, decode_log_record,
     encode_log_record, logging_protocol,
 };
@@ -113,11 +113,12 @@ fn maximum_minor_one_record_matches_literal_192_byte_body() {
 fn protocol_profiles_preserve_endpoint_capacity_boundaries() {
     let protocol = logging_protocol();
     assert_eq!(LOGGING_PROTOCOL_MAJOR, 2);
-    assert_eq!(protocol.max_minor, LOGGING_PROTOCOL_MINOR_COLLECTOR_READS);
-    assert_eq!(protocol.versions.len(), 3);
+    assert_eq!(protocol.max_minor, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY);
+    assert_eq!(protocol.versions.len(), 4);
     assert_eq!(protocol.versions[0].minimum_body_bytes, 160);
     assert_eq!(protocol.versions[1].minimum_body_bytes, 192);
     assert_eq!(protocol.versions[2].minimum_body_bytes, 192);
+    assert_eq!(protocol.versions[3].minimum_body_bytes, 192);
     assert_eq!(MAX_BODY_BYTES, 192);
     assert_eq!(EVENT_ID.to_string(), "00112233-4455-4677-8899-aabbccddeeff");
 }

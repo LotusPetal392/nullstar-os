@@ -40,6 +40,7 @@ pub struct ServiceSpec {
     pub bootstrap_handle: u64,
     pub restart_limit: u32,
     pub restart_backoff_yields: u32,
+    pub fatal_startup_exit_status: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,12 @@ impl ServiceRuntime {
         }
 
         self.process_id = None;
+        if self.state == ServiceState::Starting
+            && self.spec.fatal_startup_exit_status == Some(status)
+        {
+            self.state = ServiceState::Failed;
+            return ServiceStatusDisposition::Failed;
+        }
         if self.restart_count >= self.spec.restart_limit {
             self.state = ServiceState::Failed;
             return ServiceStatusDisposition::Failed;
@@ -128,6 +135,7 @@ mod tests {
         bootstrap_handle: 1,
         restart_limit: 2,
         restart_backoff_yields: 8,
+        fatal_startup_exit_status: Some(21),
     };
 
     #[test]
@@ -170,6 +178,31 @@ mod tests {
         assert_eq!(service.state(), ServiceState::Starting);
         service.note_ready();
         assert_eq!(service.state(), ServiceState::Running);
+    }
+
+    #[test]
+    fn fatal_startup_status_is_not_restarted_or_charged_to_the_budget() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+
+        assert_eq!(service.observe_status(21), ServiceStatusDisposition::Failed);
+        assert_eq!(service.process_id(), None);
+        assert_eq!(service.restart_count(), 0);
+        assert_eq!(service.state(), ServiceState::Failed);
+    }
+
+    #[test]
+    fn the_same_status_after_readiness_uses_normal_restart_policy() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+
+        assert_eq!(
+            service.observe_status(21),
+            ServiceStatusDisposition::Restart { backoff_yields: 8 }
+        );
+        assert_eq!(service.restart_count(), 1);
+        assert_eq!(service.state(), ServiceState::Backoff);
     }
 
     #[test]
