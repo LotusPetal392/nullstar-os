@@ -398,6 +398,27 @@ impl<'wire> ValidatedValue<'wire> {
         })
     }
 
+    pub fn structure_field(
+        &self,
+        index: usize,
+    ) -> Result<Option<ValidatedValue<'wire>>, BodyError> {
+        let TypeKind::Structure(descriptor) = self.descriptor.kind else {
+            return Err(BodyError::MaterializationMismatch);
+        };
+        let Some(field) = descriptor.fields.get(index) else {
+            return Ok(None);
+        };
+        let start = self
+            .start
+            .checked_add(field.offset as usize)
+            .ok_or(BodyError::ArithmeticOverflow)?;
+        Ok(Some(Self {
+            body: self.body,
+            start,
+            descriptor: field.ty,
+        }))
+    }
+
     pub fn table_field(&self, ordinal: u32) -> Result<Option<ValidatedField<'wire>>, BodyError> {
         let TypeKind::Table(descriptor) = self.descriptor.kind else {
             return Err(BodyError::MaterializationMismatch);

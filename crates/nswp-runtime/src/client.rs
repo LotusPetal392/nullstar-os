@@ -5,8 +5,8 @@ use nswp_core::{
 };
 
 use crate::{
-    BodyBuf, BoundState, CloseReason, ConnectionPhase, PacketBuf, ProtocolDescriptor, RuntimeError,
-    TryRecvError, TrySendError, TryTransport,
+    BodyBuf, BoundState, CloseReason, ConnectionPhase, MethodKind, PacketBuf, ProtocolDescriptor,
+    RuntimeError, TryRecvError, TrySendError, TryTransport,
     types::validate_deadline,
     wire::{body_from_packet, encode_packet, protocol_error_packet},
 };
@@ -154,6 +154,9 @@ impl<'a, T: TryTransport> Client<'a, T> {
             .protocol
             .method(ordinal)
             .ok_or(RuntimeError::UnknownMethod)?;
+        if method.kind != MethodKind::RequestResponse {
+            return Err(RuntimeError::WrongMethodKind);
+        }
         validate_deadline(method.deadline, now_ns, deadline_ns)?;
         (method.validate_request)(body, &bound.view()?)?;
         if self.outstanding_count() >= usize::from(bound.limits().max_outstanding)
@@ -202,6 +205,58 @@ impl<'a, T: TryTransport> Client<'a, T> {
                 self.next_transaction_id = self.next_transaction_id.wrapping_add(1);
                 Ok(transaction.transaction_id)
             }
+            Err(TrySendError::Full) => Err(RuntimeError::WouldBlock),
+            Err(TrySendError::PeerClosed) => {
+                self.close(CloseReason::PeerClosed);
+                Err(RuntimeError::PeerClosed)
+            }
+        }
+    }
+
+    pub fn try_send_one_way(
+        &mut self,
+        ordinal: u32,
+        body: &[u8],
+        now_ns: u64,
+        deadline_ns: u64,
+        trace_id: [u8; 16],
+    ) -> Result<(), RuntimeError> {
+        self.require_phase(ConnectionPhase::Bound)?;
+        if !self.flush_pending_cancel()? {
+            return Err(RuntimeError::WouldBlock);
+        }
+        let bound = self.bound.ok_or(RuntimeError::InvalidState)?;
+        let method = self
+            .protocol
+            .method(ordinal)
+            .ok_or(RuntimeError::UnknownMethod)?;
+        if method.kind != MethodKind::OneWay {
+            return Err(RuntimeError::WrongMethodKind);
+        }
+        validate_deadline(method.deadline, now_ns, deadline_ns)?;
+        (method.validate_request)(body, &bound.view()?)?;
+        let packet = encode_packet(
+            Header {
+                kind: PacketKind::OneWay,
+                flags: if trace_id == [0; 16] {
+                    HeaderFlags::NONE
+                } else {
+                    HeaderFlags::TRACE_SAMPLED
+                },
+                protocol_major: bound.major(),
+                protocol_minor: bound.minor(),
+                ordinal,
+                body_bytes: body.len() as u32,
+                handle_count: 0,
+                transport_status: TransportStatus::Ok,
+                transaction_id: 0,
+                deadline_ns,
+                trace_id,
+            },
+            body,
+        )?;
+        match self.transport.try_send(packet.as_slice()) {
+            Ok(()) => Ok(()),
             Err(TrySendError::Full) => Err(RuntimeError::WouldBlock),
             Err(TrySendError::PeerClosed) => {
                 self.close(CloseReason::PeerClosed);

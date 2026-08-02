@@ -5,8 +5,8 @@ use nswp_core::{
 };
 
 use crate::{
-    BodyBuf, BoundState, CloseReason, ConnectionPhase, PacketBuf, ProtocolDescriptor, RuntimeError,
-    TryRecvError, TrySendError, TryTransport,
+    BodyBuf, BoundState, CloseReason, ConnectionPhase, MethodKind, PacketBuf, PeerContextId,
+    ProtocolDescriptor, RuntimeError, TryRecvError, TrySendError, TryTransport,
     types::validate_deadline,
     wire::{body_from_packet, encode_packet, protocol_error_packet, response_packet},
 };
@@ -47,6 +47,12 @@ pub enum ServerEvent {
         token: RequestToken,
         body: BodyBuf,
     },
+    OneWay {
+        peer_context: PeerContextId,
+        ordinal: u32,
+        trace_id: [u8; 16],
+        body: BodyBuf,
+    },
     Canceled {
         token: RequestToken,
         reason: CancellationReason,
@@ -71,6 +77,7 @@ pub struct Server<'a, T: TryTransport> {
     transport: T,
     protocol: ProtocolDescriptor<'a>,
     service_generation: u64,
+    peer_context: PeerContextId,
     phase: ConnectionPhase,
     bound: Option<BoundState>,
     close_reason: Option<CloseReason>,
@@ -85,6 +92,20 @@ impl<'a, T: TryTransport> Server<'a, T> {
         protocol: ProtocolDescriptor<'a>,
         service_generation: u64,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_peer_context(
+            transport,
+            protocol,
+            service_generation,
+            PeerContextId::UNSPECIFIED,
+        )
+    }
+
+    pub fn new_with_peer_context(
+        transport: T,
+        protocol: ProtocolDescriptor<'a>,
+        service_generation: u64,
+        peer_context: PeerContextId,
+    ) -> Result<Self, RuntimeError> {
         if service_generation == 0 {
             return Err(RuntimeError::InvalidState);
         }
@@ -92,6 +113,7 @@ impl<'a, T: TryTransport> Server<'a, T> {
             transport,
             protocol,
             service_generation,
+            peer_context,
             phase: ConnectionPhase::New,
             bound: None,
             close_reason: None,
@@ -384,6 +406,10 @@ impl<'a, T: TryTransport> Server<'a, T> {
                             .protocol_failure(Some(&header), ProtocolErrorCode::UnknownOrdinal);
                     }
                 };
+                if method.kind != MethodKind::RequestResponse {
+                    return self
+                        .protocol_failure(Some(&header), ProtocolErrorCode::UnexpectedPacketKind);
+                }
                 let body = body_from_packet(&packet, &header)?;
                 if (method.validate_request)(body.as_slice(), &bound.view()?).is_err() {
                     return self.protocol_failure(Some(&header), ProtocolErrorCode::InvalidBody);
@@ -422,6 +448,42 @@ impl<'a, T: TryTransport> Server<'a, T> {
                 });
                 Ok(Some(ServerEvent::Request {
                     token: RequestToken { transaction },
+                    body,
+                }))
+            }
+            PacketKind::OneWay => {
+                header.validate_context(&ValidationContext {
+                    direction: Direction::ClientToServer,
+                    connection: &ConnectionState::Bound(bound.view()?),
+                    transport_bytes: packet.len(),
+                    attached_handles: 0,
+                    transaction: TransactionState::NotApplicable,
+                })?;
+                let method = match self.protocol.method(header.ordinal) {
+                    Some(method) => method,
+                    None => {
+                        return self
+                            .protocol_failure(Some(&header), ProtocolErrorCode::UnknownOrdinal);
+                    }
+                };
+                if method.kind != MethodKind::OneWay {
+                    return self
+                        .protocol_failure(Some(&header), ProtocolErrorCode::UnexpectedPacketKind);
+                }
+                if validate_deadline(method.deadline, now_ns, header.deadline_ns).is_err() {
+                    return self.protocol_failure(Some(&header), ProtocolErrorCode::InvalidHeader);
+                }
+                let body = body_from_packet(&packet, &header)?;
+                if (method.validate_request)(body.as_slice(), &bound.view()?).is_err() {
+                    return self.protocol_failure(Some(&header), ProtocolErrorCode::InvalidBody);
+                }
+                if header.deadline_ns != u64::MAX && now_ns >= header.deadline_ns {
+                    return Ok(None);
+                }
+                Ok(Some(ServerEvent::OneWay {
+                    peer_context: self.peer_context,
+                    ordinal: header.ordinal,
+                    trace_id: header.trace_id,
                     body,
                 }))
             }

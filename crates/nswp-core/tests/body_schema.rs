@@ -515,10 +515,21 @@ static STRUCTURE_PROTOCOL: ProtocolBodyDescriptor = ProtocolBodyDescriptor {
 };
 struct StructureSchema;
 impl WireSchema for StructureSchema {
-    type View<'wire> = ();
+    type View<'wire> = (bool, u64);
     const DESCRIPTOR: &'static ProtocolBodyDescriptor = &STRUCTURE_PROTOCOL;
-    fn materialize<'wire>(_: ValidatedValue<'wire>) -> Result<(), BodyError> {
-        Ok(())
+    fn materialize<'wire>(value: ValidatedValue<'wire>) -> Result<Self::View<'wire>, BodyError> {
+        let flag = value
+            .structure_field(0)?
+            .ok_or(BodyError::MaterializationMismatch)?
+            .bool()?;
+        let number = value
+            .structure_field(1)?
+            .ok_or(BodyError::MaterializationMismatch)?
+            .u64()?;
+        if value.structure_field(2)?.is_some() {
+            return Err(BodyError::MaterializationMismatch);
+        }
+        Ok((flag, number))
     }
 }
 
@@ -561,7 +572,12 @@ fn structures_and_malformed_descriptors_are_checked_without_panics() {
     let mut body = [0; 16];
     body[0] = 1;
     body[8..16].copy_from_slice(&7_u64.to_le_bytes());
-    validate_body::<StructureSchema>(&body, &bound(1, &[]), BodyLimits::DESKTOP).unwrap();
+    assert_eq!(
+        validate_body::<StructureSchema>(&body, &bound(1, &[]), BodyLimits::DESKTOP)
+            .unwrap()
+            .materialize(),
+        Ok((true, 7))
+    );
     body[1] = 1;
     assert_eq!(
         validate_body::<StructureSchema>(&body, &bound(1, &[]), BodyLimits::DESKTOP).err(),
