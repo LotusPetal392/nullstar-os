@@ -458,7 +458,9 @@ string<MaximumBytes>
 A string:
 
 - contains valid UTF-8;
-- has no terminating NUL;
+- has no implicit or required terminating NUL;
+- may contain U+0000, whose UTF-8 byte `00` is included in `count` like any other
+  encoded code point;
 - has an explicit maximum byte length;
 - is not automatically normalized by the wire runtime.
 
@@ -642,11 +644,12 @@ older implementation cannot continue safely without understanding the value.
 
 ## Open unions
 
-An open union accepts an unknown alternative ordinal as an unknown value.
-
-NSIDL 1 skips the unknown payload and closes all handles belonging to that alternative.
-Opaque round-trip preservation of arbitrary unknown nested payloads is deferred because
-it would require retaining unvalidated wire regions and ownership state.
+An open union is intended to accept an unknown alternative ordinal as an unknown value,
+but unknown-alternative body and handle behavior remains tentative and is outside the
+current handle-free body-codec milestone. A candidate decoder skips the unknown payload
+and closes all handles belonging to that alternative. Opaque round-trip preservation of
+arbitrary unknown nested payloads is deferred because it would require retaining
+unvalidated wire regions and ownership state.
 
 ## Type aliases and constants
 
@@ -1397,18 +1400,31 @@ minor version exactly, and renegotiation on the same channel is prohibited.
 
 ## Body arena
 
-NSWP bodies use a relocatable, self-relative, eight-byte-aligned arena.
+The byte-region, canonical-placement, table, and depth rules in this section define the
+precise but still tentative target for the current **handle-free** body-codec milestone.
+They do not stabilize the body format. The first implementation slice covers primitive
+and fixed-structure roots, strings and byte sequences, tables, and closed results. Generic
+`vector<T>`, optionals, enums, general closed unions, handle references, handle domains,
+canonical handle ordering, and unknown open-union alternatives remain separate tentative
+work and are not required by this implementation slice.
 
-The root value starts at body offset zero. Out-of-line values use relative references.
-No wire value contains a process virtual address.
+NSWP bodies use a relocatable, self-relative, eight-byte-aligned arena. The root semantic
+value starts at body offset zero. Out-of-line values use relative references. No wire
+value contains a process virtual address.
 
-Every nonempty out-of-line region:
+A region occupies the half-open byte interval `[start, start + bytes)`. Every nonempty
+out-of-line region:
 
 - begins on an eight-byte boundary;
-- lies entirely within the current enclosing region;
 - is referenced by a positive forward offset;
-- has an exact padded length;
-- does not overlap another region.
+- has an exact length that is a multiple of eight;
+- lies entirely within the allocation of the semantic value that owns the reference.
+
+Region nesting follows semantic ownership. A descendant region is contained in every
+ancestor region that accounts for it, so ancestor containment is legal and expected.
+Regions belonging to distinct siblings, or to descendants of distinct siblings, are
+disjoint. Partial overlap between regions that have no ancestor relationship, overlap
+between siblings, and aliasing one region from multiple references are malformed.
 
 ## Slice reference
 
@@ -1442,8 +1458,13 @@ For a nonempty value:
 
 - the target is eight-byte aligned;
 - the offset is positive;
-- `region_bytes` is a multiple of eight;
-- the complete value and all descendants lie inside that region.
+- `region_bytes` is a nonzero multiple of eight;
+- the inline backing data and all of its descendant regions lie inside the target region.
+
+`region_bytes` measures only the target region referenced by this slice. It excludes the
+16-byte `NswSliceRefV1` itself. If the slice is an envelope payload, the envelope's
+`payload_bytes` separately accounts for the payload root, including that slice reference,
+and all descendants.
 
 For strings and bytes:
 
@@ -1451,8 +1472,13 @@ For strings and bytes:
 region_bytes = align_up(count, 8)
 ```
 
-For vectors, `region_bytes` includes the inline element array, all out-of-line
-descendants of those elements, and trailing alignment padding.
+The first `count` bytes are the value; remaining bytes are zero alignment padding. A
+string has no implicit terminator. A counted `00` byte may encode U+0000 and is data,
+whereas any bytes after `count` are padding.
+
+For vectors, `region_bytes` includes the inline element array, padding of that inline
+array to eight bytes, all out-of-line descendants of those elements, and any required
+trailing alignment padding.
 
 ## Table reference
 
@@ -1469,12 +1495,29 @@ struct NswTableRefV1 {
 
 The encoded size is 16 bytes.
 
-The referenced region begins with a sorted array of field envelopes. The remaining
-region contains field payloads in ordinal order.
+`field_count` is exactly the number of present field envelopes, not the greatest ordinal
+and not the number of fields declared in the schema. Absent fields have no envelope.
+Every present envelope has a nonzero ordinal; ordinal zero is invalid even when the field
+is unknown to the decoder.
 
-For an empty table, every member is zero.
+For a nonempty table, `relative_offset` is positive, the target is eight-byte aligned,
+and `region_bytes` is a nonzero multiple of eight. The referenced region begins with
+exactly `field_count` sorted field envelopes. The remaining region contains their
+nonempty payload allocations in ascending ordinal order.
 
-## Handle reference
+`region_bytes` measures only this referenced target region: the envelope array, its
+padding, and all field payload allocations and descendants. It excludes the 16-byte
+`NswTableRefV1` itself. If the table is an envelope payload, `payload_bytes` includes both
+the table-reference root and the table's target region.
+
+For an empty table, `relative_offset`, `field_count`, both reserved fields, and
+`region_bytes` are all zero.
+
+## Handle reference (tentative, outside the milestone)
+
+The following representation is a tentative future extension. The handle-free body-codec
+milestone does not emit `NswHandleRefV1`; every milestone packet has
+`header.handle_count = 0`.
 
 ```rust
 #[repr(C)]
@@ -1515,23 +1558,37 @@ The fields mean:
 - `ordinal` identifies the table field or union alternative;
 - `flags` is zero in NSWP 1;
 - `payload_relative_offset` is measured from its own field address;
-- `payload_bytes` includes the payload root and all descendants;
-- `handle_start` and `handle_count` select a child handle domain;
+- `payload_bytes` is the complete allocation of the semantic payload rooted at the
+  target, including its eight-byte-padded inline root and all descendants;
+- `handle_start` and `handle_count` are reserved for the tentative child-handle-domain
+  design;
 - all reserved values are zero.
 
-If there is no payload:
+`payload_bytes` differs from slice and table `region_bytes`: `payload_bytes` begins at the
+typed payload root and includes that root plus all descendants, while `region_bytes`
+begins at the out-of-line target owned by a slice or table reference and excludes the
+reference itself.
+
+The payload fields form an exact pair. If there is no payload:
 
 ```text
 payload_relative_offset = 0
 payload_bytes = 0
 ```
 
-If there are no handles:
+For a nonempty payload, `payload_relative_offset` is positive, its target is eight-byte
+aligned, and `payload_bytes` is a nonzero multiple of eight. A zero offset with nonzero
+bytes, or a nonzero offset with zero bytes, is malformed.
+
+For the handle-free body-codec milestone every envelope, including an unknown field's
+envelope, must contain:
 
 ```text
 handle_start = 0
 handle_count = 0
 ```
+
+Any other value is malformed for this milestone.
 
 ## Optional encoding
 
@@ -1553,7 +1610,32 @@ ordinal 1 = Success
 ordinal 2 = Error
 ```
 
-## Handle domains
+## Root and envelope payload padding
+
+The inline root of a body and the inline root of every non-unit envelope payload are
+padded with zero bytes to an eight-byte boundary before any out-of-line child is emitted.
+This boundary padding is included in `body_bytes` or `payload_bytes`, respectively. It is
+not inserted around an ordinary value embedded inline in a structure, array, or vector;
+those values follow their normal inline layout.
+
+A direct `unit` body has `body_bytes = 0`. A selected envelope branch whose declared
+payload type is `unit` is represented by its nonzero branch ordinal with:
+
+```text
+payload_relative_offset = 0
+payload_bytes = 0
+```
+
+No synthetic byte or eight-byte allocation is emitted for `unit`. Thus a unit branch is
+present because of its envelope ordinal even though it has no payload allocation. An
+all-zero optional envelope remains `None`, distinct from `Some(unit)`, whose ordinal is
+one and whose other fields are zero.
+
+## Handle domains (tentative, outside the milestone)
+
+The following domain and adoption rules remain a tentative future extension. In the
+current handle-free milestone the header handle count and every envelope handle field are
+zero, so no handle domain is created.
 
 The packet begins with one root handle domain:
 
@@ -1580,9 +1662,9 @@ This design ensures that:
 3. handle adoption remains tree-shaped and auditable;
 4. skipped future fields cannot leak capabilities into old code.
 
-## Canonical handle ordering
+## Canonical handle ordering (tentative, outside the milestone)
 
-Handles are assigned in depth-first wire traversal order.
+Handles are tentatively assigned in depth-first wire traversal order.
 
 Sibling envelope handle ranges:
 
@@ -1600,9 +1682,9 @@ Within a known payload:
 If a table field or open-union alternative is unknown, the runtime closes its complete
 child handle domain.
 
-## Two-phase handle adoption
+## Two-phase handle adoption (tentative, outside the milestone)
 
-Decoding occurs in two phases:
+The future handle-bearing decoder is intended to operate in two phases:
 
 ```text
 1. validate the complete packet, value tree, and attachment domains
@@ -1650,60 +1732,116 @@ alignment: 8
 
 ## Canonical body ordering
 
-Every body is one tree-shaped region. The root value begins at offset zero. Out-of-line
-regions are emitted in deterministic depth-first order.
+Every body is one tree-shaped allocation whose root value begins at offset zero. Placement
+is deterministic **inline-first depth-first**. The encoder and strict decoder apply this
+cursor algorithm to the root allocation and recursively to every region with children:
+
+1. Emit the owner's complete inline footprint first. For a body root or envelope payload,
+   this is the typed inline root padded with zeros to eight bytes. For a slice target it is
+   the inline byte or element data padded to eight bytes; for a table target it is the
+   complete envelope array, already a multiple of eight.
+2. Set `cursor` to the first byte after that padded inline footprint.
+3. Visit direct out-of-line children in the canonical order below. An empty child emits no
+   region and does not move the cursor. For every nonempty child, require
+   `child.start == cursor`, encode and account for that child's complete region and all of
+   its descendants before visiting the next sibling, then set `cursor = child.end`.
+4. After the last child, require `cursor == owner.end`. The applicable `body_bytes`,
+   envelope `payload_bytes`, slice `region_bytes`, or table `region_bytes` must equal
+   `owner.end - owner.start` exactly.
+
+The equality checks are normative: there is no alignment gap before the first child, no
+gap between children, and no unaccounted tail after the last child. Required zero padding
+belongs to the preceding inline footprint and is not a gap.
 
 ### Structure children
 
-Children appear in field declaration order.
+Out-of-line children referenced by structure fields appear in field declaration order.
+A child's complete subtree precedes the next field's child.
 
 ### Array and vector children
 
-Children appear in element-index order.
+Out-of-line children appear in element-index order, using field declaration order within
+an aggregate element. A child's complete subtree precedes the next child's region. The
+inline array for a vector is emitted in full before any element child.
 
 ### Table children
 
 A table is emitted as:
 
-1. inline table reference;
-2. sorted field-envelope array;
-3. field payloads in ascending ordinal order.
+1. the inline table reference;
+2. its target region beginning with all present field envelopes in ascending ordinal
+   order;
+3. each nonempty field payload allocation in the same ascending ordinal order.
 
-### Union and optional children
+Each field payload's complete subtree precedes the next field payload.
 
-The selected payload follows the inline envelope.
+### Union, result, and optional children
+
+The inline envelope is emitted first. A non-unit selected payload and its complete subtree
+follow it; an absent optional or selected unit branch emits no payload region.
 
 ## Canonical body constraints
 
-- every out-of-line target is eight-byte aligned;
-- every relative offset points forward;
-- regions do not overlap;
-- each region length is exact;
-- there are no unused body bytes;
-- every padding byte is zero;
-- table envelopes are sorted;
-- attached handles follow the same depth-first ordering;
-- every reserved value is zero.
+- every nonempty out-of-line target is eight-byte aligned and forward of its reference;
+- every declared region length is exact and a multiple of eight;
+- ancestor regions contain their descendant regions;
+- sibling regions and their descendant subtrees are disjoint;
+- every understood padding byte is zero;
+- table envelopes are strictly ordered by nonzero ordinal;
+- every reserved value is zero;
+- the root cursor ends exactly at `body_bytes`.
 
 A strict decoder rejects a known value whose representation is valid but noncanonical.
 
-Unknown table-field payloads are skipped as bounded opaque regions. An older decoder does
-not recursively canonicalize a future field it does not understand.
+An unknown table-field payload is opaque but is not exempt from outer structural and
+accounting validation. The decoder validates its envelope flags and reserved fields, the
+zero handle fields required by this milestone, the offset/length pair, eight-byte target
+alignment, containment in the table region, sibling disjointness, canonical cursor
+position, and exact consumption of `payload_bytes`. Those bytes advance the parent cursor
+as one opaque allocation. The decoder does not interpret the unknown payload's type,
+follow references within it, validate its UTF-8 or semantic bounds, or classify and check
+padding inside it. Consequently it does not recursively canonicalize bytes whose schema
+it does not know.
+
+## Semantic nesting depth
+
+Depth is counted over typed semantic values, not arena-region containment. The operation's
+root semantic value has depth 1. Whenever decoding enters a nested typed value or payload,
+its depth is its semantic parent's depth plus one. This includes structure fields, array
+and vector elements, present table-field payloads, and selected union, result, or optional
+payloads. Multiple sibling values have the same depth; their number does not accumulate
+as depth. Envelope arrays, references, padding, and the raw backing octets of strings and
+bytes are representation details and do not add depth.
+
+Before entering a nested semantic value, the decoder requires the resulting depth not to
+exceed the negotiated profile's maximum nesting depth. Unknown table-field payload bytes
+remain opaque and therefore consume one field-payload depth level but are not traversed
+for additional semantic depth.
 
 ## Table validation
 
 A decoder validates a table in this order:
 
-1. validate the table reference and region bounds;
-2. validate that the envelope array fits the table region;
-3. require strictly increasing envelope ordinals;
-4. reject duplicate and reserved ordinals;
-5. validate nonoverlapping payload regions;
-6. validate nonoverlapping handle domains;
-7. decode known fields;
-8. skip unknown fields and close their handles;
-9. verify required fields for the selected minor and feature set;
-10. verify complete byte and handle consumption.
+1. validate the table reference, reserved fields, offset/length pair, alignment, and region
+   bounds;
+2. interpret `field_count` as the exact number of present envelopes and require the
+   `field_count * 24` byte envelope array to fit at the start of the table region;
+3. require every envelope ordinal to be nonzero and strictly increasing, thereby rejecting
+   ordinal zero and duplicates, and reject ordinals reserved by the selected schema;
+4. validate every envelope's flags, reserved fields, payload offset/length pair, alignment,
+   and containment, and require both handle fields to be zero for this milestone;
+5. starting immediately after the envelope array, require each nonempty payload to begin
+   at the current canonical cursor in ordinal order, advance by exactly `payload_bytes`,
+   and thereby prove sibling disjointness;
+6. recursively validate known field payloads and their semantic bounds;
+7. treat unknown field payloads as opaque while retaining all outer structural, cursor,
+   bounds, and byte-accounting checks;
+8. verify required fields for the selected minor and feature set;
+9. require the final cursor to equal the exact end declared by table `region_bytes`.
+
+A zero-field table is valid only in the all-zero reference form. For a nonempty table,
+`region_bytes` includes both the envelope array and every present nonempty payload, with no
+gaps or unaccounted tail.
 
 A sender must not emit a field whose:
 
@@ -2223,9 +2361,25 @@ The referenced bytes are:
  h  i
 ```
 
-This gives one deterministic 96-byte body representation.
+The first two bytes are counted UTF-8 data and the final six are alignment padding, not a
+NUL terminator. The exact literal 96-byte body, with offsets at the left, is:
 
-## Handle-transfer example
+```text
+0000: 10 00 00 00 02 00 00 00 50 00 00 00 00 00 00 00
+0010: 01 00 00 00 00 00 00 00 28 00 00 00 18 00 00 00
+0020: 00 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00
+0030: 28 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00
+0040: 10 00 00 00 02 00 00 00 08 00 00 00 00 00 00 00
+0050: 68 69 00 00 00 00 00 00 07 00 00 00 00 00 00 00
+```
+
+This is the single canonical body representation for the worked value under the
+milestone rules.
+
+## Handle-transfer example (tentative, outside the milestone)
+
+This example illustrates the tentative future handle design; it is not a body accepted by
+the current handle-free codec milestone.
 
 Suppose a field is:
 
@@ -2463,6 +2617,11 @@ complete byte and attachment consumption
 The decoder uses bounded memory and bounded recursion or an explicit bounded work stack.
 
 It must not invoke application-defined decode callbacks before complete validation.
+Low-level body-reader closures are schema traversal and validation code, not application
+callbacks: they must be deterministic and side-effect-free. The runtime completes the
+entire structural and schema-specific validation pass before constructing application-visible
+values or invoking service code. Table envelope structure and outer payload accounting are
+validated in a complete pre-pass before even low-level field traversal begins.
 
 ## Protocol security invariants
 
@@ -2499,16 +2658,18 @@ It must not invoke application-defined decode callbacks before complete validati
 Implement without an IDL parser:
 
 - header encoder and decoder;
-- body arena builder;
+- handle-free body arena builder;
 - canonical structure layout;
-- slice, table, and handle references;
-- envelopes and handle domains;
-- primitive, string, vector, enum, and union validation;
+- slice and table references;
+- envelopes with zero handle fields;
+- primitive, string, vector, enum, and closed-union validation;
 - negotiation records and state machine;
 - request, response, event, and cancellation handling.
 
-Use hand-written Rust type descriptors so the wire decisions can be measured before the
-source language and generator are relied upon.
+Handle references and domains, handle adoption, and unknown open-union alternatives follow
+as separate tentative work after the handle-free body codec. Use hand-written Rust type
+descriptors so the wire decisions can be measured before the source language and
+generator are relied upon.
 
 ### Phase 2: Host transport simulator
 
