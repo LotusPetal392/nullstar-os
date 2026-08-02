@@ -7,6 +7,7 @@ members = [
     "crates/nullfs-testkit",
     "crates/nullfs-userspace-blockdev",
     "crates/nswp-core",
+    "crates/nswp-logging",
     "crates/nswp-runtime",
     "crates/nswp-testkit",
     "kernel",

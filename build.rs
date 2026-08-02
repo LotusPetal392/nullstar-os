@@ -61,6 +61,14 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_vfs_probe")
             .expect("userspace vfs-probe artifact path was not set"),
     );
+    let userspace_logging_service = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_logging_service")
+            .expect("userspace logging-service artifact path was not set"),
+    );
+    let userspace_logging_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_logging_probe")
+            .expect("userspace logging-probe artifact path was not set"),
+    );
     let userspace_service_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_service_probe")
             .expect("userspace service-probe artifact path was not set"),
@@ -187,6 +195,14 @@ fn main() {
         image.set_file(String::from("tmpfs-probe"), userspace_tmpfs_probe.clone());
         image.set_file(String::from("vfs-service"), userspace_vfs_service.clone());
         image.set_file(String::from("vfs-probe"), userspace_vfs_probe.clone());
+        image.set_file(
+            String::from("logging-service"),
+            userspace_logging_service.clone(),
+        );
+        image.set_file(
+            String::from("logging-probe"),
+            userspace_logging_probe.clone(),
+        );
         image.set_file(
             String::from("service-probe"),
             userspace_service_probe.clone(),

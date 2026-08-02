@@ -10,11 +10,6 @@ pub use echo::{
     EchoService, decode_echo, echo_protocol, encode_echo,
 };
 pub use logging::{
-    COLLECTOR_MAX_RECORDS, CollectedLogRecord, LOG_RECORD_BODY_DESCRIPTOR, LOGGING_EMIT_ORDINAL,
-    LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_ID,
-    LOGGING_PROTOCOL_MAJOR, LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_WALL_TIME,
-    LogDelivery, LogDisposition, LogRecord, LogRecordSchema, LogRecordView, LogSeverity,
-    LoggingCollector, LoggingProducer, PrivacyClass, ProducerIdentity, SECRET_REDACTION,
-    decode_log_record, encode_log_record, logging_protocol, logging_protocol_through,
+    COLLECTOR_MAX_RECORDS, CollectedLogRecord, LoggingCollector, ProducerIdentity, SECRET_REDACTION,
 };
 pub use sim::{ManualClock, SimEndpoint, channel_pair};

@@ -4,21 +4,32 @@ use nswp_core::{
     BodyEncoder, BodyError, BodyLimits, BoundProtocol, ConnectionLimits, Header,
     MinorVersionProfile, NSWP_HEADER_BYTES, PacketKind, offset,
 };
+use nswp_logging::{
+    EventId, LOGGING_EMIT_ORDINAL, LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES,
+    LOGGING_PROTOCOL_ID, LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_WALL_TIME,
+    LogDelivery, LogDisposition, LogRecord, LogSeverity, LoggingProducer, PrivacyClass,
+    decode_log_record, encode_log_record, logging_protocol, logging_protocol_through,
+};
 use nswp_runtime::{
     Client, ClientEvent, CloseReason, ConnectionPhase, DeadlinePolicy, MethodDescriptor,
     MethodKind, PeerContextId, ProtocolDescriptor, RuntimeError, Server, ServerEvent, TryTransport,
 };
 use nswp_testkit::{
-    ECHO_PROTOCOL_ID, LOGGING_EMIT_ORDINAL, LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES,
-    LOGGING_PROTOCOL_ID, LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_WALL_TIME,
-    LogDelivery, LogDisposition, LogRecord, LogSeverity, LoggingCollector, LoggingProducer,
-    PrivacyClass, ProducerIdentity, SECRET_REDACTION, SimEndpoint, channel_pair, decode_log_record,
-    encode_log_record, logging_protocol, logging_protocol_through,
+    ECHO_PROTOCOL_ID, LoggingCollector, ProducerIdentity, SECRET_REDACTION, SimEndpoint,
+    channel_pair,
 };
 
 type Endpoint<const QUEUE: usize> = SimEndpoint<QUEUE>;
 type Producer<const QUEUE: usize> = LoggingProducer<'static, Endpoint<QUEUE>>;
 type CollectorServer<const QUEUE: usize> = Server<'static, Endpoint<QUEUE>>;
+
+const EVENT_ID_BYTES: [u8; 16] = [
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+];
+const EVENT_ID: EventId = match EventId::from_bytes(EVENT_ID_BYTES) {
+    Ok(id) => id,
+    Err(_) => panic!("test event ID must be a valid UUIDv4"),
+};
 
 static DEADLINE_VALIDATIONS: AtomicUsize = AtomicUsize::new(0);
 static DEADLINE_VERSIONS: [MinorVersionProfile; 1] = [MinorVersionProfile {
@@ -109,6 +120,7 @@ fn connected<const QUEUE: usize>(
 
 fn record<'a>(subsystem: &'a str, message: &'a str) -> LogRecord<'a> {
     LogRecord {
+        event_id: EVENT_ID,
         severity: LogSeverity::Warning,
         privacy: PrivacyClass::SecuritySensitive,
         monotonic_time_ns: 123_456,
@@ -219,6 +231,7 @@ fn one_way_record_is_attributed_from_connection_context() {
         stored.producer.service_generation,
         stored.collector_generation
     );
+    assert_eq!(stored.event_id, EVENT_ID);
     assert_eq!(stored.severity, LogSeverity::Warning);
     assert_eq!(stored.privacy, PrivacyClass::SecuritySensitive);
     assert_eq!(stored.subsystem, "storage");
@@ -341,15 +354,16 @@ fn maximum_minor_one_record_exactly_fills_the_endpoint_profile() {
     assert_eq!(bytes[0], LogSeverity::Warning as u8);
     assert_eq!(bytes[1], PrivacyClass::SecuritySensitive as u8);
     assert_eq!(&bytes[2..8], &[0; 6]);
-    assert_eq!(&bytes[16..20], &48_u32.to_le_bytes());
-    assert_eq!(&bytes[20..24], &16_u32.to_le_bytes());
-    assert_eq!(&bytes[24..28], &16_u32.to_le_bytes());
+    assert_eq!(&bytes[16..32], &EVENT_ID_BYTES);
     assert_eq!(&bytes[32..36], &48_u32.to_le_bytes());
-    assert_eq!(&bytes[36..40], &80_u32.to_le_bytes());
-    assert_eq!(&bytes[40..44], &80_u32.to_le_bytes());
-    assert_eq!(&bytes[48..52], &112_u32.to_le_bytes());
-    assert_eq!(&bytes[52..54], &1_u16.to_le_bytes());
-    assert_eq!(&bytes[56..60], &32_u32.to_le_bytes());
+    assert_eq!(&bytes[36..40], &16_u32.to_le_bytes());
+    assert_eq!(&bytes[40..44], &16_u32.to_le_bytes());
+    assert_eq!(&bytes[48..52], &48_u32.to_le_bytes());
+    assert_eq!(&bytes[52..56], &64_u32.to_le_bytes());
+    assert_eq!(&bytes[56..60], &64_u32.to_le_bytes());
+    assert_eq!(&bytes[64..68], &96_u32.to_le_bytes());
+    assert_eq!(&bytes[68..70], &1_u16.to_le_bytes());
+    assert_eq!(&bytes[72..76], &32_u32.to_le_bytes());
     assert_eq!(&bytes[160..164], &1_u32.to_le_bytes());
     assert_eq!(&bytes[168..172], &16_u32.to_le_bytes());
     assert_eq!(&bytes[172..176], &8_u32.to_le_bytes());
@@ -439,16 +453,17 @@ fn server_protocol_through_helper_caps_advertised_versions() {
 #[test]
 fn unknown_extension_fields_are_opaque_after_complete_validation() {
     let (_producer, server, _, _) = connected::<2>(LOGGING_PROTOCOL_MINOR_WALL_TIME, 5);
-    let mut bytes = [0; 112];
+    let mut bytes = [0; 128];
     let mut encoder =
-        BodyEncoder::new(&mut bytes, 112, 64, BodyLimits::ENDPOINT_PROTOTYPE).unwrap();
+        BodyEncoder::new(&mut bytes, 128, 80, BodyLimits::ENDPOINT_PROTOTYPE).unwrap();
     let root = encoder.root();
     root.write_u8(0, LogSeverity::Info as u8).unwrap();
     root.write_u8(1, PrivacyClass::Public as u8).unwrap();
     root.write_u64(8, 55).unwrap();
-    root.string(16, 16, "core").unwrap();
-    root.string(32, 80, "future").unwrap();
-    root.table(48, 1, 4, |table| {
+    root.write_id128(16, EVENT_ID_BYTES).unwrap();
+    root.string(32, 16, "core").unwrap();
+    root.string(48, 64, "future").unwrap();
+    root.table(64, 1, 4, |table| {
         table.field(2, 8, |value| value.write_u64(0, 0xfeed_beef))
     })
     .unwrap();
