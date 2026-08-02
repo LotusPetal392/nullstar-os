@@ -4,7 +4,8 @@ use nswp_core::{
     TableFieldDescriptor, TypeDescriptor, TypeKind, ValidatedValue, WireSchema, validate_body,
 };
 use nswp_runtime::{
-    BodyBuf, DeadlinePolicy, HANDLE_FREE_ENDPOINT_LIMITS, MethodDescriptor, ProtocolDescriptor,
+    BodyBuf, DeadlinePolicy, HANDLE_FREE_ENDPOINT_LIMITS, MethodDescriptor, MethodKind,
+    ProtocolDescriptor,
 };
 
 pub const ECHO_PROTOCOL_ID: ProtocolId = match ProtocolId::from_bytes([
@@ -85,6 +86,7 @@ static ECHO_VERSIONS: [MinorVersionProfile; 1] = [MinorVersionProfile {
 
 static ECHO_METHODS: [MethodDescriptor; 1] = [MethodDescriptor {
     ordinal: ECHO_PING_ORDINAL,
+    kind: MethodKind::RequestResponse,
     deadline: DeadlinePolicy::Optional {
         max_duration_ns: Some(ECHO_MAX_DEADLINE_NS),
     },

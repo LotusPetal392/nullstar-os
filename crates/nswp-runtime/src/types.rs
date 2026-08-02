@@ -132,6 +132,21 @@ pub trait TryTransport {
     fn close(&mut self);
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerContextId(u64);
+
+impl PeerContextId {
+    pub const UNSPECIFIED: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeadlinePolicy {
     Required { max_duration_ns: Option<u64> },
@@ -141,9 +156,16 @@ pub enum DeadlinePolicy {
 
 pub type BodyValidator = fn(&[u8], &BoundProtocol<'_>) -> Result<(), BodyError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodKind {
+    RequestResponse,
+    OneWay,
+}
+
 #[derive(Clone, Copy)]
 pub struct MethodDescriptor {
     pub ordinal: u32,
+    pub kind: MethodKind,
     pub deadline: DeadlinePolicy,
     pub validate_request: BodyValidator,
     pub validate_response: BodyValidator,
@@ -302,6 +324,7 @@ pub enum RuntimeError {
     OutstandingLimit,
     RecentlyCanceledExhausted,
     UnknownMethod,
+    WrongMethodKind,
     InvalidDeadline,
     UnknownTransaction,
     TransactionNotExecuting,

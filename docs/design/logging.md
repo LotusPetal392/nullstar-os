@@ -108,6 +108,36 @@ Realtime media, interrupt workers, and low-level drivers must never block on jou
 I/O. They should write to preallocated bounded queues and tolerate loss according to
 severity policy.
 
+### Host-tested NSWP pilot contract
+
+The first executable protocol pilot lives in `nswp-testkit`; it proves the NSWP runtime
+contract but is not yet a kernel endpoint, production collector, or journal format. It uses
+protocol ID `7db79cd9-c685-400f-b9f1-55d89b8e8a8a`, major version 1, and a client-to-server
+one-way `Emit` method.
+
+The 192-byte endpoint profile requires a compact record. The pilot uses a 64-byte fixed
+root containing severity, privacy class, monotonic time, `string<16>` subsystem,
+`string<80>` message, and an extension table. Minor 1 adds an optional wall-clock
+timestamp. Maximum records encode to exactly 160 bytes at minor 0 and 192 bytes at minor
+1; including the NSWP header, the latter is exactly one 256-byte endpoint packet.
+
+Producer principal, service identity, and producer service generation are not accepted
+from the record body. The launch or service environment binds them to a non-default
+`PeerContextId`, which accompanies the server event. The collector rejects unspecified or
+mismatched contexts. The negotiated `service_generation` remains the logging collector's
+generation and must not be mistaken for the producer generation.
+
+The producer API exposes two queue-pressure policies:
+
+- `Reliable` reports backpressure so the caller can retry; it does not imply processing,
+  journal commit, or durable storage.
+- `BestEffort` drops on queue pressure and increments an observable dropped-record count.
+
+The host collector fixture has a fixed maximum record count. It redacts
+`secret-never-persist` messages before retention. Authorization-aware reads, redaction for
+other privacy classes, rate limiting, suppression summaries, persistence, and journal
+rotation remain work for the production logging service.
+
 ## Early boot and panic records
 
 The kernel should maintain a bounded ring containing boot stages, hardware discovery,
