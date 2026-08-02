@@ -179,10 +179,12 @@ builder, inspector, checker, FUSE adapter, and NullStar service.
 The host implementation supports format version 1.2, authoritative allocation maps,
 bounded redo recovery, persistent orphan recovery, writable host operation, and
 deterministic crash testing. The kernel exposes checked, partition-relative read-only
-endpoints for discovered filesystem candidates and a separately generated writable
-endpoint only for discovered NullFS partitions. PID 1 alone acquires those objects and
+endpoints for discovered filesystem candidates and separately generated writable
+endpoints only for validated NullFS partitions. PID 1 acquires primary-volume authority by
+an exact configured filesystem UUID; the kernel requires exactly one eligible match and
+never falls back to partition order or label. PID 1 alone acquires those objects and
 delegates ordinary send-only endpoint handles; endpoint identity, not path, discovery,
-or UID, carries raw write authority.
+label, or UID, carries raw write authority.
 
 PID 1 explicitly launches the supervised service as `/nullfs-service --writable` and
 delegates a partition-scoped raw endpoint advertising exactly the required
@@ -209,11 +211,11 @@ a read-only session owns an open whose later close would reclaim storage, and op
 directory `rmdir` and unsafe rename replacement remain restricted.
 
 The kernel NullFS proxy requests exactly `WRITE` and accepts a service generation only
-when `CONNECT` returns `session_features::WRITE`. The public
-`/Volumes/NULLSTAR_DATA` mount supports ordinary `stat`, read, open, `fstat`, seek,
-directory reads, and `chdir`, plus writable, create, truncate, and append opens,
-descriptor writes, and unlink. Public `mkdir`, `rmdir`, rename, and broader namespace
-adoption remain future work; direct flags-zero sessions remain read-only.
+when `CONNECT` returns `session_features::WRITE`. The public `/Volumes/NullStar`
+mount supports ordinary `stat`, read, open, `fstat`, seek, directory reads, and `chdir`,
+plus writable, create, truncate, and append opens, descriptor writes, and unlink. Public
+`mkdir`, `rmdir`, rename, and broader namespace adoption remain future work; direct
+flags-zero sessions remain read-only.
 
 The proxy reserves its single request before staging at most 4 KiB for a write. A
 successful generic `WRITE` reply retains the byte count in `value` and carries the exact
@@ -228,12 +230,15 @@ post-send uncertainty about a mutation maps to `IO`, quarantines that service
 generation, and is never automatically retried. These rules do not add durability beyond
 NullFS's existing transaction and recovery semantics.
 
-Normal boot retains raw read-only and reversible write/flush/readback/restore coverage.
-Public probes cover create, write, independent stale append, cross-handle `fstat` and
-`SEEK_END`, truncate, descriptor duplication, unlink while open, open-unlinked read and
-write, cleanup, persistence across service restart, and stale old descriptors. Namespace
-identity and bindings, including transition to the planned `/Volumes/NullStar` backing
-volume, are the next integration work described in the
+Normal boot retains raw read-only coverage plus non-destructive writable-endpoint
+identity, bounds, and flush checks. Filesystem-level probes provide durable mutation
+coverage without using allocatable file data as raw scratch space.
+The generated 4 MiB primary volume is exposed at `/Volumes/NullStar` and contains
+`System/`, `Applications/`, and `Users/`, but those trees are not yet bound into the root
+namespace. Public probes cover create, write, independent stale append, cross-handle
+`fstat` and `SEEK_END`, truncate, descriptor duplication, unlink while open,
+open-unlinked read and write, cleanup, persistence across service restart, and stale old
+descriptors. Namespace bindings are the next integration work described in the
 [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells

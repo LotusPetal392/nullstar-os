@@ -19,7 +19,7 @@ filesystem responsibilities across userspace service boundaries:
 - a separately supervised VFS service owns the versioned longest-prefix namespace table;
 - a separately supervised NullFS service mounts its core read-write and offers explicitly
   negotiated writable sessions; its kernel proxy also negotiates bounded public write
-  authority for `/Volumes/NULLSTAR_DATA`;
+  authority for `/Volumes/NullStar`;
 - PID 1 delegates endpoint authority, including a narrowly scoped writable raw NullFS
   block endpoint, to those services;
 - provider generation, protocol session, request, and stale-handle checks protect
@@ -152,8 +152,9 @@ physical modification of earlier blocks, so possession of the capability does no
 blind retry safe; the filesystem must provide ordering and recovery. Writable flushes
 reach the AHCI cache flush.
 
-PID 1 explicitly starts `/nullfs-service --writable` and gives it this writable raw
-endpoint. The service requires `READ | WRITE | FLUSH` and mounts `nullfs-core` read-write,
+PID 1 selects exactly one eligible NullFS partition by its configured filesystem UUID,
+then starts `/nullfs-service --writable` and gives it this writable raw endpoint. Missing
+and duplicate UUID matches fail without falling back to partition index or label. The service requires `READ | WRITE | FLUSH` and mounts `nullfs-core` read-write,
 but that still grants no client mutation authority by itself. There are three distinct
 layers:
 
@@ -166,7 +167,7 @@ layers:
 
 The kernel NullFS proxy connects with exactly `WRITE` and requires the returned
 `session_features::WRITE`. Its public policy permits writable/create/truncate/append open,
-descriptor write, and unlink at `/Volumes/NULLSTAR_DATA`, but not public `mkdir`, `rmdir`,
+descriptor write, and unlink at `/Volumes/NullStar`, but not public `mkdir`, `rmdir`,
 or rename. Direct flags-zero sessions remain read-only. Neither the service's raw endpoint
 nor a different client's writable session manufactures public VFS authority.
 

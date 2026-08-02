@@ -402,6 +402,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::SHARED_MEMORY_WRITE
             | abi::syscall::OPEN_BLOCK_DEVICE_ENDPOINT
             | abi::syscall::OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT
+            | abi::syscall::OPEN_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT
     )
 }
 
@@ -475,6 +476,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         }
         abi::syscall::OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT => {
             open_block_device_endpoint(process_id, registers.rdi, BlockDeviceAccess::Writable)
+        }
+        abi::syscall::OPEN_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT => {
+            open_writable_nullfs_block_device_endpoint(process_id, registers.rdi, registers.rsi)
         }
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };

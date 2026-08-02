@@ -25,6 +25,13 @@ pub mod abi {
     ));
 }
 
+pub mod nullfs_primary_volume {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/nullfs_primary_volume.rs"
+    ));
+}
+
 /// Defines the raw ELF entry point for a Rust userspace program.
 ///
 /// The supplied function receives the original kernel-built initial stack pointer.

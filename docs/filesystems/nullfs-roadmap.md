@@ -14,9 +14,10 @@ recovery, checking, deterministic image creation, and an explicitly enabled writ
 FUSE adapter. NullStar implements narrowly scoped raw writable block-device authority and
 a separately supervised service that mounts `nullfs-core` read-write and offers explicitly
 negotiated writable protocol sessions. PR C added a bounded writable kernel proxy and
-public create, write, truncate, append, and unlink at `/Volumes/NULLSTAR_DATA`. Namespace
-identity and bindings, public `mkdir`/`rmdir`/rename, offline repair policy, and adoption as
-the primary backing volume remain future work.
+public create, write, truncate, append, and unlink. The generated primary volume is now
+selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `System/`,
+`Applications/`, and `Users/`. Namespace bindings, public `mkdir`/`rmdir`/rename, offline
+repair policy, and adoption of those backing trees remain future work.
 
 ## Status summary
 
@@ -26,7 +27,7 @@ the primary backing volume remain future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, and bounded public mutation implemented; namespace identity and bindings next |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, bounded public mutation, and primary volume identity/layout implemented; namespace bindings next |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -48,10 +49,12 @@ common filesystem-service protocol
 NullFS service -> shared NullFS core -> block-device adapter
 ```
 
-The current generated image contains a deterministic NullFS partition labelled
-`NULLSTAR_DATA`. Its service mounts the core read-write, and the kernel proxy negotiates
-exactly `WRITE` and exposes a bounded writable VFS mount at `/Volumes/NULLSTAR_DATA`. That
-path describes implemented behavior, not the final human-facing layout.
+The current generated image contains a deterministic 4 MiB NullFS primary volume with
+stable filesystem UUID and the human-facing display name `NullStar`. PID 1 asks the kernel
+for exactly that UUID; zero matches fail with `NO_ENTRY` and multiple eligible matches fail
+as ambiguous, without falling back to a partition index or label. The service mounts the
+core read-write, and the kernel proxy negotiates exactly `WRITE` and exposes a bounded
+writable VFS mount at `/Volumes/NullStar`.
 
 The accepted long-term direction is:
 
@@ -225,9 +228,9 @@ common filesystem protocol. Clients were not routed to a NullFS-specific API. Th
 read-only service details in this section are historical and are explicitly superseded by
 the implemented Phase 5 service-operation submilestone below.
 
-The current build appends a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as
-MBR partition 3. The kernel identifies the partition as NullFS, and an init-delegated
-raw probe validates its superblock through the read-only block endpoint. The typed
+The Phase 4 build appended a deterministic 1 MiB, 256-block `NULLSTAR_DATA` volume as
+MBR partition 3. At that milestone the kernel identified the partition as NullFS, and an
+init-delegated raw probe validated its superblock through the read-only block endpoint. The typed
 session client and storage adapter translate the endpoint's 512-byte device geometry
 into the 4096-byte blocks required by the shared core.
 
@@ -252,7 +255,7 @@ PR C later superseded the public-client restriction without changing the histori
 Phase 4 behavior recorded here.
 
 PID 1 registers `nullfs-service` independently of tmpfs as a generation-scoped kernel
-filesystem proxy. The VFS currently mounts it at `/Volumes/NULLSTAR_DATA`. The proxy
+filesystem proxy. The VFS currently mounts it at `/Volumes/NullStar`. The proxy
 negotiates exactly `WRITE`, requires `session_features::WRITE`, and registers one
 kernel-owned 4 KiB shared-memory buffer. Through the public descriptor and filesystem ABI,
 the mount supports ordinary stat/read/open plus writable, create, truncate, and append
@@ -286,26 +289,29 @@ cargo run --locked --quiet -- --nullfs-restart-check
 ./scripts/check-local.sh
 ```
 
-The current FAT bootstrap path and development mount at `/Volumes/NULLSTAR_DATA` remain
-until Phase 5 adds stable volume identity and namespace bindings. Its bounded public
-mutation surface is implemented; broader namespace mutation and an independent recovery
-path remain future work.
+The FAT bootstrap path remains independent while the UUID-selected primary volume is
+available at `/Volumes/NullStar`. Its bounded public mutation surface and initial backing
+layout are implemented; root namespace bindings, broader namespace mutation, and an
+independent recovery path remain future work.
 
 ## Phase 5: writable service and namespace adoption — in progress
 
 Phase 5 moves from a read-only public test mount to the accepted persistent-volume and
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
-operations, and PR C's bounded public writable proxy are implemented. Stable volume
-identity and namespace bindings are next.
+operations, PR C's bounded public writable proxy, and stable primary-volume identity and
+layout are implemented. Namespace bindings are next.
 
 ### Raw writable block authority — implemented
 
-Syscall 52 retains its original read-only partition-endpoint contract. A separate ABI 1.9
-syscall acquires writable authority, and only PID 1 may call either operation. Writable
-acquisition currently succeeds only on a disk without an extended partition, for a
-nonzero-start primary MBR `PartitionKind::NullFs` partition that does not overlap another
-discovered partition and
-contains a valid decoded NullFS superblock. Logical/extended MBR, GPT, and superfloppy
+Syscall 52 retains its original read-only partition-index endpoint contract. ABI 1.9
+syscall 54 remains available as the legacy PID-1 writable index operation for ABI
+compatibility, but primary-volume policy does not use it. The separate ABI 1.10 syscall
+55 acquires writable NullFS authority by an exact 16-byte filesystem UUID,
+and only PID 1 may call either operation. Writable acquisition requires exactly one match;
+zero matches return `NO_ENTRY`, and duplicate eligible UUIDs are rejected as ambiguous.
+Candidates must be on a disk without an extended partition, use a nonzero-start primary
+MBR `PartitionKind::NullFs` entry that does not overlap another discovered partition, and
+contain a valid decoded NullFS superblock. Logical/extended MBR, GPT, and superfloppy
 writable grants remain disabled until their reserved disk-metadata ranges are modeled
 explicitly.
 Read-only and writable access are distinct endpoint objects and generations, both
@@ -322,12 +328,11 @@ multi-block write may nevertheless have changed earlier physical blocks, so file
 recovery—not blind partial-write retry—is required. Writable `FLUSH` maps to the AHCI
 cache flush; read-only `WRITE` and `FLUSH` retain `READ_ONLY` and `NOT_SUPPORTED`.
 
-Normal boot performs a reversible write/flush/readback/restore probe on a known free
-sector in the deterministic NullFS fixture. An exact marker left by interruption is
-restored and verified on the next boot before testing resumes. All previous read-only and
-mutation-denial probes remain active. PID 1 then delegates the writable raw endpoint to
-`nullfs-service`; Phase 5's service-operation submilestone consumes that authority as
-described below.
+Normal boot non-destructively validates the selected writable endpoint's superblock,
+out-of-range write rejection, and flush operation. It does not use an allocatable NullFS
+data block as raw scratch space; durable mutation coverage runs through filesystem
+transactions instead. PID 1 then delegates the writable raw endpoint to `nullfs-service`;
+Phase 5's service-operation submilestone consumes that authority as described below.
 
 ### Writable filesystem-service operations — implemented
 
@@ -372,7 +377,7 @@ session authority, and public path authority.
 
 For each service generation, the kernel proxy requests exactly `WRITE` and requires the
 canonical `CONNECT` reply to include `session_features::WRITE`. The public
-`/Volumes/NULLSTAR_DATA` mount supports ordinary stat/read/open plus writable, create,
+`/Volumes/NullStar` mount supports ordinary stat/read/open plus writable, create,
 truncate, and append open, descriptor write, unlink, `fstat`, seek, `read_directory`, and
 `chdir`. Public `mkdir`, `rmdir`, rename, and broader namespace adoption remain future.
 
@@ -392,11 +397,15 @@ Public probes cover create, write, independent stale append, cross-handle `fstat
 `SEEK_END`, truncate, duplication, unlink while open, open-unlinked read/write, cleanup,
 persistence across service restart, and stale old descriptors.
 
-### Primary volume identity and layout
+### Primary volume identity and layout — implemented
 
-The generated primary volume should transition from the development label
-`NULLSTAR_DATA` to a stable UUID-backed volume with the human-facing display name
-`NullStar`. Generated images should contain:
+The generated primary volume is 4 MiB, is selected by its stable filesystem UUID, and has
+the human-facing display and mount name `NullStar`. This milestone assigns a new UUID
+rather than reusing the earlier `NULLSTAR_DATA` fixture identity; existing development
+fixtures must be recreated explicitly instead of being mistaken for the primary layout.
+The 4 MiB size is four times the old fixture while keeping exhaustive block-by-block
+userspace probes within current QEMU timeouts; larger volumes require allocator and
+validation batching. Generated images contain:
 
 ```text
 System/
@@ -404,8 +413,14 @@ Applications/
 Users/
 ```
 
-The display name is not a boot key. Namespace and boot policy select the volume by UUID
-or another stable identifier.
+The display name and on-disk label are not boot keys. PID 1 requests the configured UUID,
+and the kernel selects exactly one validated writable NullFS candidate before creating or
+returning an endpoint capability. Partition reordering and label changes therefore do not
+change selection. Missing, malformed, ineligible, or duplicate configured UUID candidates
+cannot cause an arbitrary volume to be mounted.
+
+These directories are visible only below `/Volumes/NullStar` for now. No root `/System`,
+`/Applications`, or `/Users` binding is part of this milestone.
 
 ### Namespace bindings
 

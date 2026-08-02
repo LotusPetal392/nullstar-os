@@ -4,7 +4,7 @@
 use userspace::{
     abi::{INIT_PROCESS_ID, signal},
     ipc::{self, CapabilityHandle, Rights},
-    platform,
+    nullfs_primary_volume, platform,
     supervisor::{
         ServiceRuntime, ServiceSpec, ServiceStatusDisposition, ShellStatusDisposition,
         shell_status_disposition,
@@ -20,11 +20,7 @@ const INIT_READY: &[u8] = b"userspace init ready: pid=1\n";
 const BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe";
 const BLOCK_DEVICE_PROBE_FAILED: &[u8] = b"userspace init: read-only block-device probe failed\n";
 const BLOCK_DEVICE_PROBE_PASSED: &[u8] = b"userspace init: read-only block-device probe passed\n";
-const NULLFS_BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe nullfs";
-const NULLFS_BLOCK_DEVICE_PROBE_FAILED: &[u8] =
-    b"userspace init: read-only NullFS partition probe failed\n";
-const NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
-    b"userspace init: read-only NullFS partition probe passed\n";
+
 const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_COMMAND: &[u8] = b"/block-device-probe nullfs-writable";
 const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_FAILED: &[u8] =
     b"userspace init: writable NullFS partition probe failed\n";
@@ -162,7 +158,11 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if syscall::write_all(STDOUT, INIT_READY).is_err() {
         syscall::exit(1);
     }
-    if platform::open_writable_block_device_endpoint(2).err() != Some(platform::Errno::PERMISSION) {
+    let mut missing_nullfs_uuid = nullfs_primary_volume::FILESYSTEM_UUID;
+    missing_nullfs_uuid[15] ^= 0xff;
+    if platform::open_writable_nullfs_block_device_endpoint(&missing_nullfs_uuid).err()
+        != Some(platform::Errno::NO_ENTRY)
+    {
         fail(BLOCK_DEVICE_BOOTSTRAP_FAILED);
     }
 
@@ -184,26 +184,10 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     );
     ipc::close(block_device_endpoint).unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
 
-    let nullfs_block_device_endpoint = platform::open_block_device_endpoint(3)
-        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
-    if !matches!(
-        ipc::info(nullfs_block_device_endpoint),
-        Ok(info)
-            if info.kind == ipc::ObjectKind::Endpoint
-                && info.rights == (Rights::SEND | Rights::TRANSFER)
-    ) {
-        fail(BLOCK_DEVICE_BOOTSTRAP_FAILED);
-    }
-    run_probe(
-        NULLFS_BLOCK_DEVICE_PROBE_COMMAND,
-        nullfs_block_device_endpoint,
-        NULLFS_BLOCK_DEVICE_PROBE_FAILED,
-        NULLFS_BLOCK_DEVICE_PROBE_PASSED,
-    );
-    ipc::close(nullfs_block_device_endpoint)
-        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
-
-    let writable_nullfs_block_device_endpoint = platform::open_writable_block_device_endpoint(3)
+    let writable_nullfs_block_device_endpoint =
+        platform::open_writable_nullfs_block_device_endpoint(
+            &nullfs_primary_volume::FILESYSTEM_UUID,
+        )
         .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
     if !matches!(
         ipc::info(writable_nullfs_block_device_endpoint),
@@ -222,8 +206,10 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     ipc::close(writable_nullfs_block_device_endpoint)
         .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
 
-    let nullfs_service_block_endpoint = platform::open_writable_block_device_endpoint(3)
-        .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
+    let nullfs_service_block_endpoint = platform::open_writable_nullfs_block_device_endpoint(
+        &nullfs_primary_volume::FILESYSTEM_UUID,
+    )
+    .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
     if !matches!(
         ipc::info(nullfs_service_block_endpoint),
         Ok(info)

@@ -244,19 +244,27 @@ the `READ_ONLY_BLOCK_DEVICE_ENDPOINTS` capability bit advertises availability.
 Other callers receive `EPERM`, and invalid or unavailable partitions are
 rejected.
 
-## Version 1.9 writable NullFS block-device acquisition
+## Version 1.10 UUID-selected writable NullFS block-device acquisition
 
 | Number | Name | Arguments | Result |
 | ---: | --- | --- | --- |
-| 54 | `open_writable_block_device_endpoint` | partition-table index | capability handle |
+| 55 | `open_writable_nullfs_block_device_endpoint` | `rdi`: 16-byte UUID address; `rsi`: exact length | capability handle |
 
-Syscall 52 remains unconditionally read-only so older callers cannot accidentally
-acquire more authority through an unspecified register. Only PID 1 may call the
-new writable operation, and it currently succeeds only when the disk has no
-extended partition and the selected entry is a nonzero-start primary MBR
-`PartitionKind::NullFs` partition that does not overlap another discovered partition and contains a valid decoded NullFS superblock. Logical/extended MBR,
-GPT, and superfloppy writable grants remain disabled until their reserved
-disk-metadata ranges are modeled explicitly.
+ABI 1.9 syscall 54 retains its PID-1-only writable partition-index contract for
+compatibility. ABI 1.10 adds syscall 55 for stable filesystem-UUID selection, and
+current primary-volume policy uses only the new operation. Syscall 52 remains
+unconditionally read-only and index-based. Only PID 1 may call syscall 55;
+permission is checked before its UUID pointer is read. The
+UUID must be nonzero and exactly 16 readable bytes. Zero eligible matches return
+`ENOENT`, while multiple eligible matches return `EINVAL` rather than selecting
+an arbitrary partition.
+
+An eligible match requires a disk with no extended partition and a nonzero-start
+primary MBR `PartitionKind::NullFs` entry that does not overlap another discovered
+partition and contains a valid decoded NullFS superblock. Selection compares only
+the decoded UUID, not partition order or label. Logical/extended MBR, GPT, and
+superfloppy writable grants remain disabled until their reserved disk-metadata
+ranges are modeled explicitly.
 
 Read-only and writable access to the same partition are distinct endpoint objects
 with distinct generations, although both are returned with ordinary endpoint
@@ -282,8 +290,10 @@ filesystem-service or VFS syscalls.
   handshake asynchronously before treating the service as ready.
 - ABI 1.6 adds VFS-routed pathname deletion at syscall 51.
 - ABI 1.7 adds PID-1 read-only partition endpoint acquisition at syscall 52.
-- ABI 1.9 adds the narrowly scoped writable NullFS partition endpoint at syscall
-  54 while preserving syscall 52 as unconditionally read-only.
+- ABI 1.9 added the initial narrowly scoped writable NullFS partition endpoint at
+  syscall 54 while preserving syscall 52 as unconditionally read-only.
+- ABI 1.10 adds exact, unique filesystem-UUID selection at syscall 55 without
+  changing the ABI 1.9 syscall 54 contract.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

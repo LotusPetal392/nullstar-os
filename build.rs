@@ -7,15 +7,16 @@ use nullfs_blockdev::MemoryBlockDevice;
 use nullfs_format::BLOCK_SIZE;
 use nullfs_testkit::ImageBuilder;
 
+#[allow(dead_code)]
+mod nullfs_primary_volume {
+    include!("shared/nullfs_primary_volume.rs");
+}
+
 const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n";
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
-const NULLFS_BLOCK_COUNT: u64 = 256;
-const NULLFS_LABEL: &str = "NULLSTAR_DATA";
-const NULLFS_UUID: [u8; 16] = [
-    0x4e, 0x75, 0x6c, 0x6c, 0x53, 0x74, 0x61, 0x72, 0x2d, 0x4e, 0x75, 0x6c, 0x6c, 0x46, 0x53, 0x01,
-];
+
 const NULLFS_MBR_TYPE: u8 = 0x7f;
 const MBR_BYTES: usize = 512;
 const MBR_PARTITION_TABLE_OFFSET: usize = 446;
@@ -279,10 +280,19 @@ fn main() {
 }
 
 fn build_nullfs_fixture() -> Vec<u8> {
-    let device = MemoryBlockDevice::new(BLOCK_SIZE, NULLFS_BLOCK_COUNT)
+    let device = MemoryBlockDevice::new(BLOCK_SIZE, nullfs_primary_volume::CAPACITY_BLOCKS)
         .expect("failed to allocate NullFS fixture device");
-    let mut image = ImageBuilder::new(device, NULLFS_UUID, NULLFS_LABEL)
-        .expect("failed to format NullFS fixture");
+    let mut image = ImageBuilder::new(
+        device,
+        nullfs_primary_volume::FILESYSTEM_UUID,
+        nullfs_primary_volume::DISPLAY_NAME,
+    )
+    .expect("failed to format NullFS fixture");
+    for directory in ["System", "Applications", "Users"] {
+        image
+            .create_directory(1, directory, 0o755)
+            .unwrap_or_else(|_| panic!("failed to create NullFS {directory} directory"));
+    }
     let docs = image
         .create_directory(1, "docs", 0o755)
         .expect("failed to create NullFS fixture directory");

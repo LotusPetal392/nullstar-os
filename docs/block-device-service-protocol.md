@@ -9,22 +9,29 @@ access.
 ## Authorization and capability model
 
 Only PID 1 may acquire a partition endpoint. `OPEN_BLOCK_DEVICE_ENDPOINT`
-retains its original read-only contract. The separate
-`OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT` syscall requests writable access and
-succeeds only when the disk has no extended partition and the selected entry is
-a nonzero-start primary MBR partition classified as `PartitionKind::NullFs` that
-does not overlap any other discovered partition and
-contains a valid decoded NullFS superblock. Logical/extended MBR, GPT, and
-superfloppy writable grants remain disabled until their reserved disk-metadata
-ranges are modeled explicitly. Each successful call returns an endpoint capability
+retains its original read-only partition-index contract. The separate
+ABI 1.9's `OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT` retains its PID-1-only
+partition-index contract for compatibility, but normal primary-volume policy does
+not use it. ABI 1.10's `OPEN_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT` syscall accepts
+an exact 16-byte filesystem UUID and requests writable access. It succeeds only when exactly one
+eligible candidate has that UUID. Zero matches return `NO_ENTRY`; duplicate
+eligible UUIDs are rejected as ambiguous with `INVALID_ARGUMENT`. An eligible
+candidate must be on a disk without an extended partition and use a nonzero-start
+primary MBR entry classified as `PartitionKind::NullFs` that does not overlap any
+other discovered partition and contains a valid decoded NullFS superblock.
+Logical/extended MBR, GPT, and superfloppy writable grants remain disabled until
+their reserved disk-metadata ranges are modeled explicitly. Each successful call
+returns an endpoint capability
 with `SEND | TRANSFER`; PID 1 can delegate a reduced send-only capability to a
 supervised filesystem service. The service cannot receive another client's
 requests or access the containing disk outside the selected partition.
 
 Read-only and writable access to the same partition are separate kernel-rooted
-endpoint objects with separate nonzero generations. Repeated acquisition of the
-same partition and access mode returns an independent handle to that mode's
-object, so closing one handle does not invalidate another caller's handle. Both
+endpoint objects with separate nonzero generations. The read-only operation names
+a discovered partition index; the writable NullFS operation selects by decoded
+UUID and does not consult the label. Repeated acquisition of the same selected
+partition and access mode returns an independent handle to that mode's object, so
+closing one handle does not invalidate another caller's handle. Both
 modes use ordinary endpoint rights, including delegated `SEND`; the endpoint
 object's access mode is the write authority. Discovering a path or partition,
 registering a provider, or possessing a UID—including a future UID 0—cannot
@@ -128,16 +135,16 @@ without the durability primitive it requires. Keeping the adapter in a separate
 crate prevents host `std` features from leaking into allocator-free userspace
 binaries and keeps `nullfs-service` a distinct package.
 
-The current normal boot verifies init-only endpoint acquisition, delegated
-send-only authority, read-only and writable metadata, a partition-relative FAT
-boot-block read, and the checksummed superblock of the dedicated `NULLSTAR_DATA`
-partition. It also performs a reversible probe on a known free sector in the
-deterministic NullFS fixture: read the original sector, write a distinct marker,
-flush, read it back, restore the original sector, flush again, and verify the
-restoration. If a previous boot stopped after making the marker durable, the
-next probe recognizes that exact marker and restores it before repeating the
-test. The previous read-only buffer-transfer, range-rejection, write-denial,
-unsupported-flush, mutation-denial, and disconnect-cleanup probes remain active.
+The current normal boot verifies init-only endpoint acquisition, rejection of a
+missing configured UUID, delegated send-only authority, read-only and writable
+metadata, a partition-relative FAT boot-block read, and successful validated
+selection and mounting of the dedicated `NullStar` primary volume. The writable
+raw probe reads and validates the selected superblock, rejects an out-of-range
+write, exercises `FLUSH`, and disconnects without modifying allocatable filesystem
+data. Durable writes are covered through NullFS transactions and the public VFS
+mutation probes instead of a raw scratch sector. The read-only FAT buffer-transfer,
+range-rejection, write-denial, unsupported-flush, writable NullFS bounds, and
+disconnect-cleanup probes remain active.
 
 PID 1 explicitly launches `/nullfs-service --writable` and gives it a send-only
 handle to the writable raw NullFS endpoint. The service requires
@@ -157,7 +164,7 @@ artifact forms left by the probe.
 
 PID 1 also registers each `nullfs-service` process as an independent,
 generation-scoped kernel filesystem proxy, while the VFS statically mounts the
-backend at `/Volumes/NULLSTAR_DATA`. The filesystem proxy's own kernel-registered
+backend at `/Volumes/NullStar`. The filesystem proxy's own kernel-registered
 4 KiB buffer is distinct from the service's block-device session window. The
 proxy connects with exactly `WRITE`, requires `session_features::WRITE`, and
 permits ordinary stat/read/open plus writable, create, truncate, and append open,
@@ -175,7 +182,7 @@ filesystem-session authority and public VFS authority.
 Explicit direct filesystem clients can negotiate the `WRITE` session feature
 and use the service's bounded mutation operations; flags-zero direct sessions
 remain read-only. The kernel NullFS proxy separately negotiates exactly `WRITE`
-and applies bounded public VFS policy at `/Volumes/NULLSTAR_DATA`. Its write path
+and applies bounded public VFS policy at `/Volumes/NullStar`. Its write path
 reserves the single proxy request before staging at most 4 KiB and validates the
 generic reply's byte count plus exact eight-byte little-endian resulting offset.
 That offset records append's service-selected EOF.

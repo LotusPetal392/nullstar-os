@@ -36,8 +36,8 @@ experimentation, not production use or untrusted workloads.
 - a PID 1 userspace supervisor, a userspace shell (`ush`) with pipelines,
   redirection, variables, background jobs and basic job control, and an
   emergency kernel diagnostic shell
-- separate normal-boot and destructive smoke-test images, including a reversible
-  free-sector NullFS write/flush/readback/restore probe during normal boot, plus
+- separate normal-boot and destructive smoke-test images, including non-destructive
+  NullFS raw-endpoint identity, bounds, and flush checks during normal boot, plus
   host-side unit tests and a local pre-push check script
 
 See [Architecture](docs/architecture.md) for how the implemented pieces fit
@@ -170,11 +170,13 @@ images, and launches QEMU.
   `nullfs-service --writable` with a partition-scoped raw `READ | WRITE | FLUSH`
   endpoint. The kernel proxy negotiates exactly `WRITE`, requires the returned
   `WRITE` session feature, and exposes bounded create, write, truncate, append,
-  and unlink through `/Volumes/NULLSTAR_DATA`; stat, read, open, `fstat`, seek,
-  directory reads, and `chdir` also remain available. Direct flags-zero sessions
-  stay read-only, and raw block authority, session authority, and public VFS
-  policy remain separate. Public `mkdir`, `rmdir`, rename, broader namespace
-  adoption, and offline repair remain future work.
+  and unlink through the UUID-selected 4 MiB primary volume at
+  `/Volumes/NullStar`; stat, read, open, `fstat`, seek, directory reads, and
+  `chdir` also remain available. The volume contains the future backing trees
+  `System/`, `Applications/`, and `Users/`, but no root namespace bindings exist
+  yet. Direct flags-zero sessions stay read-only, and raw block authority, session
+  authority, and public VFS policy remain separate. Public `mkdir`, `rmdir`,
+  rename, broader namespace adoption, and offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`
