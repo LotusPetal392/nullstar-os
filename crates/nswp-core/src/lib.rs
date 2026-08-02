@@ -13,12 +13,13 @@ mod header;
 mod negotiation;
 mod packet;
 mod protocol_id;
+mod schema;
 mod validation;
 
 pub use body::{
     BodyDecoder, BodyEncoder, BodyError, BodyLimits, ClosedResultDecoder, ENVELOPE_BYTES,
     FieldDecoder, SLICE_REF_BYTES, TABLE_REF_BYTES, TableDecoder, TableEncoder, ValueDecoder,
-    ValueEncoder,
+    ValueEncoder, VectorEncoder,
 };
 pub use error::{DecodeError, EncodeError, NegotiationError, ProtocolIdError};
 pub use header::{Header, NSWP_HEADER_BYTES, NSWP_MAGIC, NSWP_WIRE_MAJOR, NSWP_WIRE_MINOR, offset};
@@ -34,6 +35,13 @@ pub use packet::{
     TransportStatus,
 };
 pub use protocol_id::{PROTOCOL_ID_BYTES, PROTOCOL_ID_TEXT_BYTES, ProtocolId};
+pub use schema::{
+    Availability, ClosedEnumDescriptor, ClosedUnionDescriptor, InlineLayout, IntegerRepr,
+    OrdinalRange, PrimitiveKind, ProtocolBodyDescriptor, SchemaValueEncoder, StructureDescriptor,
+    StructureFieldDescriptor, TableDescriptor, TableFieldDescriptor, TypeDescriptor, TypeKind,
+    UnionAlternativeDescriptor, ValidatedBody, ValidatedField, ValidatedUnion, ValidatedValue,
+    ValidatedVector, VectorDescriptor, WireSchema, validate_body,
+};
 pub use validation::{
     BoundProtocol, ConnectionLimits, ConnectionState, Direction, OutstandingTransaction,
     TransactionState, ValidationContext,
