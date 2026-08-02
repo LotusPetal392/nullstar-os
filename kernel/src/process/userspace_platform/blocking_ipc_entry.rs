@@ -73,6 +73,29 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
     let registers_pointer = current_stack_pointer as *mut SavedRegisters;
     let syscall_number = unsafe { (*registers_pointer).rax };
 
+    if matches!(
+        syscall_number,
+        abi::syscall::OPEN_KERNEL_EARLY_LOG_READER | abi::syscall::KERNEL_EARLY_LOG_READ
+    ) {
+        let Some(process_id) = scheduler::current_process_id() else {
+            unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
+            return current_stack_pointer;
+        };
+        let registers = unsafe { &mut *registers_pointer };
+        registers.rax = if syscall_number == abi::syscall::OPEN_KERNEL_EARLY_LOG_READER {
+            open_kernel_early_log_reader(process_id)
+        } else {
+            read_kernel_early_log(
+                process_id,
+                registers.rdi,
+                registers.rsi,
+                registers.rdx,
+                registers.r10,
+            )
+        };
+        return current_stack_pointer;
+    }
+
     if syscall_number == abi::syscall::SYSTEM_INFO {
         let Some(process_id) = scheduler::current_process_id() else {
             unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
@@ -158,9 +181,9 @@ fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
     let object_index = registry.object_index(object).ok_or(abi::errno::IO)?;
     match &registry.objects[object_index].data {
         CapabilityObjectData::Endpoint(endpoint) => Ok(!endpoint.queue.is_empty()),
-        CapabilityObjectData::Notification(_) | CapabilityObjectData::SharedMemory(_) => {
-            Err(abi::errno::INVALID_ARGUMENT)
-        }
+        CapabilityObjectData::Notification(_)
+        | CapabilityObjectData::SharedMemory(_)
+        | CapabilityObjectData::KernelEarlyLogReader(_) => Err(abi::errno::INVALID_ARGUMENT),
     }
 }
 

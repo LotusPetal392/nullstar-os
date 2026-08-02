@@ -69,6 +69,13 @@ pub enum BootIdentity {
 pub struct EarlySequence(NonZeroU64);
 
 impl EarlySequence {
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
     pub const fn get(self) -> u64 {
         self.0.get()
     }
@@ -354,6 +361,13 @@ pub struct SnapshotInfo {
     pub copied: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadInfo {
+    pub stats: EarlyLogStats,
+    pub busy_drops: u64,
+    pub record: Option<EarlyLogRecord>,
+}
+
 pub struct SynchronizedEarlyLog<const N: usize> {
     inner: Mutex<Option<FixedEarlyLog<N>>>,
     busy_drops: AtomicU64,
@@ -407,6 +421,18 @@ impl<const N: usize> SynchronizedEarlyLog<N> {
         self.try_snapshot(&mut [])
     }
 
+    pub fn try_read_after(&self, after: Option<EarlySequence>) -> Result<ReadInfo, SnapshotError> {
+        let Some(slot) = self.inner.try_lock() else {
+            return Err(SnapshotError::Busy);
+        };
+        let ring = slot.as_ref().ok_or(SnapshotError::Uninitialized)?;
+        Ok(ReadInfo {
+            stats: ring.stats(),
+            busy_drops: self.busy_drops.load(Ordering::Relaxed),
+            record: ring.read_after(after).copied(),
+        })
+    }
+
     fn note_busy_drop(&self) {
         let current = self.busy_drops.load(Ordering::Relaxed);
         if current != u64::MAX {
@@ -447,6 +473,12 @@ pub fn try_snapshot_kernel_early_log(
 
 pub fn try_kernel_early_log_stats() -> Result<SnapshotInfo, SnapshotError> {
     without_local_interrupts(|| KERNEL_EARLY_LOG.try_stats())
+}
+
+pub fn try_read_kernel_early_log_after(
+    after: Option<EarlySequence>,
+) -> Result<ReadInfo, SnapshotError> {
+    without_local_interrupts(|| KERNEL_EARLY_LOG.try_read_after(after))
 }
 
 #[cfg(target_os = "none")]
@@ -692,6 +724,28 @@ mod tests {
             record.message[usize::from(record.message_len)..]
                 .iter()
                 .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn synchronized_cursor_read_returns_record_and_stats_from_one_snapshot() {
+        let logger = SynchronizedEarlyLog::<2>::new();
+        logger.try_initialize(BootIdentity::Unavailable).unwrap();
+        logger.try_record(input("one")).unwrap();
+        logger.try_record(input("two")).unwrap();
+        logger.try_record(input("three")).unwrap();
+
+        let first = logger.try_read_after(None).unwrap();
+        assert_eq!(first.record.unwrap().sequence().get(), 2);
+        assert_eq!(first.stats.oldest_sequence.unwrap().get(), 2);
+        assert_eq!(first.stats.newest_sequence.unwrap().get(), 3);
+        assert_eq!(first.stats.overwritten, 1);
+
+        let second = logger.try_read_after(EarlySequence::new(2)).unwrap();
+        assert_eq!(second.record.unwrap().sequence().get(), 3);
+        assert_eq!(
+            logger.try_read_after(EarlySequence::new(3)).unwrap().record,
+            None
         );
     }
 

@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 10;
+pub const ABI_VERSION_MINOR: u64 = 11;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -75,6 +75,8 @@ pub mod syscall {
     pub const REGISTER_NULLFS_SERVICE: u64 = 53;
     pub const OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT: u64 = 54;
     pub const OPEN_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT: u64 = 55;
+    pub const OPEN_KERNEL_EARLY_LOG_READER: u64 = 56;
+    pub const KERNEL_EARLY_LOG_READ: u64 = 57;
 }
 
 pub mod capability {
@@ -93,6 +95,7 @@ pub mod capability {
     pub const PATH_MUTATION: u64 = 1 << 12;
     pub const READ_ONLY_BLOCK_DEVICE_ENDPOINTS: u64 = 1 << 13;
     pub const WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS: u64 = 1 << 14;
+    pub const KERNEL_EARLY_LOG_READER: u64 = 1 << 15;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -109,13 +112,15 @@ pub mod capability {
         | BLOCKING_ENDPOINT_WAIT
         | PATH_MUTATION
         | READ_ONLY_BLOCK_DEVICE_ENDPOINTS
-        | WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS;
+        | WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS
+        | KERNEL_EARLY_LOG_READER;
 
     pub const INVALID_HANDLE: u64 = 0;
 
     pub const KIND_ENDPOINT: u64 = 1;
     pub const KIND_NOTIFICATION: u64 = 2;
     pub const KIND_SHARED_MEMORY: u64 = 3;
+    pub const KIND_KERNEL_EARLY_LOG_READER: u64 = 4;
 
     pub const RIGHT_DUPLICATE: u64 = 1 << 0;
     pub const RIGHT_TRANSFER: u64 = 1 << 1;
@@ -131,6 +136,7 @@ pub mod capability {
         RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SIGNAL | RIGHT_WAIT;
     pub const SHARED_MEMORY_RIGHTS: u64 =
         RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_READ | RIGHT_WRITE;
+    pub const KERNEL_EARLY_LOG_READER_RIGHTS: u64 = RIGHT_TRANSFER | RIGHT_READ;
 
     #[repr(C)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +145,7 @@ pub mod capability {
         pub kind: u64,
         pub rights: u64,
         /// Object-specific bounded state: queued endpoint messages, pending
-        /// notification count, or shared-memory byte length.
+        /// notification count, shared-memory byte length, or early-log record capacity.
         pub size: u64,
     }
 

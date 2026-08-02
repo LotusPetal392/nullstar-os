@@ -71,6 +71,7 @@ impl Rights {
     pub const ENDPOINT: Self = Self(abi_capability::ENDPOINT_RIGHTS);
     pub const NOTIFICATION: Self = Self(abi_capability::NOTIFICATION_RIGHTS);
     pub const SHARED_MEMORY: Self = Self(abi_capability::SHARED_MEMORY_RIGHTS);
+    pub const KERNEL_EARLY_LOG_READER: Self = Self(abi_capability::KERNEL_EARLY_LOG_READER_RIGHTS);
 
     pub const fn from_bits(bits: u64) -> Option<Self> {
         let all = abi_capability::ENDPOINT_RIGHTS
@@ -111,6 +112,7 @@ pub enum ObjectKind {
     Endpoint,
     Notification,
     SharedMemory,
+    KernelEarlyLogReader,
 }
 
 impl ObjectKind {
@@ -119,6 +121,7 @@ impl ObjectKind {
             abi_capability::KIND_ENDPOINT => Some(Self::Endpoint),
             abi_capability::KIND_NOTIFICATION => Some(Self::Notification),
             abi_capability::KIND_SHARED_MEMORY => Some(Self::SharedMemory),
+            abi_capability::KIND_KERNEL_EARLY_LOG_READER => Some(Self::KernelEarlyLogReader),
             _ => None,
         }
     }
@@ -427,6 +430,10 @@ mod tests {
             ObjectKind::from_raw(capability::KIND_ENDPOINT),
             Some(ObjectKind::Endpoint)
         );
+        assert_eq!(
+            ObjectKind::from_raw(capability::KIND_KERNEL_EARLY_LOG_READER),
+            Some(ObjectKind::KernelEarlyLogReader)
+        );
         assert_eq!(ObjectKind::from_raw(99), None);
     }
 
@@ -435,6 +442,14 @@ mod tests {
         assert_ne!(
             phase1_protection_abi::syscall::GRANT_CHILD,
             syscall::ENDPOINT_WAIT
+        );
+        assert_ne!(
+            syscall::OPEN_KERNEL_EARLY_LOG_READER,
+            syscall::KERNEL_EARLY_LOG_READ
+        );
+        assert_ne!(
+            syscall::OPEN_KERNEL_EARLY_LOG_READER,
+            phase1_protection_abi::syscall::GRANT_CHILD
         );
     }
 }

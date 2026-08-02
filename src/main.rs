@@ -41,6 +41,7 @@ const NORMAL_BOOT_MODE_MARKER: &str = "boot mode selected: normal";
 const NORMAL_BOOT_EARLY_LOG_MARKER: &str = "kernel early log ready: capacity=64, retained=3, overwritten=0, dropped=0, rejected=0, busy_drops=0";
 const NORMAL_BOOT_READY_MARKER: &str = "normal boot ready:";
 const NORMAL_BOOT_INIT_MARKER: &str = "userspace init ready: pid=1";
+const NORMAL_BOOT_LOGGING_IMPORT_MARKER: &str = "logging-service: kernel early log imported";
 const NORMAL_BOOT_LOGGING_SERVICE_MARKER: &str = "userspace init: logging service ready";
 const NORMAL_BOOT_LOGGING_PROBE_MARKER: &str = "userspace init: native NSWP logging probe passed";
 const NORMAL_BOOT_BLOCK_DEVICE_MARKER: &str = "userspace init: read-only block-device probe passed";
@@ -67,6 +68,7 @@ struct NormalBootProgress {
     early_log_ready: bool,
     kernel_ready: bool,
     init_ready: bool,
+    logging_imported: bool,
     logging_service_ready: bool,
     logging_probe_passed: bool,
     block_device_ready: bool,
@@ -85,6 +87,7 @@ impl NormalBootProgress {
         self.early_log_ready |= line.contains(NORMAL_BOOT_EARLY_LOG_MARKER);
         self.kernel_ready |= line.contains(NORMAL_BOOT_READY_MARKER);
         self.init_ready |= line.contains(NORMAL_BOOT_INIT_MARKER);
+        self.logging_imported |= line.contains(NORMAL_BOOT_LOGGING_IMPORT_MARKER);
         self.logging_service_ready |= line.contains(NORMAL_BOOT_LOGGING_SERVICE_MARKER);
         self.logging_probe_passed |= line.contains(NORMAL_BOOT_LOGGING_PROBE_MARKER);
         self.block_device_ready |= line.contains(NORMAL_BOOT_BLOCK_DEVICE_MARKER);
@@ -101,6 +104,7 @@ impl NormalBootProgress {
             && self.early_log_ready
             && self.kernel_ready
             && self.init_ready
+            && self.logging_imported
             && self.logging_service_ready
             && self.logging_probe_passed
             && self.block_device_ready
@@ -307,6 +311,7 @@ fn run_nullfs_restart_check(options: &Options) -> ExitCode {
 fn run_nullfs_restart_test(options: &Options) -> bool {
     let image = Path::new(env!("NULLFS_RESTART_TEST_BIOS_IMAGE"));
     let mut mode_selected = false;
+    let mut logging_import_count = 0_u8;
     let mut logging_collector_verified = false;
     let mut restart_verified = false;
     run_qemu_until(
@@ -315,9 +320,15 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
         NULLFS_RESTART_TEST_TIMEOUT,
         move |line| {
             mode_selected |= line.contains(NULLFS_RESTART_MODE_MARKER);
+            if line.contains(NORMAL_BOOT_LOGGING_IMPORT_MARKER) {
+                logging_import_count = logging_import_count.saturating_add(1);
+            }
             logging_collector_verified |= line.contains(LOGGING_COLLECTOR_RESTART_PASSED_MARKER);
             restart_verified |= line.contains(NULLFS_RESTART_PASSED_MARKER);
-            mode_selected && logging_collector_verified && restart_verified
+            mode_selected
+                && logging_import_count >= 2
+                && logging_collector_verified
+                && restart_verified
         },
     )
 }
@@ -532,12 +543,12 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
 mod tests {
     use super::{
         NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER, NORMAL_BOOT_INIT_MARKER,
-        NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGGING_PROBE_MARKER,
-        NORMAL_BOOT_LOGGING_SERVICE_MARKER, NORMAL_BOOT_MODE_MARKER,
-        NORMAL_BOOT_NULLFS_DISCOVERY_MARKER, NORMAL_BOOT_NULLFS_READINESS_MARKER,
-        NORMAL_BOOT_NULLFS_SERVICE_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
-        NORMAL_BOOT_VFS_READINESS_MARKER, NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER,
-        NormalBootProgress,
+        NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGGING_IMPORT_MARKER,
+        NORMAL_BOOT_LOGGING_PROBE_MARKER, NORMAL_BOOT_LOGGING_SERVICE_MARKER,
+        NORMAL_BOOT_MODE_MARKER, NORMAL_BOOT_NULLFS_DISCOVERY_MARKER,
+        NORMAL_BOOT_NULLFS_READINESS_MARKER, NORMAL_BOOT_NULLFS_SERVICE_MARKER,
+        NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER, NORMAL_BOOT_VFS_READINESS_MARKER,
+        NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER, NormalBootProgress,
     };
 
     #[test]
@@ -548,6 +559,7 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_EARLY_LOG_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_READY_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_LOGGING_IMPORT_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_LOGGING_SERVICE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_LOGGING_PROBE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_BLOCK_DEVICE_MARKER));

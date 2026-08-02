@@ -4,6 +4,7 @@
 pub mod args;
 pub mod block_device;
 pub mod blocking_ipc;
+pub mod early_log;
 pub mod endpoint_transport;
 pub mod environment;
 pub mod filesystem;

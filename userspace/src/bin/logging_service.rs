@@ -2,12 +2,13 @@
 #![no_main]
 
 use nswp_logging::{
-    CollectDisposition, CollectorRequest, FixedLoggingCollector, LOGGING_EMIT_ORDINAL, LogSeverity,
-    RecordId, decode_collector_request, decode_log_record, logging_protocol,
-    respond_collector_stats, respond_history,
+    CollectDisposition, CollectorRequest, FixedLoggingCollector, KernelSequence,
+    LOGGING_EMIT_ORDINAL, LogSeverity, RecordId, decode_collector_request, decode_log_record,
+    logging_protocol, respond_collector_stats, respond_history,
 };
 use nswp_runtime::{Server, ServerEvent};
 use userspace::{
+    early_log,
     endpoint_transport::EndpointTransport,
     ipc::{self, ObjectKind, Rights},
     syscall,
@@ -19,8 +20,10 @@ userspace::panic_handler!();
 const READY_HANDLE: u64 = 1;
 const RECEIVE_HANDLE: u64 = 2;
 const SEND_HANDLE: u64 = 3;
+const EARLY_LOG_HANDLE: u64 = 4;
 const READY_MESSAGE: &[u8] = b"service-ready: logging";
 const STARTED_MARKER: &[u8] = b"logging-service: fixed collector ready\n";
+const KERNEL_IMPORT_MARKER: &[u8] = b"logging-service: kernel early log imported\n";
 const RECORD_PREFIX: &[u8] = b"logging-service: retained: ";
 const RECORD_SEPARATOR: &[u8] = b": ";
 const RECORD_SUFFIX: &[u8] = b"\n";
@@ -45,14 +48,27 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         Ok(collector) => collector,
         Err(_) => syscall::exit(5),
     };
+    if !matches!(
+        ipc::info(EARLY_LOG_HANDLE),
+        Ok(info) if info.kind == ObjectKind::KernelEarlyLogReader && info.rights == Rights::READ
+    ) || early_log::open_reader() != Err(early_log::Error::PERMISSION)
+    {
+        syscall::exit(6);
+    }
+    if import_kernel_history(&mut collector).is_err() {
+        syscall::exit(early_log::IMPORT_FAILURE_EXIT_STATUS);
+    }
+    if syscall::write_all(syscall::STDOUT, KERNEL_IMPORT_MARKER).is_err() {
+        syscall::exit(6);
+    }
     let mut server = match Server::new(transport, logging_protocol(), generation) {
         Ok(server) => server,
-        Err(_) => syscall::exit(6),
+        Err(_) => syscall::exit(7),
     };
     if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err()
         || syscall::write_all(syscall::STDOUT, STARTED_MARKER).is_err()
     {
-        syscall::exit(7);
+        syscall::exit(8);
     }
 
     loop {
@@ -111,7 +127,8 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         }
                     }
                     Ok(CollectorRequest::ReadHistory(request)) => {
-                        let record = collector.read_after(request.after_record_id);
+                        let record =
+                            collector.read_after_for_minor(request.after_record_id, bound.minor());
                         if respond_history(&mut server, token, record).is_err() {
                             syscall::exit(17);
                         }
@@ -126,6 +143,54 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 }
             }
             Err(_) => syscall::exit(20),
+        }
+    }
+}
+
+fn import_kernel_history(
+    collector: &mut FixedLoggingCollector<COLLECTOR_CAPACITY>,
+) -> Result<(), ()> {
+    let mut storage = early_log::ResponseStorage::new();
+    let first = read_kernel_after(None, &mut storage)?;
+    if first.stats.retained_records == 0 || first.stats.retained_records > COLLECTOR_CAPACITY as u64
+    {
+        return Err(());
+    }
+    let mut range = early_log::SnapshotRange::new(first.boot_id, first.stats).map_err(|_| ())?;
+    let mut record = first.record.ok_or(())?;
+    let mut imported = 0_usize;
+    loop {
+        let complete = range
+            .accept(record.boot_id, record.sequence)
+            .map_err(|_| ())?;
+        if imported >= COLLECTOR_CAPACITY {
+            return Err(());
+        }
+        match collector.collect_kernel(record.view()).map_err(|_| ())? {
+            CollectDisposition::Accepted { .. } => {}
+            CollectDisposition::Dropped => return Err(()),
+        }
+        imported += 1;
+        if complete {
+            return Ok(());
+        }
+
+        let read = read_kernel_after(Some(record.sequence), &mut storage)?;
+        record = read.record.ok_or(())?;
+    }
+}
+
+fn read_kernel_after(
+    after: Option<KernelSequence>,
+    storage: &mut early_log::ResponseStorage,
+) -> Result<early_log::ReadResult, ()> {
+    loop {
+        match early_log::read_after(EARLY_LOG_HANDLE, after, storage) {
+            Ok(read) => return Ok(read),
+            Err(error) if error == early_log::Error::TRY_AGAIN => {
+                syscall::yield_now().map_err(|_| ())?;
+            }
+            Err(_) => return Err(()),
         }
     }
 }
