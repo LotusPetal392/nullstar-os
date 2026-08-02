@@ -173,6 +173,28 @@ mod tests {
     }
 
     #[test]
+    fn final_status_restarts_once_and_replacement_reaches_running() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+
+        assert_eq!(
+            service.observe_status(child_status::SIGNAL_BASE + signal::TERMINATE),
+            ServiceStatusDisposition::Restart { backoff_yields: 8 }
+        );
+        assert_eq!(service.process_id(), None);
+        assert_eq!(service.restart_count(), 1);
+        assert_eq!(service.state(), ServiceState::Backoff);
+
+        service.note_spawned(8);
+        service.note_ready();
+
+        assert_eq!(service.process_id(), Some(8));
+        assert_eq!(service.restart_count(), 1);
+        assert_eq!(service.state(), ServiceState::Running);
+    }
+
+    #[test]
     fn service_restart_budget_is_bounded() {
         let mut service = ServiceRuntime::new(TEST_SERVICE);
         service.note_spawned(7);
