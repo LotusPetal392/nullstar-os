@@ -2,31 +2,18 @@
 
 ## Status
 
-The following are **accepted direction** for the provisional NullStar Wire Protocol:
+**Accepted decision record; superseded as a normative specification.**
 
-- NSWP 1.0 uses an exact 64-byte base packet header;
-- all numeric header fields use unsigned little-endian encoding;
-- one channel connection carries one negotiated protocol family and version;
-- the protocol-family identifier is carried during negotiation and retained as immutable
-  connection metadata rather than repeated in every ordinary packet;
-- a protocol-family identifier is an explicitly generated and committed RFC 9562 UUIDv4;
-- UUID bytes use RFC UUID byte order and are never interpreted as a native-endian integer
-  or a Windows mixed-endian GUID;
-- a packet trace identifier is a separate opaque 128-bit correlation value and is not a
-  UUID;
-- the header intentionally excludes caller identity, authorization data, descriptor
-  hashes, checksums, process identifiers, user identifiers, and transport-redundant
-  sequence information.
+The 64-byte NSWP 1.0 header, protocol-family UUID rules, negotiation records, and revised
+transport profiles decided here have been consolidated into
+[NSIDL and the NullStar Wire Protocol](nsidl-and-wire-protocol.md). Contributors must use
+that main specification as the single normative source; if this record and the main
+specification differ, the main specification takes precedence.
 
-Exact packet values and field relationships in this document are concrete enough to
-implement. They remain provisional until NSWP satisfies the freeze criteria in
-[NSIDL and the NullStar Wire Protocol](nsidl-and-wire-protocol.md).
-
-This document is the authoritative decision for the packet-header and protocol-identifier
-questions. Where it differs from the provisional header, negotiation, protocol-identity,
-transport-profile, or corresponding open-question sections in
-[NSIDL and the NullStar Wire Protocol](nsidl-and-wire-protocol.md), this document takes
-precedence until those sections are consolidated.
+This document remains as the architecture decision record for rationale, rejected
+alternatives, implementation-transition history, and measurement questions. The accepted
+decisions remain provisional until NSWP satisfies the freeze criteria in the main
+specification.
 
 ## Decision summary
 
@@ -817,10 +804,9 @@ struct NswNegotiateResponseV1 {
 }
 ```
 
-On success:
+Every response exactly echoes the request's `protocol_id` and `protocol_major`.
 
-- `protocol_id` exactly echoes the request;
-- `protocol_major` exactly echoes the request;
+On success:
 - `selected_minor` lies within both supported ranges;
 - the returned limits are the negotiated minima;
 - returned feature records are sorted and enabled;
@@ -830,11 +816,15 @@ On failure:
 
 ```text
 selected_minor = 0
+max_body_bytes = 0
+max_handles = 0
+max_outstanding = 0
 features = empty
 service_generation = 0
 ```
 
-The server minor range may still be returned for diagnostics.
+The server minor range may still be returned for failures concerning a recognized
+protocol key. `UnsupportedProtocol` and `UnsupportedMajor` use a zero server-minor range.
 
 ## Negotiation statuses
 
@@ -861,14 +851,24 @@ On negotiation failure, the server sends the response and closes the channel.
 
 ## Version and limit selection
 
-The server selects the highest minor version satisfying:
+The server advertises a contiguous supported minor-version range and selects the highest
+minor version satisfying:
 
 ```text
 client_min_minor <= selected_minor <= client_max_minor
 server_min_minor <= selected_minor <= server_max_minor
-all required features are available and policy-permitted
-selected types fit the negotiated body and handle limits
+all required features are available and policy-permitted at selected_minor
+baseline and required-feature types fit the negotiated body and handle limits
 ```
+
+Feature declarations carry their introduction minor. Generated protocol metadata evaluates
+the complete selected feature set at each candidate minor against the negotiated body and
+handle limits; independent per-feature checks are not sufficient when combinations enlarge
+the same message. Optional features are considered in ascending feature-ID order and admitted
+only while the complete set remains valid. Required features that are unavailable prevent
+selecting that minor; a required feature set that exceeds the negotiated limits yields
+`TransportBoundsTooSmall` if no lower compatible minor succeeds. Clients run the same
+complete-set validation before binding the connection.
 
 The selected limits are the minimum of:
 

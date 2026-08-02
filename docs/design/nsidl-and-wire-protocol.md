@@ -15,7 +15,11 @@ NullStar Wire Protocol
 The following are **accepted direction**:
 
 - service interfaces are bounded, language-neutral, ordinal-based definitions;
-- one negotiated protocol major and minor version is carried by one channel connection;
+- one negotiated protocol family, major version, minor version, feature set, and limit
+  profile is carried by one channel connection;
+- NSWP 1.0 uses the exact 64-byte base header specified below;
+- protocol-family identifiers are generated and committed RFC 9562 UUIDv4 values carried
+  during negotiation rather than repeated in ordinary packets;
 - the wire representation is fixed-width, little-endian, pointer-independent, and
   independent of Rust or C compiler layout;
 - tables support additive minor-version evolution while structures retain fixed layouts;
@@ -27,11 +31,14 @@ The following are **accepted direction**:
 - bulk data remains outside ordinary RPC messages and uses shared memory with explicit
   synchronization.
 
-The exact grammar, packet layout, body arena, header size, negotiation records, standard
-limits, and command names in this document are **tentative design pending
-implementation**. They are concrete enough to build and test, but NSIDL and NSWP should
-not be declared stable 1.0 until the freeze criteria near the end of this document are
-met.
+This document is the normative NSIDL and NSWP specification. The packet header,
+protocol-family identifier rules, negotiation records, and transport-profile arithmetic
+specified below are accepted provisional NSWP 1.0 decisions. Their design rationale is
+retained in
+[NSWP packet header and protocol-identifier decision](nswp-header-and-protocol-identifiers.md).
+The exact grammar, body arena, remaining limits, and command names remain **tentative
+design pending implementation**. NSIDL and NSWP should not be declared stable 1.0 until
+the freeze criteria near the end of this document are met.
 
 This specification refines
 [Native application runtime, SDK, and service IDL](application-runtime-sdk-and-idl.md)
@@ -807,14 +814,28 @@ protocol or transport profile.
 
 ## Protocol identity
 
-Each protocol has:
+Each protocol family has:
 
 ```text
-one opaque 128-bit family ID
+one generated and committed RFC 9562 UUIDv4 family ID
 one major version
 one maximum supported minor version
 zero or more feature IDs
 ```
+
+The complete protocol key is:
+
+```text
+ProtocolKey {
+    protocol_id: ProtocolId,
+    major: u16,
+}
+```
+
+The UUID identifies the protocol family, not an individual version. Minor and major
+versions of the same family retain the same UUID; the major version forms the incompatible
+part of the complete protocol key. A genuinely different protocol family or independently
+developed incompatible fork allocates a new UUID.
 
 Example:
 
@@ -824,11 +845,56 @@ Example:
 protocol FilePortal
 ```
 
-The UUID is encoded as the 16 bytes in conventional UUID order and treated as opaque
-bytes. It is not reinterpreted as native-endian integers.
+The accepted NSIDL source form is exactly:
 
-The service name is discovery metadata. The protocol family ID is wire identity. Neither
-one grants authority.
+```text
+xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+```
+
+where `x` is a lowercase hexadecimal digit and `y` is `8`, `9`, `a`, or `b`. The value
+must contain exactly 36 ASCII characters, with hyphens at positions 8, 13, 18, and 23,
+the version nibble set to `4`, and the RFC variant bits set to binary `10`. Nil and
+all-ones UUIDs are prohibited. The compiler rejects noncanonical spelling rather than
+silently rewriting source.
+
+In negotiation bodies, lock files, and `.nsproto` descriptors, `protocol_id` is exactly 16
+octets in RFC UUID byte order. For example:
+
+```text
+NSIDL text:
+00112233-4455-4677-8899-aabbccddeeff
+
+Binary octets:
+00 11 22 33 44 55 46 77 88 99 aa bb cc dd ee ff
+```
+
+The UUID is treated as opaque bytes with byte-for-byte equality. It is never encoded as a
+native-endian integer or Windows mixed-endian GUID. Bindings should represent it
+conceptually as:
+
+```rust
+#[repr(transparent)]
+pub struct ProtocolId([u8; 16]);
+```
+
+The toolchain generates an ID once from a cryptographic random source, installs the RFC
+UUIDv4 version and variant bits, emits lowercase canonical text, and commits the result to
+the `.nsidl` source, `.nsidl.lock` history, and `.nsproto` descriptor. Reproducible builds
+consume that committed value and never generate a replacement. The tentative command is:
+
+```text
+nsidlc new-id
+```
+
+The protocol UUID appears in negotiation requests and responses, package and broker
+metadata, descriptors, lock files, and diagnostics. It does not appear in ordinary
+requests, responses, one-way messages, events, cancellation packets, or post-negotiation
+protocol errors. After successful negotiation, the runtime retains the UUID, selected
+version, feature set, limits, and service generation as immutable connection metadata.
+
+The service name is discovery metadata. The protocol-family UUID is wire identity. Neither
+a name nor a UUID grants authority, identifies a trusted publisher, or authorizes service
+lookup.
 
 ## Major versions
 
@@ -874,12 +940,43 @@ Within one protocol major:
 
 ## Wire header
 
-Every NSWP packet begins with an 80-byte header.
+Every NSWP 1.0 packet begins with exactly 64 bytes:
+
+```text
+Offset  Size  Field
+------  ----  ------------------
+0x00       4  magic
+0x04       2  header_bytes
+0x06       1  wire_major
+0x07       1  wire_minor
+
+0x08       1  kind
+0x09       1  flags
+0x0a       2  reserved0
+
+0x0c       2  protocol_major
+0x0e       2  protocol_minor
+
+0x10       4  ordinal
+0x14       4  body_bytes
+
+0x18       2  handle_count
+0x1a       2  reserved1
+0x1c       4  transport_status
+
+0x20       8  transaction_id
+0x28       8  deadline_ns
+
+0x30      16  trace_id
+-------------------------------
+Total      64 bytes
+```
+
+The conceptual field declaration is:
 
 ```rust
-#[repr(C)]
 struct NswHeaderV1 {
-    magic: u32,
+    magic: [u8; 4],
     header_bytes: u16,
     wire_major: u8,
     wire_minor: u8,
@@ -896,112 +993,130 @@ struct NswHeaderV1 {
 
     handle_count: u16,
     reserved1: u16,
-
     transport_status: u32,
 
     transaction_id: u64,
     deadline_ns: u64,
 
-    protocol_id: [u8; 16],
-    trace_context: [u8; 16],
+    trace_id: [u8; 16],
 }
 ```
 
-The Rust declaration illustrates layout only. The wire definition is the explicit offset
-table below, not compiler output.
-
-## Header offsets
-
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 4 | `magic` |
-| 4 | 2 | `header_bytes` |
-| 6 | 1 | `wire_major` |
-| 7 | 1 | `wire_minor` |
-| 8 | 1 | `kind` |
-| 9 | 1 | `flags` |
-| 10 | 2 | `reserved0` |
-| 12 | 2 | `protocol_major` |
-| 14 | 2 | `protocol_minor` |
-| 16 | 4 | `ordinal` |
-| 20 | 4 | `body_bytes` |
-| 24 | 2 | `handle_count` |
-| 26 | 2 | `reserved1` |
-| 28 | 4 | `transport_status` |
-| 32 | 8 | `transaction_id` |
-| 40 | 8 | `deadline_ns` |
-| 48 | 16 | `protocol_id` |
-| 64 | 16 | `trace_context` |
-
-The total is exactly 80 bytes.
+This declaration documents names and offsets. Implementations encode and decode the
+explicit wire layout and must not copy a compiler-native Rust or C structure. All numeric
+fields are unsigned little-endian integers. Byte arrays retain their declared byte order:
+`magic` is four literal octets and `trace_id` is sixteen opaque octets.
 
 ## Header magic
 
-The four header bytes are:
+The exact magic bytes are:
 
 ```text
-4e 53 57 31
- N  S  W  1
+4e 53 57 50
+ N  S  W  P
 ```
 
-As a little-endian integer:
+Normatively:
 
-```text
-0x3157534e
+```rust
+magic == *b"NSWP"
 ```
 
-## Fixed header values
+The magic remains constant across NSWP versions. `wire_major` and `wire_minor` identify
+the supported wire format.
+
+## Header size and wire version
 
 For NSWP 1.0:
 
 ```text
-header_bytes = 80
+header_bytes = 64
 wire_major = 1
 wire_minor = 0
-flags = 0
-reserved fields = 0
 ```
 
-A receiver rejects unsupported header size, major version, nonzero reserved fields, or
-unknown mandatory flags.
+A conforming NSWP 1.0 receiver rejects any other `header_bytes` value. A future supported
+wire version may add fields after byte 63, but an extended header size must be a multiple
+of eight and may only be skipped after the implementation recognizes the wire version.
+The NSWP wire version is independent of the selected service-protocol version.
+
+## Header flags
+
+NSWP 1.0 defines one flag:
+
+```text
+0x01  TRACE_SAMPLED
+```
+
+All other bits are reserved and must be zero. `TRACE_SAMPLED` is a diagnostic hint that
+requests detailed timing retention; it grants no authority, permits no payload logging,
+and does not override NSIDL privacy classifications. When set, `trace_id` must not be all
+zero. A nonzero `trace_id` may be present without `TRACE_SAMPLED`.
+
+## Reserved fields
+
+For NSWP 1.0, `reserved0` and `reserved1` are zero. A receiver rejects nonzero reserved
+fields, and senders must not use them for private extensions.
+
+## Service-protocol version fields
+
+After successful negotiation, every ordinary packet carries the exact selected service
+version in `protocol_major` and `protocol_minor`; the receiver requires an exact match with
+immutable connection state. `NegotiateRequest` and `NegotiateResponse` use `0.0` because
+the requested protocol family and major version are in the negotiation body. A
+pre-negotiation `ProtocolError` also uses `0.0`; a post-negotiation `ProtocolError` uses the
+selected version.
 
 ## Body length
 
-`body_bytes`:
+`body_bytes` is the exact number of bytes following the complete header:
 
-- excludes the 80-byte header;
-- is a multiple of eight;
-- exactly equals the remaining bytes in the transport message;
-- does not include attached handles.
+```text
+total transport bytes = 64 + body_bytes
+```
 
-Trailing bytes are not permitted.
+It is a multiple of eight, the body begins at transport-message offset 64, and no trailing
+bytes follow the declared body. Attached handles are not included in `body_bytes`. The
+body continues to use the canonical NSWP self-relative arena encoding specified below and
+must not exceed the negotiated connection limit.
 
 ## Attached handles
 
-`handle_count` exactly equals the number of handles attached by the transport. A mismatch
-is a protocol error and causes every received attachment to be closed.
+`handle_count` exactly equals the number of handles attached by the transport, including
+every nested handle domain represented in the body. A mismatch is fatal to the connection
+and causes every received attachment to be closed. Negotiation, cancellation,
+protocol-error, and non-`Ok` response packets carry zero handles.
 
 ## Deadlines
 
-`deadline_ns` is an absolute monotonic timestamp in nanoseconds.
+`deadline_ns` is an absolute timestamp from the NullStar monotonic clock, measured in
+nanoseconds.
 
 ```text
 0xffffffffffffffff = no deadline
+0x0000000000000000 = already expired
 ```
 
-Zero represents an already expired deadline.
+The value is meaningful only within the current boot's monotonic clock domain. It is never
+persisted or interpreted as wall-clock time.
 
-The monotonic clock epoch is local to the current boot. Deadline values are never stored
-as durable wall-clock timestamps.
+## Trace identifier
 
-## Trace context
+`trace_id` is an opaque 128-bit correlation identifier:
 
-`trace_context` is an opaque 128-bit correlation value.
+```text
+all zero = no trace correlation
+nonzero  = active trace correlation
+```
 
-All zero means no trace context. A response echoes the request context. Nested service
-calls may derive a new child context using the runtime tracing API.
+It is not a UUID and has no UUID version or variant bits. A client creates or inherits a
+request trace identifier; the response and cancellation packet echo it exactly. A server
+event may use a server-generated trace identifier, and nested RPCs normally retain the
+same identifier. Local span identifiers belong to tracing metadata rather than the packet
+header.
 
-Trace context grants no authority and must not contain secrets.
+The trace identifier grants no authority and must not influence authentication,
+authorization, routing, or retry behavior.
 
 ## Packet kinds
 
@@ -1086,57 +1201,123 @@ Renegotiation on the same connection is prohibited.
 
 ## Negotiation request
 
-The client sends:
+The fixed request root is exactly 48 bytes:
+
+```text
+Offset  Size  Field
+------  ----  ------------------
+0x00      16  protocol_id
+0x10       2  protocol_major
+0x12       2  min_minor
+0x14       2  max_minor
+0x16       2  flags
+0x18       4  max_body_bytes
+0x1c       2  max_handles
+0x1e       2  max_outstanding
+0x20      16  features
+-------------------------------
+Total      48 bytes
+```
+
+Conceptually:
 
 ```rust
-#[repr(C)]
 struct NswNegotiateRequestV1 {
+    protocol_id: [u8; 16],
+
+    protocol_major: u16,
     min_minor: u16,
     max_minor: u16,
-    max_handles: u16,
-    max_outstanding: u16,
+    flags: u16,
 
     max_body_bytes: u32,
-    reserved0: u32,
+    max_handles: u16,
+    max_outstanding: u16,
 
     features: NswSliceRefV1,
 }
 ```
 
-The encoded size is 32 bytes.
+The `protocol_id` uses RFC UUID byte order. Requirements are:
 
-The header carries the requested protocol family and major version. The request record
-contains the client's acceptable minor range, limits, and requested feature records.
+```text
+protocol_major != 0
+min_minor <= max_minor
+flags = 0
+max_body_bytes > 0
+max_handles <= transport attachment limit
+max_outstanding > 0
+```
+
+Feature records follow through the unchanged canonical body arena. Negotiation packets
+never carry handles.
 
 ## Negotiation response
 
-The server returns:
+The fixed response root is exactly 64 bytes:
+
+```text
+Offset  Size  Field
+------  ----  ------------------
+0x00      16  protocol_id
+0x10       4  status
+0x14       2  protocol_major
+0x16       2  selected_minor
+0x18       2  server_min_minor
+0x1a       2  server_max_minor
+0x1c       4  max_body_bytes
+0x20       2  max_handles
+0x22       2  max_outstanding
+0x24       4  reserved0
+0x28      16  features
+0x38       8  service_generation
+-------------------------------
+Total      64 bytes
+```
+
+Conceptually:
 
 ```rust
-#[repr(C)]
 struct NswNegotiateResponseV1 {
+    protocol_id: [u8; 16],
     status: u32,
 
+    protocol_major: u16,
     selected_minor: u16,
-    max_handles: u16,
-
-    max_outstanding: u16,
-    reserved0: u16,
+    server_min_minor: u16,
+    server_max_minor: u16,
 
     max_body_bytes: u32,
+    max_handles: u16,
+    max_outstanding: u16,
+    reserved0: u32,
 
     features: NswSliceRefV1,
-
     service_generation: u64,
-    reserved1: u64,
 }
 ```
 
-The encoded size is 48 bytes.
+`reserved0` is always zero. Every response, including failure, exactly echoes the
+request's `protocol_id` and `protocol_major`. On success, `selected_minor` lies within both
+supported ranges, returned limits are the negotiated minima, returned feature records are
+sorted and enabled, and `service_generation` is nonzero. The generation identifies the current disposable
+provider incarnation for tracing, failure attribution, and reconnect decisions; it grants
+no authority and is not a process ID.
 
-`service_generation` identifies the current disposable provider incarnation for tracing,
-failure attribution, and reconnect decisions. It does not grant authority and is not a
-process ID.
+On failure:
+
+```text
+selected_minor = 0
+max_body_bytes = 0
+max_handles = 0
+max_outstanding = 0
+features = empty
+service_generation = 0
+```
+
+The server minor range may be returned for failures concerning a recognized protocol key.
+`UnsupportedProtocol` and `UnsupportedMajor` return a zero server-minor range so the
+response never associates another protocol key or major version with unrelated minors.
 
 ## Feature records
 
@@ -1161,29 +1342,45 @@ Feature records are sorted by ascending feature ID and contain no duplicates.
 
 ## Negotiation statuses
 
+The exact response statuses are:
+
 ```text
 0 = Ok
-1 = UnsupportedMajor
-2 = NoCommonMinor
-3 = RequiredFeatureUnavailable
-4 = TransportBoundsTooSmall
-5 = PolicyDenied
-6 = Busy
-7 = Internal
+1 = UnsupportedProtocol
+2 = UnsupportedMajor
+3 = NoCommonMinor
+4 = RequiredFeatureUnavailable
+5 = TransportBoundsTooSmall
+6 = PolicyDenied
+7 = Busy
+8 = Internal
 ```
 
-On negotiation failure, the server sends the response and closes the connection.
+`UnsupportedProtocol` means the provider does not implement the requested UUID.
+`UnsupportedMajor` means it recognizes the protocol family but not the requested major
+version. On negotiation failure, the server sends the response and closes the connection.
 
 ## Version and feature selection
 
-The server selects the highest minor version satisfying:
+The server advertises a contiguous supported minor-version range and selects the highest
+minor version satisfying:
 
 ```text
 client minimum <= selected <= client maximum
 server minimum <= selected <= server maximum
-selected version fits negotiated body and handle bounds
-all required features are available and policy-permitted
+selected version's baseline types fit negotiated body and handle bounds
+all required features are available and policy-permitted at the selected minor
+all required features' types fit negotiated body and handle bounds
 ```
+
+Each feature declaration carries its introduction minor. Generated protocol metadata must
+also evaluate the complete selected feature set at a candidate minor against the negotiated
+body and handle bounds; checking features independently is insufficient because combinations
+can enlarge the same message. Optional features are considered in ascending feature-ID order
+and admitted only while the complete set remains valid. A required feature that is unavailable
+prevents selecting that minor; a required feature set whose types exceed the negotiated bounds
+produces `TransportBoundsTooSmall` when no lower compatible minor succeeds. Clients run the
+same complete-set validation over returned features before binding the connection.
 
 The final connection limits are the minimum of:
 
@@ -1194,7 +1391,9 @@ transport limit
 protocol-declared limit
 ```
 
-Every later packet uses the selected minor version exactly.
+The chosen protocol family, version, features, limits, and service generation are
+immutable for the life of the connection. Every later packet uses the selected major and
+minor version exactly, and renegotiation on the same channel is prohibited.
 
 ## Body arena
 
@@ -1535,7 +1734,7 @@ A response:
 - echoes the request transaction identifier;
 - echoes the method ordinal;
 - uses the selected protocol minor;
-- echoes the request trace context;
+- echoes the request trace identifier;
 - contains either a successful response body or a nonzero transport status.
 
 A duplicate response is a protocol error.
@@ -2116,7 +2315,7 @@ impl FilePortalServer for PortalService {
 transaction identity
 absolute deadline
 cancellation token
-trace context
+trace identifier
 selected protocol version
 enabled feature set
 trusted connection identity
@@ -2190,8 +2389,8 @@ The normal NSWP 1 desktop profile should support at least:
 
 ```text
 Maximum total packet bytes:     65,536
-Header bytes:                        80
-Maximum body bytes:              65,456
+Header bytes:                        64
+Maximum body bytes:              65,472
 Maximum attached handles:            64
 Maximum nesting depth:                32
 Maximum table fields:              1,024
@@ -2203,13 +2402,14 @@ A protocol may declare lower limits.
 
 Large media, graphics, storage, and network payloads use shared memory.
 
-## Early endpoint profile
+## Current endpoint prototype profile
 
 The current bounded endpoint implementation can prototype a reduced NSWP profile:
 
 ```text
 Maximum total packet bytes:        256
-Maximum body bytes:                176
+Header bytes:                       64
+Maximum body bytes:                192
 Maximum attached handles:            1
 Maximum outstanding calls:           8
 ```
@@ -2240,7 +2440,7 @@ header magic and size
 wire version
 reserved fields
 packet kind and direction
-protocol family and selected version
+protocol family in negotiation and selected version against connection state
 ordinal availability
 body and attachment counts
 transaction state
@@ -2423,8 +2623,7 @@ Do not declare stable 1.0 until:
 
 ## Open questions
 
-- Whether the final fixed header remains 80 bytes after pilot measurements.
-- Whether protocol family identifiers remain UUID-form 128-bit values.
+
 - Whether the first stable body format keeps 32-bit relative offsets.
 - Whether strict canonical decoding should be mandatory for all system protocols or
   selectable for explicitly internal high-performance connections.

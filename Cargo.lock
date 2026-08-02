@@ -393,6 +393,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a27daf9557165efe1d09b52f97393bf6283cadb0a76fbe64a1061e15553a994a"
 
 [[package]]
+name = "nswp-core"
+version = "0.1.0"
+
+[[package]]
 name = "nullfs-blockdev"
 version = "0.1.0"
 
