@@ -52,6 +52,8 @@ const NORMAL_BOOT_VFS_READINESS_MARKER: &str = "userspace init: vfs readiness pa
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
 const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-test";
+const LOGGING_COLLECTOR_RESTART_PASSED_MARKER: &str =
+    "userspace init: logging collector ring, backpressure, redaction, and restart verified";
 const NULLFS_RESTART_PASSED_MARKER: &str =
     "userspace init: NullFS restart persistent VFS mutation and stale descriptors verified";
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -301,6 +303,7 @@ fn run_nullfs_restart_check(options: &Options) -> ExitCode {
 fn run_nullfs_restart_test(options: &Options) -> bool {
     let image = Path::new(env!("NULLFS_RESTART_TEST_BIOS_IMAGE"));
     let mut mode_selected = false;
+    let mut logging_collector_verified = false;
     let mut restart_verified = false;
     run_qemu_until(
         qemu_command_for_image(options, image),
@@ -308,8 +311,9 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
         NULLFS_RESTART_TEST_TIMEOUT,
         move |line| {
             mode_selected |= line.contains(NULLFS_RESTART_MODE_MARKER);
+            logging_collector_verified |= line.contains(LOGGING_COLLECTOR_RESTART_PASSED_MARKER);
             restart_verified |= line.contains(NULLFS_RESTART_PASSED_MARKER);
-            mode_selected && restart_verified
+            mode_selected && logging_collector_verified && restart_verified
         },
     )
 }

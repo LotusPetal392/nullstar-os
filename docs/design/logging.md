@@ -117,16 +117,25 @@ uses protocol family ID `7db79cd9-c685-400f-b9f1-55d89b8e8a8a`, major version 2,
 client-to-server one-way `Emit` method. Major 2 reflects the fixed-layout change from the original
 host pilot.
 
-Each record carries a required UUIDv4 `EventId` in RFC byte order. An `EventId` identifies an
-event type: an event definition commits to one stable constant and all occurrences reuse it. It is
-not generated per record, is distinct from the NSWP transport `trace_id`, and is not the future
-collector-assigned `RecordId` used to identify one retained occurrence.
+Each submitted record carries a required UUIDv4 `EventId` in RFC byte order. An `EventId`
+identifies an event type: an event definition commits to one stable constant and all occurrences
+reuse it. It is not generated per record and is distinct from the NSWP transport `trace_id`.
+The collector assigns a monotonic nonzero `RecordId` to each retained occurrence. Record IDs are
+never producer-supplied or reused and are scoped by the negotiated collector service generation.
 
-The 192-byte endpoint profile requires a compact record. The contract uses an 80-byte fixed root
-containing severity, privacy class, monotonic time, the 16-byte event ID, `string<16>` subsystem,
+The 192-byte endpoint profile requires compact bodies. `Emit` uses an 80-byte fixed root containing
+severity, privacy class, monotonic time, the 16-byte event ID, `string<16>` subsystem,
 `string<64>` message, and an extension table. Minor 1 adds an optional wall-clock timestamp.
 Maximum records encode to exactly 160 bytes at minor 0 and 192 bytes at minor 1; including the
 NSWP header, the latter is exactly one 256-byte endpoint packet.
+
+Minor 2 adds request/reply `GetCollectorStats` and `ReadHistory` methods. Statistics use a fixed
+64-byte response containing received, retained, capacity, eviction, collector-drop, and redaction
+counts plus oldest and newest record IDs. History reads are live, one-record-at-a-time queries using
+a caller-supplied `after RecordId` cursor. A present history response carries the record ID,
+kernel-stamped source PID, event and trace IDs, severity, privacy, timestamps, and packed text in at
+most 192 bytes. An all-zero optional envelope represents the ordinary end of currently retained
+history.
 
 Producer principal, service identity, and producer service generation are not accepted from the
 record body. The host collector models the intended production rule: the launch or service
@@ -141,10 +150,13 @@ The producer API exposes two queue-pressure policies:
   journal commit, or durable storage.
 - `BestEffort` drops on queue pressure and increments an observable dropped-record count.
 
-The host collector fixture retains the event-type ID, has a fixed maximum record count, and
-redacts `secret-never-persist` messages before retention. Authorization-aware reads, redaction
-for other privacy classes, rate limiting, suppression summaries, persistence, and journal
-rotation remain work for the production logging service.
+The production crate provides an allocation-free fixed collector. The native service currently
+keeps 64 records, overwrites the oldest record when full, and saturates its counters. It redacts
+`secret-never-persist` before copying message bytes into retained storage. Producer-side
+best-effort drops and collector-side drops are separate counters because the collector never sees
+a record rejected at the producer mailbox. Authorization-aware general reads, redaction for other
+privacy classes, rate limiting, suppression summaries, persistence, and journal rotation remain
+future work.
 
 ### Native endpoint pilot
 
@@ -155,15 +167,26 @@ only `SEND` on the outgoing mailbox and `RECEIVE` on the incoming mailbox to eac
 allocation-free userspace transport requires distinct objects, rejects transferred capabilities,
 and pins the sender process ID observed on the first packet.
 
-The probe negotiates the production contract and sends a maximum-size minor-1 record: a 192-byte
-body plus the 64-byte NSWP header, exactly filling one 256-byte endpoint message. PID 1 reports
-success only after the service has dispatched and decoded that record, not merely after the client
-enqueues it.
+The normal probe negotiates minor 2, sends a maximum-size record whose 192-byte body exactly fills
+one 256-byte endpoint message, submits a secret record, and verifies collector statistics and
+history through actual request/reply packets. PID 1 reports success only after those queries prove
+that the service retained both records, attributed them to the kernel-stamped producer PID, and
+redacted the secret.
 
-This remains a transport pilot rather than the production collector. Current endpoint objects do
-not report peer closure, queued messages are not tied to a service generation, and the adapter
-cannot derive a durable principal or service identity from the mailbox. The pilot has one delegated
-producer connection, mirrors accepted records to standard output, and retains no history.
+The NullFS restart diagnostic also stops the collector, fills the actual eight-message request
+mailbox, verifies reliable backpressure and one best-effort producer drop, resumes the service, and
+submits 65 records. It checks the 64-record ring wrap, oldest/newest IDs, redaction, and counters,
+then replaces the service on empty mailboxes. A fresh negotiated connection verifies that the new
+collector generation starts with empty volatile history and record ID 1. The kernel nonblocking
+child-wait path treats a signaled-but-not-yet-reaped direct child as pending so this supervised
+restart cannot transiently misreport `NO_CHILD`.
+
+This remains a single delegated connection rather than a general logging broker. Current endpoint
+objects do not report peer closure, queued messages are not tied to a service generation, and the
+adapter cannot derive a durable principal or service identity from the mailbox. PID 1 explicitly
+grants the boot probe both submission and collector-read authority; ordinary future producers must
+not automatically receive history-read authority. Records at `trace` and `debug` remain retained
+but are not mirrored to the console.
 
 ## Early boot and panic records
 

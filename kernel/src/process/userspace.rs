@@ -6250,9 +6250,7 @@ fn syscall_try_wait_child(process_id: u64, child_process_id: u64) -> u64 {
         .as_ref()
         .map(child_status);
     let active_child_index = manager.processes.iter().position(|child| {
-        child.process_id == child_process_id
-            && child.parent_process_id == Some(process_id)
-            && child.is_live()
+        child.process_id == child_process_id && child.parent_process_id == Some(process_id)
     });
     if completed_status.is_none() && active_child_index.is_none() {
         return error_return(ERR_NO_CHILD);

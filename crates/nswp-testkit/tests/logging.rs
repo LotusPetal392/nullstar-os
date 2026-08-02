@@ -5,10 +5,14 @@ use nswp_core::{
     MinorVersionProfile, NSWP_HEADER_BYTES, PacketKind, offset,
 };
 use nswp_logging::{
-    EventId, LOGGING_EMIT_ORDINAL, LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES,
-    LOGGING_PROTOCOL_ID, LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_WALL_TIME,
-    LogDelivery, LogDisposition, LogRecord, LogSeverity, LoggingProducer, PrivacyClass,
-    decode_log_record, encode_log_record, logging_protocol, logging_protocol_through,
+    CollectorRequest, CollectorStats, EventId, HistoryReadRequest, LOGGING_EMIT_ORDINAL,
+    LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_ID,
+    LOGGING_PROTOCOL_MINOR_BASE, LOGGING_PROTOCOL_MINOR_COLLECTOR_READS,
+    LOGGING_PROTOCOL_MINOR_WALL_TIME, LogDelivery, LogDisposition, LogRecord, LogSeverity,
+    LoggingProducer, PrivacyClass, decode_collector_request,
+    decode_collector_stats_client_response, decode_history_read_client_response, decode_log_record,
+    encode_log_record, logging_protocol, logging_protocol_through, respond_collector_stats,
+    respond_history,
 };
 use nswp_runtime::{
     Client, ClientEvent, CloseReason, ConnectionPhase, DeadlinePolicy, MethodDescriptor,
@@ -576,4 +580,138 @@ fn producer_reports_peer_closure_without_counting_a_drop() {
     );
     assert_eq!(producer.dropped_records(), 0);
     assert_eq!(producer.client().phase(), ConnectionPhase::Closed);
+}
+
+#[test]
+fn minor_two_negotiates_typed_stats_and_history_requests() {
+    let (mut producer, mut server, _, _) =
+        connected::<4>(LOGGING_PROTOCOL_MINOR_COLLECTOR_READS, 51);
+    assert_eq!(
+        producer.client().bound().unwrap().minor(),
+        LOGGING_PROTOCOL_MINOR_COLLECTOR_READS
+    );
+    assert_eq!(
+        server.bound().unwrap().minor(),
+        LOGGING_PROTOCOL_MINOR_COLLECTOR_READS
+    );
+
+    assert_eq!(
+        producer.try_get_collector_stats(0, u64::MAX, [0; 16]),
+        Err(RuntimeError::InvalidDeadline)
+    );
+    assert_eq!(
+        producer.try_read_history(None, 0, u64::MAX, [0; 16]),
+        Err(RuntimeError::InvalidDeadline)
+    );
+
+    let stats_transaction = producer
+        .try_get_collector_stats(0, 100, [0x11; 16])
+        .unwrap();
+    let (stats_token, stats_body) = match server.poll(0).unwrap().unwrap() {
+        ServerEvent::Request { token, body } => (token, body),
+        event => panic!("unexpected event: {event:?}"),
+    };
+    let server_bound = server.bound().unwrap().view().unwrap();
+    assert_eq!(
+        decode_collector_request(stats_token, stats_body.as_slice(), &server_bound).unwrap(),
+        CollectorRequest::GetCollectorStats
+    );
+    let stats = CollectorStats {
+        received_records: 0,
+        retained_records: 0,
+        capacity_records: 8,
+        evicted_records: 0,
+        dropped_records: 0,
+        redacted_records: 0,
+        oldest_record_id: None,
+        newest_record_id: None,
+    };
+    respond_collector_stats(&mut server, stats_token, stats).unwrap();
+    let stats_event = producer.poll().unwrap().unwrap();
+    let producer_bound = producer.client().bound().unwrap().view().unwrap();
+    assert_eq!(
+        decode_collector_stats_client_response(&stats_event, stats_transaction, &producer_bound,)
+            .unwrap(),
+        stats
+    );
+
+    let history_transaction = producer.try_read_history(None, 0, 100, [0x22; 16]).unwrap();
+    let (history_token, history_body) = match server.poll(0).unwrap().unwrap() {
+        ServerEvent::Request { token, body } => (token, body),
+        event => panic!("unexpected event: {event:?}"),
+    };
+    let server_bound = server.bound().unwrap().view().unwrap();
+    assert_eq!(
+        decode_collector_request(history_token, history_body.as_slice(), &server_bound).unwrap(),
+        CollectorRequest::ReadHistory(HistoryReadRequest {
+            after_record_id: None,
+        })
+    );
+    respond_history(&mut server, history_token, None).unwrap();
+    let history_event = producer.poll().unwrap().unwrap();
+    let producer_bound = producer.client().bound().unwrap().view().unwrap();
+    assert_eq!(
+        decode_history_read_client_response(&history_event, history_transaction, &producer_bound,)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn reads_are_rejected_after_negotiating_below_minor_two() {
+    let (mut producer, _server, _, _) = connected::<2>(LOGGING_PROTOCOL_MINOR_WALL_TIME, 52);
+    assert_eq!(
+        producer.try_get_collector_stats(0, 100, [0; 16]),
+        Err(RuntimeError::Body(BodyError::FieldUnavailable))
+    );
+    assert_eq!(
+        producer.try_read_history(None, 0, 100, [0; 16]),
+        Err(RuntimeError::Body(BodyError::FieldUnavailable))
+    );
+}
+
+#[test]
+fn queue_depth_eight_rejects_the_ninth_record_without_partial_enqueue() {
+    let (mut producer, mut server, _, collector_control) =
+        connected::<8>(LOGGING_PROTOCOL_MINOR_COLLECTOR_READS, 53);
+    for index in 0..8 {
+        let message = match index {
+            0 => "zero",
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            5 => "five",
+            6 => "six",
+            _ => "seven",
+        };
+        assert_eq!(
+            producer
+                .try_log(record("queue", message), LogDelivery::Reliable, [0; 16])
+                .unwrap(),
+            LogDisposition::Queued
+        );
+    }
+    assert_eq!(collector_control.queued_incoming(), 8);
+    assert_eq!(
+        producer.try_log(record("queue", "ninth"), LogDelivery::Reliable, [0; 16]),
+        Err(RuntimeError::WouldBlock)
+    );
+    assert_eq!(collector_control.queued_incoming(), 8);
+    assert_eq!(producer.dropped_records(), 0);
+    assert_eq!(
+        producer
+            .try_log(record("queue", "ninth"), LogDelivery::BestEffort, [0; 16],)
+            .unwrap(),
+        LogDisposition::Dropped
+    );
+    assert_eq!(producer.dropped_records(), 1);
+    assert_eq!(collector_control.queued_incoming(), 8);
+
+    for _ in 0..8 {
+        assert!(matches!(
+            server.poll(0).unwrap(),
+            Some(ServerEvent::OneWay { .. })
+        ));
+    }
 }
