@@ -55,8 +55,7 @@ const NORMAL_BOOT_VFS_READINESS_MARKER: &str = "userspace init: vfs readiness pa
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
 const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-test";
-const LOGGING_COLLECTOR_RESTART_PASSED_MARKER: &str =
-    "userspace init: logging collector ring, backpressure, redaction, and restart verified";
+const LOGGING_COLLECTOR_RESTART_PASSED_MARKER: &str = "userspace init: logging collector ring, backpressure, redaction, and route generation isolation verified";
 const NULLFS_RESTART_PASSED_MARKER: &str =
     "userspace init: NullFS restart persistent VFS mutation and stale descriptors verified";
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);

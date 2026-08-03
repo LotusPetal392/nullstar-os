@@ -16,8 +16,9 @@ service-definition locations are described in
 [Service management and command-line direction](service-management-and-cli.md).
 
 It describes future architecture. The implemented system still uses a hard-coded PID 1
-that directly launches the current services and shell; see
-[NullStar OS architecture](../architecture.md).
+that directly launches the current services and shell. PID 1 also acts as the temporary broker for
+the first generic logging routes; see [NullStar OS architecture](../architecture.md) and the
+[current service route protocol](../service-route-protocol.md).
 
 ## Design goals
 
@@ -170,6 +171,13 @@ stable service identity
 Logs, crash records, resource usage, and client failures should include both stable
 identity and generation so a replacement is never confused with its predecessor.
 
+The implemented route substrate represents a stable identity as a UUIDv4 `ServiceId` plus a
+nonzero role ID. A role matters because one service can expose independently authorized authorities;
+the logging producer and observer are separate routes under one service ID. The current PID 1 pilot
+uses the provider process PID as its nonzero generation. That is a temporary integration shortcut,
+not the intended durable generation source: the service manager must eventually own generation
+allocation independently of process IDs.
+
 ## Service definitions
 
 A declarative service definition should eventually include:
@@ -290,6 +298,18 @@ Requests may queue within strict limits while the service starts. This provides
 race-free demand activation and avoids requiring the provider to bind a privileged
 global name.
 
+The implemented `NSRT` stepping stone is userspace-managed and allocation-free. A stable exact-`SEND`
+route grant reaches a broker ingress bound to one service-and-role key. The client transfers exactly
+one fresh reply capability with its 40-byte request; an accepted reply transfers exactly one
+send-only capability for the current provider ingress. The broker authorizes before checking
+availability and never parses the service protocol carried on the returned endpoint.
+
+A provider replacement publishes fresh ingress endpoint objects for the new generation. This keeps
+old clients isolated from the replacement without pretending to revoke every old delegated handle:
+the current kernel has no global capability-revocation primitive. Old ingress handles can remain
+live until their holders close them, and the current 32-object endpoint limit makes prompt cleanup
+and bounded activation important.
+
 Activation state belongs to the manager or broker, not the disposable service process.
 It may preserve:
 
@@ -350,9 +370,11 @@ CANCELED
 ```
 
 The userspace runtime may automatically reconnect only for protocols that explicitly
-permit it. Automatic reconnection is reasonable for settings notifications, clipboard,
-logging, or other restart-safe services. It is unsafe by default for file mutations,
-package installation, firmware update, authentication, and other non-repeatable work.
+permit it. Reconnection is reasonable for settings notifications, clipboard, logging, or other
+restart-safe services, but reconnection does not imply replay. In particular, an uncertain one-way
+logging `Emit` is not replayed on a new generation because the current protocol cannot prove whether
+the old provider processed it. Automatic replay is unsafe by default for file mutations, package
+installation, firmware update, authentication, and other non-repeatable work.
 
 Protocol definitions should mark requests as idempotent, retry-safe, or non-repeatable
 and define the fate of in-flight operations across a provider generation change.

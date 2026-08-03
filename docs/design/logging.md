@@ -154,9 +154,14 @@ collector's generation and must not be mistaken for the producer generation.
 
 The producer API exposes two queue-pressure policies:
 
-- `Reliable` reports backpressure so the caller can retry; it does not imply processing,
-  journal commit, or durable storage.
+- `Reliable` reports backpressure so the caller can retry when the endpoint did not accept the
+  packet; it does not imply processing, journal commit, durable storage, or safe replay after an
+  uncertain send.
 - `BestEffort` drops on queue pressure and increments an observable dropped-record count.
+
+`Emit` remains one-way. If a packet was accepted but provider failure makes processing uncertain,
+the producer does not replay it on a replacement generation: replay could duplicate a retained
+record, and the current protocol has no acknowledgement that distinguishes that case from loss.
 
 The production crate provides an allocation-free fixed collector. The native service currently
 keeps 64 records, overwrites the oldest record when full, and saturates its counters. It redacts
@@ -166,51 +171,75 @@ a record rejected at the producer mailbox. Authorization-aware general reads, re
 privacy classes, rate limiting, suppression summaries, persistence, and journal rotation remain
 future work.
 
-### Native endpoint sessions
+### Native service routes and endpoint sessions
 
-The native implementation runs `/logging-service` over two shared ingress endpoints. Possession of
-the producer ingress is `Emit` authority; possession of the observer ingress is collector-statistics
-and history-read authority. The role is not caller-supplied on the wire, and the service enforces the
-method set again after NSWP validation. A producer request for history receives `AccessDenied`; an
-observer that sends a one-way record loses only its own session.
+The logging service has stable service ID `7cbd3f65-50a6-4c30-b195-9fbed633da43`, distinct from its
+NSWP protocol family ID. Role `1` is producer authority and role `2` is observer authority. They are
+separate stable routes: possession of a resolved producer ingress is `Emit` authority, while a
+resolved observer ingress is collector-statistics and history-read authority. The role is not
+caller-supplied in NSWP, and the service enforces the method set again after validation. A producer
+request for history receives `AccessDenied`; an observer that sends a one-way record loses only its
+own session.
 
-A fixed 16-byte `NSLS` bootstrap record establishes each connection before ordinary NSWP
-negotiation. The client transfers exact `SEND` authority for a fresh private reply endpoint while
-retaining exact `RECEIVE`. The service binds the resulting session to the role endpoint, the
-kernel-stamped nonzero sender PID, and its current generation. Each session owns independent NSWP
-negotiation and transaction state, so transaction identifiers and responses cannot cross clients.
-The allocation-free service admits at most four total sessions and at most three of either role.
-Explicit disconnect releases a slot; malformed packets or failed private replies remove only the
-offending session.
+PID 1 temporarily brokers both routes using the allocation-free
+[service route protocol](../service-route-protocol.md). Each route grant is bound to exactly one
+service-and-role key. A client sends one exact 40-byte `NSRT` v1 request with one fresh exact-`SEND`
+reply capability; acceptance returns one exact-`SEND` capability for the current role ingress and
+the nonzero provider generation. Failure replies carry no capability. The broker authorizes the
+kernel-stamped sender PID before looking up availability. It never parses NSWP negotiation or log
+packets and is not on the logging data path after resolution.
 
-The normal probe negotiates separate producer and observer sessions at minor 3. It verifies four
-imported kernel records with ordered kernel sequences, proves that a non-PID-1 process cannot open
-kernel early-log authority, and confirms that producer authority cannot query collector history. It
-then sends a maximum-size process record whose 192-byte body exactly fills one 256-byte endpoint
-message, submits a secret record, and verifies collector statistics, process attribution, and
-redaction through the observer session. Because the role ingresses are independent connections,
+Each `/logging-service` generation receives fresh producer and observer ingress endpoint objects.
+PID 1 retains separate stable publication sources for the two roles, and clients resolve each role
+independently. Within one generation, each role ingress remains shared by its resolved clients, so a
+noisy producer can still impose queue pressure on other producers. Replacement publishes the fresh
+objects rather than rebinding old ingress handles. The current pilot uses the service process PID as
+the route generation; this is not a durable service-generation authority and must eventually be
+replaced by a service-manager-owned counter.
+
+Fresh ingress objects isolate generations but do not provide global revocation. Future resolutions
+select only the replacement, and packets sent through an old ingress cannot reach it. Existing
+exact-`SEND` handles to the old object cannot all be invalidated, however, because the current kernel
+has no general capability-revocation primitive. Old handles and queued transfers can also retain
+endpoint objects, which matters under the current system-wide limit of 32 live endpoint objects.
+Clients close stale routes and resolve again after replacement.
+
+After resolution, a fixed 16-byte `NSLS` bootstrap record establishes each direct service connection
+before ordinary NSWP negotiation. The client transfers exact `SEND` authority for a fresh private
+reply endpoint while retaining exact `RECEIVE`. The service binds the resulting session to the role
+ingress, kernel-stamped nonzero sender PID, and current generation. Each session owns independent
+NSWP negotiation and transaction state, so transaction identifiers and responses cannot cross
+clients. The allocation-free service admits at most four total sessions and at most three of either
+role. Explicit disconnect releases a slot; malformed packets or failed private replies remove only
+the offending session. Current endpoints lack peer-close notification, so a client that crashes
+without sending `NSLS` disconnect can occupy a bounded slot until service replacement.
+
+The normal probe resolves and negotiates separate producer and observer sessions at minor 3. It
+verifies four imported kernel records with ordered kernel sequences, proves that a non-PID-1 process
+cannot open kernel early-log authority, and confirms that producer authority cannot query collector
+history. It then sends a maximum-size process record whose 192-byte body exactly fills one 256-byte
+endpoint message, submits a secret record, and verifies collector statistics, process attribution,
+and redaction through the observer session. Because the role ingresses are independent connections,
 the probe waits for the expected collector high-water count rather than assuming an observer query
 is ordered after a preceding one-way producer send.
 
-The NullFS restart diagnostic stops the collector, fills the actual eight-message producer ingress,
+The NullFS restart diagnostic stops the collector, fills the current eight-message producer ingress,
 verifies reliable backpressure and one best-effort producer drop, resumes the service, and submits 65
 records. It checks the 64-record ring wrap, oldest/newest IDs, redaction, and counters, then replaces
 the service after the clients disconnect. PID 1 delegates the same read-only early-log reader to the
-replacement, which reimports the kernel snapshot before readiness. Fresh producer and observer
-sessions verify the same boot-scoped kernel sequences at collector record IDs 1 through 4 before
-accepting a new process record.
+replacement, which reimports the kernel snapshot before readiness, and publishes fresh producer and
+observer ingress objects. Freshly resolved sessions verify the same boot-scoped kernel sequences at
+collector record IDs 1 through 4 before accepting a new process record. Neither PID 1 nor the route
+layer replays an uncertain one-way `Emit` across this boundary.
 
-PID 1 temporarily delegates both role routes to the boot probe. The trusted root recovery shell
-receives `SEND | DUPLICATE` observer authority and implements `logctl show` as a builtin over a
-locally duplicated exact-`SEND` client route; it has no `TRANSFER` right and unrelated shell children receive no logging
-capability. The standalone `/logctl` binary is used only when an authorized launcher such as PID 1
-installs observer authority before execution. This avoids treating a mutable pathname as an
-executable-identity security boundary. The arrangement is still an interim restricted service route,
-not a general service broker or durable principal identity. Current endpoints lack peer-close
-notification, so a client that crashes without sending `NSLS` disconnect can occupy a bounded slot
-until service replacement. Shared role ingress also means one noisy producer can impose queue
-pressure on other producers. Records at `trace` and `debug` remain retained but are not mirrored to
-the console.
+PID 1 delegates only selected stable role grants to the boot probes. The trusted root recovery shell
+receives `SEND | DUPLICATE` observer-route authority and implements `logctl show` as a builtin over a
+locally duplicated exact-`SEND` route; it has no `TRANSFER` right, and unrelated shell children
+receive no logging capability. The standalone `/logctl` binary is used only when an authorized
+launcher such as PID 1 installs observer-route authority before execution. This avoids treating a
+mutable pathname as an executable-identity security boundary. The arrangement remains an interim
+PID 1 broker rather than the general service manager or a durable principal-identity system. Records
+at `trace` and `debug` remain retained but are not mirrored to the console.
 
 ## Early boot and panic records
 

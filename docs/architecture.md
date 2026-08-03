@@ -97,6 +97,30 @@ ownership, signals, and completion state. `exec` constructs and validates a repl
 image before committing it, and `fork` initially shares read-only pages before copying
 on write.
 
+### Userspace service routes
+
+The allocation-free [service route protocol](service-route-protocol.md) provides the first generic
+userspace-managed route layer. `NSRT` v1 uses exact 40-byte request and response records keyed by a
+UUIDv4 service ID and nonzero role. The current endpoint ABI permits at most one transferred
+capability per message, so a route request carries exactly one fresh send-only reply endpoint and an
+accepted response carries exactly one send-only provider ingress; failure responses carry none.
+
+PID 1 is the temporary broker for the logging service ID
+`7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable
+route authorities. The broker authorizes the kernel-stamped caller PID before consulting its
+fixed-capacity publication table. It does not parse the NSWP negotiation or logging packets that
+clients send directly to the resolved service ingress.
+
+Each logging-service generation uses fresh producer and observer ingress endpoint objects, and
+accepted routes report that publication's nonzero generation. The pilot currently uses the provider
+process PID as this value rather than an independently allocated service generation. Fresh objects
+prevent old clients from reaching the replacement, but they cannot revoke all handles to the old
+objects. Retained old-generation handles and per-resolution reply objects also consume the current
+global limit of 32 live endpoint objects, so route setup can fail under endpoint pressure.
+
+The broker never replays service traffic. In particular, a one-way logging `Emit` whose processing
+became uncertain during failure is not submitted again automatically to a replacement generation.
+
 ### Future service and session lifecycle
 
 The current init sequence and service launch policy are explicitly coded into PID 1. The
@@ -252,11 +276,11 @@ restarts it after exit.
 
 Bounds are explicit so exhaustion returns defined errors. Important current limits
 include 64 live process slots, 67 scheduler tasks, 128 retained completion records, 32
-kernel pipes, 16 descriptors per process, 16 arguments, 16 environment variables, eight
-pipeline stages, four background jobs, 32 tmpfs files, 64 KiB per tmpfs file, 256 KiB of
-total tmpfs data, four NullFS sessions, 64 NullFS open references per session, a 2 MiB
-NullFS-service heap, and a 4 KiB registered proxy buffer. Implementation constants remain
-authoritative.
+kernel pipes, 64 capabilities per process, 32 live endpoint objects system-wide, eight messages per
+endpoint, 16 descriptors per process, 16 arguments, 16 environment variables, eight pipeline stages,
+four background jobs, 32 tmpfs files, 64 KiB per tmpfs file, 256 KiB of total tmpfs data, four NullFS
+sessions, 64 NullFS open references per session, a 2 MiB NullFS-service heap, and a 4 KiB registered
+proxy buffer. Implementation constants remain authoritative.
 
 ## Verification model
 

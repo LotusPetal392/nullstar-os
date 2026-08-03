@@ -6,6 +6,7 @@
 //! server traffic and a fresh private endpoint for server-to-client traffic.
 
 use nswp_runtime::{MAX_PACKET_BYTES, PacketBuf, TryRecvError, TrySendError, TryTransport};
+use service_route::ProviderGeneration;
 
 use crate::ipc::{
     self, CapabilityHandle, CapabilityInfo, ObjectKind, ReceivedCapability, Rights, Transfer,
@@ -211,22 +212,41 @@ pub enum ClientConnectError {
     UnexpectedControlRecord,
     MalformedControl(ControlDecodeError),
     Rejected(ConnectStatus),
+    ServiceGenerationMismatch {
+        expected: ProviderGeneration,
+        actual: u64,
+    },
 }
 
 /// A nonblocking client-side session bootstrap.
 ///
-/// `new` takes ownership of `ingress_handle` only when it succeeds. The resulting bootstrap owns
-/// all of its handles and closes them on failure or drop.
+/// `new` and `new_for_generation` take ownership of `ingress_handle` only when they succeed. The
+/// resulting bootstrap owns all of its handles and closes them on failure or drop.
 pub struct ClientBootstrap {
     ingress_handle: CapabilityHandle,
     reply_source_handle: CapabilityHandle,
     receive_handle: CapabilityHandle,
+    expected_generation: Option<ProviderGeneration>,
     connect_sent: bool,
     closed: bool,
 }
 
 impl ClientBootstrap {
     pub fn new(ingress_handle: CapabilityHandle) -> Result<Self, ClientConnectError> {
+        Self::new_with_generation(ingress_handle, None)
+    }
+
+    pub fn new_for_generation(
+        ingress_handle: CapabilityHandle,
+        generation: ProviderGeneration,
+    ) -> Result<Self, ClientConnectError> {
+        Self::new_with_generation(ingress_handle, Some(generation))
+    }
+
+    fn new_with_generation(
+        ingress_handle: CapabilityHandle,
+        expected_generation: Option<ProviderGeneration>,
+    ) -> Result<Self, ClientConnectError> {
         let ingress_info = ipc::info(ingress_handle).map_err(ClientConnectError::Ipc)?;
         if !exact_endpoint(ingress_info, Rights::SEND) {
             return Err(ClientConnectError::InvalidIngress);
@@ -252,6 +272,7 @@ impl ClientBootstrap {
             ingress_handle,
             reply_source_handle,
             receive_handle,
+            expected_generation,
             connect_sent: false,
             closed: false,
         })
@@ -325,8 +346,7 @@ impl ClientBootstrap {
             self.close_local();
             return Err(ClientConnectError::Rejected(status));
         }
-
-        let transport = ClientTransport {
+        let mut transport = ClientTransport {
             ingress_handle: self.take_ingress(),
             receive_handle: self.take_receive(),
             service_process_id: message.sender_process_id,
@@ -335,6 +355,12 @@ impl ClientBootstrap {
             closed: false,
         };
         self.closed = true;
+        if let Err(error) =
+            validate_accepted_generation(self.expected_generation, service_generation)
+        {
+            transport.disconnect();
+            return Err(error);
+        }
         Ok(Some(transport))
     }
 
@@ -921,6 +947,18 @@ fn sender_is_pinned(expected: u64, actual: u64) -> bool {
     expected != 0 && actual == expected
 }
 
+fn validate_accepted_generation(
+    expected: Option<ProviderGeneration>,
+    actual: u64,
+) -> Result<(), ClientConnectError> {
+    match expected {
+        Some(expected) if expected.get() != actual => {
+            Err(ClientConnectError::ServiceGenerationMismatch { expected, actual })
+        }
+        None | Some(_) => Ok(()),
+    }
+}
+
 fn validate_disconnect(
     closed: bool,
     role: SessionRole,
@@ -1189,6 +1227,20 @@ mod tests {
         assert!(!sender_is_pinned(7, 0));
         assert!(sender_is_pinned(7, 7));
         assert!(!sender_is_pinned(7, 8));
+    }
+
+    #[test]
+    fn generation_pinned_bootstrap_rejects_a_different_accepted_generation() {
+        let expected = ProviderGeneration::new(7).unwrap();
+        assert_eq!(validate_accepted_generation(None, 8), Ok(()));
+        assert_eq!(validate_accepted_generation(Some(expected), 7), Ok(()));
+        assert_eq!(
+            validate_accepted_generation(Some(expected), 8),
+            Err(ClientConnectError::ServiceGenerationMismatch {
+                expected,
+                actual: 8,
+            })
+        );
     }
 
     #[test]

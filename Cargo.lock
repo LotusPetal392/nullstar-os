@@ -403,6 +403,7 @@ version = "0.1.0"
 dependencies = [
  "nswp-core",
  "nswp-runtime",
+ "service-route",
 ]
 
 [[package]]
@@ -751,6 +752,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-route"
+version = "0.1.0"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -893,6 +898,7 @@ dependencies = [
  "nswp-logging",
  "nswp-runtime",
  "nullfs-format",
+ "service-route",
 ]
 
 [[package]]

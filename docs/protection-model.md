@@ -22,6 +22,8 @@ filesystem responsibilities across userspace service boundaries:
   authority for `/Volumes/NullStar`;
 - PID 1 delegates endpoint authority, including a narrowly scoped writable raw NullFS
   block endpoint, to those services;
+- an allocation-free userspace service-route layer now separates stable logging producer and
+  observer route grants from generation-specific provider ingress authority;
 - provider generation, protocol session, request, and stale-handle checks protect
   replacement boundaries.
 
@@ -87,6 +89,45 @@ initial handle across `fork` and `exec`.
 
 This is intentionally not a general operation for opening another process. It cannot
 grant directly to siblings, unrelated processes, or arbitrary process identifiers.
+
+## Userspace service-route use
+
+The [service route protocol](service-route-protocol.md) builds generic discovery and issuance from
+ordinary endpoint capabilities without adding service names or application-protocol parsing to the
+kernel. Its `no_std` route table and codec are allocation-free. PID 1 currently supplies the broker
+policy and publication lifetime for the logging pilot; it is a temporary broker, not the final
+service manager.
+
+A stable route grant has exact `SEND` rights and is bound by the broker to one UUIDv4 service ID and
+nonzero role. Logging producer role `1` and observer role `2` under service ID
+`7cbd3f65-50a6-4c30-b195-9fbed633da43` are separate authorities. Knowing those identifiers grants
+nothing.
+
+`NSRT` v1 records are exactly 40 bytes. A request must transfer exactly one fresh empty reply
+endpoint with exact `SEND` rights. An accepted reply transfers exactly one current provider ingress
+with exact `SEND` rights; a failure transfers no capability. These cardinalities use the implemented
+endpoint limit of at most one transferred capability per message. The broker validates the granted
+key and kernel-stamped sender PID, authorizes before checking availability, and never parses NSWP or
+logging packets.
+
+Provider publication retains a stable `SEND | DUPLICATE | TRANSFER` source from which the broker
+issues reduced send-only handles. Each provider generation has fresh ingress endpoint objects. This
+prevents an old route from reaching the replacement, but it does not revoke all old handles: the
+kernel has no general revocation operation, and an endpoint object remains reachable while a handle
+or queued transfer refers to it. The current logging pilot also uses provider PID as generation,
+which conflates process and service-generation identity until a service manager owns an independent
+counter.
+
+The distinction has a resource cost. The kernel currently permits 32 live endpoint objects
+system-wide. Every in-progress route resolution creates a private reply endpoint, every provider
+generation creates fresh ingress objects, and retained old handles can delay object collection.
+Resolution or publication can therefore fail under endpoint pressure even if a route-table slot is
+available. Fixed route tables add a separate bound: withdrawn keys leave generation tombstones that
+continue to consume distinct-key capacity.
+
+The route broker never queues or replays application traffic. A one-way logging `Emit` is not
+replayed on a replacement when processing by the old provider is uncertain; generation isolation
+cannot determine whether that record was retained before failure.
 
 ## Filesystem-service use
 
@@ -181,8 +222,9 @@ device replies as untrusted input.
 Important current limitations include:
 
 - no IOMMU-backed userspace driver isolation;
-- no general capability revocation primitive;
-- no stable named service broker;
+- no general capability revocation primitive; fresh generation endpoints isolate replacements but
+  cannot invalidate every previously delegated old-generation handle;
+- no general service-manager-owned named broker beyond the temporary PID 1 logging routes;
 - no authenticated multiuser credentials or UID/GID enforcement;
 - no direct mapped shared-memory pages;
 - no complete sandbox or portal system;
@@ -198,7 +240,8 @@ Future work should preserve the current rules while adding:
 - typed MMIO, IRQ, DMA, and device-ownership capabilities;
 - direct shared-memory mappings with explicit cache and protection semantics;
 - cancellation, multi-object waiting, and endpoint peer-liveness notification;
-- a named, versioned service broker;
+- replacement of the temporary PID 1 route broker with a named, policy-backed service-manager
+  broker and independent service-generation allocation;
 - job-level resource accounting and limits;
 - capability-aware identity, sandbox, portal, driver, network, media, and graphics
   services.

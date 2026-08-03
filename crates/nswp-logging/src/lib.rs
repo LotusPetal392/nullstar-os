@@ -15,6 +15,22 @@ use nswp_runtime::{
     BodyBuf, Client, ClientEvent, DeadlinePolicy, HANDLE_FREE_ENDPOINT_LIMITS, MethodDescriptor,
     MethodKind, ProtocolDescriptor, RequestToken, RuntimeError, Server, TryTransport,
 };
+use service_route::{RoleId, ServiceId};
+
+pub const LOGGING_SERVICE_ID: ServiceId = match ServiceId::from_bytes([
+    0x7c, 0xbd, 0x3f, 0x65, 0x50, 0xa6, 0x4c, 0x30, 0xb1, 0x95, 0x9f, 0xbe, 0xd6, 0x33, 0xda, 0x43,
+]) {
+    Ok(id) => id,
+    Err(_) => panic!("logging service ID must be canonical"),
+};
+pub const LOGGING_PRODUCER_ROLE: RoleId = match RoleId::new(1) {
+    Some(role) => role,
+    None => panic!("logging producer role must be nonzero"),
+};
+pub const LOGGING_OBSERVER_ROLE: RoleId = match RoleId::new(2) {
+    Some(role) => role,
+    None => panic!("logging observer role must be nonzero"),
+};
 
 pub const LOGGING_PROTOCOL_ID: ProtocolId = match ProtocolId::from_bytes([
     0x7d, 0xb7, 0x9c, 0xd9, 0xc6, 0x85, 0x40, 0x0f, 0xb9, 0xf1, 0x55, 0xd8, 0x9b, 0x8e, 0x8a, 0x8a,
@@ -1837,6 +1853,23 @@ mod tests {
             message,
             wall_time_unix_ns: None,
         }
+    }
+
+    #[test]
+    fn logging_service_routes_are_committed_and_distinct_from_the_protocol() {
+        assert_eq!(
+            LOGGING_SERVICE_ID.into_bytes(),
+            [
+                0x7c, 0xbd, 0x3f, 0x65, 0x50, 0xa6, 0x4c, 0x30, 0xb1, 0x95, 0x9f, 0xbe, 0xd6, 0x33,
+                0xda, 0x43,
+            ]
+        );
+        assert_ne!(
+            LOGGING_SERVICE_ID.into_bytes(),
+            LOGGING_PROTOCOL_ID.into_bytes()
+        );
+        assert_eq!(LOGGING_PRODUCER_ROLE.get(), 1);
+        assert_eq!(LOGGING_OBSERVER_ROLE.get(), 2);
     }
 
     #[test]
