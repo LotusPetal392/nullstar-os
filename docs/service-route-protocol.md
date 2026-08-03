@@ -156,19 +156,33 @@ handles were globally revoked.
 
 ## Current logging deployment
 
-PID 1 is the temporary broker and publication owner for the logging producer and observer routes.
-This is an integration step, not the intended permanent service manager, policy engine, or global
-service namespace. PID 1 delegates only the stable role grants selected for each child and publishes
-the fresh producer and observer ingress objects for the active `/logging-service` generation.
+PID 1 is the temporary broker, publication owner, and generation authority for the logging producer
+and observer routes. It owns an allocation-free monotonic provider-generation sequence independent
+of process IDs. Every `/logging-service` startup attempt consumes a nonzero generation, including an
+attempt that fails before readiness. The current contract provides no durable cross-boot persistence.
 
-The current deployment uses the logging-service process PID as `ProviderGeneration`. That supplies a
-nonzero incarnation value for the pilot but conflates process identity with service generation and is
-not a durable generation authority. A future service manager must own an independent monotonically
-increasing generation value rather than treating PID as the stable lifecycle contract.
+PID 1 creates a private bootstrap endpoint, grants the logging-service child a handle with exactly
+`RECEIVE` rights, and sends exactly one 16-byte `NSGN` v1 record with no capability attachment:
 
-After route resolution, logging clients perform the existing `NSLS` session bootstrap and NSWP
-negotiation directly with `/logging-service`. The broker is not on that data path and never parses,
-queues, or replays NSWP negotiation, `Emit`, collector-statistics, or history packets.
+| Byte range | Size | Field | Encoding and constraint |
+| --- | ---: | --- | --- |
+| `0..4` | 4 | magic | ASCII `NSGN` (`4e 53 47 4e`) |
+| `4..6` | 2 | version | little-endian `u16`, exactly `1` |
+| `6..8` | 2 | reserved | all zero |
+| `8..16` | 8 | provider generation | little-endian nonzero `u64` |
+
+The service requires exact `RECEIVE` rights on its bootstrap handle, a kernel-stamped sender PID of
+`1`, an exact canonical record, and no transferred capability. It closes the bootstrap handle after
+this one receive attempt. The accepted generation identifies the collector, binds `NSLS` sessions
+and NSWP negotiation, and is the generation PID 1 publishes on both logging routes.
+
+This remains an integration step, not the intended permanent service manager, policy engine, or
+global service namespace. PID 1 delegates only selected stable role grants. A restartable service
+manager must eventually own the sequence and receive its current state across manager replacement.
+
+After route resolution, logging clients perform `NSLS` session bootstrap and NSWP negotiation
+directly with `/logging-service`. The broker is not on that data path and never parses, queues, or
+replays NSWP negotiation, `Emit`, collector-statistics, or history packets.
 
 ## Exhaustion and retry rules
 

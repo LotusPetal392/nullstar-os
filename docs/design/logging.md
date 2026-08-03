@@ -189,13 +189,24 @@ the nonzero provider generation. Failure replies carry no capability. The broker
 kernel-stamped sender PID before looking up availability. It never parses NSWP negotiation or log
 packets and is not on the logging data path after resolution.
 
-Each `/logging-service` generation receives fresh producer and observer ingress endpoint objects.
-PID 1 retains separate stable publication sources for the two roles, and clients resolve each role
-independently. Within one generation, each role ingress remains shared by its resolved clients, so a
-noisy producer can still impose queue pressure on other producers. Replacement publishes the fresh
-objects rather than rebinding old ingress handles. The current pilot uses the service process PID as
-the route generation; this is not a durable service-generation authority and must eventually be
-replaced by a service-manager-owned counter.
+PID 1 owns an allocation-free monotonic logging provider-generation sequence independent of process
+IDs. Every `/logging-service` startup attempt consumes a nonzero generation, including an attempt
+that fails before readiness. PID 1 sends it in one exact 16-byte `NSGN` v1 record, with no capability
+attachment, over a private bootstrap endpoint granted to the child with exact `RECEIVE` rights. The
+service requires that exact handle authority, kernel-stamped sender PID 1, `NSGN` magic, version 1,
+zero reserved bytes, a nonzero generation, and no trailing data. It closes the bootstrap handle after
+the one receive attempt.
+
+The accepted generation identifies the collector, binds `NSLS` sessions and the negotiated NSWP
+`service_generation`, and is published by PID 1 on both routes. Each generation receives fresh
+producer and observer ingress endpoint objects. PID 1 retains separate stable publication sources for
+the two roles, and clients resolve each role independently. Within one generation, each role ingress
+remains shared by its resolved clients, so a noisy producer can still impose queue pressure on other
+producers. Replacement publishes fresh objects rather than rebinding old ingress handles.
+
+This ownership is temporary. A restartable service manager must eventually own the sequence and
+receive its current state across manager replacement. The current contract provides no durable
+cross-boot persistence.
 
 Fresh ingress objects isolate generations but do not provide global revocation. Future resolutions
 select only the replacement, and packets sent through an old ingress cannot reach it. Existing

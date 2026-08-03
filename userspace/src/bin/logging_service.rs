@@ -9,12 +9,14 @@ use nswp_logging::{
 };
 use nswp_runtime::{Server, ServerEvent};
 use userspace::{
+    abi::INIT_PROCESS_ID,
     early_log,
     ipc::{self, ObjectKind, Rights},
     logging_session::{
         AcceptError, InboundPacket, MAX_LOGGING_SESSIONS, PendingConnect, ServerIngress,
         ServerIngressEvent, ServerTransport, SessionRole, admission_rejection,
     },
+    service_route::receive_service_generation,
     syscall,
 };
 
@@ -25,6 +27,7 @@ const READY_HANDLE: u64 = 1;
 const PRODUCER_INGRESS_HANDLE: u64 = 2;
 const OBSERVER_INGRESS_HANDLE: u64 = 3;
 const EARLY_LOG_HANDLE: u64 = 4;
+const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: logging";
 const STARTED_MARKER: &[u8] = b"logging-service: bounded session collector ready\n";
 const KERNEL_IMPORT_MARKER: &[u8] = b"logging-service: kernel early log imported\n";
@@ -250,9 +253,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             Ok(ingress) => ingress,
             Err(_) => syscall::exit(3),
         };
-    let generation = match syscall::getpid() {
-        Ok(generation) if generation != 0 => generation,
-        _ => syscall::exit(4),
+    let generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
+        Ok(generation) => generation.get(),
+        Err(_) => syscall::exit(4),
     };
     let mut collector = match FixedLoggingCollector::<COLLECTOR_CAPACITY>::new(generation) {
         Ok(collector) => collector,
