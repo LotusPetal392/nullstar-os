@@ -752,6 +752,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-control"
+version = "0.1.0"
+dependencies = [
+ "service-route",
+]
+
+[[package]]
 name = "service-route"
 version = "0.1.0"
 

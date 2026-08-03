@@ -9,7 +9,9 @@ utility, and eventual GNU compatibility remain **tentative design**.
 
 The complete process, job, activation, restart, session, application, login, and recovery
 model is specified in
-[Service, session, and application lifecycle](service-and-session-lifecycle.md).
+[Service, session, and application lifecycle](service-and-session-lifecycle.md). The current
+[`NSVC` v1 milestone](../service-control-protocol.md) supplies only a host-testable,
+allocation-free 64-byte control codec; it is not wired to PID 1, a manager, or `sv`.
 
 ## PID 1 and the system service manager
 
@@ -217,9 +219,18 @@ system services or another login session.
 The `sv` client selects or is given an explicit scope. A user may manage services in the
 user's own session; machine changes require administrative authorization.
 
+## Current control-contract milestone
+
+`NSVC` v1 fixes the request/response encoding for one-record paginated `list`, `status`, `start`,
+`stop`, and `restart`, including nonzero request-ID correlation, optional service generation, and
+separate observed and desired lifecycle states. It transfers no handles. A later transport will make
+possession of an appropriate endpoint, rather than knowledge of an ID, the basis of control
+authority. This milestone adds no manager process, activation, definitions, kernel changes, or
+command implementation.
+
 ## The `sv` command
 
-`sv` is the native service control and inspection client. It talks to the appropriate
+`sv` is the future native service control and inspection client. It talks to the appropriate
 service manager over a versioned protocol; it does not scan PIDs, edit packaged files,
 or send arbitrary signals as its primary mechanism.
 
@@ -375,8 +386,10 @@ The name `ush` should not silently imply complete POSIX shell behavior.
 ## Recommended implementation stages
 
 1. Add job containment, process-exit observation, and a versioned control protocol to the
-   current supervisor.
-2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol.
+   current supervisor. **Partly delivered:** the allocation-free, host-testable `NSVC` v1 codec fixes
+   the control contract, but supervisor integration, job containment, and exit observation remain.
+2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Future:**
+   no `sv` client or live control endpoint exists yet.
 3. Introduce the one-bootstrap-channel startup contract and stable service generations.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.
