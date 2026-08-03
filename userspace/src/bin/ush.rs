@@ -4,7 +4,8 @@
 use userspace::{
     abi::{limits, signal},
     environment::Environment,
-    platform,
+    ipc::{self, Rights},
+    logctl, platform,
     syscall::{
         self, ChildStatus, DescriptorFlags, FileDescriptor, LaunchBarrier, OpenFlags, PipePair,
         ProcessGroupId, ProcessId, STDERR, STDIN, STDOUT, SpawnFlags,
@@ -22,10 +23,11 @@ const MAX_JOBS: usize = 4;
 const MAX_VARIABLES: usize = limits::MAX_ENVIRONMENT_VARIABLES;
 const VARIABLE_NAME_BYTES: usize = limits::MAX_ENVIRONMENT_NAME_BYTES;
 const VARIABLE_VALUE_BYTES: usize = COMMAND_BYTES;
+const OBSERVER_ROUTE_HANDLE: u64 = 1;
 
 const PROMPT: &[u8] = b"ush> ";
 const READY: &[u8] = b"userspace shell ready\n";
-const HELP: &[u8] = b"builtins: help cd DIRECTORY jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
+const HELP: &[u8] = b"builtins: help cd DIRECTORY jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env logctl show exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
 const REDIRECTION_SYNTAX_FAILURE: &[u8] = b"ush: invalid redirection syntax\n";
@@ -42,6 +44,9 @@ const JOB_CONTROL_FAILURE: &[u8] = b"ush: job control failed\n";
 const INTERRUPTED: &[u8] = b"ush: interrupted\n";
 const PIPE_FAILURE: &[u8] = b"ush: pipe failed\n";
 const SPAWN_FAILURE: &[u8] = b"ush: spawn failed\n";
+const LOGCTL_USAGE: &[u8] = b"ush: usage: logctl show\n";
+const LOGCTL_FAILURE: &[u8] = b"ush: logctl show failed\n";
+const LOGCTL_COMPLETE: &[u8] = b"logctl: show complete\n";
 const WAIT_FAILURE: &[u8] = b"ush: wait failed\n";
 const WAIT_COMPLETE: &[u8] = b"ush: background jobs complete\n";
 const NO_JOBS: &[u8] = b"ush: no background jobs\n";
@@ -236,6 +241,8 @@ enum Builtin {
     Export,
     Unset,
     Environment,
+    LogShow,
+    LogUsage,
     Exit,
     Kill(JobTarget),
 }
@@ -429,6 +436,18 @@ impl Shell {
             Builtin::Export => self.export_variable(command_arguments(command)),
             Builtin::Unset => self.unset_variable(command_arguments(command)),
             Builtin::Environment => self.print_environment(),
+            Builtin::LogShow => {
+                let observer = ipc::duplicate(OBSERVER_ROUTE_HANDLE, Rights::SEND);
+                if observer
+                    .ok()
+                    .is_none_or(|observer| logctl::show(observer).is_err())
+                {
+                    self.error(LOGCTL_FAILURE);
+                } else {
+                    self.output(LOGCTL_COMPLETE);
+                }
+            }
+            Builtin::LogUsage => self.error(LOGCTL_USAGE),
             Builtin::Exit => {
                 self.terminate_all_jobs();
                 syscall::exit(0)
@@ -1499,6 +1518,8 @@ fn detect_builtin(command: &[u8]) -> Option<Builtin> {
         b"env" if arguments.iter().all(|byte| is_horizontal_space(*byte)) => {
             Some(Builtin::Environment)
         }
+        b"logctl" if trim_horizontal(arguments) == b"show" => Some(Builtin::LogShow),
+        b"logctl" => Some(Builtin::LogUsage),
         _ => None,
     }
 }

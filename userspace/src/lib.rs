@@ -11,6 +11,8 @@ pub mod filesystem;
 pub mod filesystem_service;
 pub mod heap;
 pub mod ipc;
+pub mod logctl;
+pub mod logging_session;
 pub mod platform;
 pub mod supervisor;
 #[path = "syscall_facade.rs"]

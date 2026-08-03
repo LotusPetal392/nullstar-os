@@ -37,6 +37,9 @@ const LOGGING_PROBE_BACKPRESSURE: &[u8] = b"logging-probe: backpressure verified
 const LOGGING_PROBE_MAX_YIELDS: u32 = 65_536;
 const LOGGING_PROBE_FAILED: &[u8] = b"userspace init: native NSWP logging probe failed\n";
 const LOGGING_PROBE_PASSED: &[u8] = b"userspace init: native NSWP logging probe passed\n";
+const LOGCTL_COMMAND: &[u8] = b"/logctl show";
+const LOGCTL_FAILED: &[u8] = b"userspace init: logctl show failed\n";
+const LOGCTL_PASSED: &[u8] = b"userspace init: logctl show passed\n";
 const LOGGING_COLLECTOR_TEST_PASSED: &[u8] =
     b"userspace init: logging collector ring, backpressure, redaction, and restart verified\n";
 const LOGGING_COLLECTOR_EXIT_WAIT_FAILED: &[u8] =
@@ -118,7 +121,7 @@ const SHELL_FOREGROUND_FAILED: &[u8] =
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
-const LOGGING_RESPONSE_HANDLE: u64 = 3;
+const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
 const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
@@ -220,9 +223,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
 
     let logging_readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let logging_request_endpoint =
+    let logging_producer_ingress =
         ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let logging_response_endpoint =
+    let logging_observer_ingress =
         ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
     let logging_early_log_reader =
         early_log::open_reader().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
@@ -235,21 +238,21 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
     let mut logging_service = ServiceRuntime::new(LOGGING_SERVICE);
-    let logging_response_capability = BootstrapCapability {
-        source_handle: logging_response_endpoint,
-        rights: Rights::SEND,
-        target_handle: LOGGING_RESPONSE_HANDLE,
+    let logging_observer_capability = BootstrapCapability {
+        source_handle: logging_observer_ingress,
+        rights: Rights::RECEIVE,
+        target_handle: LOGGING_OBSERVER_INGRESS_HANDLE,
     };
     let logging_early_log_capability = BootstrapCapability {
         source_handle: logging_early_log_reader,
         rights: Rights::READ,
         target_handle: LOGGING_EARLY_LOG_HANDLE,
     };
-    let logging_capabilities = [logging_response_capability, logging_early_log_capability];
+    let logging_capabilities = [logging_observer_capability, logging_early_log_capability];
     start_service(
         &mut logging_service,
         logging_readiness_endpoint,
-        logging_request_endpoint,
+        logging_producer_ingress,
         &logging_capabilities,
         &LOGGING_MESSAGES,
     );
@@ -257,19 +260,20 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         run_logging_collector_restart_test(
             &mut logging_service,
             logging_readiness_endpoint,
-            logging_request_endpoint,
-            logging_response_endpoint,
+            logging_producer_ingress,
+            logging_observer_ingress,
             &logging_capabilities,
         );
     } else {
         run_logging_probe(
             &logging_service,
-            logging_request_endpoint,
-            logging_response_endpoint,
+            logging_producer_ingress,
+            logging_observer_ingress,
             LOGGING_PROBE_COMMAND,
             LOGGING_PROBE_PASSED,
         );
     }
+    run_logctl_show(&logging_service, logging_observer_ingress);
 
     let mut missing_nullfs_uuid = nullfs_primary_volume::FILESYSTEM_UUID;
     missing_nullfs_uuid[15] ^= 0xff;
@@ -410,7 +414,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             VFS_READINESS_PROBE_PASSED,
         );
     }
-    let mut shell_process_id = spawn_shell();
+    let mut shell_process_id = spawn_shell(logging_observer_ingress);
 
     loop {
         if let Some(service_process_id) = logging_service.process_id() {
@@ -423,7 +427,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         start_service(
                             &mut logging_service,
                             logging_readiness_endpoint,
-                            logging_request_endpoint,
+                            logging_producer_ingress,
                             &logging_capabilities,
                             &LOGGING_MESSAGES,
                         );
@@ -518,7 +522,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 }
                 ShellStatusDisposition::RestartShell => {
                     let _ = syscall::write_all(STDOUT, SHELL_RESTARTING);
-                    shell_process_id = spawn_shell();
+                    shell_process_id = spawn_shell(logging_observer_ingress);
                 }
             },
             Err(error) if error == syscall::Errno::TRY_AGAIN => {}
@@ -843,8 +847,8 @@ fn start_service(
 
 fn run_logging_probe(
     service: &ServiceRuntime,
-    request_endpoint: CapabilityHandle,
-    response_endpoint: CapabilityHandle,
+    producer_ingress: CapabilityHandle,
+    observer_ingress: CapabilityHandle,
     command: &[u8],
     passed_message: &[u8],
 ) {
@@ -859,7 +863,7 @@ fn run_logging_probe(
         &barrier,
     )
     .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
-    grant_logging_probe_endpoints(probe_process_id, request_endpoint, response_endpoint);
+    grant_logging_probe_endpoints(probe_process_id, producer_ingress, observer_ingress);
     barrier
         .release()
         .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
@@ -867,11 +871,51 @@ fn run_logging_probe(
     let _ = syscall::write_all(STDOUT, passed_message);
 }
 
+fn run_logctl_show(service: &ServiceRuntime, observer_ingress: CapabilityHandle) {
+    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGCTL_FAILED));
+    let process_id = syscall::spawn_command_with_barrier(
+        LOGCTL_COMMAND,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(LOGCTL_FAILED));
+    if ipc::grant_child(process_id, observer_ingress, Rights::SEND, READY_HANDLE).ok()
+        != Some(READY_HANDLE)
+    {
+        fail(LOGCTL_FAILED);
+    }
+    barrier.release().unwrap_or_else(|_| fail(LOGCTL_FAILED));
+
+    let mut remaining = LOGGING_PROBE_MAX_YIELDS;
+    loop {
+        match syscall::try_wait_child(process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(status) if status.success() => break,
+            Ok(_) => fail(LOGCTL_FAILED),
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(LOGCTL_FAILED),
+        }
+        if service.process_id().is_none() {
+            fail(LOGCTL_FAILED);
+        }
+        if remaining == 0 || syscall::yield_now().is_err() {
+            fail(LOGCTL_FAILED);
+        }
+        remaining -= 1;
+    }
+    let _ = syscall::write_all(STDOUT, LOGCTL_PASSED);
+}
+
 fn run_logging_collector_restart_test(
     service: &mut ServiceRuntime,
     readiness_endpoint: CapabilityHandle,
-    request_endpoint: CapabilityHandle,
-    response_endpoint: CapabilityHandle,
+    producer_ingress: CapabilityHandle,
+    observer_ingress: CapabilityHandle,
     bootstrap_capabilities: &[BootstrapCapability],
 ) {
     let status_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
@@ -887,7 +931,7 @@ fn run_logging_collector_restart_test(
         &barrier,
     )
     .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
-    grant_logging_probe_endpoints(probe_process_id, request_endpoint, response_endpoint);
+    grant_logging_probe_endpoints(probe_process_id, producer_ingress, observer_ingress);
     if ipc::grant_child(
         probe_process_id,
         status_endpoint,
@@ -927,8 +971,8 @@ fn run_logging_collector_restart_test(
     if service.restart_count() != 0 {
         fail(LOGGING_COLLECTOR_RESTART_POLICY_FAILED);
     }
-    require_empty_endpoint(request_endpoint);
-    require_empty_endpoint(response_endpoint);
+    require_empty_endpoint(producer_ingress);
+    require_empty_endpoint(observer_ingress);
     if ipc::send(control_endpoint, LOGGING_PROBE_FILL_QUEUE, None).is_err() {
         fail(LOGGING_PROBE_FAILED);
     }
@@ -938,7 +982,7 @@ fn run_logging_collector_restart_test(
         status_endpoint,
         LOGGING_PROBE_BACKPRESSURE,
     );
-    if ipc::info(request_endpoint).map(|info| info.size).ok() != Some(8) {
+    if ipc::info(producer_ingress).map(|info| info.size).ok() != Some(8) {
         fail(LOGGING_PROBE_FAILED);
     }
     if syscall::signal_process_group(old_service_process_id, signal::CONTINUE).ok() != Some(1) {
@@ -948,8 +992,8 @@ fn run_logging_collector_restart_test(
     wait_for_logging_probe_exit(service, probe_process_id);
 
     require_empty_endpoint(readiness_endpoint);
-    require_empty_endpoint(request_endpoint);
-    require_empty_endpoint(response_endpoint);
+    require_empty_endpoint(producer_ingress);
+    require_empty_endpoint(observer_ingress);
     require_empty_endpoint(status_endpoint);
     require_empty_endpoint(control_endpoint);
     if syscall::signal_process_group(old_service_process_id, signal::TERMINATE).ok() != Some(1) {
@@ -964,7 +1008,7 @@ fn run_logging_collector_restart_test(
     start_service(
         service,
         readiness_endpoint,
-        request_endpoint,
+        producer_ingress,
         bootstrap_capabilities,
         &LOGGING_MESSAGES,
     );
@@ -973,13 +1017,13 @@ fn run_logging_collector_restart_test(
     }
     run_logging_probe(
         service,
-        request_endpoint,
-        response_endpoint,
+        producer_ingress,
+        observer_ingress,
         LOGGING_RESTART_PROBE_COMMAND,
         &[],
     );
-    require_empty_endpoint(request_endpoint);
-    require_empty_endpoint(response_endpoint);
+    require_empty_endpoint(producer_ingress);
+    require_empty_endpoint(observer_ingress);
     ipc::close(status_endpoint).unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     ipc::close(control_endpoint).unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     let _ = syscall::write_all(STDOUT, LOGGING_COLLECTOR_TEST_PASSED);
@@ -987,12 +1031,12 @@ fn run_logging_collector_restart_test(
 
 fn grant_logging_probe_endpoints(
     probe_process_id: ProcessId,
-    request_endpoint: CapabilityHandle,
-    response_endpoint: CapabilityHandle,
+    producer_ingress: CapabilityHandle,
+    observer_ingress: CapabilityHandle,
 ) {
     if ipc::grant_child(
         probe_process_id,
-        request_endpoint,
+        producer_ingress,
         Rights::SEND,
         READY_HANDLE,
     )
@@ -1000,8 +1044,8 @@ fn grant_logging_probe_endpoints(
         != Some(READY_HANDLE)
         || ipc::grant_child(
             probe_process_id,
-            response_endpoint,
-            Rights::RECEIVE,
+            observer_ingress,
+            Rights::SEND,
             REQUEST_HANDLE,
         )
         .ok()
@@ -1211,16 +1255,32 @@ fn run_probe(
     let _ = syscall::write_all(STDOUT, passed_message);
 }
 
-fn spawn_shell() -> ProcessId {
-    let process_id = syscall::spawn_command(
+fn spawn_shell(observer_ingress: CapabilityHandle) -> ProcessId {
+    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
+    let process_id = syscall::spawn_command_with_barrier(
         SHELL_COMMAND,
         SpawnFlags::FOREGROUND | SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
         None,
         None,
+        &barrier,
     )
     .unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
+    if ipc::grant_child(
+        process_id,
+        observer_ingress,
+        Rights::SEND | Rights::DUPLICATE,
+        READY_HANDLE,
+    )
+    .ok()
+        != Some(READY_HANDLE)
+    {
+        fail(SHELL_SPAWN_FAILED);
+    }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
     let _ = syscall::write_all(STDOUT, SHELL_LAUNCHED);
     process_id
 }

@@ -10,7 +10,7 @@ use nswp_logging::{
     LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_ID, LOGGING_PROTOCOL_MINOR_BASE,
     LOGGING_PROTOCOL_MINOR_COLLECTOR_READS, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
     LOGGING_PROTOCOL_MINOR_WALL_TIME, LogDelivery, LogDisposition, LogRecord, LogSeverity,
-    LoggingProducer, PrivacyClass, RecordId, decode_collector_request,
+    LoggingObserver, LoggingProducer, PrivacyClass, RecordId, decode_collector_request,
     decode_collector_stats_client_response, decode_history_read_client_response, decode_log_record,
     encode_log_record, logging_protocol, logging_protocol_through, respond_collector_stats,
     respond_history,
@@ -25,6 +25,7 @@ use nswp_testkit::{
 };
 
 type Endpoint<const QUEUE: usize> = SimEndpoint<QUEUE>;
+type Observer<const QUEUE: usize> = LoggingObserver<'static, Endpoint<QUEUE>>;
 type Producer<const QUEUE: usize> = LoggingProducer<'static, Endpoint<QUEUE>>;
 type CollectorServer<const QUEUE: usize> = Server<'static, Endpoint<QUEUE>>;
 
@@ -129,6 +130,31 @@ fn connected<const QUEUE: usize>(
     (producer, server, producer_control, collector_control)
 }
 
+fn connected_observer<const QUEUE: usize>(
+    max_minor: u16,
+    collector_generation: u64,
+) -> (Observer<QUEUE>, CollectorServer<QUEUE>) {
+    let (observer_endpoint, collector_endpoint) = channel_pair::<QUEUE>();
+    let mut observer = LoggingObserver::through_minor(observer_endpoint, max_minor);
+    let mut server = Server::new_with_peer_context(
+        collector_endpoint,
+        logging_protocol(),
+        collector_generation,
+        peer_context(),
+    )
+    .unwrap();
+    observer.try_negotiate().unwrap();
+    assert!(matches!(
+        server.poll(0).unwrap(),
+        Some(ServerEvent::Bound(bound)) if bound.service_generation() == collector_generation
+    ));
+    assert!(matches!(
+        observer.poll().unwrap(),
+        Some(ClientEvent::Bound(_))
+    ));
+    (observer, server)
+}
+
 fn record<'a>(subsystem: &'a str, message: &'a str) -> LogRecord<'a> {
     LogRecord {
         event_id: EVENT_ID,
@@ -152,6 +178,102 @@ fn producer_identity() -> ProducerIdentity {
         service_id: ECHO_PROTOCOL_ID,
         service_generation: 77,
     }
+}
+
+#[test]
+fn observer_negotiates_the_collector_read_profile_and_returns_its_transport() {
+    let (mut observer, server) =
+        connected_observer::<4>(LOGGING_PROTOCOL_MINOR_COLLECTOR_READS, 61);
+
+    assert_eq!(
+        observer.client().bound().unwrap().minor(),
+        LOGGING_PROTOCOL_MINOR_COLLECTOR_READS
+    );
+    assert_eq!(observer.client_mut().phase(), ConnectionPhase::Bound);
+    assert_eq!(
+        server.bound().unwrap().minor(),
+        LOGGING_PROTOCOL_MINOR_COLLECTOR_READS
+    );
+
+    let _transport = observer.into_transport();
+}
+
+#[test]
+fn observer_queries_decode_collector_stats_and_history() {
+    let (mut observer, mut server) =
+        connected_observer::<4>(LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY, 62);
+
+    let stats_transaction = observer
+        .try_get_collector_stats(10, 20, [0x41; 16])
+        .unwrap();
+    let stats_token = match server.poll(10).unwrap().unwrap() {
+        ServerEvent::Request { token, body } => {
+            let bound = server.bound().unwrap().view().unwrap();
+            assert_eq!(
+                decode_collector_request(token, body.as_slice(), &bound).unwrap(),
+                CollectorRequest::GetCollectorStats
+            );
+            token
+        }
+        event => panic!("unexpected event: {event:?}"),
+    };
+    let stats = CollectorStats {
+        received_records: 5,
+        retained_records: 2,
+        capacity_records: 2,
+        evicted_records: 2,
+        dropped_records: 1,
+        redacted_records: 1,
+        oldest_record_id: Some(RecordId::new(3).unwrap()),
+        newest_record_id: Some(RecordId::new(4).unwrap()),
+    };
+    respond_collector_stats(&mut server, stats_token, stats).unwrap();
+    let stats_event = observer.poll().unwrap().unwrap();
+    let observer_bound = observer.client().bound().unwrap().view().unwrap();
+    assert_eq!(
+        decode_collector_stats_client_response(&stats_event, stats_transaction, &observer_bound,)
+            .unwrap(),
+        stats
+    );
+
+    let after_record_id = RecordId::new(6).unwrap();
+    let history_transaction = observer
+        .try_read_history(Some(after_record_id), 10, 20, [0x42; 16])
+        .unwrap();
+    let history_token = match server.poll(10).unwrap().unwrap() {
+        ServerEvent::Request { token, body } => {
+            let bound = server.bound().unwrap().view().unwrap();
+            assert_eq!(
+                decode_collector_request(token, body.as_slice(), &bound).unwrap(),
+                CollectorRequest::ReadHistory(HistoryReadRequest {
+                    after_record_id: Some(after_record_id),
+                })
+            );
+            token
+        }
+        event => panic!("unexpected event: {event:?}"),
+    };
+    let record = HistoryRecordView {
+        record_id: RecordId::new(7).unwrap(),
+        source: HistorySource::Kernel {
+            sequence: KernelSequence::new(99).unwrap(),
+            boot_id: Some(BOOT_ID),
+        },
+        event_id: EVENT_ID,
+        severity: LogSeverity::Notice,
+        privacy: PrivacyClass::Administrator,
+        monotonic_time_ns: 123,
+        subsystem: "kernel",
+        message: "observer history",
+    };
+    respond_history(&mut server, history_token, Some(record)).unwrap();
+    let history_event = observer.poll().unwrap().unwrap();
+    let observer_bound = observer.client().bound().unwrap().view().unwrap();
+    assert_eq!(
+        decode_history_read_client_response(&history_event, history_transaction, &observer_bound,)
+            .unwrap(),
+        Some(record)
+    );
 }
 
 #[test]

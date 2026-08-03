@@ -1,27 +1,29 @@
 #![no_std]
 #![no_main]
 
+use nswp_core::TransportStatus;
 use nswp_logging::{
     COLLECTOR_SECRET_REDACTION, CollectorStats, EventId, HistoryRecordView, HistorySource,
     LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
-    LogDelivery, LogDisposition, LogRecord, LogSeverity, LoggingProducer, PrivacyClass, RecordId,
-    decode_collector_stats_client_response, decode_history_read_client_response,
+    LogDelivery, LogDisposition, LogRecord, LogSeverity, LoggingObserver, LoggingProducer,
+    PrivacyClass, RecordId, decode_collector_stats_client_response,
+    decode_history_read_client_response,
 };
 use nswp_runtime::{ClientEvent, RuntimeError};
 use userspace::{
     abi::INIT_PROCESS_ID,
     args::Args,
     early_log,
-    endpoint_transport::EndpointTransport,
     ipc::{self, ObjectKind, Rights},
+    logging_session::{ClientBootstrap, ClientTransport},
     syscall,
 };
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const SEND_HANDLE: u64 = 1;
-const RECEIVE_HANDLE: u64 = 2;
+const PRODUCER_INGRESS_HANDLE: u64 = 1;
+const OBSERVER_INGRESS_HANDLE: u64 = 2;
 const STATUS_HANDLE: u64 = 3;
 const CONTROL_HANDLE: u64 = 4;
 const MAX_YIELDS: u32 = 65_536;
@@ -79,7 +81,8 @@ const fn event_id(bytes: [u8; 16]) -> EventId {
     }
 }
 
-type Producer = LoggingProducer<'static, EndpointTransport>;
+type Producer = LoggingProducer<'static, ClientTransport>;
+type Observer = LoggingObserver<'static, ClientTransport>;
 
 #[derive(Clone, Copy)]
 enum ProbeMode {
@@ -132,22 +135,34 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if matches!(mode, ProbeMode::CollectorStress) {
         validate_stress_handles();
     }
-    let transport = match EndpointTransport::new(SEND_HANDLE, RECEIVE_HANDLE) {
-        Ok(transport) => transport,
-        Err(_) => syscall::exit(4),
-    };
-    let mut producer = LoggingProducer::new(transport);
-    negotiate(&mut producer);
+    let producer_transport = ClientBootstrap::new(PRODUCER_INGRESS_HANDLE)
+        .and_then(ClientBootstrap::connect)
+        .unwrap_or_else(|_| syscall::exit(4));
+    let observer_transport = ClientBootstrap::new(OBSERVER_INGRESS_HANDLE)
+        .and_then(ClientBootstrap::connect)
+        .unwrap_or_else(|_| syscall::exit(4));
+    if producer_transport.service_process_id() != observer_transport.service_process_id()
+        || producer_transport.service_generation() != observer_transport.service_generation()
+    {
+        syscall::exit(4);
+    }
+    let mut producer = LoggingProducer::new(producer_transport);
+    let mut observer = LoggingObserver::new(observer_transport);
+    negotiate_producer(&mut producer);
+    negotiate_observer(&mut observer);
+    verify_producer_cannot_read(&mut producer);
 
     match mode {
-        ProbeMode::Basic => run_basic(&mut producer, process_id),
-        ProbeMode::CollectorStress => run_collector_stress(&mut producer, process_id),
-        ProbeMode::AfterRestart => run_after_restart(&mut producer, process_id),
+        ProbeMode::Basic => run_basic(&mut producer, &mut observer, process_id),
+        ProbeMode::CollectorStress => {
+            run_collector_stress(&mut producer, &mut observer, process_id)
+        }
+        ProbeMode::AfterRestart => run_after_restart(&mut producer, &mut observer, process_id),
     }
     syscall::exit(0)
 }
 
-fn negotiate(producer: &mut Producer) {
+fn negotiate_producer(producer: &mut Producer) {
     let mut remaining = MAX_YIELDS;
     loop {
         match producer.try_negotiate() {
@@ -170,9 +185,54 @@ fn negotiate(producer: &mut Producer) {
     }
 }
 
-fn verify_kernel_baseline(producer: &mut Producer, code: u64) -> RecordId {
+fn negotiate_observer(observer: &mut Observer) {
+    let mut remaining = MAX_YIELDS;
+    loop {
+        match observer.try_negotiate() {
+            Ok(()) => break,
+            Err(RuntimeError::WouldBlock) => yield_bounded(&mut remaining, 5),
+            Err(_) => syscall::exit(6),
+        }
+    }
+    let mut remaining = MAX_YIELDS;
+    loop {
+        match observer.poll() {
+            Ok(Some(ClientEvent::Bound(bound)))
+                if bound.minor() == LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY =>
+            {
+                return;
+            }
+            Ok(None) => yield_bounded(&mut remaining, 7),
+            Ok(Some(_)) | Err(_) => syscall::exit(8),
+        }
+    }
+}
+
+fn verify_producer_cannot_read(producer: &mut Producer) {
+    let mut remaining = MAX_YIELDS;
+    let transaction = loop {
+        match producer.try_get_collector_stats(QUERY_NOW_NS, QUERY_DEADLINE_NS, [0x44; 16]) {
+            Ok(transaction) => break transaction,
+            Err(RuntimeError::WouldBlock) => yield_bounded(&mut remaining, 8),
+            Err(_) => syscall::exit(8),
+        }
+    };
+    let event = wait_for_producer_response(producer, 8);
+    if !matches!(
+        event,
+        ClientEvent::Response {
+            transaction_id,
+            status: TransportStatus::AccessDenied,
+            ref body,
+        } if transaction_id == transaction.get() && body.is_empty()
+    ) {
+        syscall::exit(8);
+    }
+}
+
+fn verify_kernel_baseline(observer: &mut Observer, code: u64) -> RecordId {
     verify_stats(
-        query_stats(producer, code),
+        query_stats(observer, code),
         ExpectedStats {
             received: EXPECTED_KERNEL_BASELINE_RECORDS,
             retained: EXPECTED_KERNEL_BASELINE_RECORDS,
@@ -188,21 +248,21 @@ fn verify_kernel_baseline(producer: &mut Producer, code: u64) -> RecordId {
 
     let mut cursor = None;
     for expected in 1..=EXPECTED_KERNEL_BASELINE_RECORDS {
-        cursor = Some(expect_kernel_history(producer, cursor, expected, code));
+        cursor = Some(expect_kernel_history(observer, cursor, expected, code));
     }
-    expect_history(producer, cursor, None, code);
+    expect_history(observer, cursor, None, code);
     cursor.unwrap_or_else(|| syscall::exit(code))
 }
 
 fn expect_kernel_history(
-    producer: &mut Producer,
+    observer: &mut Observer,
     after_record_id: Option<RecordId>,
     expected: u64,
     code: u64,
 ) -> RecordId {
     let mut remaining = MAX_YIELDS;
     let transaction = loop {
-        match producer.try_read_history(
+        match observer.try_read_history(
             after_record_id,
             QUERY_NOW_NS,
             QUERY_DEADLINE_NS,
@@ -213,8 +273,8 @@ fn expect_kernel_history(
             Err(_) => syscall::exit(code),
         }
     };
-    let event = wait_for_response(producer, code);
-    let bound = match producer
+    let event = wait_for_response(observer, code);
+    let bound = match observer
         .client()
         .bound()
         .and_then(|bound| bound.view().ok())
@@ -242,8 +302,8 @@ fn expect_kernel_history(
     actual.record_id
 }
 
-fn run_basic(producer: &mut Producer, process_id: u64) {
-    let baseline_last = verify_kernel_baseline(producer, 9);
+fn run_basic(producer: &mut Producer, observer: &mut Observer, process_id: u64) {
+    let baseline_last = verify_kernel_baseline(observer, 9);
     let public_trace = [0x11; 16];
     let secret_trace = [0x22; 16];
     send_reliable(
@@ -276,7 +336,7 @@ fn run_basic(producer: &mut Producer, process_id: u64) {
     );
 
     verify_stats(
-        query_stats(producer, 11),
+        query_stats_at_least(observer, 6, 11),
         ExpectedStats {
             received: 6,
             retained: 6,
@@ -290,7 +350,7 @@ fn run_basic(producer: &mut Producer, process_id: u64) {
         12,
     );
     let first = expect_history(
-        producer,
+        observer,
         Some(baseline_last),
         Some(ExpectedHistory {
             record_id: 5,
@@ -307,7 +367,7 @@ fn run_basic(producer: &mut Producer, process_id: u64) {
         13,
     );
     let second = expect_history(
-        producer,
+        observer,
         first,
         Some(ExpectedHistory {
             record_id: 6,
@@ -326,11 +386,11 @@ fn run_basic(producer: &mut Producer, process_id: u64) {
     if COLLECTOR_SECRET_REDACTION == SECRET_INPUT {
         syscall::exit(15);
     }
-    expect_history(producer, second, None, 16);
+    expect_history(observer, second, None, 16);
 }
 
-fn run_collector_stress(producer: &mut Producer, process_id: u64) {
-    let _baseline_last = verify_kernel_baseline(producer, 20);
+fn run_collector_stress(producer: &mut Producer, observer: &mut Observer, process_id: u64) {
+    let _baseline_last = verify_kernel_baseline(observer, 20);
     if ipc::send(STATUS_HANDLE, BOUND_MARKER, None).is_err() {
         syscall::exit(20);
     }
@@ -363,7 +423,7 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
     }
 
     verify_stats(
-        query_stats(producer, 27),
+        query_stats_at_least(observer, 69, 27),
         ExpectedStats {
             received: 69,
             retained: 64,
@@ -377,7 +437,7 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
         28,
     );
     expect_history(
-        producer,
+        observer,
         None,
         Some(ExpectedHistory {
             record_id: 6,
@@ -394,7 +454,7 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
         29,
     );
     let newest = expect_history(
-        producer,
+        observer,
         Some(record_id(68, 30)),
         Some(ExpectedHistory {
             record_id: 69,
@@ -413,11 +473,11 @@ fn run_collector_stress(producer: &mut Producer, process_id: u64) {
     if COLLECTOR_SECRET_REDACTION == STRESS_SECRET_INPUT {
         syscall::exit(32);
     }
-    expect_history(producer, newest, None, 33);
+    expect_history(observer, newest, None, 33);
 }
 
-fn run_after_restart(producer: &mut Producer, process_id: u64) {
-    let baseline_last = verify_kernel_baseline(producer, 40);
+fn run_after_restart(producer: &mut Producer, observer: &mut Observer, process_id: u64) {
+    let baseline_last = verify_kernel_baseline(observer, 40);
     send_reliable(
         producer,
         LogRecord {
@@ -433,7 +493,7 @@ fn run_after_restart(producer: &mut Producer, process_id: u64) {
         40,
     );
     verify_stats(
-        query_stats(producer, 41),
+        query_stats_at_least(observer, 5, 41),
         ExpectedStats {
             received: 5,
             retained: 5,
@@ -447,7 +507,7 @@ fn run_after_restart(producer: &mut Producer, process_id: u64) {
         42,
     );
     let first = expect_history(
-        producer,
+        observer,
         Some(baseline_last),
         Some(ExpectedHistory {
             record_id: 5,
@@ -463,7 +523,7 @@ fn run_after_restart(producer: &mut Producer, process_id: u64) {
         }),
         43,
     );
-    expect_history(producer, first, None, 44);
+    expect_history(observer, first, None, 44);
 }
 
 fn stress_record(sequence: u64) -> LogRecord<'static> {
@@ -506,17 +566,32 @@ fn send_reliable(producer: &mut Producer, record: LogRecord<'_>, trace_id: [u8; 
     }
 }
 
-fn query_stats(producer: &mut Producer, code: u64) -> CollectorStats {
+fn query_stats_at_least(
+    observer: &mut Observer,
+    minimum_received: u64,
+    code: u64,
+) -> CollectorStats {
+    let mut remaining = MAX_YIELDS;
+    loop {
+        let stats = query_stats(observer, code);
+        if stats.received_records >= minimum_received {
+            return stats;
+        }
+        yield_bounded(&mut remaining, code);
+    }
+}
+
+fn query_stats(observer: &mut Observer, code: u64) -> CollectorStats {
     let mut remaining = MAX_YIELDS;
     let transaction = loop {
-        match producer.try_get_collector_stats(QUERY_NOW_NS, QUERY_DEADLINE_NS, [0x55; 16]) {
+        match observer.try_get_collector_stats(QUERY_NOW_NS, QUERY_DEADLINE_NS, [0x55; 16]) {
             Ok(transaction) => break transaction,
             Err(RuntimeError::WouldBlock) => yield_bounded(&mut remaining, code),
             Err(_) => syscall::exit(code),
         }
     };
-    let event = wait_for_response(producer, code);
-    let bound = match producer
+    let event = wait_for_response(observer, code);
+    let bound = match observer
         .client()
         .bound()
         .and_then(|bound| bound.view().ok())
@@ -531,14 +606,14 @@ fn query_stats(producer: &mut Producer, code: u64) -> CollectorStats {
 }
 
 fn expect_history(
-    producer: &mut Producer,
+    observer: &mut Observer,
     after_record_id: Option<RecordId>,
     expected: Option<ExpectedHistory<'_>>,
     code: u64,
 ) -> Option<RecordId> {
     let mut remaining = MAX_YIELDS;
     let transaction = loop {
-        match producer.try_read_history(
+        match observer.try_read_history(
             after_record_id,
             QUERY_NOW_NS,
             QUERY_DEADLINE_NS,
@@ -549,8 +624,8 @@ fn expect_history(
             Err(_) => syscall::exit(code),
         }
     };
-    let event = wait_for_response(producer, code);
-    let bound = match producer
+    let event = wait_for_response(observer, code);
+    let bound = match observer
         .client()
         .bound()
         .and_then(|bound| bound.view().ok())
@@ -571,7 +646,18 @@ fn expect_history(
     }
 }
 
-fn wait_for_response(producer: &mut Producer, code: u64) -> ClientEvent {
+fn wait_for_response(observer: &mut Observer, code: u64) -> ClientEvent {
+    let mut remaining = MAX_YIELDS;
+    loop {
+        match observer.poll() {
+            Ok(Some(event @ ClientEvent::Response { .. })) => return event,
+            Ok(None) => yield_bounded(&mut remaining, code),
+            Ok(Some(_)) | Err(_) => syscall::exit(code),
+        }
+    }
+}
+
+fn wait_for_producer_response(producer: &mut Producer, code: u64) -> ClientEvent {
     let mut remaining = MAX_YIELDS;
     loop {
         match producer.poll() {

@@ -1,6 +1,6 @@
 #![no_std]
 
-//! Allocation-free production contract and producer for the NullStar logging protocol.
+//! Allocation-free production contract and clients for the NullStar logging protocol.
 
 use core::{fmt, str};
 
@@ -1587,6 +1587,96 @@ pub fn logging_protocol_through(max_minor: u16) -> ProtocolDescriptor<'static> {
         versions,
         feature_set_fits: nswp_runtime::no_features_fit,
         methods,
+    }
+}
+
+/// Client for observing collector state and retained logging history.
+pub struct LoggingObserver<'a, T: TryTransport> {
+    client: Client<'a, T>,
+}
+
+impl<T: TryTransport> LoggingObserver<'static, T> {
+    pub fn new(transport: T) -> Self {
+        Self::with_protocol(transport, logging_protocol())
+    }
+
+    pub fn through_minor(transport: T, max_minor: u16) -> Self {
+        Self::with_protocol(transport, logging_protocol_through(max_minor))
+    }
+
+    fn with_protocol(transport: T, protocol: ProtocolDescriptor<'static>) -> Self {
+        Self {
+            client: Client::new(transport, protocol),
+        }
+    }
+}
+
+impl<'a, T: TryTransport> LoggingObserver<'a, T> {
+    pub fn try_negotiate(&mut self) -> Result<(), RuntimeError> {
+        self.client.try_negotiate()
+    }
+
+    pub fn poll(&mut self) -> Result<Option<ClientEvent>, RuntimeError> {
+        self.client.poll()
+    }
+
+    pub fn try_get_collector_stats(
+        &mut self,
+        now_ns: u64,
+        deadline_ns: u64,
+        trace_id: [u8; 16],
+    ) -> Result<CollectorStatsTransactionId, RuntimeError> {
+        let minor = self
+            .client
+            .bound()
+            .ok_or(RuntimeError::InvalidState)?
+            .minor();
+        let body = encode_collector_stats_request(minor)?;
+        self.client
+            .try_call(
+                LOGGING_GET_COLLECTOR_STATS_ORDINAL,
+                body.as_slice(),
+                now_ns,
+                deadline_ns,
+                trace_id,
+            )
+            .map(CollectorStatsTransactionId)
+    }
+
+    pub fn try_read_history(
+        &mut self,
+        after_record_id: Option<RecordId>,
+        now_ns: u64,
+        deadline_ns: u64,
+        trace_id: [u8; 16],
+    ) -> Result<HistoryReadTransactionId, RuntimeError> {
+        let minor = self
+            .client
+            .bound()
+            .ok_or(RuntimeError::InvalidState)?
+            .minor();
+        let body = encode_history_read_request(HistoryReadRequest { after_record_id }, minor)?;
+        self.client
+            .try_call(
+                LOGGING_READ_HISTORY_ORDINAL,
+                body.as_slice(),
+                now_ns,
+                deadline_ns,
+                trace_id,
+            )
+            .map(HistoryReadTransactionId)
+    }
+
+    pub const fn client(&self) -> &Client<'a, T> {
+        &self.client
+    }
+
+    pub fn client_mut(&mut self) -> &mut Client<'a, T> {
+        &mut self.client
+    }
+
+    pub fn into_transport(self) -> T {
+        self.client.into_transport()
     }
 }
 
