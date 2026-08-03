@@ -401,9 +401,16 @@ Authorization occurs before availability lookup.
 The broker handles only route control. It does not parse the NSWP or application packets sent after
 acceptance. Provider generations use fresh ingress endpoint objects, so old handles do not become
 handles to the replacement. This is generation isolation rather than global revocation: already
-delegated handles remain valid for their old objects until references disappear. The initial logging
-integration uses PID 1 as a temporary broker and provider PID as generation; both are migration
-constraints rather than the final service-manager contract.
+delegated handles remain valid for their old objects until references disappear.
+
+For the initial logging integration, PID 1 is the temporary broker and owns an allocation-free
+monotonic provider-generation sequence independent of process IDs. Every startup attempt consumes a
+generation. PID 1 sends it once in an exact 16-byte `NSGN` v1 record with no capability over a private
+endpoint granted to the service with exact `RECEIVE` rights. The service validates those rights,
+kernel-stamped sender PID 1, and canonical encoding, closes the bootstrap handle, and uses the value
+for the collector, `NSLS`, NSWP, and routes. A restartable service manager must eventually own the
+sequence and receive its state across replacement. The current contract provides no durable
+cross-boot persistence.
 
 Stable protocols should define:
 

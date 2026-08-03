@@ -2,13 +2,13 @@
 #![no_main]
 
 use nswp_logging::{LOGGING_OBSERVER_ROLE, LOGGING_PRODUCER_ROLE, LOGGING_SERVICE_ID};
-use service_route::{Authorizer, ProviderGeneration, RouteKey};
+use service_route::{Authorizer, ProviderGeneration, ProviderGenerationSequence, RouteKey};
 use userspace::{
     abi::{INIT_PROCESS_ID, signal},
     early_log,
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
-    service_route::{NativeRouteTable, RouteIngress},
+    service_route::{NativeRouteTable, RouteIngress, queue_service_generation},
     supervisor::{
         ServiceRuntime, ServiceSpec, ServiceStatusDisposition, ShellStatusDisposition,
         shell_status_disposition,
@@ -125,6 +125,7 @@ const REQUEST_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
 const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
 const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
+const LOGGING_GENERATION_HANDOFF_HANDLE: u64 = 5;
 const MAX_BOOTSTRAP_ROUTES: usize = 2;
 const ROUTE_PUMP_BUDGET: usize = 4;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
@@ -371,15 +372,18 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
     let mut logging_service = ServiceRuntime::new(LOGGING_SERVICE);
+    let mut logging_generations = ProviderGenerationSequence::new();
     let mut logging_generation = start_logging_generation(
         &mut logging_service,
         &mut route_broker,
+        &mut logging_generations,
         logging_early_log_reader,
     );
     if nullfs_restart_test {
         logging_generation = run_logging_collector_restart_test(
             &mut logging_service,
             &mut route_broker,
+            &mut logging_generations,
             logging_early_log_reader,
             logging_generation,
         );
@@ -547,6 +551,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         logging_generation = start_logging_generation(
                             &mut logging_service,
                             &mut route_broker,
+                            &mut logging_generations,
                             logging_early_log_reader,
                         );
                     }
@@ -880,9 +885,17 @@ fn register_vfs_router(service: &ServiceRuntime, request_endpoint: CapabilityHan
 fn start_logging_generation(
     service: &mut ServiceRuntime,
     route_broker: &mut RouteBrokerState,
+    generations: &mut ProviderGenerationSequence,
     early_log_reader: CapabilityHandle,
 ) -> LoggingGeneration {
     'attempt: loop {
+        let generation = generations
+            .next_generation()
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let generation_handoff_source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        queue_service_generation(generation_handoff_source, generation)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
         let readiness_source =
             ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
         let producer_source =
@@ -937,9 +950,19 @@ fn start_logging_generation(
             )
             .ok()
                 != Some(LOGGING_EARLY_LOG_HANDLE)
+            || ipc::grant_child(
+                process_id,
+                generation_handoff_source,
+                Rights::RECEIVE,
+                LOGGING_GENERATION_HANDOFF_HANDLE,
+            )
+            .ok()
+                != Some(LOGGING_GENERATION_HANDOFF_HANDLE)
         {
             fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
         }
+        ipc::close(generation_handoff_source)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
         barrier
             .release()
             .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
@@ -989,8 +1012,6 @@ fn start_logging_generation(
                         }
                     }
                     service.note_ready();
-                    let generation = ProviderGeneration::new(process_id)
-                        .unwrap_or_else(|| fail(LOGGING_SERVICE_PROTOCOL_FAILED));
                     route_broker.publish(generation, producer_source, observer_source);
                     let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.ready);
                     return LoggingGeneration {
@@ -1191,6 +1212,7 @@ fn run_logctl_show(service: &ServiceRuntime, route_broker: &mut RouteBrokerState
 fn run_logging_collector_restart_test(
     service: &mut ServiceRuntime,
     route_broker: &mut RouteBrokerState,
+    generations: &mut ProviderGenerationSequence,
     early_log_reader: CapabilityHandle,
     generation: LoggingGeneration,
 ) -> LoggingGeneration {
@@ -1293,7 +1315,8 @@ fn run_logging_collector_restart_test(
     generation.close();
     let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_RESTARTING);
     backoff(backoff_yields);
-    let replacement = start_logging_generation(service, route_broker, early_log_reader);
+    let replacement =
+        start_logging_generation(service, route_broker, generations, early_log_reader);
     if service.process_id() == Some(old_service_process_id)
         || service.restart_count() != 1
         || replacement.generation.get() <= old_generation.get()

@@ -114,9 +114,15 @@ Provider publication retains a stable `SEND | DUPLICATE | TRANSFER` source from 
 issues reduced send-only handles. Each provider generation has fresh ingress endpoint objects. This
 prevents an old route from reaching the replacement, but it does not revoke all old handles: the
 kernel has no general revocation operation, and an endpoint object remains reachable while a handle
-or queued transfer refers to it. The current logging pilot also uses provider PID as generation,
-which conflates process and service-generation identity until a service manager owns an independent
-counter.
+or queued transfer refers to it.
+
+For logging, PID 1 owns an allocation-free monotonic provider-generation sequence independent of
+process IDs, and every startup attempt consumes a value. It sends one exact 16-byte `NSGN` v1 record
+with no capability over a private endpoint granted to the service with exact `RECEIVE` rights. The
+service accepts only the canonical record from kernel-stamped sender PID 1 on that exact-rights
+handle, closes the handle after the one receive attempt, and uses the generation for its collector,
+`NSLS`, NSWP, and route publications. The current contract provides no durable cross-boot sequence
+persistence.
 
 The distinction has a resource cost. The kernel currently permits 32 live endpoint objects
 system-wide. Every in-progress route resolution creates a private reply endpoint, every provider
@@ -240,8 +246,8 @@ Future work should preserve the current rules while adding:
 - typed MMIO, IRQ, DMA, and device-ownership capabilities;
 - direct shared-memory mappings with explicit cache and protection semantics;
 - cancellation, multi-object waiting, and endpoint peer-liveness notification;
-- replacement of the temporary PID 1 route broker with a named, policy-backed service-manager
-  broker and independent service-generation allocation;
+- replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
+  restartable service-manager broker that owns the sequence and receives its current state;
 - job-level resource accounting and limits;
 - capability-aware identity, sandbox, portal, driver, network, media, and graphics
   services.

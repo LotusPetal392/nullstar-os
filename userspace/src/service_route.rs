@@ -5,7 +5,8 @@
 
 use service_route::{
     Authorizer, DecodeError, ProviderGeneration, PublishError, PublishedRoute, RouteFailure,
-    RouteKey, RouteMessage, RouteTable, SERVICE_ROUTE_WIRE_BYTES, WithdrawError,
+    RouteKey, RouteMessage, RouteTable, SERVICE_GENERATION_WIRE_BYTES, SERVICE_ROUTE_WIRE_BYTES,
+    ServiceGenerationDecodeError, ServiceGenerationHandoff, WithdrawError,
 };
 
 use crate::ipc::{
@@ -23,6 +24,105 @@ const DISPOSABLE_PROVIDER_RIGHTS: Rights =
         Some(rights) => rights,
         None => panic!("disposable provider rights must be valid"),
     };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationHandoffSendError {
+    Inspect(ipc::Error),
+    InvalidEndpoint(EndpointShapeError),
+    Send(ipc::Error),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationHandoffReceiveError {
+    InvalidExpectedSender,
+    Inspect(ipc::Error),
+    InvalidEndpoint(EndpointShapeError),
+    Receive(ipc::Error),
+    UnexpectedSender { expected: u64, actual: u64 },
+    UnexpectedCapability,
+    Decode(ServiceGenerationDecodeError),
+    Close(ipc::Error),
+}
+
+/// Queues one canonical generation handoff on an empty full-rights endpoint.
+///
+/// The source remains caller-owned. Sending before the child is released ensures the child cannot
+/// observe an uninitialized generation slot.
+pub fn queue_service_generation(
+    source: CapabilityHandle,
+    generation: ProviderGeneration,
+) -> Result<(), GenerationHandoffSendError> {
+    let info = ipc::info(source).map_err(GenerationHandoffSendError::Inspect)?;
+    validate_endpoint(info, Rights::ENDPOINT, true)
+        .map_err(GenerationHandoffSendError::InvalidEndpoint)?;
+    ipc::send(
+        source,
+        &ServiceGenerationHandoff::new(generation).encode(),
+        None,
+    )
+    .map_err(GenerationHandoffSendError::Send)
+}
+
+/// Receives one generation from an exact-`RECEIVE` bootstrap endpoint and closes the handle.
+///
+/// The handle is consumed on every return path. The sender identity is kernel-stamped and must
+/// match the expected generation authority.
+pub fn receive_service_generation(
+    receive: CapabilityHandle,
+    expected_sender: u64,
+) -> Result<ProviderGeneration, GenerationHandoffReceiveError> {
+    if expected_sender == 0 {
+        close_quietly(receive);
+        return Err(GenerationHandoffReceiveError::InvalidExpectedSender);
+    }
+    let result = receive_service_generation_inner(receive, expected_sender);
+    let close_result = ipc::close(receive);
+    match (result, close_result) {
+        (Err(error), _) => Err(error),
+        (Ok(generation), Ok(())) => Ok(generation),
+        (Ok(_), Err(error)) => Err(GenerationHandoffReceiveError::Close(error)),
+    }
+}
+
+fn receive_service_generation_inner(
+    receive: CapabilityHandle,
+    expected_sender: u64,
+) -> Result<ProviderGeneration, GenerationHandoffReceiveError> {
+    let info = ipc::info(receive).map_err(GenerationHandoffReceiveError::Inspect)?;
+    validate_endpoint(info, Rights::RECEIVE, false)
+        .map_err(GenerationHandoffReceiveError::InvalidEndpoint)?;
+    let mut bytes = [0_u8; SERVICE_GENERATION_WIRE_BYTES];
+    let message =
+        ipc::receive(receive, &mut bytes).map_err(GenerationHandoffReceiveError::Receive)?;
+    let has_capability = message.capability.is_some();
+    close_received(message.capability);
+    validate_service_generation_envelope(
+        &bytes[..message.bytes],
+        message.sender_process_id,
+        expected_sender,
+        has_capability,
+    )
+}
+
+fn validate_service_generation_envelope(
+    bytes: &[u8],
+    sender_process_id: u64,
+    expected_sender: u64,
+    has_capability: bool,
+) -> Result<ProviderGeneration, GenerationHandoffReceiveError> {
+    if has_capability {
+        return Err(GenerationHandoffReceiveError::UnexpectedCapability);
+    }
+    if sender_process_id != expected_sender {
+        return Err(GenerationHandoffReceiveError::UnexpectedSender {
+            expected: expected_sender,
+            actual: sender_process_id,
+        });
+    }
+    ServiceGenerationHandoff::decode(bytes)
+        .map(ServiceGenerationHandoff::generation)
+        .map_err(GenerationHandoffReceiveError::Decode)
+}
 
 /// Why a capability does not have the exact endpoint shape required by service routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -952,6 +1052,53 @@ mod tests {
             rights,
             size,
         }
+    }
+
+    #[test]
+    fn generation_handoff_endpoints_have_exact_directional_rights() {
+        assert_eq!(
+            validate_endpoint(endpoint(1, Rights::ENDPOINT, 0), Rights::ENDPOINT, true),
+            Ok(())
+        );
+        assert_eq!(
+            validate_endpoint(endpoint(1, Rights::RECEIVE, 1), Rights::RECEIVE, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_endpoint(endpoint(1, Rights::SEND, 1), Rights::RECEIVE, false),
+            Err(EndpointShapeError::WrongRights {
+                expected: Rights::RECEIVE,
+                actual: Rights::SEND,
+            })
+        );
+    }
+
+    #[test]
+    fn generation_handoff_envelope_pins_sender_capability_count_and_codec() {
+        let bytes = ServiceGenerationHandoff::new(generation(7)).encode();
+        assert_eq!(
+            validate_service_generation_envelope(&bytes, 1, 1, false),
+            Ok(generation(7))
+        );
+        assert_eq!(
+            validate_service_generation_envelope(&bytes, 2, 1, false),
+            Err(GenerationHandoffReceiveError::UnexpectedSender {
+                expected: 1,
+                actual: 2,
+            })
+        );
+        assert_eq!(
+            validate_service_generation_envelope(&bytes, 1, 1, true),
+            Err(GenerationHandoffReceiveError::UnexpectedCapability)
+        );
+        let mut malformed = bytes;
+        malformed[6] = 1;
+        assert_eq!(
+            validate_service_generation_envelope(&malformed, 1, 1, false),
+            Err(GenerationHandoffReceiveError::Decode(
+                ServiceGenerationDecodeError::NonzeroReserved,
+            ))
+        );
     }
 
     #[test]

@@ -174,9 +174,13 @@ identity and generation so a replacement is never confused with its predecessor.
 The implemented route substrate represents a stable identity as a UUIDv4 `ServiceId` plus a
 nonzero role ID. A role matters because one service can expose independently authorized authorities;
 the logging producer and observer are separate routes under one service ID. The current PID 1 pilot
-uses the provider process PID as its nonzero generation. That is a temporary integration shortcut,
-not the intended durable generation source: the service manager must eventually own generation
-allocation independently of process IDs.
+owns an allocation-free monotonic provider-generation sequence independent of process IDs, and every
+startup attempt consumes a generation. PID 1 hands it to the service in a strict one-use `NSGN` v1
+record over a private receive-only bootstrap endpoint; the service validates PID 1, exact rights, no
+capability attachment, and canonical encoding before closing the handle. The generation then binds
+the collector, `NSLS`, NSWP, and route publications. A restartable service manager must eventually
+own the sequence and receive its current state across replacement. The current contract provides no
+durable cross-boot persistence.
 
 ## Service definitions
 
@@ -407,7 +411,7 @@ Machine shutdown is coordinated in stages:
 4. stop nonessential machine services;
 5. flush filesystem and storage services in dependency order;
 6. stop networking and device services where safe;
-7. preserve final logs and generation state;
+7. preserve final logs and record final lifecycle state;
 8. request final kernel power transition.
 
 Each service receives a stop request with an absolute deadline. It may report readiness
