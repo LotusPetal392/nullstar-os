@@ -390,6 +390,21 @@ A client does not enumerate a global process table and send to a process ID. A b
 resolves a stable service identity, checks the caller's route and policy, activates the
 provider where necessary, and returns a fresh channel endpoint.
 
+The current [service route protocol](../service-route-protocol.md) is a smaller implemented step over
+one-ended endpoints. Its generic `no_std` core and native adapter are allocation-free: a stable
+UUIDv4 service ID and nonzero role select one independently authorized route, while a nonzero
+provider generation identifies the current publication. `NSRT` v1 is exactly 40 bytes. Under the
+current endpoint ABI, a request transfers exactly one fresh send-only reply capability and an
+accepted reply transfers exactly one send-only provider capability; a failure transfers none.
+Authorization occurs before availability lookup.
+
+The broker handles only route control. It does not parse the NSWP or application packets sent after
+acceptance. Provider generations use fresh ingress endpoint objects, so old handles do not become
+handles to the replacement. This is generation isolation rather than global revocation: already
+delegated handles remain valid for their old objects until references disappear. The initial logging
+integration uses PID 1 as a temporary broker and provider PID as generation; both are migration
+constraints rather than the final service-manager contract.
+
 Stable protocols should define:
 
 - canonical protocol identity;

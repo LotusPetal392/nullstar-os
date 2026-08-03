@@ -10,7 +10,7 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const OBSERVER_INGRESS_HANDLE: u64 = 1;
+const OBSERVER_ROUTE_HANDLE: u64 = 1;
 const COMPLETE_MARKER: &[u8] = b"logctl: show complete\n";
 const USAGE: &[u8] = b"usage: logctl show\n";
 const SHOW_FAILED: &[u8] = b"logctl: history query failed\n";
@@ -20,7 +20,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if arguments.len() != 2 || arguments.get(1) != Some(b"show") {
         fail(USAGE, 2);
     }
-    if logctl::show(OBSERVER_INGRESS_HANDLE).is_err()
+    if logctl::show(OBSERVER_ROUTE_HANDLE).is_err()
         || syscall::write_all(STDOUT, COMPLETE_MARKER).is_err()
     {
         fail(SHOW_FAILED, 3);

@@ -1,15 +1,18 @@
 //! Authorized logging history display used by the command and trusted recovery shell.
 
 use nswp_logging::{
-    CollectorStats, HistoryRecordView, HistorySource, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
-    LogSeverity, LoggingObserver, RecordId, decode_collector_stats_client_response,
-    decode_history_read_client_response,
+    CollectorStats, HistoryRecordView, HistorySource, LOGGING_OBSERVER_ROLE,
+    LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY, LOGGING_SERVICE_ID, LogSeverity, LoggingObserver,
+    RecordId, decode_collector_stats_client_response, decode_history_read_client_response,
 };
 use nswp_runtime::{ClientEvent, RuntimeError};
+use service_route::{ProviderGeneration, RouteKey};
 
 use crate::{
+    abi::INIT_PROCESS_ID,
     ipc::{self, CapabilityHandle},
     logging_session::{ClientBootstrap, ClientTransport},
+    service_route::RouteResolution,
     syscall::{self, STDOUT},
 };
 
@@ -73,34 +76,60 @@ impl SnapshotProgress {
     }
 }
 
-pub fn show(observer_ingress: CapabilityHandle) -> Result<(), ShowError> {
-    let transport = connect_observer(observer_ingress)?;
-    let expected_generation = transport.service_generation();
+/// Resolves and uses the observer route once. The exact-`SEND` route grant remains caller-owned.
+pub fn show(observer_route_grant: CapabilityHandle) -> Result<(), ShowError> {
+    let (transport, route_generation) = connect_observer(observer_route_grant)?;
     let mut observer = LoggingObserver::new(transport);
-    negotiate(&mut observer, expected_generation)?;
+    negotiate(&mut observer, route_generation)?;
     let stats = query_stats(&mut observer)?;
     show_history(&mut observer, stats)
 }
 
-fn connect_observer(observer_ingress: CapabilityHandle) -> Result<ClientTransport, ShowError> {
-    let mut bootstrap = match ClientBootstrap::new(observer_ingress) {
-        Ok(bootstrap) => bootstrap,
-        Err(_) => {
-            let _ = ipc::close(observer_ingress);
-            return Err(ShowError::Connect);
+const fn observer_route_key() -> RouteKey {
+    RouteKey::new(LOGGING_SERVICE_ID, LOGGING_OBSERVER_ROLE)
+}
+
+fn connect_observer(
+    observer_route_grant: CapabilityHandle,
+) -> Result<(ClientTransport, ProviderGeneration), ShowError> {
+    let mut resolution = RouteResolution::begin(observer_route_grant, observer_route_key())
+        .map_err(|_| ShowError::Connect)?;
+    let mut remaining = MAX_YIELDS;
+    let resolved = loop {
+        match resolution.try_complete() {
+            Ok(Some(resolved)) => break resolved,
+            Ok(None) => yield_bounded(&mut remaining, ShowError::Connect)?,
+            Err(_) => return Err(ShowError::Connect),
         }
     };
+    if resolved.broker_process_id() != INIT_PROCESS_ID {
+        return Err(ShowError::Connect);
+    }
+
+    let route_generation = resolved.generation();
+    let observer_ingress = resolved.into_handle();
+    let mut bootstrap =
+        match ClientBootstrap::new_for_generation(observer_ingress, route_generation) {
+            Ok(bootstrap) => bootstrap,
+            Err(_) => {
+                let _ = ipc::close(observer_ingress);
+                return Err(ShowError::Connect);
+            }
+        };
     let mut remaining = MAX_YIELDS;
     loop {
         match bootstrap.try_connect() {
-            Ok(Some(transport)) => return Ok(transport),
+            Ok(Some(transport)) => return Ok((transport, route_generation)),
             Ok(None) => yield_bounded(&mut remaining, ShowError::Connect)?,
             Err(_) => return Err(ShowError::Connect),
         }
     }
 }
 
-fn negotiate(observer: &mut Observer, expected_generation: u64) -> Result<(), ShowError> {
+fn negotiate(
+    observer: &mut Observer,
+    expected_generation: ProviderGeneration,
+) -> Result<(), ShowError> {
     let mut remaining = MAX_YIELDS;
     loop {
         match observer.try_negotiate() {
@@ -117,7 +146,10 @@ fn negotiate(observer: &mut Observer, expected_generation: u64) -> Result<(), Sh
         match observer.poll() {
             Ok(Some(ClientEvent::Bound(bound)))
                 if bound.minor() == LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY
-                    && bound.service_generation() == expected_generation =>
+                    && bound_generation_matches(
+                        expected_generation,
+                        bound.service_generation(),
+                    ) =>
             {
                 return Ok(());
             }
@@ -125,6 +157,10 @@ fn negotiate(observer: &mut Observer, expected_generation: u64) -> Result<(), Sh
             Ok(Some(_)) | Err(_) => return Err(ShowError::Connect),
         }
     }
+}
+
+const fn bound_generation_matches(expected: ProviderGeneration, actual: u64) -> bool {
+    expected.get() == actual
 }
 
 fn query_stats(observer: &mut Observer) -> Result<CollectorStats, ShowError> {
@@ -272,6 +308,17 @@ fn yield_bounded(remaining: &mut u32, error: ShowError) -> Result<(), ShowError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_route_and_bound_generation_are_pinned() {
+        let key = observer_route_key();
+        assert_eq!(key.service(), LOGGING_SERVICE_ID);
+        assert_eq!(key.role(), LOGGING_OBSERVER_ROLE);
+
+        let generation = ProviderGeneration::new(9).unwrap();
+        assert!(bound_generation_matches(generation, 9));
+        assert!(!bound_generation_matches(generation, 10));
+    }
 
     fn stats(oldest: u64, newest: u64, retained: u64) -> CollectorStats {
         CollectorStats {

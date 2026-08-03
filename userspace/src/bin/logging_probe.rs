@@ -4,26 +4,28 @@
 use nswp_core::TransportStatus;
 use nswp_logging::{
     COLLECTOR_SECRET_REDACTION, CollectorStats, EventId, HistoryRecordView, HistorySource,
-    LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY,
-    LogDelivery, LogDisposition, LogRecord, LogSeverity, LoggingObserver, LoggingProducer,
-    PrivacyClass, RecordId, decode_collector_stats_client_response,
-    decode_history_read_client_response,
+    LOGGING_MAX_MESSAGE_BYTES, LOGGING_MAX_SUBSYSTEM_BYTES, LOGGING_OBSERVER_ROLE,
+    LOGGING_PRODUCER_ROLE, LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY, LOGGING_SERVICE_ID, LogDelivery,
+    LogDisposition, LogRecord, LogSeverity, LoggingObserver, LoggingProducer, PrivacyClass,
+    RecordId, decode_collector_stats_client_response, decode_history_read_client_response,
 };
 use nswp_runtime::{ClientEvent, RuntimeError};
+use service_route::{ProviderGeneration, RouteKey};
 use userspace::{
     abi::INIT_PROCESS_ID,
     args::Args,
     early_log,
     ipc::{self, ObjectKind, Rights},
     logging_session::{ClientBootstrap, ClientTransport},
+    service_route::RouteResolution,
     syscall,
 };
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const PRODUCER_INGRESS_HANDLE: u64 = 1;
-const OBSERVER_INGRESS_HANDLE: u64 = 2;
+const PRODUCER_ROUTE_HANDLE: u64 = 1;
+const OBSERVER_ROUTE_HANDLE: u64 = 2;
 const STATUS_HANDLE: u64 = 3;
 const CONTROL_HANDLE: u64 = 4;
 const MAX_YIELDS: u32 = 65_536;
@@ -135,21 +137,24 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if matches!(mode, ProbeMode::CollectorStress) {
         validate_stress_handles();
     }
-    let producer_transport = ClientBootstrap::new(PRODUCER_INGRESS_HANDLE)
-        .and_then(ClientBootstrap::connect)
-        .unwrap_or_else(|_| syscall::exit(4));
-    let observer_transport = ClientBootstrap::new(OBSERVER_INGRESS_HANDLE)
-        .and_then(ClientBootstrap::connect)
-        .unwrap_or_else(|_| syscall::exit(4));
+    let (producer_transport, producer_generation, producer_object_id) = connect_route(
+        PRODUCER_ROUTE_HANDLE,
+        RouteKey::new(LOGGING_SERVICE_ID, LOGGING_PRODUCER_ROLE),
+    );
+    let (observer_transport, observer_generation, observer_object_id) = connect_route(
+        OBSERVER_ROUTE_HANDLE,
+        RouteKey::new(LOGGING_SERVICE_ID, LOGGING_OBSERVER_ROLE),
+    );
     if producer_transport.service_process_id() != observer_transport.service_process_id()
-        || producer_transport.service_generation() != observer_transport.service_generation()
+        || producer_generation != observer_generation
+        || producer_object_id == observer_object_id
     {
         syscall::exit(4);
     }
     let mut producer = LoggingProducer::new(producer_transport);
     let mut observer = LoggingObserver::new(observer_transport);
-    negotiate_producer(&mut producer);
-    negotiate_observer(&mut observer);
+    negotiate_producer(&mut producer, producer_generation);
+    negotiate_observer(&mut observer, observer_generation);
     verify_producer_cannot_read(&mut producer);
 
     match mode {
@@ -162,7 +167,43 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     syscall::exit(0)
 }
 
-fn negotiate_producer(producer: &mut Producer) {
+fn connect_route(route_grant: u64, key: RouteKey) -> (ClientTransport, ProviderGeneration, u64) {
+    let mut resolution =
+        RouteResolution::begin(route_grant, key).unwrap_or_else(|_| syscall::exit(4));
+    let mut remaining = MAX_YIELDS;
+    let resolved = loop {
+        match resolution.try_complete() {
+            Ok(Some(resolved)) => break resolved,
+            Ok(None) => yield_bounded(&mut remaining, 4),
+            Err(_) => syscall::exit(4),
+        }
+    };
+    if resolved.broker_process_id() != INIT_PROCESS_ID {
+        syscall::exit(4);
+    }
+
+    let generation = resolved.generation();
+    let object_id = resolved.object_id();
+    let ingress = resolved.into_handle();
+    let mut bootstrap = match ClientBootstrap::new_for_generation(ingress, generation) {
+        Ok(bootstrap) => bootstrap,
+        Err(_) => {
+            let _ = ipc::close(ingress);
+            syscall::exit(4)
+        }
+    };
+    let mut remaining = MAX_YIELDS;
+    let transport = loop {
+        match bootstrap.try_connect() {
+            Ok(Some(transport)) => break transport,
+            Ok(None) => yield_bounded(&mut remaining, 4),
+            Err(_) => syscall::exit(4),
+        }
+    };
+    (transport, generation, object_id)
+}
+
+fn negotiate_producer(producer: &mut Producer, expected_generation: ProviderGeneration) {
     let mut remaining = MAX_YIELDS;
     loop {
         match producer.try_negotiate() {
@@ -175,7 +216,8 @@ fn negotiate_producer(producer: &mut Producer) {
     loop {
         match producer.poll() {
             Ok(Some(ClientEvent::Bound(bound)))
-                if bound.minor() == LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY =>
+                if bound.minor() == LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY
+                    && bound.service_generation() == expected_generation.get() =>
             {
                 return;
             }
@@ -185,7 +227,7 @@ fn negotiate_producer(producer: &mut Producer) {
     }
 }
 
-fn negotiate_observer(observer: &mut Observer) {
+fn negotiate_observer(observer: &mut Observer, expected_generation: ProviderGeneration) {
     let mut remaining = MAX_YIELDS;
     loop {
         match observer.try_negotiate() {
@@ -198,7 +240,8 @@ fn negotiate_observer(observer: &mut Observer) {
     loop {
         match observer.poll() {
             Ok(Some(ClientEvent::Bound(bound)))
-                if bound.minor() == LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY =>
+                if bound.minor() == LOGGING_PROTOCOL_MINOR_KERNEL_HISTORY
+                    && bound.service_generation() == expected_generation.get() =>
             {
                 return;
             }

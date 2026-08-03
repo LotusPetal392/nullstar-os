@@ -437,14 +437,18 @@ impl Shell {
             Builtin::Unset => self.unset_variable(command_arguments(command)),
             Builtin::Environment => self.print_environment(),
             Builtin::LogShow => {
-                let observer = ipc::duplicate(OBSERVER_ROUTE_HANDLE, Rights::SEND);
-                if observer
-                    .ok()
-                    .is_none_or(|observer| logctl::show(observer).is_err())
-                {
-                    self.error(LOGCTL_FAILURE);
-                } else {
+                let succeeded = match ipc::duplicate(OBSERVER_ROUTE_HANDLE, Rights::SEND) {
+                    Ok(observer_route) => {
+                        let show_result = logctl::show(observer_route);
+                        let close_result = ipc::close(observer_route);
+                        show_result.is_ok() && close_result.is_ok()
+                    }
+                    Err(_) => false,
+                };
+                if succeeded {
                     self.output(LOGCTL_COMPLETE);
+                } else {
+                    self.error(LOGCTL_FAILURE);
                 }
             }
             Builtin::LogUsage => self.error(LOGCTL_USAGE),

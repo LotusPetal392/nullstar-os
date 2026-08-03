@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
 
+use nswp_logging::{LOGGING_OBSERVER_ROLE, LOGGING_PRODUCER_ROLE, LOGGING_SERVICE_ID};
+use service_route::{Authorizer, ProviderGeneration, RouteKey};
 use userspace::{
     abi::{INIT_PROCESS_ID, signal},
     early_log,
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
+    service_route::{NativeRouteTable, RouteIngress},
     supervisor::{
         ServiceRuntime, ServiceSpec, ServiceStatusDisposition, ShellStatusDisposition,
         shell_status_disposition,
@@ -40,8 +43,7 @@ const LOGGING_PROBE_PASSED: &[u8] = b"userspace init: native NSWP logging probe 
 const LOGCTL_COMMAND: &[u8] = b"/logctl show";
 const LOGCTL_FAILED: &[u8] = b"userspace init: logctl show failed\n";
 const LOGCTL_PASSED: &[u8] = b"userspace init: logctl show passed\n";
-const LOGGING_COLLECTOR_TEST_PASSED: &[u8] =
-    b"userspace init: logging collector ring, backpressure, redaction, and restart verified\n";
+const LOGGING_COLLECTOR_TEST_PASSED: &[u8] = b"userspace init: logging collector ring, backpressure, redaction, and route generation isolation verified\n";
 const LOGGING_COLLECTOR_EXIT_WAIT_FAILED: &[u8] =
     b"userspace init: logging collector service exit wait failed\n";
 const LOGGING_COLLECTOR_EXIT_NO_CHILD: &[u8] =
@@ -123,6 +125,8 @@ const REQUEST_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
 const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
 const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
+const MAX_BOOTSTRAP_ROUTES: usize = 2;
+const ROUTE_PUMP_BUDGET: usize = 4;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
 
@@ -179,6 +183,140 @@ struct BootstrapCapability {
     target_handle: CapabilityHandle,
 }
 
+const LOGGING_PRODUCER_KEY: RouteKey = RouteKey::new(LOGGING_SERVICE_ID, LOGGING_PRODUCER_ROLE);
+const LOGGING_OBSERVER_KEY: RouteKey = RouteKey::new(LOGGING_SERVICE_ID, LOGGING_OBSERVER_ROLE);
+
+struct RouteBrokerState {
+    routes: NativeRouteTable<CapabilityHandle, MAX_BOOTSTRAP_ROUTES>,
+    producer_grant_source: CapabilityHandle,
+    observer_grant_source: CapabilityHandle,
+    producer_ingress: RouteIngress,
+    observer_ingress: RouteIngress,
+}
+
+impl RouteBrokerState {
+    fn new() -> Self {
+        let producer_grant_source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let observer_grant_source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let producer_receive = ipc::duplicate(producer_grant_source, Rights::RECEIVE)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let observer_receive = ipc::duplicate(observer_grant_source, Rights::RECEIVE)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let producer_ingress = RouteIngress::bind(producer_receive, LOGGING_PRODUCER_KEY)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let observer_ingress = RouteIngress::bind(observer_receive, LOGGING_OBSERVER_KEY)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        Self {
+            routes: NativeRouteTable::new(),
+            producer_grant_source,
+            observer_grant_source,
+            producer_ingress,
+            observer_ingress,
+        }
+    }
+
+    fn pump(&mut self) {
+        for _ in 0..ROUTE_PUMP_BUDGET {
+            let mut progressed = false;
+            progressed |= pump_route_ingress(&mut self.producer_ingress, &self.routes);
+            progressed |= pump_route_ingress(&mut self.observer_ingress, &self.routes);
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    fn publish(
+        &mut self,
+        generation: ProviderGeneration,
+        producer_source: CapabilityHandle,
+        observer_source: CapabilityHandle,
+    ) {
+        let producer_authority = ipc::duplicate(
+            producer_source,
+            Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+        )
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let observer_authority = ipc::duplicate(
+            observer_source,
+            Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+        )
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        if !matches!(
+            self.routes
+                .publish(LOGGING_PRODUCER_KEY, generation, producer_authority),
+            Ok(None)
+        ) {
+            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+        }
+        if !matches!(
+            self.routes
+                .publish(LOGGING_OBSERVER_KEY, generation, observer_authority),
+            Ok(None)
+        ) {
+            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+        }
+    }
+
+    fn withdraw(&mut self, generation: ProviderGeneration) {
+        let producer = self
+            .routes
+            .withdraw(LOGGING_PRODUCER_KEY, generation)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let observer = self
+            .routes
+            .withdraw(LOGGING_OBSERVER_KEY, generation)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        ipc::close(producer).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        ipc::close(observer).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    }
+}
+
+struct AllowGrantedRoute;
+
+impl Authorizer<u64> for AllowGrantedRoute {
+    type Error = ();
+
+    fn authorize(&mut self, caller: &u64, _key: RouteKey) -> Result<(), Self::Error> {
+        if *caller == 0 { Err(()) } else { Ok(()) }
+    }
+}
+
+fn pump_route_ingress(
+    ingress: &mut RouteIngress,
+    routes: &NativeRouteTable<CapabilityHandle, MAX_BOOTSTRAP_ROUTES>,
+) -> bool {
+    let request = match ingress.try_accept() {
+        Ok(Some(request)) => request,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    if let Ok(authorized) = request.authorize(&mut AllowGrantedRoute) {
+        let _ = authorized.resolve(routes);
+    }
+    true
+}
+
+struct LoggingGeneration {
+    generation: ProviderGeneration,
+    readiness_source: CapabilityHandle,
+    producer_source: CapabilityHandle,
+    observer_source: CapabilityHandle,
+    producer_object_id: u64,
+    observer_object_id: u64,
+}
+
+impl LoggingGeneration {
+    fn close(self) {
+        ipc::close(self.readiness_source)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        ipc::close(self.producer_source).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        ipc::close(self.observer_source).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    }
+}
+
 const LOGGING_MESSAGES: ServiceMessages = ServiceMessages {
     starting: LOGGING_SERVICE_STARTING,
     restarting: LOGGING_SERVICE_RESTARTING,
@@ -221,12 +359,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     }
     let nullfs_restart_test = nullfs_restart_test_boot();
 
-    let logging_readiness_endpoint =
-        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let logging_producer_ingress =
-        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let logging_observer_ingress =
-        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let mut route_broker = RouteBrokerState::new();
     let logging_early_log_reader =
         early_log::open_reader().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
     if !matches!(
@@ -238,42 +371,27 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
     let mut logging_service = ServiceRuntime::new(LOGGING_SERVICE);
-    let logging_observer_capability = BootstrapCapability {
-        source_handle: logging_observer_ingress,
-        rights: Rights::RECEIVE,
-        target_handle: LOGGING_OBSERVER_INGRESS_HANDLE,
-    };
-    let logging_early_log_capability = BootstrapCapability {
-        source_handle: logging_early_log_reader,
-        rights: Rights::READ,
-        target_handle: LOGGING_EARLY_LOG_HANDLE,
-    };
-    let logging_capabilities = [logging_observer_capability, logging_early_log_capability];
-    start_service(
+    let mut logging_generation = start_logging_generation(
         &mut logging_service,
-        logging_readiness_endpoint,
-        logging_producer_ingress,
-        &logging_capabilities,
-        &LOGGING_MESSAGES,
+        &mut route_broker,
+        logging_early_log_reader,
     );
     if nullfs_restart_test {
-        run_logging_collector_restart_test(
+        logging_generation = run_logging_collector_restart_test(
             &mut logging_service,
-            logging_readiness_endpoint,
-            logging_producer_ingress,
-            logging_observer_ingress,
-            &logging_capabilities,
+            &mut route_broker,
+            logging_early_log_reader,
+            logging_generation,
         );
     } else {
         run_logging_probe(
             &logging_service,
-            logging_producer_ingress,
-            logging_observer_ingress,
+            &mut route_broker,
             LOGGING_PROBE_COMMAND,
             LOGGING_PROBE_PASSED,
         );
     }
-    run_logctl_show(&logging_service, logging_observer_ingress);
+    run_logctl_show(&logging_service, &mut route_broker);
 
     let mut missing_nullfs_uuid = nullfs_primary_volume::FILESYSTEM_UUID;
     missing_nullfs_uuid[15] ^= 0xff;
@@ -414,7 +532,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             VFS_READINESS_PROBE_PASSED,
         );
     }
-    let mut shell_process_id = spawn_shell(logging_observer_ingress);
+    let mut shell_process_id = spawn_shell(route_broker.observer_grant_source);
 
     loop {
         if let Some(service_process_id) = logging_service.process_id() {
@@ -422,14 +540,14 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 Ok(status) => match logging_service.observe_status(status.raw()) {
                     ServiceStatusDisposition::WaitForNextEvent => {}
                     ServiceStatusDisposition::Restart { backoff_yields } => {
+                        route_broker.withdraw(logging_generation.generation);
+                        logging_generation.close();
                         let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_RESTARTING);
                         backoff(backoff_yields);
-                        start_service(
+                        logging_generation = start_logging_generation(
                             &mut logging_service,
-                            logging_readiness_endpoint,
-                            logging_producer_ingress,
-                            &logging_capabilities,
-                            &LOGGING_MESSAGES,
+                            &mut route_broker,
+                            logging_early_log_reader,
                         );
                     }
                     ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
@@ -439,6 +557,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 Err(_) => fail(LOGGING_SERVICE_FAILED),
             }
         }
+        route_broker.pump();
 
         if let Some(service_process_id) = nullfs_service.process_id() {
             match syscall::try_wait_child(service_process_id) {
@@ -522,7 +641,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 }
                 ShellStatusDisposition::RestartShell => {
                     let _ = syscall::write_all(STDOUT, SHELL_RESTARTING);
-                    shell_process_id = spawn_shell(logging_observer_ingress);
+                    shell_process_id = spawn_shell(route_broker.observer_grant_source);
                 }
             },
             Err(error) if error == syscall::Errno::TRY_AGAIN => {}
@@ -758,6 +877,160 @@ fn register_vfs_router(service: &ServiceRuntime, request_endpoint: CapabilityHan
         .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
 }
 
+fn start_logging_generation(
+    service: &mut ServiceRuntime,
+    route_broker: &mut RouteBrokerState,
+    early_log_reader: CapabilityHandle,
+) -> LoggingGeneration {
+    'attempt: loop {
+        let readiness_source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let producer_source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let observer_source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let producer_object_id = ipc::info(producer_source)
+            .map(|info| info.object_id)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let observer_object_id = ipc::info(observer_source)
+            .map(|info| info.object_id)
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        if producer_object_id == 0
+            || observer_object_id == 0
+            || producer_object_id == observer_object_id
+        {
+            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+        }
+
+        let spec = service.spec();
+        let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.starting);
+        let barrier =
+            syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
+        let process_id = syscall::spawn_command_with_barrier(
+            spec.command,
+            SpawnFlags::NEW_PROCESS_GROUP,
+            None,
+            None,
+            None,
+            None,
+            &barrier,
+        )
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
+        service.note_spawned(process_id);
+        if ipc::grant_child(process_id, readiness_source, Rights::SEND, READY_HANDLE).ok()
+            != Some(READY_HANDLE)
+            || ipc::grant_child(process_id, producer_source, Rights::RECEIVE, REQUEST_HANDLE).ok()
+                != Some(REQUEST_HANDLE)
+            || ipc::grant_child(
+                process_id,
+                observer_source,
+                Rights::RECEIVE,
+                LOGGING_OBSERVER_INGRESS_HANDLE,
+            )
+            .ok()
+                != Some(LOGGING_OBSERVER_INGRESS_HANDLE)
+            || ipc::grant_child(
+                process_id,
+                early_log_reader,
+                Rights::READ,
+                LOGGING_EARLY_LOG_HANDLE,
+            )
+            .ok()
+                != Some(LOGGING_EARLY_LOG_HANDLE)
+        {
+            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+        }
+        barrier
+            .release()
+            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+
+        let mut ready_buffer = [0_u8; 64];
+        loop {
+            route_broker.pump();
+            match ipc::try_receive(readiness_source, &mut ready_buffer) {
+                Ok(message) => {
+                    if message.sender_process_id != process_id
+                        || message.capability.is_some()
+                        || message.bytes != spec.ready_message.len()
+                        || &ready_buffer[..message.bytes] != spec.ready_message
+                    {
+                        fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+                    }
+                    loop {
+                        match syscall::try_wait_child(process_id) {
+                            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                            Err(error) if error == syscall::Errno::TRY_AGAIN => break,
+                            Err(_) => fail(LOGGING_SERVICE_FAILED),
+                            Ok(status) if status.continued() => {
+                                if service.observe_status(status.raw())
+                                    != ServiceStatusDisposition::WaitForNextEvent
+                                {
+                                    fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+                                }
+                            }
+                            Ok(status) if status.stopped_signal().is_some() => {
+                                fail(LOGGING_SERVICE_PROTOCOL_FAILED)
+                            }
+                            Ok(status) => match service.observe_status(status.raw()) {
+                                ServiceStatusDisposition::Restart { backoff_yields } => {
+                                    ipc::close(readiness_source)
+                                        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                                    ipc::close(producer_source)
+                                        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                                    ipc::close(observer_source)
+                                        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                                    let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.restarting);
+                                    backoff(backoff_yields);
+                                    continue 'attempt;
+                                }
+                                ServiceStatusDisposition::WaitForNextEvent
+                                | ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
+                            },
+                        }
+                    }
+                    service.note_ready();
+                    let generation = ProviderGeneration::new(process_id)
+                        .unwrap_or_else(|| fail(LOGGING_SERVICE_PROTOCOL_FAILED));
+                    route_broker.publish(generation, producer_source, observer_source);
+                    let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.ready);
+                    return LoggingGeneration {
+                        generation,
+                        readiness_source,
+                        producer_source,
+                        observer_source,
+                        producer_object_id,
+                        observer_object_id,
+                    };
+                }
+                Err(error) if error == ipc::Error::TRY_AGAIN => {}
+                Err(_) => fail(LOGGING_SERVICE_PROTOCOL_FAILED),
+            }
+
+            match syscall::try_wait_child(process_id) {
+                Ok(status) => match service.observe_status(status.raw()) {
+                    ServiceStatusDisposition::WaitForNextEvent => {}
+                    ServiceStatusDisposition::Restart { backoff_yields } => {
+                        ipc::close(readiness_source)
+                            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                        ipc::close(producer_source)
+                            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                        ipc::close(observer_source)
+                            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                        let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.restarting);
+                        backoff(backoff_yields);
+                        break;
+                    }
+                    ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
+                },
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+                Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                Err(_) => fail(LOGGING_SERVICE_FAILED),
+            }
+            let _ = syscall::yield_now();
+        }
+    }
+}
+
 fn start_service(
     service: &mut ServiceRuntime,
     readiness_endpoint: CapabilityHandle,
@@ -847,8 +1120,7 @@ fn start_service(
 
 fn run_logging_probe(
     service: &ServiceRuntime,
-    producer_ingress: CapabilityHandle,
-    observer_ingress: CapabilityHandle,
+    route_broker: &mut RouteBrokerState,
     command: &[u8],
     passed_message: &[u8],
 ) {
@@ -863,15 +1135,15 @@ fn run_logging_probe(
         &barrier,
     )
     .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
-    grant_logging_probe_endpoints(probe_process_id, producer_ingress, observer_ingress);
+    grant_logging_probe_routes(probe_process_id, route_broker);
     barrier
         .release()
         .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
-    wait_for_logging_probe_exit(service, probe_process_id);
+    wait_for_logging_probe_exit(service, route_broker, probe_process_id);
     let _ = syscall::write_all(STDOUT, passed_message);
 }
 
-fn run_logctl_show(service: &ServiceRuntime, observer_ingress: CapabilityHandle) {
+fn run_logctl_show(service: &ServiceRuntime, route_broker: &mut RouteBrokerState) {
     let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGCTL_FAILED));
     let process_id = syscall::spawn_command_with_barrier(
         LOGCTL_COMMAND,
@@ -883,7 +1155,13 @@ fn run_logctl_show(service: &ServiceRuntime, observer_ingress: CapabilityHandle)
         &barrier,
     )
     .unwrap_or_else(|_| fail(LOGCTL_FAILED));
-    if ipc::grant_child(process_id, observer_ingress, Rights::SEND, READY_HANDLE).ok()
+    if ipc::grant_child(
+        process_id,
+        route_broker.observer_grant_source,
+        Rights::SEND,
+        READY_HANDLE,
+    )
+    .ok()
         != Some(READY_HANDLE)
     {
         fail(LOGCTL_FAILED);
@@ -892,6 +1170,8 @@ fn run_logctl_show(service: &ServiceRuntime, observer_ingress: CapabilityHandle)
 
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     loop {
+        require_service_running(service);
+        route_broker.pump();
         match syscall::try_wait_child(process_id) {
             Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
             Ok(status) if status.success() => break,
@@ -899,9 +1179,6 @@ fn run_logctl_show(service: &ServiceRuntime, observer_ingress: CapabilityHandle)
             Err(error) if error == syscall::Errno::TRY_AGAIN => {}
             Err(error) if error == syscall::Errno::INTERRUPTED => {}
             Err(_) => fail(LOGCTL_FAILED),
-        }
-        if service.process_id().is_none() {
-            fail(LOGCTL_FAILED);
         }
         if remaining == 0 || syscall::yield_now().is_err() {
             fail(LOGCTL_FAILED);
@@ -913,11 +1190,10 @@ fn run_logctl_show(service: &ServiceRuntime, observer_ingress: CapabilityHandle)
 
 fn run_logging_collector_restart_test(
     service: &mut ServiceRuntime,
-    readiness_endpoint: CapabilityHandle,
-    producer_ingress: CapabilityHandle,
-    observer_ingress: CapabilityHandle,
-    bootstrap_capabilities: &[BootstrapCapability],
-) {
+    route_broker: &mut RouteBrokerState,
+    early_log_reader: CapabilityHandle,
+    generation: LoggingGeneration,
+) -> LoggingGeneration {
     let status_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     let control_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
@@ -931,7 +1207,7 @@ fn run_logging_collector_restart_test(
         &barrier,
     )
     .unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
-    grant_logging_probe_endpoints(probe_process_id, producer_ingress, observer_ingress);
+    grant_logging_probe_routes(probe_process_id, route_broker);
     if ipc::grant_child(
         probe_process_id,
         status_endpoint,
@@ -957,6 +1233,7 @@ fn run_logging_collector_restart_test(
 
     wait_for_logging_probe_message(
         service,
+        route_broker,
         probe_process_id,
         status_endpoint,
         LOGGING_PROBE_BOUND,
@@ -967,76 +1244,77 @@ fn run_logging_collector_restart_test(
     if syscall::signal_process_group(old_service_process_id, signal::STOP).ok() != Some(1) {
         fail(LOGGING_PROBE_FAILED);
     }
-    wait_for_logging_service_stop(service, old_service_process_id);
+    wait_for_logging_service_stop(service, route_broker, old_service_process_id);
     if service.restart_count() != 0 {
         fail(LOGGING_COLLECTOR_RESTART_POLICY_FAILED);
     }
-    require_empty_endpoint(producer_ingress);
-    require_empty_endpoint(observer_ingress);
+    require_empty_endpoint(generation.producer_source);
+    require_empty_endpoint(generation.observer_source);
     if ipc::send(control_endpoint, LOGGING_PROBE_FILL_QUEUE, None).is_err() {
         fail(LOGGING_PROBE_FAILED);
     }
     wait_for_logging_probe_message(
         service,
+        route_broker,
         probe_process_id,
         status_endpoint,
         LOGGING_PROBE_BACKPRESSURE,
     );
-    if ipc::info(producer_ingress).map(|info| info.size).ok() != Some(8) {
+    if ipc::info(generation.producer_source)
+        .map(|info| info.size)
+        .ok()
+        != Some(8)
+    {
         fail(LOGGING_PROBE_FAILED);
     }
     if syscall::signal_process_group(old_service_process_id, signal::CONTINUE).ok() != Some(1) {
         fail(LOGGING_PROBE_FAILED);
     }
-    wait_for_logging_service_continue(service, old_service_process_id);
-    wait_for_logging_probe_exit(service, probe_process_id);
+    wait_for_logging_service_continue(service, route_broker, old_service_process_id);
+    wait_for_logging_probe_exit(service, route_broker, probe_process_id);
 
-    require_empty_endpoint(readiness_endpoint);
-    require_empty_endpoint(producer_ingress);
-    require_empty_endpoint(observer_ingress);
+    require_empty_endpoint(generation.readiness_source);
+    require_empty_endpoint(generation.producer_source);
+    require_empty_endpoint(generation.observer_source);
     require_empty_endpoint(status_endpoint);
     require_empty_endpoint(control_endpoint);
     if syscall::signal_process_group(old_service_process_id, signal::TERMINATE).ok() != Some(1) {
         fail(LOGGING_PROBE_FAILED);
     }
-    let backoff_yields = wait_for_logging_service_restart(service, old_service_process_id);
+    let backoff_yields =
+        wait_for_logging_service_restart(service, route_broker, old_service_process_id);
     if service.restart_count() != 1 {
         fail(LOGGING_COLLECTOR_RESTART_POLICY_FAILED);
     }
+    let old_generation = generation.generation;
+    let old_producer_object_id = generation.producer_object_id;
+    let old_observer_object_id = generation.observer_object_id;
+    route_broker.withdraw(old_generation);
+    generation.close();
     let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_RESTARTING);
     backoff(backoff_yields);
-    start_service(
-        service,
-        readiness_endpoint,
-        producer_ingress,
-        bootstrap_capabilities,
-        &LOGGING_MESSAGES,
-    );
-    if service.process_id() == Some(old_service_process_id) || service.restart_count() != 1 {
+    let replacement = start_logging_generation(service, route_broker, early_log_reader);
+    if service.process_id() == Some(old_service_process_id)
+        || service.restart_count() != 1
+        || replacement.generation.get() <= old_generation.get()
+        || replacement.producer_object_id == old_producer_object_id
+        || replacement.observer_object_id == old_observer_object_id
+    {
         fail(LOGGING_COLLECTOR_RESTART_POLICY_FAILED);
     }
-    run_logging_probe(
-        service,
-        producer_ingress,
-        observer_ingress,
-        LOGGING_RESTART_PROBE_COMMAND,
-        &[],
-    );
-    require_empty_endpoint(producer_ingress);
-    require_empty_endpoint(observer_ingress);
+    run_logging_probe(service, route_broker, LOGGING_RESTART_PROBE_COMMAND, &[]);
+    require_empty_endpoint(replacement.producer_source);
+    require_empty_endpoint(replacement.observer_source);
     ipc::close(status_endpoint).unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     ipc::close(control_endpoint).unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     let _ = syscall::write_all(STDOUT, LOGGING_COLLECTOR_TEST_PASSED);
+    replacement
 }
 
-fn grant_logging_probe_endpoints(
-    probe_process_id: ProcessId,
-    producer_ingress: CapabilityHandle,
-    observer_ingress: CapabilityHandle,
-) {
+fn grant_logging_probe_routes(probe_process_id: ProcessId, route_broker: &RouteBrokerState) {
     if ipc::grant_child(
         probe_process_id,
-        producer_ingress,
+        route_broker.producer_grant_source,
         Rights::SEND,
         READY_HANDLE,
     )
@@ -1044,7 +1322,7 @@ fn grant_logging_probe_endpoints(
         != Some(READY_HANDLE)
         || ipc::grant_child(
             probe_process_id,
-            observer_ingress,
+            route_broker.observer_grant_source,
             Rights::SEND,
             REQUEST_HANDLE,
         )
@@ -1057,6 +1335,7 @@ fn grant_logging_probe_endpoints(
 
 fn wait_for_logging_probe_message(
     service: &ServiceRuntime,
+    route_broker: &mut RouteBrokerState,
     probe_process_id: ProcessId,
     endpoint: CapabilityHandle,
     expected: &[u8],
@@ -1064,6 +1343,8 @@ fn wait_for_logging_probe_message(
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     let mut buffer = [0_u8; 64];
     loop {
+        require_service_running(service);
+        route_broker.pump();
         match ipc::try_receive(endpoint, &mut buffer) {
             Ok(message)
                 if message.sender_process_id == probe_process_id
@@ -1078,14 +1359,19 @@ fn wait_for_logging_probe_message(
             Err(_) => fail(LOGGING_PROBE_FAILED),
         }
         require_process_running(probe_process_id);
-        require_service_running(service);
         yield_logging_probe(&mut remaining);
     }
 }
 
-fn wait_for_logging_probe_exit(service: &ServiceRuntime, probe_process_id: ProcessId) {
+fn wait_for_logging_probe_exit(
+    service: &ServiceRuntime,
+    route_broker: &mut RouteBrokerState,
+    probe_process_id: ProcessId,
+) {
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     loop {
+        require_service_running(service);
+        route_broker.pump();
         match syscall::try_wait_child(probe_process_id) {
             Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
             Ok(status) if status.success() => return,
@@ -1094,7 +1380,6 @@ fn wait_for_logging_probe_exit(service: &ServiceRuntime, probe_process_id: Proce
             Err(error) if error == syscall::Errno::INTERRUPTED => {}
             Err(_) => fail(LOGGING_PROBE_FAILED),
         }
-        require_service_running(service);
         yield_logging_probe(&mut remaining);
     }
 }
@@ -1115,7 +1400,11 @@ fn require_service_running(service: &ServiceRuntime) {
     require_process_running(process_id);
 }
 
-fn wait_for_logging_service_stop(service: &mut ServiceRuntime, process_id: ProcessId) {
+fn wait_for_logging_service_stop(
+    service: &mut ServiceRuntime,
+    route_broker: &mut RouteBrokerState,
+    process_id: ProcessId,
+) {
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     loop {
         match syscall::try_wait_child(process_id) {
@@ -1139,11 +1428,16 @@ fn wait_for_logging_service_stop(service: &mut ServiceRuntime, process_id: Proce
             Err(error) if error == syscall::Errno::INTERRUPTED => {}
             Err(_) => fail(LOGGING_PROBE_FAILED),
         }
+        route_broker.pump();
         yield_logging_probe(&mut remaining);
     }
 }
 
-fn wait_for_logging_service_continue(service: &mut ServiceRuntime, process_id: ProcessId) {
+fn wait_for_logging_service_continue(
+    service: &mut ServiceRuntime,
+    route_broker: &mut RouteBrokerState,
+    process_id: ProcessId,
+) {
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     loop {
         match syscall::try_wait_child(process_id) {
@@ -1167,11 +1461,16 @@ fn wait_for_logging_service_continue(service: &mut ServiceRuntime, process_id: P
             Err(error) if error == syscall::Errno::INTERRUPTED => {}
             Err(_) => fail(LOGGING_PROBE_FAILED),
         }
+        route_broker.pump();
         yield_logging_probe(&mut remaining);
     }
 }
 
-fn wait_for_logging_service_restart(service: &mut ServiceRuntime, process_id: ProcessId) -> u32 {
+fn wait_for_logging_service_restart(
+    service: &mut ServiceRuntime,
+    route_broker: &mut RouteBrokerState,
+    process_id: ProcessId,
+) -> u32 {
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     loop {
         match syscall::try_wait_child(process_id) {
@@ -1195,6 +1494,7 @@ fn wait_for_logging_service_restart(service: &mut ServiceRuntime, process_id: Pr
             }
             Err(_) => fail(LOGGING_COLLECTOR_EXIT_WAIT_FAILED),
         }
+        route_broker.pump();
         yield_logging_probe(&mut remaining);
     }
 }

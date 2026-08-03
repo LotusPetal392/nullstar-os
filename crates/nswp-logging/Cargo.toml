@@ -8,6 +8,7 @@ repository = "https://github.com/LotusPetal392/nullstar-os"
 [dependencies]
 nswp-core = { path = "../nswp-core" }
 nswp-runtime = { path = "../nswp-runtime" }
+service-route = { path = "../service-route" }
 
 [lib]
 path = "src/lib.rs"
