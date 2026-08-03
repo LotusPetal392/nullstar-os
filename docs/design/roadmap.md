@@ -50,6 +50,12 @@ The detailed contract is in
 10. add richer session restoration, background policy, and multi-seat support only after
     lifecycle containment is reliable.
 
+In the service-management implementation sequence, the
+[allocation-free `NSVC` v1 codec](../service-control-protocol.md) partly delivers the stage 1 control
+contract through a host-testable exact 64-byte format. It does not deliver supervisor or PID 1
+integration, jobs, a manager process, activation, definitions, kernel changes, or endpoint-based
+transport authority. Stage 2 `sv list`, `status`, `start`, `stop`, and `restart` remains future.
+
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).
 

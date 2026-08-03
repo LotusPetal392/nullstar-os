@@ -128,6 +128,16 @@ limit of 32 live endpoint objects, so route setup can fail under endpoint pressu
 The broker never replays service traffic. In particular, a one-way logging `Emit` whose processing
 became uncertain during failure is not submitted again automatically to a replacement generation.
 
+### Service control codec milestone
+
+The allocation-free [service control protocol](service-control-protocol.md) defines the host-testable
+`NSVC` v1 codec: exact 64-byte request and response records for paginated one-record listing, status,
+start, stop, and restart, with strict request-ID correlation and explicit observed and desired states.
+This milestone is codec-only. It is not integrated with PID 1 or an `sv` client, carries no handle or
+capability attachments, and adds no manager process, kernel behavior, activation, or service
+definitions. Endpoint possession is intended to become control authority only in a later transport
+integration.
+
 ### Future service and session lifecycle
 
 The current init sequence and service launch policy are explicitly coded into PID 1. The

@@ -403,6 +403,13 @@ acceptance. Provider generations use fresh ingress endpoint objects, so old hand
 handles to the replacement. This is generation isolation rather than global revocation: already
 delegated handles remain valid for their old objects until references disappear.
 
+The [service control protocol](../service-control-protocol.md) is another bounded stepping stone:
+`NSVC` v1 is an allocation-free, host-testable codec for exact 64-byte list, status, start, stop, and
+restart records. This milestone has no endpoint adapter and permits no handle attachments. A future
+integration will derive observation or mutation authority from possession of an appropriate endpoint;
+request IDs, service IDs, provider generations, and cursors are data and grant no authority. It is not
+yet connected to PID 1, a manager, or `sv`, and requires no kernel changes.
+
 For the initial logging integration, PID 1 is the temporary broker and owns an allocation-free
 monotonic provider-generation sequence independent of process IDs. Every startup attempt consumes a
 generation. PID 1 sends it once in an exact 16-byte `NSGN` v1 record with no capability over a private

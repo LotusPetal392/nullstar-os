@@ -18,7 +18,10 @@ service-definition locations are described in
 It describes future architecture. The implemented system still uses a hard-coded PID 1
 that directly launches the current services and shell. PID 1 also acts as the temporary broker for
 the first generic logging routes; see [NullStar OS architecture](../architecture.md) and the
-[current service route protocol](../service-route-protocol.md).
+[current service route protocol](../service-route-protocol.md). The
+[`NSVC` v1 service-control contract](../service-control-protocol.md) is currently only an
+allocation-free, host-testable 64-byte codec. No manager or `sv` process dispatches it, and it is not
+integrated with PID 1.
 
 ## Design goals
 
@@ -257,7 +260,11 @@ STOPPED
 
 `FAILED` may transition back to `ACTIVATING` under restart policy. A separate
 `QUARANTINED` state is appropriate when repeated failures or a security violation make
-automatic restart unsafe.
+automatic restart unsafe. The codec milestone represents the bounded control view as `Defined`,
+`Activating`, `Starting`, `Ready`, `Degraded`, `Stopping`, `Terminating`, `Stopped`, `Failed`, or
+`Quarantined`, independently from desired `Stopped` or `Running`; it does not implement the
+transitions. See the
+[service control protocol](../service-control-protocol.md).
 
 A process existing is not readiness. A service must satisfy an explicit readiness
 contract, such as:
