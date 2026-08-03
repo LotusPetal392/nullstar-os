@@ -172,6 +172,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_ush")
             .expect("userspace shell artifact path was not set"),
     );
+    let userspace_logctl = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_logctl")
+            .expect("userspace logctl artifact path was not set"),
+    );
     let hello_text = output_directory.join("hello.txt");
     fs::write(&hello_text, HELLO_TEXT).expect("failed to create userspace file-I/O fixture");
 
@@ -259,6 +263,7 @@ fn main() {
             userspace_environment_target.clone(),
         );
         image.set_file(String::from("ush"), userspace_shell.clone());
+        image.set_file(String::from("logctl"), userspace_logctl.clone());
         image.set_file(String::from("hello.txt"), hello_text.clone());
         image
     };

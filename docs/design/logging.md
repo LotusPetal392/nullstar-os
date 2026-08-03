@@ -166,37 +166,51 @@ a record rejected at the producer mailbox. Authorization-aware general reads, re
 privacy classes, rate limiting, suppression summaries, persistence, and journal rotation remain
 future work.
 
-### Native endpoint pilot
+### Native endpoint sessions
 
-The first native pilot runs `/logging-probe` and `/logging-service` over the current endpoint ABI.
-Because an endpoint is one FIFO mailbox rather than one side of a duplex channel, the NSWP
-connection uses separate client-to-server and server-to-client endpoint objects. PID 1 delegates
-only `SEND` on the outgoing mailbox and `RECEIVE` on the incoming mailbox to each process. The
-allocation-free userspace transport requires distinct objects, rejects transferred capabilities,
-and pins the sender process ID observed on the first packet.
+The native implementation runs `/logging-service` over two shared ingress endpoints. Possession of
+the producer ingress is `Emit` authority; possession of the observer ingress is collector-statistics
+and history-read authority. The role is not caller-supplied on the wire, and the service enforces the
+method set again after NSWP validation. A producer request for history receives `AccessDenied`; an
+observer that sends a one-way record loses only its own session.
 
-The normal probe negotiates minor 3 and first verifies four imported kernel records with ordered
-kernel sequences through ordinary `ReadHistory` requests. It also proves that a non-PID-1 process
-cannot open kernel early-log authority. The probe then sends a maximum-size process record whose
-192-byte body exactly fills one 256-byte endpoint message, submits a secret record, and verifies
-collector statistics, process attribution, and redaction through actual request/reply packets.
+A fixed 16-byte `NSLS` bootstrap record establishes each connection before ordinary NSWP
+negotiation. The client transfers exact `SEND` authority for a fresh private reply endpoint while
+retaining exact `RECEIVE`. The service binds the resulting session to the role endpoint, the
+kernel-stamped nonzero sender PID, and its current generation. Each session owns independent NSWP
+negotiation and transaction state, so transaction identifiers and responses cannot cross clients.
+The allocation-free service admits at most four total sessions and at most three of either role.
+Explicit disconnect releases a slot; malformed packets or failed private replies remove only the
+offending session.
 
-The NullFS restart diagnostic also stops the collector, fills the actual eight-message request
-mailbox, verifies reliable backpressure and one best-effort producer drop, resumes the service, and
-submits 65 records. It checks the 64-record ring wrap, oldest/newest IDs, redaction, and counters,
-then replaces the service on empty mailboxes. PID 1 delegates the same read-only early-log reader to
-the replacement, which reimports the kernel snapshot before readiness. A fresh negotiated
-connection verifies the same boot-scoped kernel sequences at collector record IDs 1 through 4
-before accepting a new process record. The kernel nonblocking child-wait path treats a
-signaled-but-not-yet-reaped direct child as pending so this supervised restart cannot transiently
-misreport `NO_CHILD`.
+The normal probe negotiates separate producer and observer sessions at minor 3. It verifies four
+imported kernel records with ordered kernel sequences, proves that a non-PID-1 process cannot open
+kernel early-log authority, and confirms that producer authority cannot query collector history. It
+then sends a maximum-size process record whose 192-byte body exactly fills one 256-byte endpoint
+message, submits a secret record, and verifies collector statistics, process attribution, and
+redaction through the observer session. Because the role ingresses are independent connections,
+the probe waits for the expected collector high-water count rather than assuming an observer query
+is ordered after a preceding one-way producer send.
 
-This remains a single delegated connection rather than a general logging broker. Current endpoint
-objects do not report peer closure, queued messages are not tied to a service generation, and the
-adapter cannot derive a durable principal or service identity from the mailbox. PID 1 explicitly
-grants the boot probe both submission and collector-read authority; ordinary future producers must
-not automatically receive history-read authority. Records at `trace` and `debug` remain retained
-but are not mirrored to the console.
+The NullFS restart diagnostic stops the collector, fills the actual eight-message producer ingress,
+verifies reliable backpressure and one best-effort producer drop, resumes the service, and submits 65
+records. It checks the 64-record ring wrap, oldest/newest IDs, redaction, and counters, then replaces
+the service after the clients disconnect. PID 1 delegates the same read-only early-log reader to the
+replacement, which reimports the kernel snapshot before readiness. Fresh producer and observer
+sessions verify the same boot-scoped kernel sequences at collector record IDs 1 through 4 before
+accepting a new process record.
+
+PID 1 temporarily delegates both role routes to the boot probe. The trusted root recovery shell
+receives `SEND | DUPLICATE` observer authority and implements `logctl show` as a builtin over a
+locally duplicated exact-`SEND` client route; it has no `TRANSFER` right and unrelated shell children receive no logging
+capability. The standalone `/logctl` binary is used only when an authorized launcher such as PID 1
+installs observer authority before execution. This avoids treating a mutable pathname as an
+executable-identity security boundary. The arrangement is still an interim restricted service route,
+not a general service broker or durable principal identity. Current endpoints lack peer-close
+notification, so a client that crashes without sending `NSLS` disconnect can occupy a bounded slot
+until service replacement. Shared role ingress also means one noisy producer can impose queue
+pressure on other producers. Records at `trace` and `debug` remain retained but are not mirrored to
+the console.
 
 ## Early boot and panic records
 
@@ -284,7 +298,8 @@ logging.
 
 ## `logctl`
 
-The native query and administration command should be `logctl`:
+The native query and administration command is `logctl`. The first implemented operation is
+`logctl show`; the remaining operations are accepted direction:
 
 ```text
 logctl show
@@ -298,6 +313,12 @@ logctl storage
 logctl vacuum
 logctl crashes
 ```
+
+`logctl show` uses an observer session and captures the current oldest and newest collector
+`RecordId` plus retained count. It requires the first record, every exact successor, the final
+high-water record, and the number of displayed records to match that captured range. It is a bounded
+live view rather than an atomic snapshot: if concurrent eviction makes the range inconsistent, the
+command reports that history changed instead of silently presenting a partial snapshot.
 
 Filters should include time range, boot, service and generation, application, user,
 severity, subsystem, event, and structured fields. A machine-readable output format
