@@ -178,13 +178,14 @@ identity and generation so a replacement is never confused with its predecessor.
 The implemented route substrate represents a stable identity as a UUIDv4 `ServiceId` plus a
 nonzero role ID. A role matters because one service can expose independently authorized authorities;
 the logging producer and observer are separate routes under one service ID. The current PID 1 pilot
-owns an allocation-free monotonic provider-generation sequence independent of process IDs, and every
-startup attempt consumes a generation. PID 1 hands it to the service in a strict one-use `NSGN` v1
-record over a private receive-only bootstrap endpoint; the service validates PID 1, exact rights, no
-capability attachment, and canonical encoding before closing the handle. The generation then binds
-the collector, `NSLS`, NSWP, and route publications. A restartable service manager must eventually
-own the sequence and receive its current state across replacement. The current contract provides no
-durable cross-boot persistence.
+owns allocation-free monotonic provider-generation sequences for logging, NullFS, tmpfs, and VFS,
+and every startup attempt consumes a generation independent of process IDs. PID 1 hands it to the
+service in a strict one-use `NSGN` v1 record over a private receive-only bootstrap endpoint; the
+service validates PID 1, exact rights, no capability attachment, and canonical encoding before
+closing the handle and declaring readiness. The generation binds filesystem sessions and proxy
+registrations, while logging also binds its collector, `NSLS`, NSWP, and route publications. A
+restartable service manager must eventually own these sequences and receive their current state
+across replacement. The current contract provides no durable cross-boot persistence.
 
 ## Service definitions
 

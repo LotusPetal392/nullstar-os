@@ -4,9 +4,11 @@
 use core::{mem::size_of, slice};
 
 use userspace::{
+    abi::INIT_PROCESS_ID,
     filesystem::protocol as filesystem_protocol,
     filesystem_service::{Error as SessionError, NodeReference, NodeReferenceError, SessionTable},
     ipc::{self, ObjectKind, ReceivedCapability, Rights},
+    service_route::receive_service_generation,
     syscall,
     tmpfs::protocol,
 };
@@ -16,6 +18,7 @@ userspace::panic_handler!();
 
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
+const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
 
 #[derive(Clone, Copy)]
@@ -63,14 +66,24 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(3);
     }
 
+    let generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
+        Ok(generation) => generation.get(),
+        Err(_) => {
+            let _ = syscall::write_all(syscall::STDERR, b"tmpfs: generation handoff failed\n");
+            syscall::exit(4);
+        }
+    };
+    let legacy_generation = match u32::try_from(generation) {
+        Ok(generation) => generation,
+        Err(_) => syscall::exit(4),
+    };
+
     let _ = syscall::write_all(syscall::STDERR, b"tmpfs: sending readiness message\n");
     if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err() {
         let _ = syscall::write_all(syscall::STDERR, b"tmpfs: readiness send failed\n");
-        syscall::exit(4);
+        syscall::exit(5);
     }
     let _ = syscall::write_all(syscall::STDERR, b"tmpfs: ready\n");
-
-    let generation = syscall::getpid().unwrap_or(1);
     let mut files = [File::EMPTY; protocol::MAX_FILES];
     let mut next_node_id = filesystem_protocol::ROOT_NODE_ID + 1;
     let mut sessions = SessionTable::new();
@@ -78,13 +91,13 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     loop {
         let message = match ipc::receive(REQUEST_HANDLE, &mut request_bytes) {
             Ok(message) => message,
-            Err(_) => syscall::exit(5),
+            Err(_) => syscall::exit(6),
         };
         if message.bytes == size_of::<protocol::Request>() {
             dispatch_legacy_message(
                 &mut files,
                 &mut next_node_id,
-                generation as u32,
+                legacy_generation,
                 &request_bytes,
                 message.capability,
             );

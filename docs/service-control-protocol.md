@@ -131,7 +131,7 @@ Possession of an exact-`SEND` observation grant is the current source of authori
 
 Observation and mutation authority are intentionally separate. The current observation client refuses to originate `Start`, `Stop`, or `Restart`; if a valid mutation packet reaches PID 1's observation ingress through another client, PID 1 replies with `AccessDenied` without consulting service state. No mutation endpoint is currently exposed.
 
-PID 1's temporary registry contains `logging`, `nullfs`, `tmpfs`, and `vfs` in stable list order. Desired state is always `Running`. Logging reports its manager-issued generation; the other three services temporarily report their current process PID as a nonzero generation while starting or ready. Stopped, backoff, and quarantined views omit generation where allowed by the wire contract.
+PID 1's temporary registry contains `logging`, `nullfs`, `tmpfs`, and `vfs` in stable list order. Desired state is always `Running`. Every service reports the manager-issued generation assigned to that startup attempt rather than deriving lifecycle identity from its process ID. Stopped, backoff, and quarantined views omit generation where allowed by the wire contract.
 
 The standalone `/sv` binary supports `sv list` and `sv status SERVICE` only when an authorized launcher installs observation authority at handle `1`. The trusted `ush` builtins receive `SEND | DUPLICATE` observation authority at handle `2`, duplicate it down to exact `SEND` for each operation, and never receive `TRANSFER`. Pathname identity is not authorization.
 
