@@ -34,6 +34,7 @@ authoritative when it differs from future design.
 - [Filesystem namespace and boot](filesystem-namespace.md)
 - [Driver model](driver-model.md)
 - [Logging, journal, and rotation](logging.md)
+- [Network management, diagnostics, and local sockets](network-management-and-local-sockets.md)
 - [Network policy and firewall](network-policy.md)
 
 ## Desktop and media
