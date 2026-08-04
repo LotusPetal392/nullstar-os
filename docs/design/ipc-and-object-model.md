@@ -416,14 +416,15 @@ shell receives `SEND | DUPLICATE` but not `TRANSFER`, and ordinary shell childre
 Valid mutation packets reaching this ingress receive `AccessDenied`. No mutation endpoint, separate
 manager, activation, or kernel change is part of the current integration.
 
-For the initial logging integration, PID 1 is the temporary broker and owns an allocation-free
-monotonic provider-generation sequence independent of process IDs. Every startup attempt consumes a
-generation. PID 1 sends it once in an exact 16-byte `NSGN` v1 record with no capability over a private
+PID 1 is the temporary generation authority and owns separate allocation-free monotonic sequences for
+logging, NullFS, tmpfs, and VFS. Every startup attempt consumes a generation independent of process
+IDs. PID 1 sends it once in an exact 16-byte `NSGN` v1 record with no capability over a private
 endpoint granted to the service with exact `RECEIVE` rights. The service validates those rights,
-kernel-stamped sender PID 1, and canonical encoding, closes the bootstrap handle, and uses the value
-for the collector, `NSLS`, NSWP, and routes. A restartable service manager must eventually own the
-sequence and receive its state across replacement. The current contract provides no durable
-cross-boot persistence.
+kernel-stamped sender PID 1, and canonical encoding, closes the bootstrap handle, and accepts the
+generation before readiness. NullFS and tmpfs bind filesystem sessions to it; PID 1 registers the
+matching generation with kernel proxies; logging also binds its collector, `NSLS`, NSWP, and routes.
+A restartable service manager must eventually own the sequences and receive their state across
+replacement. The current contract provides no durable cross-boot persistence.
 
 Stable protocols should define:
 

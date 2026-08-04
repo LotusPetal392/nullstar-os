@@ -4,8 +4,11 @@
 use core::{mem::size_of, slice};
 
 use userspace::{
+    abi::INIT_PROCESS_ID,
     ipc::{self, ObjectKind, Rights},
-    nullfs_primary_volume, syscall,
+    nullfs_primary_volume,
+    service_route::receive_service_generation,
+    syscall,
     vfs::protocol,
 };
 
@@ -14,6 +17,7 @@ userspace::panic_handler!();
 
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
+const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: vfs";
 
 struct Route {
@@ -111,15 +115,19 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     {
         syscall::exit(2);
     }
+    let _generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
+        Ok(generation) => generation,
+        Err(_) => syscall::exit(3),
+    };
     if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err() {
-        syscall::exit(3);
+        syscall::exit(4);
     }
 
     let mut bytes = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
     loop {
         let message = match ipc::receive(REQUEST_HANDLE, &mut bytes) {
             Ok(message) => message,
-            Err(_) => syscall::exit(4),
+            Err(_) => syscall::exit(5),
         };
         let Some(reply_capability) = message.capability else {
             continue;

@@ -111,14 +111,15 @@ route authorities. The broker authorizes the kernel-stamped caller PID before co
 fixed-capacity publication table. It does not parse the NSWP negotiation or logging packets that
 clients send directly to the resolved service ingress.
 
-PID 1 owns an allocation-free monotonic logging provider-generation sequence independent of process
-IDs, and each logging-service startup attempt consumes a generation. It sends that value in a one-use
-exact 16-byte `NSGN` v1 record over a private bootstrap endpoint granted to the service with exact
-`RECEIVE` rights. The service requires sender PID 1, exact rights, no attached capability, and a
-canonical record, then closes the bootstrap handle. The accepted value identifies the collector and
-is used consistently by `NSLS`, NSWP, and both route publications. The current contract provides no
-durable cross-boot persistence; a restartable service manager must eventually own and receive the
-sequence state.
+PID 1 owns allocation-free monotonic provider-generation sequences scoped to the stable identities of
+logging, NullFS, tmpfs, and VFS. Every startup attempt consumes a generation independently of process
+IDs. PID 1 sends that value in a one-use exact 16-byte `NSGN` v1 record over a private bootstrap
+endpoint granted to the service with exact `RECEIVE` rights. Each service requires sender PID 1,
+exact rights, no attached capability, and a canonical record, then closes the bootstrap handle before
+readiness. NullFS and tmpfs use the value in filesystem sessions, PID 1 uses the same value for kernel
+proxy registration, and logging uses it consistently for its collector, `NSLS`, NSWP, and route
+publications. The current contract provides no durable cross-boot persistence; a restartable service
+manager must eventually own and receive each sequence's state.
 
 Each generation uses fresh producer and observer ingress endpoint objects. Fresh objects prevent old
 clients from reaching the replacement, but they cannot revoke all handles to the old objects.

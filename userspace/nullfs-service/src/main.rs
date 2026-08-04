@@ -14,10 +14,13 @@ use nullfs_core::Filesystem;
 use nullfs_format::NodeKind;
 use nullfs_userspace_blockdev::SessionBlockDevice;
 use userspace::{
+    abi::INIT_PROCESS_ID,
     args::Args,
     block_device::{self, protocol},
     ipc::{self, ObjectKind, Rights},
-    nullfs_primary_volume, syscall,
+    nullfs_primary_volume,
+    service_route::receive_service_generation,
+    syscall,
 };
 
 userspace::entry!(rust_main);
@@ -25,6 +28,7 @@ userspace::entry!(rust_main);
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const BLOCK_HANDLE: u64 = 3;
+const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const SHARED_BUFFER_BYTES: usize = 4096;
 const SHARED_BUFFER_ID: u64 = 1;
@@ -58,6 +62,11 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         12,
         b"nullfs: handle 3 must be Endpoint SEND\n",
     );
+    let service_generation =
+        match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
+            Ok(generation) => generation.get(),
+            Err(_) => fail(13, b"nullfs: generation handoff failed\n"),
+        };
 
     let mut session = match block_device::connect_service(BLOCK_HANDLE, 1) {
         Ok(session) => session,
@@ -112,8 +121,6 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if root_attributes.node != root || root_attributes.kind != NodeKind::Directory {
         fail(29, b"nullfs: root is not a directory\n");
     }
-    let service_generation = syscall::getpid().unwrap_or(1).max(1);
-
     server::serve(filesystem, service_generation, root_attributes)
 }
 

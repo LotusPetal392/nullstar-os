@@ -118,13 +118,14 @@ prevents an old route from reaching the replacement, but it does not revoke all 
 kernel has no general revocation operation, and an endpoint object remains reachable while a handle
 or queued transfer refers to it.
 
-For logging, PID 1 owns an allocation-free monotonic provider-generation sequence independent of
-process IDs, and every startup attempt consumes a value. It sends one exact 16-byte `NSGN` v1 record
-with no capability over a private endpoint granted to the service with exact `RECEIVE` rights. The
-service accepts only the canonical record from kernel-stamped sender PID 1 on that exact-rights
-handle, closes the handle after the one receive attempt, and uses the generation for its collector,
-`NSLS`, NSWP, and route publications. The current contract provides no durable cross-boot sequence
-persistence.
+PID 1 owns separate allocation-free monotonic provider-generation sequences for logging, NullFS,
+tmpfs, and VFS, and every startup attempt consumes a value independently of process IDs. It sends one
+exact 16-byte `NSGN` v1 record with no capability over a private endpoint granted to the service with
+exact `RECEIVE` rights. Each service accepts only the canonical record from kernel-stamped sender PID
+1 on that exact-rights handle and closes the handle after the one receive attempt. NullFS and tmpfs
+bind filesystem sessions to the value, PID 1 registers matching generations with the kernel proxies,
+and logging also uses it for its collector, `NSLS`, NSWP, and route publications. The current
+contract provides no durable cross-boot sequence persistence.
 
 The distinction has a resource cost. The kernel currently permits 32 live endpoint objects
 system-wide. Every in-progress route resolution creates a private reply endpoint, every provider

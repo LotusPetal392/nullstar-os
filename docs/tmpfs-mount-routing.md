@@ -7,10 +7,10 @@ volatile filesystem state and old client assumptions must not silently continue.
 
 ## Mount handshake
 
-A client first sends the versioned `MOUNT` operation. The running service returns
-a nonzero generation derived from its process identity. The client stores that
-generation in a typed `tmpfs::Mount` value and includes it in every subsequent
-request.
+Before readiness, tmpfs accepts one manager-issued nonzero generation from PID 1 through the strict
+`NSGN` bootstrap handoff. A client then sends the versioned `MOUNT` operation, and the running service
+returns that generation rather than deriving lifecycle identity from its process ID. The client stores
+the value in a typed `tmpfs::Mount` and includes it in every subsequent request.
 
 The service compares each request generation with its current generation before
 accessing filesystem state. A mismatch returns `STALE_MOUNT` without changing
@@ -28,8 +28,8 @@ state. Clients must discard stale mounts and reconnect.
 ## Current boundary
 
 The kernel now uses this mount identity for ordinary `/tmp/<name>` file syscalls.
-PID 1 registers the service request endpoint and generation after the mount
-handshake. For proxied `open`, `read`, `write`, `stat`, and directory syscalls,
+PID 1 verifies that the mount handshake echoes the generation it issued, then registers the service
+request endpoint and that same generation. For proxied `open`, `read`, `write`, `stat`, and directory syscalls,
 the kernel queues a bounded protocol request to `/tmpfs-service`, transfers a
 private send-only reply endpoint, blocks the calling process, and completes the
 saved syscall frame from the service reply.

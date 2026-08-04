@@ -141,7 +141,7 @@ const REQUEST_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
 const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
 const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
-const LOGGING_GENERATION_HANDOFF_HANDLE: u64 = 5;
+const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const SHELL_SERVICE_CONTROL_HANDLE: u64 = 2;
 const MAX_BOOTSTRAP_ROUTES: usize = 2;
 const ROUTE_PUMP_BUDGET: usize = 4;
@@ -298,8 +298,11 @@ struct ServiceRegistryView<'a> {
     logging: &'a ServiceRuntime,
     logging_generation: ProviderGeneration,
     nullfs: &'a ServiceRuntime,
+    nullfs_generation: ProviderGeneration,
     tmpfs: &'a ServiceRuntime,
+    tmpfs_generation: ProviderGeneration,
     vfs: &'a ServiceRuntime,
+    vfs_generation: ProviderGeneration,
 }
 
 struct ServiceControlState {
@@ -343,26 +346,30 @@ fn service_control_response(
                     service_record(
                         CONTROL_LOGGING_SERVICE_ID,
                         registry.logging,
-                        Some(registry.logging_generation),
+                        registry.logging_generation,
                     ),
                     1,
                 )
                 .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
                 1 => ListResponse::record(
                     cursor,
-                    service_record(NULLFS_SERVICE_ID, registry.nullfs, None),
+                    service_record(
+                        NULLFS_SERVICE_ID,
+                        registry.nullfs,
+                        registry.nullfs_generation,
+                    ),
                     2,
                 )
                 .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
                 2 => ListResponse::record(
                     cursor,
-                    service_record(TMPFS_SERVICE_ID, registry.tmpfs, None),
+                    service_record(TMPFS_SERVICE_ID, registry.tmpfs, registry.tmpfs_generation),
                     3,
                 )
                 .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
                 3 => ListResponse::record(
                     cursor,
-                    service_record(VFS_SERVICE_ID, registry.vfs, None),
+                    service_record(VFS_SERVICE_ID, registry.vfs, registry.vfs_generation),
                     0,
                 )
                 .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
@@ -397,14 +404,26 @@ fn service_status(service: ServiceId, registry: ServiceRegistryView<'_>) -> Opti
         Some(service_record(
             service,
             registry.logging,
-            Some(registry.logging_generation),
+            registry.logging_generation,
         ))
     } else if service == NULLFS_SERVICE_ID {
-        Some(service_record(service, registry.nullfs, None))
+        Some(service_record(
+            service,
+            registry.nullfs,
+            registry.nullfs_generation,
+        ))
     } else if service == TMPFS_SERVICE_ID {
-        Some(service_record(service, registry.tmpfs, None))
+        Some(service_record(
+            service,
+            registry.tmpfs,
+            registry.tmpfs_generation,
+        ))
     } else if service == VFS_SERVICE_ID {
-        Some(service_record(service, registry.vfs, None))
+        Some(service_record(
+            service,
+            registry.vfs,
+            registry.vfs_generation,
+        ))
     } else {
         None
     }
@@ -413,32 +432,17 @@ fn service_status(service: ServiceId, registry: ServiceRegistryView<'_>) -> Opti
 fn service_record(
     service: ServiceId,
     runtime: &ServiceRuntime,
-    managed_generation: Option<ProviderGeneration>,
+    managed_generation: ProviderGeneration,
 ) -> ServiceRecord {
     let (observed, generation) = match runtime.state() {
         ServiceState::Stopped => (ObservedState::Stopped, None),
-        ServiceState::Starting => (
-            ObservedState::Starting,
-            Some(runtime_generation(runtime, managed_generation)),
-        ),
-        ServiceState::Running => (
-            ObservedState::Ready,
-            Some(runtime_generation(runtime, managed_generation)),
-        ),
+        ServiceState::Starting => (ObservedState::Starting, Some(managed_generation)),
+        ServiceState::Running => (ObservedState::Ready, Some(managed_generation)),
         ServiceState::Backoff => (ObservedState::Stopped, None),
         ServiceState::Failed => (ObservedState::Quarantined, None),
     };
     ServiceRecord::new(service, generation, observed, DesiredState::Running)
         .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
-}
-
-fn runtime_generation(
-    runtime: &ServiceRuntime,
-    managed_generation: Option<ProviderGeneration>,
-) -> ProviderGeneration {
-    managed_generation
-        .or_else(|| runtime.process_id().and_then(ProviderGeneration::new))
-        .unwrap_or_else(|| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
 }
 
 struct AllowGrantedRoute;
@@ -628,13 +632,15 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let mut nullfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
     let mut nullfs_service = ServiceRuntime::new(NULLFS_SERVICE);
+    let mut nullfs_generations = ProviderGenerationSequence::new();
     let nullfs_block_capability = BootstrapCapability {
         source_handle: nullfs_service_block_endpoint,
         rights: Rights::SEND,
         target_handle: NULLFS_BLOCK_HANDLE,
     };
-    start_service(
+    let mut nullfs_generation = start_service(
         &mut nullfs_service,
+        &mut nullfs_generations,
         nullfs_readiness_endpoint,
         nullfs_request_endpoint,
         &[nullfs_block_capability],
@@ -646,35 +652,39 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         NULLFS_READINESS_PROBE_FAILED,
         NULLFS_READINESS_PROBE_PASSED,
     );
-    register_nullfs_proxy(&nullfs_service, nullfs_request_endpoint);
+    register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
 
     let readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let mut service = ServiceRuntime::new(TMPFS_SERVICE);
-    start_service(
+    let mut tmpfs_generations = ProviderGenerationSequence::new();
+    let mut tmpfs_generation = start_service(
         &mut service,
+        &mut tmpfs_generations,
         readiness_endpoint,
         request_endpoint,
         &[],
         &TMPFS_MESSAGES,
     );
-    register_tmpfs_proxy(request_endpoint);
+    register_tmpfs_proxy(tmpfs_generation, request_endpoint);
     run_tmpfs_probe(request_endpoint);
     let vfs_readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
     let vfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
     let mut vfs_service = ServiceRuntime::new(VFS_SERVICE);
-    start_service(
+    let mut vfs_generations = ProviderGenerationSequence::new();
+    let mut vfs_generation = start_service(
         &mut vfs_service,
+        &mut vfs_generations,
         vfs_readiness_endpoint,
         vfs_request_endpoint,
         &[],
         &VFS_MESSAGES,
     );
-    register_vfs_router(&vfs_service, vfs_request_endpoint);
+    register_vfs_router(vfs_generation, vfs_request_endpoint);
     if nullfs_restart_test {
         run_probe(
             NULLFS_FULL_PROBE_COMMAND,
@@ -688,8 +698,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             VFS_FULL_PROBE_FAILED,
             VFS_FULL_PROBE_PASSED,
         );
-        run_nullfs_restart_probe(
+        nullfs_generation = run_nullfs_restart_probe(
             &mut nullfs_service,
+            &mut nullfs_generations,
             nullfs_readiness_endpoint,
             &mut nullfs_request_endpoint,
             nullfs_block_capability,
@@ -708,8 +719,11 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         logging: &logging_service,
         logging_generation: logging_generation.generation,
         nullfs: &nullfs_service,
+        nullfs_generation,
         tmpfs: &service,
+        tmpfs_generation,
         vfs: &vfs_service,
+        vfs_generation,
     };
     run_service_control_probe(
         SV_LIST_COMMAND,
@@ -755,8 +769,11 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             logging: &logging_service,
             logging_generation: logging_generation.generation,
             nullfs: &nullfs_service,
+            nullfs_generation,
             tmpfs: &service,
+            tmpfs_generation,
             vfs: &vfs_service,
+            vfs_generation,
         });
 
         if let Some(service_process_id) = nullfs_service.process_id() {
@@ -766,14 +783,15 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
                         backoff(backoff_yields);
-                        start_service(
+                        nullfs_generation = start_service(
                             &mut nullfs_service,
+                            &mut nullfs_generations,
                             nullfs_readiness_endpoint,
                             nullfs_request_endpoint,
                             &[nullfs_block_capability],
                             &NULLFS_MESSAGES,
                         );
-                        register_nullfs_proxy(&nullfs_service, nullfs_request_endpoint);
+                        register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
                     }
                     ServiceStatusDisposition::Failed => fail(NULLFS_SERVICE_FAILED),
                 },
@@ -790,14 +808,15 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, SERVICE_RESTARTING);
                         backoff(backoff_yields);
-                        start_service(
+                        tmpfs_generation = start_service(
                             &mut service,
+                            &mut tmpfs_generations,
                             readiness_endpoint,
                             request_endpoint,
                             &[],
                             &TMPFS_MESSAGES,
                         );
-                        register_tmpfs_proxy(request_endpoint);
+                        register_tmpfs_proxy(tmpfs_generation, request_endpoint);
                     }
                     ServiceStatusDisposition::Failed => fail(SERVICE_FAILED),
                 },
@@ -814,14 +833,15 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, VFS_SERVICE_RESTARTING);
                         backoff(backoff_yields);
-                        start_service(
+                        vfs_generation = start_service(
                             &mut vfs_service,
+                            &mut vfs_generations,
                             vfs_readiness_endpoint,
                             vfs_request_endpoint,
                             &[],
                             &VFS_MESSAGES,
                         );
-                        register_vfs_router(&vfs_service, vfs_request_endpoint);
+                        register_vfs_router(vfs_generation, vfs_request_endpoint);
                     }
                     ServiceStatusDisposition::Failed => fail(VFS_SERVICE_FAILED),
                 },
@@ -872,10 +892,11 @@ fn nullfs_restart_test_boot() -> bool {
 
 fn run_nullfs_restart_probe(
     service: &mut ServiceRuntime,
+    generations: &mut ProviderGenerationSequence,
     readiness_endpoint: CapabilityHandle,
     request_endpoint: &mut CapabilityHandle,
     block_capability: BootstrapCapability,
-) {
+) -> ProviderGeneration {
     let ready_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     let control_endpoint =
@@ -1014,14 +1035,15 @@ fn run_nullfs_restart_probe(
 
     let replacement_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    start_service(
+    let generation = start_service(
         service,
+        generations,
         readiness_endpoint,
         replacement_request_endpoint,
         &[block_capability],
         &NULLFS_MESSAGES,
     );
-    register_nullfs_proxy(service, replacement_request_endpoint);
+    register_nullfs_proxy(generation, replacement_request_endpoint);
     let stale_request_endpoint = *request_endpoint;
     *request_endpoint = replacement_request_endpoint;
     ipc::close(stale_request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
@@ -1038,14 +1060,15 @@ fn run_nullfs_restart_probe(
     ipc::close(ready_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     ipc::close(control_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     let _ = syscall::write_all(STDOUT, NULLFS_RESTART_PROBE_PASSED);
+    generation
 }
 
-fn register_nullfs_proxy(service: &ServiceRuntime, request_endpoint: CapabilityHandle) {
-    let generation = service
-        .process_id()
-        .and_then(|process_id| u32::try_from(process_id).ok())
-        .filter(|generation| *generation != 0)
-        .unwrap_or_else(|| fail(NULLFS_SERVICE_PROTOCOL_FAILED));
+fn register_nullfs_proxy(
+    service_generation: ProviderGeneration,
+    request_endpoint: CapabilityHandle,
+) {
+    let generation = u32::try_from(service_generation.get())
+        .unwrap_or_else(|_| fail(NULLFS_SERVICE_PROTOCOL_FAILED));
     for _ in 0..8 {
         match platform::register_nullfs_service(request_endpoint, generation) {
             Ok(()) => return,
@@ -1058,9 +1081,16 @@ fn register_nullfs_proxy(service: &ServiceRuntime, request_endpoint: CapabilityH
     fail(NULLFS_SERVICE_BOOTSTRAP_FAILED)
 }
 
-fn register_tmpfs_proxy(request_endpoint: CapabilityHandle) {
+fn register_tmpfs_proxy(
+    service_generation: ProviderGeneration,
+    request_endpoint: CapabilityHandle,
+) {
     let mount = Mount::connect(request_endpoint).unwrap_or_else(|_| fail(SERVICE_PROTOCOL_FAILED));
-    let generation = mount.generation();
+    let generation =
+        u32::try_from(service_generation.get()).unwrap_or_else(|_| fail(SERVICE_PROTOCOL_FAILED));
+    if mount.generation() != generation {
+        fail(SERVICE_PROTOCOL_FAILED);
+    }
     mount
         .disconnect()
         .unwrap_or_else(|_| fail(SERVICE_PROTOCOL_FAILED));
@@ -1068,12 +1098,9 @@ fn register_tmpfs_proxy(request_endpoint: CapabilityHandle) {
         .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
 }
 
-fn register_vfs_router(service: &ServiceRuntime, request_endpoint: CapabilityHandle) {
-    let generation = service
-        .process_id()
-        .and_then(|process_id| u32::try_from(process_id).ok())
-        .filter(|generation| *generation != 0)
-        .unwrap_or_else(|| fail(VFS_SERVICE_PROTOCOL_FAILED));
+fn register_vfs_router(service_generation: ProviderGeneration, request_endpoint: CapabilityHandle) {
+    let generation = u32::try_from(service_generation.get())
+        .unwrap_or_else(|_| fail(VFS_SERVICE_PROTOCOL_FAILED));
     platform::register_vfs_service(request_endpoint, generation)
         .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
 }
@@ -1150,10 +1177,10 @@ fn start_logging_generation(
                 process_id,
                 generation_handoff_source,
                 Rights::RECEIVE,
-                LOGGING_GENERATION_HANDOFF_HANDLE,
+                GENERATION_HANDOFF_HANDLE,
             )
             .ok()
-                != Some(LOGGING_GENERATION_HANDOFF_HANDLE)
+                != Some(GENERATION_HANDOFF_HANDLE)
         {
             fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
         }
@@ -1250,13 +1277,21 @@ fn start_logging_generation(
 
 fn start_service(
     service: &mut ServiceRuntime,
+    generations: &mut ProviderGenerationSequence,
     readiness_endpoint: CapabilityHandle,
     request_endpoint: CapabilityHandle,
     additional_capabilities: &[BootstrapCapability],
     messages: &ServiceMessages,
-) {
+) -> ProviderGeneration {
     loop {
         let spec = service.spec();
+        let generation = generations
+            .next_generation()
+            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
+        let generation_handoff_source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(messages.bootstrap_failed));
+        queue_service_generation(generation_handoff_source, generation)
+            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
         let _ = syscall::write_all(STDOUT, messages.starting);
         let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(messages.failed));
         let process_id = syscall::spawn_command_with_barrier(
@@ -1280,6 +1315,14 @@ fn start_service(
             )
             .ok()
                 != Some(REQUEST_HANDLE)
+            || ipc::grant_child(
+                process_id,
+                generation_handoff_source,
+                Rights::RECEIVE,
+                GENERATION_HANDOFF_HANDLE,
+            )
+            .ok()
+                != Some(GENERATION_HANDOFF_HANDLE)
             || additional_capabilities.iter().copied().any(|capability| {
                 ipc::grant_child(
                     process_id,
@@ -1293,6 +1336,7 @@ fn start_service(
         {
             fail(messages.bootstrap_failed);
         }
+        ipc::close(generation_handoff_source).unwrap_or_else(|_| fail(messages.bootstrap_failed));
         barrier
             .release()
             .unwrap_or_else(|_| fail(messages.bootstrap_failed));
@@ -1310,7 +1354,7 @@ fn start_service(
                     }
                     service.note_ready();
                     let _ = syscall::write_all(STDOUT, messages.ready);
-                    return;
+                    return generation;
                 }
                 Err(error) if error == ipc::Error::TRY_AGAIN => {}
                 Err(_) => fail(messages.protocol_failed),
