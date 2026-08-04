@@ -42,6 +42,7 @@ authoritative when it differs from future design.
 - [Native graphics renderer and UI toolkit](graphics-renderer-and-toolkit.md)
 - [Freedesktop compatibility](freedesktop-compatibility.md)
 - [Media graph](media-graph.md)
+- [Control surfaces and application controllers](control-surfaces-and-controllers.md)
 - [LV2 hosting](lv2-hosting.md)
 
 ## Consolidated planning
