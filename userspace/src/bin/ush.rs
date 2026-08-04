@@ -1,11 +1,12 @@
 #![no_std]
 #![no_main]
 
+use service_control::ServiceId;
 use userspace::{
     abi::{limits, signal},
     environment::Environment,
     ipc::{self, Rights},
-    logctl, platform,
+    logctl, platform, sv,
     syscall::{
         self, ChildStatus, DescriptorFlags, FileDescriptor, LaunchBarrier, OpenFlags, PipePair,
         ProcessGroupId, ProcessId, STDERR, STDIN, STDOUT, SpawnFlags,
@@ -24,10 +25,11 @@ const MAX_VARIABLES: usize = limits::MAX_ENVIRONMENT_VARIABLES;
 const VARIABLE_NAME_BYTES: usize = limits::MAX_ENVIRONMENT_NAME_BYTES;
 const VARIABLE_VALUE_BYTES: usize = COMMAND_BYTES;
 const OBSERVER_ROUTE_HANDLE: u64 = 1;
+const SERVICE_CONTROL_OBSERVER_HANDLE: u64 = 2;
 
 const PROMPT: &[u8] = b"ush> ";
 const READY: &[u8] = b"userspace shell ready\n";
-const HELP: &[u8] = b"builtins: help cd DIRECTORY jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env logctl show exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
+const HELP: &[u8] = b"builtins: help cd DIRECTORY jobs wait [%N] fg %N bg %N kill %N export NAME[=VALUE] unset NAME env logctl show sv list sv status SERVICE exit\nvariables: NAME=VALUE and $NAME or ${NAME} expansion\nexec: exec <program> [arguments...]\nbackground: command & (up to 4 jobs)\nredirection: < > >> 2> 2>> 2>&1\nCtrl-C: interrupt foreground process group\nCtrl-Z: stop foreground process group\npipeline: producer | filter | consumer (up to 8 stages)\n";
 const SYNTAX_FAILURE: &[u8] = b"ush: expected a non-empty pipeline stage\n";
 const STAGE_FAILURE: &[u8] = b"ush: pipeline supports at most 8 stages\n";
 const REDIRECTION_SYNTAX_FAILURE: &[u8] = b"ush: invalid redirection syntax\n";
@@ -47,6 +49,10 @@ const SPAWN_FAILURE: &[u8] = b"ush: spawn failed\n";
 const LOGCTL_USAGE: &[u8] = b"ush: usage: logctl show\n";
 const LOGCTL_FAILURE: &[u8] = b"ush: logctl show failed\n";
 const LOGCTL_COMPLETE: &[u8] = b"logctl: show complete\n";
+const SV_USAGE: &[u8] = b"ush: usage: sv list | sv status {logging|nullfs|tmpfs|vfs}\n";
+const SV_FAILURE: &[u8] = b"ush: service observation failed\n";
+const SV_LIST_COMPLETE: &[u8] = b"sv: list complete\n";
+const SV_STATUS_COMPLETE: &[u8] = b"sv: status complete\n";
 const WAIT_FAILURE: &[u8] = b"ush: wait failed\n";
 const WAIT_COMPLETE: &[u8] = b"ush: background jobs complete\n";
 const NO_JOBS: &[u8] = b"ush: no background jobs\n";
@@ -243,6 +249,9 @@ enum Builtin {
     Environment,
     LogShow,
     LogUsage,
+    ServiceList,
+    ServiceStatus(ServiceId),
+    ServiceUsage,
     Exit,
     Kill(JobTarget),
 }
@@ -452,12 +461,37 @@ impl Shell {
                 }
             }
             Builtin::LogUsage => self.error(LOGCTL_USAGE),
+            Builtin::ServiceList => self.run_service_observation(None),
+            Builtin::ServiceStatus(service) => self.run_service_observation(Some(service)),
+            Builtin::ServiceUsage => self.error(SV_USAGE),
             Builtin::Exit => {
                 self.terminate_all_jobs();
                 syscall::exit(0)
             }
             Builtin::Kill(JobTarget::Usage) => self.error(JOB_TARGET_USAGE),
             Builtin::Kill(JobTarget::Job(s)) => self.kill_job(s),
+        }
+    }
+    fn run_service_observation(&mut self, service: Option<ServiceId>) {
+        let succeeded = match ipc::duplicate(SERVICE_CONTROL_OBSERVER_HANDLE, Rights::SEND) {
+            Ok(observer) => {
+                let result = match service {
+                    Some(service) => sv::status(observer, service),
+                    None => sv::list(observer),
+                };
+                let close_result = ipc::close(observer);
+                result.is_ok() && close_result.is_ok()
+            }
+            Err(_) => false,
+        };
+        if succeeded {
+            self.output(if service.is_some() {
+                SV_STATUS_COMPLETE
+            } else {
+                SV_LIST_COMPLETE
+            });
+        } else {
+            self.error(SV_FAILURE);
         }
     }
     fn import_environment(&mut self, initial_stack: *const usize) {
@@ -1524,7 +1558,26 @@ fn detect_builtin(command: &[u8]) -> Option<Builtin> {
         }
         b"logctl" if trim_horizontal(arguments) == b"show" => Some(Builtin::LogShow),
         b"logctl" => Some(Builtin::LogUsage),
+        b"sv" => Some(detect_service_builtin(arguments)),
         _ => None,
+    }
+}
+
+fn detect_service_builtin(arguments: &[u8]) -> Builtin {
+    let arguments = trim_horizontal(arguments);
+    if arguments == b"list" {
+        return Builtin::ServiceList;
+    }
+    let Some(separator) = arguments.iter().position(|byte| is_horizontal_space(*byte)) else {
+        return Builtin::ServiceUsage;
+    };
+    if &arguments[..separator] != b"status" {
+        return Builtin::ServiceUsage;
+    }
+    let service_name = trim_horizontal(&arguments[separator..]);
+    match sv::service_id(service_name) {
+        Some(service) => Builtin::ServiceStatus(service),
+        None => Builtin::ServiceUsage,
     }
 }
 

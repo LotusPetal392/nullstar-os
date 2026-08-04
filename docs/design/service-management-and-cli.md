@@ -10,8 +10,9 @@ utility, and eventual GNU compatibility remain **tentative design**.
 The complete process, job, activation, restart, session, application, login, and recovery
 model is specified in
 [Service, session, and application lifecycle](service-and-session-lifecycle.md). The current
-[`NSVC` v1 milestone](../service-control-protocol.md) supplies only a host-testable,
-allocation-free 64-byte control codec; it is not wired to PID 1, a manager, or `sv`.
+[`NSVC` v1 milestone](../service-control-protocol.md) supplies a host-testable, allocation-free
+64-byte control codec plus native read-only observation through PID 1 and `sv`. It does not yet
+supply a separate manager or mutation authority.
 
 ## PID 1 and the system service manager
 
@@ -223,22 +224,34 @@ user's own session; machine changes require administrative authorization.
 
 `NSVC` v1 fixes the request/response encoding for one-record paginated `list`, `status`, `start`,
 `stop`, and `restart`, including nonzero request-ID correlation, optional service generation, and
-separate observed and desired lifecycle states. It transfers no handles. A later transport will make
-possession of an appropriate endpoint, rather than knowledge of an ID, the basis of control
-authority. This milestone adds no manager process, activation, definitions, kernel changes, or
-command implementation.
+separate observed and desired lifecycle states. The native transport keeps each wire record at 64
+bytes and transfers one exact-`SEND` private reply endpoint with a request; responses transfer no
+capability. Possession of an exact-`SEND` observation endpoint, rather than knowledge of an ID or
+pathname, authorizes list and status.
+
+PID 1 currently serves a fixed registry for `logging`, `nullfs`, `tmpfs`, and `vfs`. `/sv list`, `/sv
+status SERVICE`, and trusted `ush` builtins are implemented. Valid mutation requests on the observation
+ingress receive `AccessDenied`; there is no mutation endpoint. The trusted shell receives only
+`SEND | DUPLICATE`, while standalone `/sv` works only when an authorized launcher installs exact
+`SEND` authority at handle `1`. This milestone adds no manager process, activation, definitions, or
+kernel changes.
 
 ## The `sv` command
 
-`sv` is the future native service control and inspection client. It talks to the appropriate
-service manager over a versioned protocol; it does not scan PIDs, edit packaged files,
-or send arbitrary signals as its primary mechanism.
+`sv` is the native service control and inspection client. It talks over the versioned `NSVC`
+protocol; it does not scan PIDs, edit packaged files, or send arbitrary signals as its primary
+mechanism.
 
-Initial commands should be:
+The implemented read-only commands are:
 
 ```text
 sv list
-sv status [service]
+sv status SERVICE
+```
+
+The next management commands should be:
+
+```text
 sv start <service>
 sv stop <service>
 sv restart <service>
@@ -386,10 +399,11 @@ The name `ush` should not silently imply complete POSIX shell behavior.
 ## Recommended implementation stages
 
 1. Add job containment, process-exit observation, and a versioned control protocol to the
-   current supervisor. **Partly delivered:** the allocation-free, host-testable `NSVC` v1 codec fixes
-   the control contract, but supervisor integration, job containment, and exit observation remain.
-2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Future:**
-   no `sv` client or live control endpoint exists yet.
+   current supervisor. **Partly delivered:** the allocation-free, host-testable `NSVC` v1 codec and
+   PID 1 read-only registry fix the observation contract, but job containment remains.
+2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
+   delivered:** native `list` and `status` use capability-authorized IPC; mutation packets are
+   canonically denied and live mutation remains future work.
 3. Introduce the one-bootstrap-channel startup contract and stable service generations.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.

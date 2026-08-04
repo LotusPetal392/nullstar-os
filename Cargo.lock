@@ -905,6 +905,7 @@ dependencies = [
  "nswp-logging",
  "nswp-runtime",
  "nullfs-format",
+ "service-control",
  "service-route",
 ]
 

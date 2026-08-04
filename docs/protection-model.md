@@ -24,6 +24,8 @@ filesystem responsibilities across userspace service boundaries:
   block endpoint, to those services;
 - an allocation-free userspace service-route layer now separates stable logging producer and
   observer route grants from generation-specific provider ingress authority;
+- PID 1 exposes a separate stable, read-only service-observation endpoint to authorized `sv`
+  clients and trusted shell builtins;
 - provider generation, protocol session, request, and stale-handle checks protect
   replacement boundaries.
 
@@ -135,6 +137,27 @@ The route broker never queues or replays application traffic. A one-way logging 
 replayed on a replacement when processing by the old provider is uncertain; generation isolation
 cannot determine whether that record was retained before failure.
 
+## Service-control observation use
+
+The [service control protocol](service-control-protocol.md) uses a distinct stable endpoint object for
+read-only service observation. PID 1 retains the source and an exact-`RECEIVE` duplicate. An
+authorized client holds exact `SEND`, creates a fresh private reply endpoint per request, transfers
+only exact `SEND` for that reply, and retains exact `RECEIVE`. The 64-byte `NSVC` response transfers
+no capability and is accepted only when it is canonically correlated and has a nonzero kernel-stamped
+server PID; the reusable `sv` client additionally pins that PID to PID 1.
+
+The trusted recovery shell receives `SEND | DUPLICATE` observation authority but not `TRANSFER`. It
+attenuates each local duplicate to exact `SEND`; arbitrary child processes do not inherit the grant.
+The standalone `/sv` pathname is not trusted by itself and works only when an authorized launcher
+installs authority at its expected handle. Service IDs, list cursors, request IDs, generations, PIDs,
+and UID-like identity do not manufacture access.
+
+The current endpoint is observation-only. Its client API refuses to originate mutation packets, and
+PID 1 returns canonical `AccessDenied` if a valid `Start`, `Stop`, or `Restart` reaches the ingress by
+another implementation. Malformed requests are consumed without killing PID 1, and every terminal or
+failed path closes private reply handles. There is no live mutation authority, manager process,
+partially visible registry policy, or general revocation primitive yet.
+
 ## Filesystem-service use
 
 The common [filesystem service protocol](filesystem-service-protocol.md) builds on these
@@ -230,7 +253,8 @@ Important current limitations include:
 - no IOMMU-backed userspace driver isolation;
 - no general capability revocation primitive; fresh generation endpoints isolate replacements but
   cannot invalidate every previously delegated old-generation handle;
-- no general service-manager-owned named broker beyond the temporary PID 1 logging routes;
+- no general service-manager-owned named broker beyond the temporary PID 1 logging routes and
+  read-only service-observation endpoint;
 - no authenticated multiuser credentials or UID/GID enforcement;
 - no direct mapped shared-memory pages;
 - no complete sandbox or portal system;
