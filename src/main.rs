@@ -52,6 +52,7 @@ const NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER: &str =
 const NORMAL_BOOT_NULLFS_SERVICE_MARKER: &str = "userspace init: writable NullFS service ready";
 const NORMAL_BOOT_NULLFS_READINESS_MARKER: &str = "userspace init: NullFS readiness passed";
 const NORMAL_BOOT_VFS_READINESS_MARKER: &str = "userspace init: vfs readiness passed";
+const NORMAL_BOOT_SERVICE_CONTROL_MARKER: &str = "userspace init: sv status logging passed";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
 const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-test";
@@ -78,6 +79,7 @@ struct NormalBootProgress {
     nullfs_service_ready: bool,
     nullfs_readiness_passed: bool,
     vfs_readiness_passed: bool,
+    service_control_passed: bool,
     init_launched_shell: bool,
     shell_ready: bool,
 }
@@ -99,6 +101,7 @@ impl NormalBootProgress {
         self.nullfs_service_ready |= line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
         self.nullfs_readiness_passed |= line.contains(NORMAL_BOOT_NULLFS_READINESS_MARKER);
         self.vfs_readiness_passed |= line.contains(NORMAL_BOOT_VFS_READINESS_MARKER);
+        self.service_control_passed |= line.contains(NORMAL_BOOT_SERVICE_CONTROL_MARKER);
         self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
         self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
 
@@ -116,6 +119,7 @@ impl NormalBootProgress {
             && self.nullfs_service_ready
             && self.nullfs_readiness_passed
             && self.vfs_readiness_passed
+            && self.service_control_passed
             && self.init_launched_shell
             && self.shell_ready
     }
@@ -550,7 +554,8 @@ mod tests {
         NORMAL_BOOT_LOGGING_IMPORT_MARKER, NORMAL_BOOT_LOGGING_PROBE_MARKER,
         NORMAL_BOOT_LOGGING_SERVICE_MARKER, NORMAL_BOOT_MODE_MARKER,
         NORMAL_BOOT_NULLFS_DISCOVERY_MARKER, NORMAL_BOOT_NULLFS_READINESS_MARKER,
-        NORMAL_BOOT_NULLFS_SERVICE_MARKER, NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SHELL_MARKER,
+        NORMAL_BOOT_NULLFS_SERVICE_MARKER, NORMAL_BOOT_READY_MARKER,
+        NORMAL_BOOT_SERVICE_CONTROL_MARKER, NORMAL_BOOT_SHELL_MARKER,
         NORMAL_BOOT_VFS_READINESS_MARKER, NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER,
         NormalBootProgress,
     };
@@ -573,6 +578,7 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_READINESS_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_VFS_READINESS_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_SERVICE_CONTROL_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_SHELL_MARKER));
         assert!(progress.observe(NORMAL_BOOT_SHELL_MARKER));
     }

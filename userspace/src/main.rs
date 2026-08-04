@@ -2,16 +2,24 @@
 #![no_main]
 
 use nswp_logging::{LOGGING_OBSERVER_ROLE, LOGGING_PRODUCER_ROLE, LOGGING_SERVICE_ID};
+use service_control::{
+    DesiredState, ListResponse, ObservedState, ServiceControlFailure, ServiceControlRequest,
+    ServiceControlResponse, ServiceId, ServiceRecord, TargetResponse,
+};
 use service_route::{Authorizer, ProviderGeneration, ProviderGenerationSequence, RouteKey};
 use userspace::{
     abi::{INIT_PROCESS_ID, signal},
     early_log,
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
+    service_control::{
+        ControlIngress, LOGGING_SERVICE_ID as CONTROL_LOGGING_SERVICE_ID, NULLFS_SERVICE_ID,
+        TMPFS_SERVICE_ID, VFS_SERVICE_ID,
+    },
     service_route::{NativeRouteTable, RouteIngress, queue_service_generation},
     supervisor::{
-        ServiceRuntime, ServiceSpec, ServiceStatusDisposition, ShellStatusDisposition,
-        shell_status_disposition,
+        ServiceRuntime, ServiceSpec, ServiceState, ServiceStatusDisposition,
+        ShellStatusDisposition, shell_status_disposition,
     },
     syscall::{self, ProcessId, STDERR, STDOUT, SpawnFlags},
     tmpfs::Mount,
@@ -43,6 +51,14 @@ const LOGGING_PROBE_PASSED: &[u8] = b"userspace init: native NSWP logging probe 
 const LOGCTL_COMMAND: &[u8] = b"/logctl show";
 const LOGCTL_FAILED: &[u8] = b"userspace init: logctl show failed\n";
 const LOGCTL_PASSED: &[u8] = b"userspace init: logctl show passed\n";
+const SV_LIST_COMMAND: &[u8] = b"/sv list";
+const SV_STATUS_LOGGING_COMMAND: &[u8] = b"/sv status logging";
+const SV_LIST_PASSED: &[u8] = b"userspace init: sv list passed\n";
+const SV_STATUS_LOGGING_PASSED: &[u8] = b"userspace init: sv status logging passed\n";
+const SERVICE_CONTROL_BOOTSTRAP_FAILED: &[u8] =
+    b"userspace init: failed to create service-control observation endpoint\n";
+const SERVICE_CONTROL_PROBE_FAILED: &[u8] = b"userspace init: service-control probe failed\n";
+const SERVICE_CONTROL_PROTOCOL_FAILED: &[u8] = b"userspace init: service-control state invalid\n";
 const LOGGING_COLLECTOR_TEST_PASSED: &[u8] = b"userspace init: logging collector ring, backpressure, redaction, and route generation isolation verified\n";
 const LOGGING_COLLECTOR_EXIT_WAIT_FAILED: &[u8] =
     b"userspace init: logging collector service exit wait failed\n";
@@ -126,8 +142,10 @@ const NULLFS_BLOCK_HANDLE: u64 = 3;
 const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
 const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
 const LOGGING_GENERATION_HANDOFF_HANDLE: u64 = 5;
+const SHELL_SERVICE_CONTROL_HANDLE: u64 = 2;
 const MAX_BOOTSTRAP_ROUTES: usize = 2;
 const ROUTE_PUMP_BUDGET: usize = 4;
+const SERVICE_CONTROL_PUMP_BUDGET: usize = 4;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
 
@@ -273,6 +291,154 @@ impl RouteBrokerState {
         ipc::close(producer).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
         ipc::close(observer).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
     }
+}
+
+#[derive(Clone, Copy)]
+struct ServiceRegistryView<'a> {
+    logging: &'a ServiceRuntime,
+    logging_generation: ProviderGeneration,
+    nullfs: &'a ServiceRuntime,
+    tmpfs: &'a ServiceRuntime,
+    vfs: &'a ServiceRuntime,
+}
+
+struct ServiceControlState {
+    source: CapabilityHandle,
+    ingress: ControlIngress,
+}
+
+impl ServiceControlState {
+    fn new() -> Self {
+        let source =
+            ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_CONTROL_BOOTSTRAP_FAILED));
+        let receive = ipc::duplicate(source, Rights::RECEIVE)
+            .unwrap_or_else(|_| fail(SERVICE_CONTROL_BOOTSTRAP_FAILED));
+        let ingress = ControlIngress::bind(receive)
+            .unwrap_or_else(|_| fail(SERVICE_CONTROL_BOOTSTRAP_FAILED));
+        Self { source, ingress }
+    }
+
+    fn pump(&mut self, registry: ServiceRegistryView<'_>) {
+        for _ in 0..SERVICE_CONTROL_PUMP_BUDGET {
+            let request = match self.ingress.try_accept() {
+                Ok(Some(request)) => request,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+            let response = service_control_response(request.request(), registry);
+            let _ = request.reply(response);
+        }
+    }
+}
+
+fn service_control_response(
+    request: ServiceControlRequest,
+    registry: ServiceRegistryView<'_>,
+) -> ServiceControlResponse {
+    match request {
+        ServiceControlRequest::List { cursor } => {
+            let response = match cursor {
+                0 => ListResponse::record(
+                    cursor,
+                    service_record(
+                        CONTROL_LOGGING_SERVICE_ID,
+                        registry.logging,
+                        Some(registry.logging_generation),
+                    ),
+                    1,
+                )
+                .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+                1 => ListResponse::record(
+                    cursor,
+                    service_record(NULLFS_SERVICE_ID, registry.nullfs, None),
+                    2,
+                )
+                .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+                2 => ListResponse::record(
+                    cursor,
+                    service_record(TMPFS_SERVICE_ID, registry.tmpfs, None),
+                    3,
+                )
+                .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+                3 => ListResponse::record(
+                    cursor,
+                    service_record(VFS_SERVICE_ID, registry.vfs, None),
+                    0,
+                )
+                .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+                _ => ListResponse::failure(cursor, ServiceControlFailure::NotFound),
+            };
+            ServiceControlResponse::list(response)
+        }
+        ServiceControlRequest::Status { service } => {
+            let response = match service_status(service, registry) {
+                Some(record) => TargetResponse::success(record),
+                None => TargetResponse::failure(service, ServiceControlFailure::NotFound),
+            };
+            ServiceControlResponse::status(response)
+        }
+        ServiceControlRequest::Start { service } => ServiceControlResponse::start(
+            TargetResponse::failure(service, ServiceControlFailure::AccessDenied),
+        )
+        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+        ServiceControlRequest::Stop { service } => ServiceControlResponse::stop(
+            TargetResponse::failure(service, ServiceControlFailure::AccessDenied),
+        )
+        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+        ServiceControlRequest::Restart { service } => ServiceControlResponse::restart(
+            TargetResponse::failure(service, ServiceControlFailure::AccessDenied),
+        )
+        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+    }
+}
+
+fn service_status(service: ServiceId, registry: ServiceRegistryView<'_>) -> Option<ServiceRecord> {
+    if service == CONTROL_LOGGING_SERVICE_ID {
+        Some(service_record(
+            service,
+            registry.logging,
+            Some(registry.logging_generation),
+        ))
+    } else if service == NULLFS_SERVICE_ID {
+        Some(service_record(service, registry.nullfs, None))
+    } else if service == TMPFS_SERVICE_ID {
+        Some(service_record(service, registry.tmpfs, None))
+    } else if service == VFS_SERVICE_ID {
+        Some(service_record(service, registry.vfs, None))
+    } else {
+        None
+    }
+}
+
+fn service_record(
+    service: ServiceId,
+    runtime: &ServiceRuntime,
+    managed_generation: Option<ProviderGeneration>,
+) -> ServiceRecord {
+    let (observed, generation) = match runtime.state() {
+        ServiceState::Stopped => (ObservedState::Stopped, None),
+        ServiceState::Starting => (
+            ObservedState::Starting,
+            Some(runtime_generation(runtime, managed_generation)),
+        ),
+        ServiceState::Running => (
+            ObservedState::Ready,
+            Some(runtime_generation(runtime, managed_generation)),
+        ),
+        ServiceState::Backoff => (ObservedState::Stopped, None),
+        ServiceState::Failed => (ObservedState::Quarantined, None),
+    };
+    ServiceRecord::new(service, generation, observed, DesiredState::Running)
+        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
+}
+
+fn runtime_generation(
+    runtime: &ServiceRuntime,
+    managed_generation: Option<ProviderGeneration>,
+) -> ProviderGeneration {
+    managed_generation
+        .or_else(|| runtime.process_id().and_then(ProviderGeneration::new))
+        .unwrap_or_else(|| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
 }
 
 struct AllowGrantedRoute;
@@ -536,7 +702,29 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             VFS_READINESS_PROBE_PASSED,
         );
     }
-    let mut shell_process_id = spawn_shell(route_broker.observer_grant_source);
+
+    let mut service_control = ServiceControlState::new();
+    let registry = ServiceRegistryView {
+        logging: &logging_service,
+        logging_generation: logging_generation.generation,
+        nullfs: &nullfs_service,
+        tmpfs: &service,
+        vfs: &vfs_service,
+    };
+    run_service_control_probe(
+        SV_LIST_COMMAND,
+        SV_LIST_PASSED,
+        &mut service_control,
+        registry,
+    );
+    run_service_control_probe(
+        SV_STATUS_LOGGING_COMMAND,
+        SV_STATUS_LOGGING_PASSED,
+        &mut service_control,
+        registry,
+    );
+    let mut shell_process_id =
+        spawn_shell(route_broker.observer_grant_source, service_control.source);
 
     loop {
         if let Some(service_process_id) = logging_service.process_id() {
@@ -563,6 +751,13 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             }
         }
         route_broker.pump();
+        service_control.pump(ServiceRegistryView {
+            logging: &logging_service,
+            logging_generation: logging_generation.generation,
+            nullfs: &nullfs_service,
+            tmpfs: &service,
+            vfs: &vfs_service,
+        });
 
         if let Some(service_process_id) = nullfs_service.process_id() {
             match syscall::try_wait_child(service_process_id) {
@@ -646,7 +841,8 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 }
                 ShellStatusDisposition::RestartShell => {
                     let _ = syscall::write_all(STDOUT, SHELL_RESTARTING);
-                    shell_process_id = spawn_shell(route_broker.observer_grant_source);
+                    shell_process_id =
+                        spawn_shell(route_broker.observer_grant_source, service_control.source);
                 }
             },
             Err(error) if error == syscall::Errno::TRY_AGAIN => {}
@@ -1578,7 +1774,56 @@ fn run_probe(
     let _ = syscall::write_all(STDOUT, passed_message);
 }
 
-fn spawn_shell(observer_ingress: CapabilityHandle) -> ProcessId {
+fn run_service_control_probe(
+    command: &[u8],
+    passed_message: &[u8],
+    control: &mut ServiceControlState,
+    registry: ServiceRegistryView<'_>,
+) {
+    let barrier =
+        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(SERVICE_CONTROL_PROBE_FAILED));
+    let process_id = syscall::spawn_command_with_barrier(
+        command,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROBE_FAILED));
+    if ipc::grant_child(process_id, control.source, Rights::SEND, READY_HANDLE).ok()
+        != Some(READY_HANDLE)
+    {
+        fail(SERVICE_CONTROL_PROBE_FAILED);
+    }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROBE_FAILED));
+
+    let mut remaining = LOGGING_PROBE_MAX_YIELDS;
+    loop {
+        control.pump(registry);
+        match syscall::try_wait_child(process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(status) if status.success() => break,
+            Ok(_) => fail(SERVICE_CONTROL_PROBE_FAILED),
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(SERVICE_CONTROL_PROBE_FAILED),
+        }
+        if remaining == 0 || syscall::yield_now().is_err() {
+            fail(SERVICE_CONTROL_PROBE_FAILED);
+        }
+        remaining -= 1;
+    }
+    let _ = syscall::write_all(STDOUT, passed_message);
+}
+
+fn spawn_shell(
+    observer_ingress: CapabilityHandle,
+    service_control_observer: CapabilityHandle,
+) -> ProcessId {
     let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
     let process_id = syscall::spawn_command_with_barrier(
         SHELL_COMMAND,
@@ -1598,6 +1843,14 @@ fn spawn_shell(observer_ingress: CapabilityHandle) -> ProcessId {
     )
     .ok()
         != Some(READY_HANDLE)
+        || ipc::grant_child(
+            process_id,
+            service_control_observer,
+            Rights::SEND | Rights::DUPLICATE,
+            SHELL_SERVICE_CONTROL_HANDLE,
+        )
+        .ok()
+            != Some(SHELL_SERVICE_CONTROL_HANDLE)
     {
         fail(SHELL_SPAWN_FAILED);
     }

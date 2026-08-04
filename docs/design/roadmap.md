@@ -51,10 +51,11 @@ The detailed contract is in
     lifecycle containment is reliable.
 
 In the service-management implementation sequence, the
-[allocation-free `NSVC` v1 codec](../service-control-protocol.md) partly delivers the stage 1 control
-contract through a host-testable exact 64-byte format. It does not deliver supervisor or PID 1
-integration, jobs, a manager process, activation, definitions, kernel changes, or endpoint-based
-transport authority. Stage 2 `sv list`, `status`, `start`, `stop`, and `restart` remains future.
+[allocation-free `NSVC` v1 contract](../service-control-protocol.md) now provides a host-testable exact
+64-byte codec, native endpoint transport, a temporary PID 1 read-only registry, and implemented `sv
+list` and `sv status SERVICE` clients. Exact observation endpoint possession is authority; mutation
+packets are denied. Jobs, a separate manager process, activation, definitions, and live `sv start`,
+`stop`, and `restart` remain future work, and this milestone required no kernel changes.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

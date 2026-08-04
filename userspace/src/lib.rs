@@ -14,8 +14,10 @@ pub mod ipc;
 pub mod logctl;
 pub mod logging_session;
 pub mod platform;
+pub mod service_control;
 pub mod service_route;
 pub mod supervisor;
+pub mod sv;
 #[path = "syscall_facade.rs"]
 pub mod syscall;
 #[path = "syscall.rs"]

@@ -15,13 +15,14 @@ This document defines the lifecycle architecture that uses the native
 service-definition locations are described in
 [Service management and command-line direction](service-management-and-cli.md).
 
-It describes future architecture. The implemented system still uses a hard-coded PID 1
-that directly launches the current services and shell. PID 1 also acts as the temporary broker for
-the first generic logging routes; see [NullStar OS architecture](../architecture.md) and the
-[current service route protocol](../service-route-protocol.md). The
-[`NSVC` v1 service-control contract](../service-control-protocol.md) is currently only an
-allocation-free, host-testable 64-byte codec. No manager or `sv` process dispatches it, and it is not
-integrated with PID 1.
+It describes future architecture. The implemented system still uses a hard-coded PID 1 that directly
+launches the current services and shell. PID 1 also acts as the temporary broker for the first generic
+logging routes and as the read-only [`NSVC` v1 service-observation
+server](../service-control-protocol.md); see [NullStar OS architecture](../architecture.md) and the
+[current service route protocol](../service-route-protocol.md). Native `/sv list`, `/sv status
+SERVICE`, and trusted shell builtins observe the current four-service registry through exact endpoint
+capabilities. Mutations are denied, and no separate manager, activation engine, or definition loader
+exists yet.
 
 ## Design goals
 

@@ -404,11 +404,17 @@ handles to the replacement. This is generation isolation rather than global revo
 delegated handles remain valid for their old objects until references disappear.
 
 The [service control protocol](../service-control-protocol.md) is another bounded stepping stone:
-`NSVC` v1 is an allocation-free, host-testable codec for exact 64-byte list, status, start, stop, and
-restart records. This milestone has no endpoint adapter and permits no handle attachments. A future
-integration will derive observation or mutation authority from possession of an appropriate endpoint;
-request IDs, service IDs, provider generations, and cursors are data and grant no authority. It is not
-yet connected to PID 1, a manager, or `sv`, and requires no kernel changes.
+`NSVC` v1 provides an allocation-free, host-testable codec and native endpoint adapter for exact
+64-byte list, status, start, stop, and restart records. Each native request attaches one fresh empty
+exact-`SEND` private reply endpoint while the client retains exact `RECEIVE`; responses attach no
+capability. PID 1 temporarily owns the stable observation ingress and serves its current four-service
+registry to `/sv` and trusted `ush` builtins.
+
+Possession of exact-`SEND` observation authority permits `List` and `Status`; request IDs, service IDs,
+provider generations, cursors, PIDs, and executable paths are data and grant no authority. The trusted
+shell receives `SEND | DUPLICATE` but not `TRANSFER`, and ordinary shell children receive no grant.
+Valid mutation packets reaching this ingress receive `AccessDenied`. No mutation endpoint, separate
+manager, activation, or kernel change is part of the current integration.
 
 For the initial logging integration, PID 1 is the temporary broker and owns an allocation-free
 monotonic provider-generation sequence independent of process IDs. Every startup attempt consumes a
