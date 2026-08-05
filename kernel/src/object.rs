@@ -95,9 +95,8 @@ impl Rights {
     pub const SET_PROPERTY: Self = Self(1 << 9);
     pub const MANAGE: Self = Self(1 << 10);
 
-    pub const BASIC: Self = Self(
-        Self::INSPECT.0 | Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::WAIT.0,
-    );
+    pub const BASIC: Self =
+        Self(Self::INSPECT.0 | Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::WAIT.0);
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -324,11 +323,16 @@ mod tests {
     #[test]
     fn rights_can_only_be_reduced() {
         let original = Rights::BASIC.union(Rights::READ).union(Rights::WRITE);
-        let reduced = original.reduce_to(Rights::BASIC.union(Rights::READ)).unwrap();
+        let reduced = original
+            .reduce_to(Rights::BASIC.union(Rights::READ))
+            .unwrap();
 
         assert!(reduced.contains(Rights::READ));
         assert!(!reduced.contains(Rights::WRITE));
-        assert_eq!(original.reduce_to(original.union(Rights::MANAGE)), Err(RightsEscalation));
+        assert_eq!(
+            original.reduce_to(original.union(Rights::MANAGE)),
+            Err(RightsEscalation)
+        );
     }
 
     #[test]
