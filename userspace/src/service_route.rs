@@ -897,7 +897,7 @@ impl<H: Copy, const N: usize> NativeRouteTable<H, N> {
         self.table.generation(key)
     }
 
-    fn published(&self, key: RouteKey) -> Option<PublishedRoute<&H>> {
+    pub fn published(&self, key: RouteKey) -> Option<PublishedRoute<&H>> {
         self.table.get(key)
     }
 

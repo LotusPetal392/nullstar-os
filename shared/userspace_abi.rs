@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 11;
+pub const ABI_VERSION_MINOR: u64 = 12;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -280,6 +280,7 @@ pub mod file {
 
 pub mod signal {
     pub const INTERRUPT: u64 = 2;
+    pub const KILL: u64 = 9;
     pub const TERMINATE: u64 = 15;
     pub const CONTINUE: u64 = 18;
     pub const STOP: u64 = 19;
@@ -294,9 +295,13 @@ pub mod signal {
         }
     }
 
-    pub const SUPPORTED_MASK: u64 =
-        bit(INTERRUPT) | bit(TERMINATE) | bit(CONTINUE) | bit(STOP) | bit(TERMINAL_STOP);
-    pub const UNBLOCKABLE_MASK: u64 = bit(STOP);
+    pub const SUPPORTED_MASK: u64 = bit(INTERRUPT)
+        | bit(KILL)
+        | bit(TERMINATE)
+        | bit(CONTINUE)
+        | bit(STOP)
+        | bit(TERMINAL_STOP);
+    pub const UNBLOCKABLE_MASK: u64 = bit(KILL) | bit(STOP);
 }
 
 pub mod signal_action {

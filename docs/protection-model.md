@@ -24,8 +24,9 @@ filesystem responsibilities across userspace service boundaries:
   block endpoint, to those services;
 - an allocation-free userspace service-route layer now separates stable logging producer and
   observer route grants from generation-specific provider ingress authority;
-- PID 1 exposes separate stable service-observation and restart-only mutation endpoints to
-  authorized `sv` clients and trusted shell builtins;
+- PID 1 exposes separate stable service-observation and mutation endpoints to authorized `sv`
+  clients and trusted shell builtins; logging supports live start/stop while filesystem mutations
+  remain restricted;
 - provider generation, protocol session, request, and stale-handle checks protect
   replacement boundaries.
 
@@ -138,10 +139,10 @@ The route broker never queues or replays application traffic. A one-way logging 
 replayed on a replacement when processing by the old provider is uncertain; generation isolation
 cannot determine whether that record was retained before failure.
 
-## Service-control observation and restart use
+## Service-control observation and mutation use
 
 The [service control protocol](service-control-protocol.md) uses distinct stable endpoint objects for
-observation and restart-only mutation. PID 1 retains each source and an exact-`RECEIVE` duplicate. An
+observation and mutation. PID 1 retains each source and an exact-`RECEIVE` duplicate. An
 authorized client holds exact `SEND`, creates a fresh private reply endpoint per request, transfers
 only exact `SEND` for that reply, and retains exact `RECEIVE`. The 64-byte `NSVC` response transfers
 no capability and is accepted only when it is canonically correlated and has a nonzero kernel-stamped
@@ -155,12 +156,15 @@ IDs, generations, PIDs, and UID-like identity do not manufacture access.
 
 The observation client refuses to originate mutation packets, and PID 1 returns canonical
 `AccessDenied` if a valid `Start`, `Stop`, or `Restart` reaches that ingress. The mutation client
-refuses observation operations. Its endpoint implements `Restart`; `Start` and `Stop` return
-`Unsupported`. Controlled restart does not charge failure policy, and an unconfirmed sent mutation is
-outcome unknown and never retried automatically. Malformed requests are consumed without killing PID
-1, and every terminal or failed path closes private reply handles. There is no persistent stopped
-state, separate manager process, partially visible registry policy, or general revocation primitive
-yet.
+refuses observation operations. Its endpoint implements generic `Restart` plus logging `Start` and
+`Stop`; filesystem `Start` and `Stop` return `Unsupported`. Controlled restart and stop do not charge
+failure policy. PID 1 first requests cooperative logging termination and, after a bounded grace
+period, uses uncatchable and unblockable signal 9 through the existing direct-child `kill` syscall;
+this escalation authority is not delegated merely by granting service-control mutation access. An
+unconfirmed sent mutation is outcome unknown and never retried automatically. Malformed requests are
+consumed without killing PID 1, and every terminal or failed path closes private reply handles. Logging stopped state persists only
+in PID 1 memory; there is no cross-reboot policy, separate manager process, partially visible registry
+policy, or general revocation primitive yet.
 
 ## Filesystem-service use
 

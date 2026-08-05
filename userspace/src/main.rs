@@ -3,8 +3,9 @@
 
 use nswp_logging::{LOGGING_OBSERVER_ROLE, LOGGING_PRODUCER_ROLE, LOGGING_SERVICE_ID};
 use service_control::{
-    ListResponse, ObservedState, ServiceControlFailure, ServiceControlRequest,
-    ServiceControlResponse, ServiceId, ServiceRecord, TargetResponse,
+    DesiredState, ListResponse, ObservedState, Operation, RequestId, ServiceControlFailure,
+    ServiceControlRequest, ServiceControlResponse, ServiceId, ServiceRecord, TargetOutcome,
+    TargetResponse,
 };
 use service_route::{Authorizer, ProviderGeneration, ProviderGenerationSequence, RouteKey};
 use userspace::{
@@ -13,13 +14,14 @@ use userspace::{
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
     service_control::{
-        ControlIngress, LOGGING_SERVICE_ID as CONTROL_LOGGING_SERVICE_ID, NULLFS_SERVICE_ID,
-        TMPFS_SERVICE_ID, VFS_SERVICE_ID,
+        ControlExchange, ControlIngress, LOGGING_SERVICE_ID as CONTROL_LOGGING_SERVICE_ID,
+        NULLFS_SERVICE_ID, TMPFS_SERVICE_ID, VFS_SERVICE_ID,
     },
     service_route::{NativeRouteTable, RouteIngress, queue_service_generation},
     supervisor::{
         ReadyDisposition, RestartRequestError, ServiceRuntime, ServiceSpec, ServiceState,
-        ServiceStatusDisposition, ShellStatusDisposition, shell_status_disposition,
+        ServiceStatusDisposition, ShellStatusDisposition, StartRequestError, StopRequestError,
+        shell_status_disposition,
     },
     syscall::{self, ProcessId, STDERR, STDOUT, SpawnFlags},
     tmpfs::Mount,
@@ -30,11 +32,17 @@ userspace::panic_handler!();
 
 const INIT_READY: &[u8] = b"userspace init ready: pid=1\n";
 const LOGGING_SERVICE_COMMAND: &[u8] = b"/logging-service";
+const LOGGING_SERVICE_IGNORE_TERMINATE_COMMAND: &[u8] = b"/logging-service --ignore-terminate";
+const LOGGING_SERVICE_SUPPRESS_READINESS_COMMAND: &[u8] = b"/logging-service --suppress-readiness";
 const LOGGING_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: logging";
 const LOGGING_SERVICE_STARTING: &[u8] = b"userspace init: starting logging service\n";
 const LOGGING_SERVICE_RESTARTING: &[u8] = b"userspace init: logging service exited; restarting\n";
 const LOGGING_SERVICE_READY: &[u8] = b"userspace init: logging service ready\n";
 const LOGGING_SERVICE_FAILED: &[u8] = b"userspace init: logging service exhausted restart budget\n";
+const LOGGING_SERVICE_FORCE_TERMINATING: &[u8] =
+    b"userspace init: logging service termination grace expired; forcing exit\n";
+const LOGGING_SERVICE_READINESS_TIMEOUT: &[u8] =
+    b"userspace init: logging service readiness deadline expired; forcing exit\n";
 const LOGGING_SERVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to grant logging capabilities\n";
 const LOGGING_SERVICE_PROTOCOL_FAILED: &[u8] =
@@ -54,6 +62,9 @@ const LOGCTL_PASSED: &[u8] = b"userspace init: logctl show passed\n";
 const SV_LIST_COMMAND: &[u8] = b"/sv list";
 const SV_STATUS_LOGGING_COMMAND: &[u8] = b"/sv status logging";
 const SV_STATUS_NULLFS_COMMAND: &[u8] = b"/sv status nullfs";
+const SV_START_LOGGING_COMMAND: &[u8] = b"/sv start logging";
+const SV_STOP_LOGGING_COMMAND: &[u8] = b"/sv stop logging";
+const SV_RESTART_LOGGING_COMMAND: &[u8] = b"/sv restart logging";
 const SV_RESTART_NULLFS_COMMAND: &[u8] = b"/sv restart nullfs";
 const SV_LIST_PASSED: &[u8] = b"userspace init: sv list passed\n";
 const SV_STATUS_LOGGING_PASSED: &[u8] = b"userspace init: sv status logging passed\n";
@@ -126,8 +137,11 @@ const NULLFS_RESTART_PROBE_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale rea
 const NULLFS_RESTART_PROBE_PASSED: &[u8] =
     b"userspace init: NullFS restart persistent VFS mutation and stale descriptors verified\n";
 const NULLFS_RESTART_PROBE_FAILED: &[u8] = b"userspace init: NullFS restart probe failed\n";
+const LOGGING_LIFECYCLE_TEST_PASSED: &[u8] = b"userspace init: logging live start, stop, route withdrawal, restart fencing, and generation replacement verified\n";
+const LOGGING_LIFECYCLE_TEST_FAILED: &[u8] = b"userspace init: logging lifecycle test failed\n";
 const BOOT_MODE_PATH: &[u8] = b"/BOOTMODE";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
+const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const BOOT_MODE_PROBE_FAILED: &[u8] = b"userspace init: unable to read boot mode\n";
 const SHELL_COMMAND: &[u8] = b"/ush";
 const SHELL_LAUNCHED: &[u8] = b"userspace init launched /ush\n";
@@ -140,6 +154,8 @@ const SHELL_FOREGROUND_FAILED: &[u8] =
 
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
+const SV_OBSERVATION_HANDLE: u64 = 1;
+const SV_MUTATION_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
 const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
 const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
@@ -149,6 +165,10 @@ const SHELL_SERVICE_CONTROL_MUTATION_HANDLE: u64 = 3;
 const MAX_BOOTSTRAP_ROUTES: usize = 2;
 const ROUTE_PUMP_BUDGET: usize = 4;
 const SERVICE_CONTROL_PUMP_BUDGET: usize = 4;
+const LOGGING_TERMINATION_GRACE_YIELDS: u32 = 64;
+const LOGGING_READINESS_GRACE_YIELDS: u32 = 2_048;
+const LOGGING_TEST_READINESS_GRACE_YIELDS: u32 = 64;
+const LOGGING_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
 
@@ -485,14 +505,34 @@ fn service_mutation_response(
         ServiceControlRequest::Status { service } => ServiceControlResponse::status(
             TargetResponse::failure(service, ServiceControlFailure::AccessDenied),
         ),
-        ServiceControlRequest::Start { service } => ServiceControlResponse::start(
-            TargetResponse::failure(service, ServiceControlFailure::Unsupported),
-        )
-        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
-        ServiceControlRequest::Stop { service } => ServiceControlResponse::stop(
-            TargetResponse::failure(service, ServiceControlFailure::Unsupported),
-        )
-        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED)),
+        ServiceControlRequest::Start { service } => {
+            let response = if service == CONTROL_LOGGING_SERVICE_ID {
+                request_service_start(service, registry.logging, registry.logging_generation)
+            } else if matches!(
+                service,
+                NULLFS_SERVICE_ID | TMPFS_SERVICE_ID | VFS_SERVICE_ID
+            ) {
+                TargetResponse::failure(service, ServiceControlFailure::Unsupported)
+            } else {
+                TargetResponse::failure(service, ServiceControlFailure::NotFound)
+            };
+            ServiceControlResponse::start(response)
+                .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
+        }
+        ServiceControlRequest::Stop { service } => {
+            let response = if service == CONTROL_LOGGING_SERVICE_ID {
+                request_service_stop(service, registry.logging, registry.logging_generation)
+            } else if matches!(
+                service,
+                NULLFS_SERVICE_ID | TMPFS_SERVICE_ID | VFS_SERVICE_ID
+            ) {
+                TargetResponse::failure(service, ServiceControlFailure::Unsupported)
+            } else {
+                TargetResponse::failure(service, ServiceControlFailure::NotFound)
+            };
+            ServiceControlResponse::stop(response)
+                .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
+        }
         ServiceControlRequest::Restart { service } => {
             let response = if service == CONTROL_LOGGING_SERVICE_ID {
                 request_service_restart(service, registry.logging, registry.logging_generation)
@@ -509,6 +549,47 @@ fn service_mutation_response(
                 .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
         }
     }
+}
+
+fn request_service_start(
+    service: ServiceId,
+    runtime: &mut ServiceRuntime,
+    generation: ProviderGeneration,
+) -> TargetResponse {
+    match runtime.request_start() {
+        Ok(()) => TargetResponse::success(service_record(service, runtime, generation)),
+        Err(StartRequestError::InvalidState) => {
+            TargetResponse::failure(service, ServiceControlFailure::InvalidState)
+        }
+    }
+}
+
+fn request_service_stop(
+    service: ServiceId,
+    runtime: &mut ServiceRuntime,
+    generation: ProviderGeneration,
+) -> TargetResponse {
+    let request = match runtime.request_stop() {
+        Ok(request) => request,
+        Err(StopRequestError::InvalidState) => {
+            return TargetResponse::failure(service, ServiceControlFailure::InvalidState);
+        }
+        Err(StopRequestError::TransitionExhausted) => {
+            return TargetResponse::failure(service, ServiceControlFailure::Exhausted);
+        }
+    };
+    if let Some(process_group) = request.process_group()
+        && !matches!(
+            syscall::signal_process_group(process_group, signal::TERMINATE),
+            Ok(signaled) if signaled != 0
+        )
+    {
+        if runtime.cancel_stop(request).is_err() {
+            fail(SERVICE_CONTROL_PROTOCOL_FAILED);
+        }
+        return TargetResponse::failure(service, ServiceControlFailure::Busy);
+    }
+    TargetResponse::success(service_record(service, runtime, generation))
 }
 
 fn request_service_restart(
@@ -615,6 +696,12 @@ struct LoggingGeneration {
     observer_source: CapabilityHandle,
     producer_object_id: u64,
     observer_object_id: u64,
+    readiness_received: bool,
+    child_stopped: bool,
+    routes_published: bool,
+    readiness_yields_remaining: u32,
+    readiness_force_termination_sent: bool,
+    force_termination_attempts_remaining: u32,
 }
 
 impl LoggingGeneration {
@@ -623,6 +710,570 @@ impl LoggingGeneration {
             .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
         ipc::close(self.producer_source).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
         ipc::close(self.observer_source).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    }
+}
+
+struct LoggingLifecycle {
+    current: Option<LoggingGeneration>,
+    last_generation: ProviderGeneration,
+    backoff_yields_remaining: u32,
+    termination_grace_yields_remaining: Option<u32>,
+    force_termination_sent: bool,
+    force_termination_attempts_remaining: u32,
+}
+
+impl LoggingLifecycle {
+    fn running(generation: LoggingGeneration) -> Self {
+        if !generation.routes_published {
+            fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+        }
+        Self {
+            last_generation: generation.generation,
+            current: Some(generation),
+            backoff_yields_remaining: 0,
+            termination_grace_yields_remaining: None,
+            force_termination_sent: false,
+            force_termination_attempts_remaining: 0,
+        }
+    }
+
+    const fn generation(&self) -> ProviderGeneration {
+        self.last_generation
+    }
+
+    fn withdraw_routes(&mut self, route_broker: &mut RouteBrokerState) {
+        let Some(generation) = self.current.as_mut() else {
+            return;
+        };
+        if generation.routes_published {
+            route_broker.withdraw(generation.generation);
+            generation.routes_published = false;
+        }
+    }
+
+    fn close_current(&mut self) {
+        if let Some(generation) = self.current.take() {
+            generation.close();
+        }
+        self.termination_grace_yields_remaining = None;
+        self.force_termination_sent = false;
+        self.force_termination_attempts_remaining = 0;
+    }
+
+    fn install(&mut self, generation: LoggingGeneration) {
+        if self.current.is_some() {
+            fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+        }
+        self.last_generation = generation.generation;
+        self.current = Some(generation);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LoggingLifecycleCheckPhase {
+    SpawnStop,
+    WaitStopClient(ProcessId),
+    WaitStopped,
+    WaitStartClient(ProcessId),
+    WaitReady,
+    WaitReadyStatus(ProcessId),
+    WaitRestartPending(ProcessId),
+    WaitRestartResults(ProcessId),
+    WaitRestartReady,
+    WaitReadyDuplicate,
+    WaitRestartFence,
+    BeginUnsupported(usize),
+    WaitUnsupported(usize),
+    SpawnReadinessTimeout,
+    WaitReadinessRestartClient(ProcessId),
+    WaitReadinessFailure,
+    Complete,
+}
+
+struct LoggingLifecycleCheck {
+    phase: LoggingLifecycleCheckPhase,
+    initial_generation: ProviderGeneration,
+    initial_producer_object_id: u64,
+    initial_observer_object_id: u64,
+    started_generation: Option<ProviderGeneration>,
+    started_producer_object_id: u64,
+    started_observer_object_id: u64,
+    initial_restart_count: u32,
+    restart_routes_withdrawn: bool,
+    restart_client_completed: bool,
+    duplicate_restart_completed: bool,
+    pending_exchange: Option<ControlExchange>,
+    filesystem_records: [ServiceRecord; 3],
+}
+
+impl LoggingLifecycleCheck {
+    fn new(
+        service: &ServiceRuntime,
+        lifecycle: &LoggingLifecycle,
+        route_broker: &RouteBrokerState,
+        filesystem_records: [ServiceRecord; 3],
+    ) -> Self {
+        let generation = lifecycle
+            .current
+            .as_ref()
+            .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+        if service.state() != ServiceState::Running
+            || service.desired_state() != DesiredState::Running
+            || !generation.routes_published
+            || published_route(route_broker, LOGGING_PRODUCER_KEY)
+                != Some((generation.generation, generation.producer_object_id))
+            || published_route(route_broker, LOGGING_OBSERVER_KEY)
+                != Some((generation.generation, generation.observer_object_id))
+        {
+            fail(LOGGING_LIFECYCLE_TEST_FAILED);
+        }
+        Self {
+            phase: LoggingLifecycleCheckPhase::SpawnStop,
+            initial_generation: generation.generation,
+            initial_producer_object_id: generation.producer_object_id,
+            initial_observer_object_id: generation.observer_object_id,
+            started_generation: None,
+            started_producer_object_id: 0,
+            started_observer_object_id: 0,
+            initial_restart_count: service.restart_count(),
+            restart_routes_withdrawn: false,
+            restart_client_completed: false,
+            duplicate_restart_completed: false,
+            pending_exchange: None,
+            filesystem_records,
+        }
+    }
+
+    fn begin_mutation(
+        &mut self,
+        control: &ServiceControlState,
+        request_id: u64,
+        request: ServiceControlRequest,
+    ) {
+        if self.pending_exchange.is_some() {
+            fail(LOGGING_LIFECYCLE_TEST_FAILED);
+        }
+        let authority = ipc::duplicate(control.mutation_source, Rights::SEND)
+            .unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+        let exchange = ControlExchange::begin_mutation(
+            authority,
+            RequestId::new(request_id).unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED)),
+            request,
+        )
+        .unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+        ipc::close(authority).unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+        self.pending_exchange = Some(exchange);
+    }
+
+    fn try_complete_mutation(&mut self) -> Option<ServiceControlResponse> {
+        let exchange = self
+            .pending_exchange
+            .as_mut()
+            .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+        let reply = match exchange.try_complete() {
+            Ok(Some(reply)) => reply,
+            Ok(None) => return None,
+            Err(_) => fail(LOGGING_LIFECYCLE_TEST_FAILED),
+        };
+        if reply.server_process_id() != INIT_PROCESS_ID {
+            fail(LOGGING_LIFECYCLE_TEST_FAILED);
+        }
+        self.pending_exchange = None;
+        Some(reply.response())
+    }
+
+    fn note_restart_route_state(&mut self, route_broker: &RouteBrokerState) {
+        if published_route(route_broker, LOGGING_PRODUCER_KEY).is_none()
+            && published_route(route_broker, LOGGING_OBSERVER_KEY).is_none()
+        {
+            self.restart_routes_withdrawn = true;
+        }
+    }
+
+    fn advance(
+        &mut self,
+        service: &ServiceRuntime,
+        lifecycle: &LoggingLifecycle,
+        route_broker: &RouteBrokerState,
+        control: &ServiceControlState,
+        filesystem_records: [ServiceRecord; 3],
+    ) {
+        match self.phase {
+            LoggingLifecycleCheckPhase::SpawnStop => {
+                let process_id = spawn_sv_command(
+                    SV_STOP_LOGGING_COMMAND,
+                    control.mutation_source,
+                    SV_MUTATION_HANDLE,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitStopClient(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitStopClient(process_id) => {
+                let Some(success) = try_wait_probe(process_id) else {
+                    return;
+                };
+                if !success
+                    || service.desired_state() != DesiredState::Stopped
+                    || !matches!(
+                        service.state(),
+                        ServiceState::Stopping | ServiceState::Stopped
+                    )
+                    || published_route(route_broker, LOGGING_PRODUCER_KEY).is_some()
+                    || published_route(route_broker, LOGGING_OBSERVER_KEY).is_some()
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.phase = LoggingLifecycleCheckPhase::WaitStopped;
+            }
+            LoggingLifecycleCheckPhase::WaitStopped => {
+                if service.state() != ServiceState::Stopped {
+                    return;
+                }
+                if service.desired_state() != DesiredState::Stopped
+                    || lifecycle.current.is_some()
+                    || service.restart_count() != self.initial_restart_count
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                let process_id = spawn_sv_command(
+                    SV_START_LOGGING_COMMAND,
+                    control.mutation_source,
+                    SV_MUTATION_HANDLE,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitStartClient(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitStartClient(process_id) => {
+                let Some(success) = try_wait_probe(process_id) else {
+                    return;
+                };
+                if !success || service.desired_state() != DesiredState::Running {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.phase = LoggingLifecycleCheckPhase::WaitReady;
+            }
+            LoggingLifecycleCheckPhase::WaitReady => {
+                if service.state() != ServiceState::Running {
+                    return;
+                }
+                let generation = lifecycle
+                    .current
+                    .as_ref()
+                    .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+                if service.restart_count() != self.initial_restart_count
+                    || generation.generation.get()
+                        != self.initial_generation.get().saturating_add(1)
+                    || generation.producer_object_id == self.initial_producer_object_id
+                    || generation.observer_object_id == self.initial_observer_object_id
+                    || published_route(route_broker, LOGGING_PRODUCER_KEY)
+                        != Some((generation.generation, generation.producer_object_id))
+                    || published_route(route_broker, LOGGING_OBSERVER_KEY)
+                        != Some((generation.generation, generation.observer_object_id))
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.started_generation = Some(generation.generation);
+                self.started_producer_object_id = generation.producer_object_id;
+                self.started_observer_object_id = generation.observer_object_id;
+                let process_id = spawn_sv_command(
+                    SV_STATUS_LOGGING_COMMAND,
+                    control.observation_source,
+                    SV_OBSERVATION_HANDLE,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitReadyStatus(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitReadyStatus(process_id) => {
+                let Some(success) = try_wait_probe(process_id) else {
+                    return;
+                };
+                if !success {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                let process_id = spawn_sv_command(
+                    SV_RESTART_LOGGING_COMMAND,
+                    control.mutation_source,
+                    SV_MUTATION_HANDLE,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitRestartPending(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitRestartPending(process_id) => {
+                self.note_restart_route_state(route_broker);
+                if !service.controlled_restart_pending() {
+                    if let Some(success) = try_wait_probe(process_id)
+                        && !success
+                    {
+                        fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                    }
+                    return;
+                }
+                if service.desired_state() != DesiredState::Running {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.begin_mutation(
+                    control,
+                    0x4c4f_4747_494e_4701,
+                    ServiceControlRequest::Restart {
+                        service: CONTROL_LOGGING_SERVICE_ID,
+                    },
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitRestartResults(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitRestartResults(process_id) => {
+                self.note_restart_route_state(route_broker);
+                if !self.restart_client_completed
+                    && let Some(success) = try_wait_probe(process_id)
+                {
+                    if !success {
+                        fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                    }
+                    self.restart_client_completed = true;
+                }
+                if !self.duplicate_restart_completed
+                    && let Some(response) = self.try_complete_mutation()
+                {
+                    require_control_failure(
+                        response,
+                        Operation::Restart,
+                        CONTROL_LOGGING_SERVICE_ID,
+                        ServiceControlFailure::Busy,
+                    );
+                    self.duplicate_restart_completed = true;
+                }
+                if self.restart_client_completed && self.duplicate_restart_completed {
+                    self.phase = LoggingLifecycleCheckPhase::WaitRestartReady;
+                }
+            }
+            LoggingLifecycleCheckPhase::WaitRestartReady => {
+                self.note_restart_route_state(route_broker);
+                if service.state() != ServiceState::Running {
+                    return;
+                }
+                let previous_generation = self
+                    .started_generation
+                    .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+                let generation = lifecycle
+                    .current
+                    .as_ref()
+                    .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+                if !self.restart_routes_withdrawn
+                    || !service.controlled_restart_pending()
+                    || service.restart_count() != self.initial_restart_count
+                    || generation.generation.get() != previous_generation.get().saturating_add(1)
+                    || generation.producer_object_id == self.started_producer_object_id
+                    || generation.observer_object_id == self.started_observer_object_id
+                    || published_route(route_broker, LOGGING_PRODUCER_KEY)
+                        != Some((generation.generation, generation.producer_object_id))
+                    || published_route(route_broker, LOGGING_OBSERVER_KEY)
+                        != Some((generation.generation, generation.observer_object_id))
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.begin_mutation(
+                    control,
+                    0x4c4f_4747_494e_4702,
+                    ServiceControlRequest::Restart {
+                        service: CONTROL_LOGGING_SERVICE_ID,
+                    },
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitReadyDuplicate;
+            }
+            LoggingLifecycleCheckPhase::WaitReadyDuplicate => {
+                let Some(response) = self.try_complete_mutation() else {
+                    return;
+                };
+                require_control_failure(
+                    response,
+                    Operation::Restart,
+                    CONTROL_LOGGING_SERVICE_ID,
+                    ServiceControlFailure::Busy,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitRestartFence;
+            }
+            LoggingLifecycleCheckPhase::WaitRestartFence => {
+                if service.controlled_restart_pending() {
+                    return;
+                }
+                self.phase = LoggingLifecycleCheckPhase::BeginUnsupported(0);
+            }
+            LoggingLifecycleCheckPhase::BeginUnsupported(index) => {
+                let (operation, service_id, request) = unsupported_filesystem_request(index);
+                self.begin_mutation(control, 0x4c4f_4747_494e_4710 + index as u64, request);
+                if operation != request.operation() || request.service() != Some(service_id) {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.phase = LoggingLifecycleCheckPhase::WaitUnsupported(index);
+            }
+            LoggingLifecycleCheckPhase::WaitUnsupported(index) => {
+                let Some(response) = self.try_complete_mutation() else {
+                    return;
+                };
+                let (operation, service_id, _) = unsupported_filesystem_request(index);
+                require_control_failure(
+                    response,
+                    operation,
+                    service_id,
+                    ServiceControlFailure::Unsupported,
+                );
+                if filesystem_records != self.filesystem_records {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                if index == 5 {
+                    self.phase = LoggingLifecycleCheckPhase::SpawnReadinessTimeout;
+                } else {
+                    self.phase = LoggingLifecycleCheckPhase::BeginUnsupported(index + 1);
+                }
+            }
+            LoggingLifecycleCheckPhase::SpawnReadinessTimeout => {
+                let process_id = spawn_sv_command(
+                    SV_RESTART_LOGGING_COMMAND,
+                    control.mutation_source,
+                    SV_MUTATION_HANDLE,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitReadinessRestartClient(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitReadinessRestartClient(process_id) => {
+                let Some(success) = try_wait_probe(process_id) else {
+                    return;
+                };
+                if !success
+                    || service.desired_state() != DesiredState::Running
+                    || !service.controlled_restart_pending()
+                    || published_route(route_broker, LOGGING_PRODUCER_KEY).is_some()
+                    || published_route(route_broker, LOGGING_OBSERVER_KEY).is_some()
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.phase = LoggingLifecycleCheckPhase::WaitReadinessFailure;
+            }
+            LoggingLifecycleCheckPhase::WaitReadinessFailure => {
+                if service.state() != ServiceState::Failed {
+                    return;
+                }
+                if service.desired_state() != DesiredState::Running
+                    || service.process_id().is_some()
+                    || service.controlled_restart_pending()
+                    || service.restart_count() != LOGGING_SERVICE.restart_limit
+                    || lifecycle.current.is_some()
+                    || published_route(route_broker, LOGGING_PRODUCER_KEY).is_some()
+                    || published_route(route_broker, LOGGING_OBSERVER_KEY).is_some()
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                let _ = syscall::write_all(STDOUT, LOGGING_LIFECYCLE_TEST_PASSED);
+                self.phase = LoggingLifecycleCheckPhase::Complete;
+            }
+            LoggingLifecycleCheckPhase::Complete => {}
+        }
+    }
+}
+
+fn require_control_failure(
+    response: ServiceControlResponse,
+    operation: Operation,
+    service: ServiceId,
+    expected: ServiceControlFailure,
+) {
+    let target = response
+        .target_response()
+        .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+    if response.operation() != operation
+        || target.service() != service
+        || target.outcome() != TargetOutcome::Failure(expected)
+    {
+        fail(LOGGING_LIFECYCLE_TEST_FAILED);
+    }
+}
+
+fn unsupported_filesystem_request(index: usize) -> (Operation, ServiceId, ServiceControlRequest) {
+    match index {
+        0 => (
+            Operation::Stop,
+            NULLFS_SERVICE_ID,
+            ServiceControlRequest::Stop {
+                service: NULLFS_SERVICE_ID,
+            },
+        ),
+        1 => (
+            Operation::Start,
+            NULLFS_SERVICE_ID,
+            ServiceControlRequest::Start {
+                service: NULLFS_SERVICE_ID,
+            },
+        ),
+        2 => (
+            Operation::Stop,
+            TMPFS_SERVICE_ID,
+            ServiceControlRequest::Stop {
+                service: TMPFS_SERVICE_ID,
+            },
+        ),
+        3 => (
+            Operation::Start,
+            TMPFS_SERVICE_ID,
+            ServiceControlRequest::Start {
+                service: TMPFS_SERVICE_ID,
+            },
+        ),
+        4 => (
+            Operation::Stop,
+            VFS_SERVICE_ID,
+            ServiceControlRequest::Stop {
+                service: VFS_SERVICE_ID,
+            },
+        ),
+        5 => (
+            Operation::Start,
+            VFS_SERVICE_ID,
+            ServiceControlRequest::Start {
+                service: VFS_SERVICE_ID,
+            },
+        ),
+        _ => fail(LOGGING_LIFECYCLE_TEST_FAILED),
+    }
+}
+
+fn published_route(
+    route_broker: &RouteBrokerState,
+    key: RouteKey,
+) -> Option<(ProviderGeneration, u64)> {
+    let route = route_broker.routes.published(key)?;
+    let object_id = ipc::info(*route.authority).ok()?.object_id;
+    Some((route.generation, object_id))
+}
+
+fn spawn_sv_command(
+    command: &[u8],
+    authority: CapabilityHandle,
+    target_handle: CapabilityHandle,
+) -> ProcessId {
+    let barrier =
+        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+    let process_id = syscall::spawn_command_with_barrier(
+        command,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+    if ipc::grant_child(process_id, authority, Rights::SEND, target_handle).ok()
+        != Some(target_handle)
+    {
+        fail(LOGGING_LIFECYCLE_TEST_FAILED);
+    }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+    process_id
+}
+
+fn try_wait_probe(process_id: ProcessId) -> Option<bool> {
+    match syscall::try_wait_child(process_id) {
+        Ok(status) if status.continued() || status.stopped_signal().is_some() => None,
+        Ok(status) => Some(status.success()),
+        Err(error) if error == syscall::Errno::TRY_AGAIN => None,
+        Err(error) if error == syscall::Errno::INTERRUPTED => None,
+        Err(_) => fail(LOGGING_LIFECYCLE_TEST_FAILED),
     }
 }
 
@@ -666,7 +1317,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if syscall::write_all(STDOUT, INIT_READY).is_err() {
         syscall::exit(1);
     }
-    let nullfs_restart_test = nullfs_restart_test_boot();
+    let boot_mode = init_boot_mode();
+    let nullfs_restart_test = boot_mode == InitBootMode::NullfsRestartTest;
+    let logging_lifecycle_test = boot_mode == InitBootMode::LoggingLifecycleTest;
 
     let mut route_broker = RouteBrokerState::new();
     let logging_early_log_reader =
@@ -704,6 +1357,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         );
     }
     run_logctl_show(&logging_service, &mut route_broker);
+    let mut logging_lifecycle = LoggingLifecycle::running(logging_generation);
 
     let mut missing_nullfs_uuid = nullfs_primary_volume::FILESYSTEM_UUID;
     missing_nullfs_uuid[15] ^= 0xff;
@@ -841,7 +1495,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             &mut service_control,
             ServiceRegistryMut {
                 logging: &mut logging_service,
-                logging_generation: logging_generation.generation,
+                logging_generation: logging_lifecycle.generation(),
                 nullfs: &mut nullfs_service,
                 nullfs_generation,
                 tmpfs: &mut service,
@@ -860,7 +1514,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             &mut service_control,
             ServiceRegistryView {
                 logging: &logging_service,
-                logging_generation: logging_generation.generation,
+                logging_generation: logging_lifecycle.generation(),
                 nullfs: &nullfs_service,
                 nullfs_generation,
                 tmpfs: &service,
@@ -881,7 +1535,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
 
     let registry = ServiceRegistryView {
         logging: &logging_service,
-        logging_generation: logging_generation.generation,
+        logging_generation: logging_lifecycle.generation(),
         nullfs: &nullfs_service,
         nullfs_generation,
         tmpfs: &service,
@@ -906,57 +1560,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         service_control.observation_source,
         service_control.mutation_source,
     );
+    let mut logging_lifecycle_check = if logging_lifecycle_test {
+        Some(LoggingLifecycleCheck::new(
+            &logging_service,
+            &logging_lifecycle,
+            &route_broker,
+            [
+                service_record(NULLFS_SERVICE_ID, &nullfs_service, nullfs_generation),
+                service_record(TMPFS_SERVICE_ID, &service, tmpfs_generation),
+                service_record(VFS_SERVICE_ID, &vfs_service, vfs_generation),
+            ],
+        ))
+    } else {
+        None
+    };
 
     loop {
-        if let Some(service_process_id) = logging_service.process_id() {
-            match syscall::try_wait_child(service_process_id) {
-                Ok(status) => match logging_service.observe_status(status.raw()) {
-                    ServiceStatusDisposition::WaitForNextEvent => {}
-                    ServiceStatusDisposition::Restart { backoff_yields } => {
-                        route_broker.withdraw(logging_generation.generation);
-                        logging_generation.close();
-                        let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_RESTARTING);
-                        backoff(backoff_yields);
-                        logging_generation = start_logging_generation(
-                            &mut logging_service,
-                            &mut route_broker,
-                            &mut logging_generations,
-                            logging_early_log_reader,
-                        );
-                        service_control.drain_mutation(ServiceRegistryMut {
-                            logging: &mut logging_service,
-                            logging_generation: logging_generation.generation,
-                            nullfs: &mut nullfs_service,
-                            nullfs_generation,
-                            tmpfs: &mut service,
-                            tmpfs_generation,
-                            vfs: &mut vfs_service,
-                            vfs_generation,
-                        });
-                        logging_service.complete_restart();
-                    }
-                    ServiceStatusDisposition::Stopped => {}
-                    ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
-                },
-                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
-                Err(error) if error == syscall::Errno::INTERRUPTED => {}
-                Err(_) => fail(LOGGING_SERVICE_FAILED),
-            }
-        }
-        route_broker.pump();
-        service_control.pump_observation(ServiceRegistryView {
-            logging: &logging_service,
-            logging_generation: logging_generation.generation,
-            nullfs: &nullfs_service,
-            nullfs_generation,
-            tmpfs: &service,
-            tmpfs_generation,
-            vfs: &vfs_service,
-            vfs_generation,
-        });
-        service_control.pump_mutation(ServiceRegistryMut {
+        poll_logging_child(
+            &mut logging_service,
+            &mut logging_lifecycle,
+            &mut route_broker,
+        );
+        let logging_restart_ready = logging_service.state() == ServiceState::Running
+            && logging_service.controlled_restart_pending();
+        let mutation_count = service_control.pump_mutation(ServiceRegistryMut {
             logging: &mut logging_service,
-            logging_generation: logging_generation.generation,
+            logging_generation: logging_lifecycle.generation(),
             nullfs: &mut nullfs_service,
             nullfs_generation,
             tmpfs: &mut service,
@@ -964,6 +1593,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             vfs: &mut vfs_service,
             vfs_generation,
         });
+        sync_logging_routes(&logging_service, &mut logging_lifecycle, &mut route_broker);
+        if logging_restart_ready
+            && mutation_count < SERVICE_CONTROL_PUMP_BUDGET
+            && logging_service.state() == ServiceState::Running
+        {
+            logging_service.complete_restart();
+        }
+        advance_logging_lifecycle(
+            &mut logging_service,
+            &mut logging_lifecycle,
+            &mut route_broker,
+            &mut logging_generations,
+            logging_early_log_reader,
+            logging_lifecycle_test,
+        );
+        service_control.pump_observation(ServiceRegistryView {
+            logging: &logging_service,
+            logging_generation: logging_lifecycle.generation(),
+            nullfs: &nullfs_service,
+            nullfs_generation,
+            tmpfs: &service,
+            tmpfs_generation,
+            vfs: &vfs_service,
+            vfs_generation,
+        });
+        route_broker.pump();
 
         if let Some(service_process_id) = nullfs_service.process_id() {
             match syscall::try_wait_child(service_process_id) {
@@ -983,7 +1638,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
                         service_control.drain_mutation(ServiceRegistryMut {
                             logging: &mut logging_service,
-                            logging_generation: logging_generation.generation,
+                            logging_generation: logging_lifecycle.generation(),
                             nullfs: &mut nullfs_service,
                             nullfs_generation,
                             tmpfs: &mut service,
@@ -1020,7 +1675,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         register_tmpfs_proxy(tmpfs_generation, request_endpoint);
                         service_control.drain_mutation(ServiceRegistryMut {
                             logging: &mut logging_service,
-                            logging_generation: logging_generation.generation,
+                            logging_generation: logging_lifecycle.generation(),
                             nullfs: &mut nullfs_service,
                             nullfs_generation,
                             tmpfs: &mut service,
@@ -1057,7 +1712,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         register_vfs_router(vfs_generation, vfs_request_endpoint);
                         service_control.drain_mutation(ServiceRegistryMut {
                             logging: &mut logging_service,
-                            logging_generation: logging_generation.generation,
+                            logging_generation: logging_lifecycle.generation(),
                             nullfs: &mut nullfs_service,
                             nullfs_generation,
                             tmpfs: &mut service,
@@ -1098,13 +1753,35 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             Err(_) => fail(SHELL_WAIT_FAILED),
         }
 
+        if let Some(check) = logging_lifecycle_check.as_mut() {
+            check.advance(
+                &logging_service,
+                &logging_lifecycle,
+                &route_broker,
+                &service_control,
+                [
+                    service_record(NULLFS_SERVICE_ID, &nullfs_service, nullfs_generation),
+                    service_record(TMPFS_SERVICE_ID, &service, tmpfs_generation),
+                    service_record(VFS_SERVICE_ID, &vfs_service, vfs_generation),
+                ],
+            );
+        }
+
         if syscall::yield_now().is_err() {
             fail(SHELL_WAIT_FAILED);
         }
     }
 }
 
-fn nullfs_restart_test_boot() -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitBootMode {
+    Normal,
+    SmokeTest,
+    NullfsRestartTest,
+    LoggingLifecycleTest,
+}
+
+fn init_boot_mode() -> InitBootMode {
     let descriptor = syscall::open(BOOT_MODE_PATH, syscall::OpenFlags::READ)
         .unwrap_or_else(|_| fail(BOOT_MODE_PROBE_FAILED));
     let mut bytes = [0_u8; 32];
@@ -1112,8 +1789,12 @@ fn nullfs_restart_test_boot() -> bool {
         syscall::read(descriptor, &mut bytes).unwrap_or_else(|_| fail(BOOT_MODE_PROBE_FAILED));
     syscall::close(descriptor).unwrap_or_else(|_| fail(BOOT_MODE_PROBE_FAILED));
     match &bytes[..count] {
-        b"nullfs-restart-test" | NULLFS_RESTART_TEST_BOOT_MODE => true,
-        b"normal" | b"normal\n" | b"smoke-test" | b"smoke-test\n" => false,
+        b"normal" | b"normal\n" => InitBootMode::Normal,
+        b"smoke-test" | b"smoke-test\n" => InitBootMode::SmokeTest,
+        b"nullfs-restart-test" | NULLFS_RESTART_TEST_BOOT_MODE => InitBootMode::NullfsRestartTest,
+        b"logging-lifecycle-test" | LOGGING_LIFECYCLE_TEST_BOOT_MODE => {
+            InitBootMode::LoggingLifecycleTest
+        }
         _ => fail(BOOT_MODE_PROBE_FAILED),
     }
 }
@@ -1561,6 +2242,9 @@ fn start_logging_generation(
             .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
 
         let mut ready_buffer = [0_u8; 64];
+        let mut readiness_yields_remaining = LOGGING_READINESS_GRACE_YIELDS;
+        let mut force_termination_attempts_remaining = LOGGING_FORCE_TERMINATION_ATTEMPTS;
+        let mut force_termination_sent = false;
         loop {
             route_broker.pump();
             match ipc::try_receive(readiness_source, &mut ready_buffer) {
@@ -1617,9 +2301,27 @@ fn start_logging_generation(
                         observer_source,
                         producer_object_id,
                         observer_object_id,
+                        readiness_received: true,
+                        child_stopped: false,
+                        routes_published: true,
+                        readiness_yields_remaining: 0,
+                        readiness_force_termination_sent: false,
+                        force_termination_attempts_remaining: 0,
                     };
                 }
-                Err(error) if error == ipc::Error::TRY_AGAIN => {}
+                Err(error) if error == ipc::Error::TRY_AGAIN => {
+                    if readiness_yields_remaining != 0 {
+                        readiness_yields_remaining -= 1;
+                    } else if !force_termination_sent
+                        && request_forced_termination(
+                            process_id,
+                            &mut force_termination_attempts_remaining,
+                        )
+                    {
+                        let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_READINESS_TIMEOUT);
+                        force_termination_sent = true;
+                    }
+                }
                 Err(_) => fail(LOGGING_SERVICE_PROTOCOL_FAILED),
             }
 
@@ -1648,6 +2350,301 @@ fn start_logging_generation(
             let _ = syscall::yield_now();
         }
     }
+}
+
+fn begin_logging_generation(
+    service: &mut ServiceRuntime,
+    generations: &mut ProviderGenerationSequence,
+    early_log_reader: CapabilityHandle,
+    lifecycle_test: bool,
+) -> LoggingGeneration {
+    let generation = generations
+        .next_generation()
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let generation_handoff_source =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    queue_service_generation(generation_handoff_source, generation)
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let readiness_source =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let producer_source =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let observer_source =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let producer_object_id = ipc::info(producer_source)
+        .map(|info| info.object_id)
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let observer_object_id = ipc::info(observer_source)
+        .map(|info| info.object_id)
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    if producer_object_id == 0
+        || observer_object_id == 0
+        || producer_object_id == observer_object_id
+    {
+        fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+
+    let spec = service.spec();
+    let suppress_readiness = lifecycle_test && generation.get() >= 4;
+    let command = if suppress_readiness {
+        LOGGING_SERVICE_SUPPRESS_READINESS_COMMAND
+    } else if lifecycle_test {
+        LOGGING_SERVICE_IGNORE_TERMINATE_COMMAND
+    } else {
+        spec.command
+    };
+    let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.starting);
+    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
+    let process_id = syscall::spawn_command_with_barrier(
+        command,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
+    service.note_spawned(process_id);
+    if ipc::grant_child(process_id, readiness_source, Rights::SEND, READY_HANDLE).ok()
+        != Some(READY_HANDLE)
+        || ipc::grant_child(process_id, producer_source, Rights::RECEIVE, REQUEST_HANDLE).ok()
+            != Some(REQUEST_HANDLE)
+        || ipc::grant_child(
+            process_id,
+            observer_source,
+            Rights::RECEIVE,
+            LOGGING_OBSERVER_INGRESS_HANDLE,
+        )
+        .ok()
+            != Some(LOGGING_OBSERVER_INGRESS_HANDLE)
+        || ipc::grant_child(
+            process_id,
+            early_log_reader,
+            Rights::READ,
+            LOGGING_EARLY_LOG_HANDLE,
+        )
+        .ok()
+            != Some(LOGGING_EARLY_LOG_HANDLE)
+        || ipc::grant_child(
+            process_id,
+            generation_handoff_source,
+            Rights::RECEIVE,
+            GENERATION_HANDOFF_HANDLE,
+        )
+        .ok()
+            != Some(GENERATION_HANDOFF_HANDLE)
+    {
+        fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+    ipc::close(generation_handoff_source)
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+
+    LoggingGeneration {
+        generation,
+        readiness_source,
+        producer_source,
+        observer_source,
+        producer_object_id,
+        observer_object_id,
+        readiness_received: false,
+        child_stopped: false,
+        routes_published: false,
+        readiness_yields_remaining: if suppress_readiness {
+            LOGGING_TEST_READINESS_GRACE_YIELDS
+        } else {
+            LOGGING_READINESS_GRACE_YIELDS
+        },
+        readiness_force_termination_sent: false,
+        force_termination_attempts_remaining: LOGGING_FORCE_TERMINATION_ATTEMPTS,
+    }
+}
+
+fn poll_logging_child(
+    service: &mut ServiceRuntime,
+    lifecycle: &mut LoggingLifecycle,
+    route_broker: &mut RouteBrokerState,
+) {
+    let Some(process_id) = service.process_id() else {
+        return;
+    };
+    let status = match syscall::try_wait_child(process_id) {
+        Ok(status) => status,
+        Err(error) if error == syscall::Errno::TRY_AGAIN => return,
+        Err(error) if error == syscall::Errno::INTERRUPTED => return,
+        Err(_) => fail(LOGGING_SERVICE_FAILED),
+    };
+
+    if status.stopped_signal().is_some() {
+        if service.observe_status(status.raw()) != ServiceStatusDisposition::WaitForNextEvent {
+            fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+        }
+        if let Some(generation) = lifecycle.current.as_mut() {
+            generation.child_stopped = true;
+        }
+        return;
+    }
+    if status.continued() {
+        if service.observe_status(status.raw()) != ServiceStatusDisposition::WaitForNextEvent {
+            fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+        }
+        if let Some(generation) = lifecycle.current.as_mut() {
+            generation.child_stopped = false;
+        }
+        return;
+    }
+
+    let disposition = service.observe_status(status.raw());
+    lifecycle.withdraw_routes(route_broker);
+    lifecycle.close_current();
+    match disposition {
+        ServiceStatusDisposition::Stopped => {
+            lifecycle.backoff_yields_remaining = 0;
+        }
+        ServiceStatusDisposition::Restart { backoff_yields } => {
+            lifecycle.backoff_yields_remaining = backoff_yields;
+            let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.restarting);
+        }
+        ServiceStatusDisposition::Failed => {
+            lifecycle.backoff_yields_remaining = 0;
+        }
+        ServiceStatusDisposition::WaitForNextEvent => fail(LOGGING_SERVICE_PROTOCOL_FAILED),
+    }
+}
+
+fn request_forced_termination(process_id: ProcessId, attempts_remaining: &mut u32) -> bool {
+    if platform::kill(process_id, signal::KILL).is_ok() {
+        return true;
+    }
+    if *attempts_remaining == 0 {
+        fail(LOGGING_SERVICE_FAILED);
+    }
+    *attempts_remaining -= 1;
+    false
+}
+
+fn sync_logging_routes(
+    service: &ServiceRuntime,
+    lifecycle: &mut LoggingLifecycle,
+    route_broker: &mut RouteBrokerState,
+) {
+    if !matches!(
+        service.state(),
+        ServiceState::Stopping | ServiceState::Restarting
+    ) {
+        lifecycle.termination_grace_yields_remaining = None;
+        lifecycle.force_termination_sent = false;
+        lifecycle.force_termination_attempts_remaining = 0;
+        return;
+    }
+
+    lifecycle.withdraw_routes(route_broker);
+    let Some(process_id) = service.process_id() else {
+        lifecycle.termination_grace_yields_remaining = None;
+        lifecycle.force_termination_sent = false;
+        lifecycle.force_termination_attempts_remaining = 0;
+        return;
+    };
+    match lifecycle.termination_grace_yields_remaining {
+        None => {
+            lifecycle.termination_grace_yields_remaining = Some(LOGGING_TERMINATION_GRACE_YIELDS);
+            lifecycle.force_termination_attempts_remaining = LOGGING_FORCE_TERMINATION_ATTEMPTS;
+        }
+        Some(remaining) if remaining != 0 => {
+            lifecycle.termination_grace_yields_remaining = Some(remaining - 1);
+        }
+        Some(_) if !lifecycle.force_termination_sent => {
+            if request_forced_termination(
+                process_id,
+                &mut lifecycle.force_termination_attempts_remaining,
+            ) {
+                let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_FORCE_TERMINATING);
+                lifecycle.force_termination_sent = true;
+            }
+        }
+        Some(_) => {}
+    }
+}
+
+fn advance_logging_lifecycle(
+    service: &mut ServiceRuntime,
+    lifecycle: &mut LoggingLifecycle,
+    route_broker: &mut RouteBrokerState,
+    generations: &mut ProviderGenerationSequence,
+    early_log_reader: CapabilityHandle,
+    lifecycle_test: bool,
+) {
+    if lifecycle.current.is_none() {
+        if lifecycle.backoff_yields_remaining != 0 {
+            lifecycle.backoff_yields_remaining -= 1;
+            return;
+        }
+        if service.should_start() || service.state() == ServiceState::Backoff {
+            let generation =
+                begin_logging_generation(service, generations, early_log_reader, lifecycle_test);
+            lifecycle.install(generation);
+        }
+        return;
+    }
+
+    if service.state() != ServiceState::Starting {
+        return;
+    }
+    let process_id = service
+        .process_id()
+        .unwrap_or_else(|| fail(LOGGING_SERVICE_PROTOCOL_FAILED));
+    let generation = lifecycle
+        .current
+        .as_mut()
+        .unwrap_or_else(|| fail(LOGGING_SERVICE_PROTOCOL_FAILED));
+    if !generation.readiness_received {
+        let mut ready_buffer = [0_u8; 64];
+        match ipc::try_receive(generation.readiness_source, &mut ready_buffer) {
+            Ok(message) => {
+                let spec = service.spec();
+                if message.sender_process_id != process_id
+                    || message.capability.is_some()
+                    || message.bytes != spec.ready_message.len()
+                    || &ready_buffer[..message.bytes] != spec.ready_message
+                {
+                    fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+                }
+                generation.readiness_received = true;
+                return;
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {
+                if generation.readiness_yields_remaining != 0 {
+                    generation.readiness_yields_remaining -= 1;
+                } else if !generation.readiness_force_termination_sent
+                    && request_forced_termination(
+                        process_id,
+                        &mut generation.force_termination_attempts_remaining,
+                    )
+                {
+                    let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_READINESS_TIMEOUT);
+                    generation.readiness_force_termination_sent = true;
+                }
+                return;
+            }
+            Err(_) => fail(LOGGING_SERVICE_PROTOCOL_FAILED),
+        }
+    }
+    if generation.child_stopped {
+        return;
+    }
+    if service.note_ready() != ReadyDisposition::Accepted {
+        fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+    }
+    route_broker.publish(
+        generation.generation,
+        generation.producer_source,
+        generation.observer_source,
+    );
+    generation.routes_published = true;
+    let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.ready);
 }
 
 fn start_service(

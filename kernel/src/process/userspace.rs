@@ -113,6 +113,7 @@ const SYSCALL_ENVIRONMENT_SET: u64 = abi::syscall::ENVIRONMENT_SET;
 const SYSCALL_ENVIRONMENT_UNSET: u64 = abi::syscall::ENVIRONMENT_UNSET;
 
 pub const SIGNAL_INTERRUPT: u64 = abi::signal::INTERRUPT;
+pub const SIGNAL_KILL: u64 = abi::signal::KILL;
 pub const SIGNAL_TERMINATE: u64 = abi::signal::TERMINATE;
 pub const SIGNAL_CONTINUE: u64 = abi::signal::CONTINUE;
 pub const SIGNAL_STOP: u64 = abi::signal::STOP;
@@ -6282,7 +6283,7 @@ fn signal_is_supported(signal: u64) -> bool {
 }
 
 fn signal_is_catchable(signal: u64) -> bool {
-    signal_is_supported(signal) && signal != SIGNAL_STOP
+    signal_is_supported(signal) && !matches!(signal, SIGNAL_KILL | SIGNAL_STOP)
 }
 
 fn user_executable_address(process_id: u64, address: u64) -> bool {
@@ -6344,7 +6345,9 @@ fn validate_signal_action(
     action.mask &= !SIGNAL_UNBLOCKABLE_MASK;
     match action.handler {
         abi::signal_action::DEFAULT | abi::signal_action::IGNORE => {
-            if signal == SIGNAL_STOP && action.handler != abi::signal_action::DEFAULT {
+            if matches!(signal, SIGNAL_KILL | SIGNAL_STOP)
+                && action.handler != abi::signal_action::DEFAULT
+            {
                 return Err(ERR_INVALID_ARGUMENT);
             }
             action.restorer = 0;
@@ -6648,7 +6651,9 @@ enum DefaultSignalAction {
 
 fn default_signal_action(signal: u64) -> Option<DefaultSignalAction> {
     match signal {
-        SIGNAL_INTERRUPT | SIGNAL_TERMINATE => Some(DefaultSignalAction::Terminate),
+        SIGNAL_INTERRUPT | SIGNAL_KILL | SIGNAL_TERMINATE => {
+            Some(DefaultSignalAction::Terminate)
+        }
         SIGNAL_STOP | SIGNAL_TERMINAL_STOP => Some(DefaultSignalAction::Stop),
         SIGNAL_CONTINUE => Some(DefaultSignalAction::Continue),
         _ => None,

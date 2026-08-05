@@ -52,14 +52,17 @@ The detailed contract is in
 
 In the service-management implementation sequence, the
 [allocation-free `NSVC` v1 contract](../service-control-protocol.md) now provides a host-testable exact
-64-byte codec, native endpoint transport, a temporary PID 1 registry, and implemented `sv list`, `sv
-status SERVICE`, and separately authorized `sv restart SERVICE`. Controlled restart advances the
-manager-owned generation without charging failure policy, while an unconfirmed mutation is never
-replayed. The generic supervisor now also owns host-tested in-memory desired-state transitions for
-controlled stop, stop-over-restart, explicit re-arming, and rollback before those transitions are
-exposed through the live mutation ingress. Jobs, a separate manager process, activation, definitions,
-cross-reboot desired-state persistence, and live `sv start` and `sv stop` remain future work; these
-milestones required no kernel changes.
+64-byte codec, native endpoint transport, a temporary PID 1 registry, implemented `sv list`, `sv
+status SERVICE`, and separately authorized mutation. `sv restart SERVICE` remains generic, while live
+`sv start logging` and `sv stop logging` exercise bounded desired-state convergence, immediate route
+withdrawal, fresh route objects, and manager-owned generation replacement without charging failure
+policy. Logging restart retains a fence through replacement startup, rejects a queued duplicate with
+`Busy`, and escalates from cooperative termination to uncatchable signal 9 after a bounded grace
+period. A separate bounded readiness deadline prevents a live but unready logging child from holding
+replacement convergence indefinitely and feeds expiry into normal restart/backoff policy. Filesystem
+start/stop waits on provider-offline and quiesce semantics. Jobs, a separate manager
+process, activation, definitions, and cross-reboot desired-state persistence remain future work. No new
+lifecycle syscall was required, but the existing signal ABI gained the forced-termination signal.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

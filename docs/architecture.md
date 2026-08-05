@@ -40,7 +40,9 @@ Generated images use `/BOOTMODE` to select among:
 - `normal`, which starts services, PID 1, and the foreground userspace shell;
 - `smoke-test`, which runs deterministic subsystem probes and persistence checks;
 - `nullfs-restart-test`, which replaces the mounted NullFS service while a probe owns a
-  live descriptor and blocked read.
+  live descriptor and blocked read;
+- `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
+  generation replacement, restart fencing, filesystem mutation policy, and forced termination.
 
 ## Boot sequence
 
@@ -139,7 +141,8 @@ carries no capability and must come from a nonzero kernel-stamped server PID.
 PID 1 temporarily owns separate stable observation and mutation ingresses for its hard-coded
 `logging`, `nullfs`, `tmpfs`, and `vfs` services. Exact-`SEND` observation authority permits `/sv
 list` and `/sv status SERVICE`; mutation packets on that endpoint receive `AccessDenied`. Separate
-mutation authority permits `/sv restart SERVICE`; `Start` and `Stop` remain `Unsupported`.
+mutation authority permits `/sv restart SERVICE` and live `/sv start logging` and `/sv stop
+logging`; filesystem `Start` and `Stop` remain `Unsupported`.
 
 A committed restart reports the old generation as `Terminating`, uses no failure backoff or restart
 budget, and assigns the replacement's next manager-owned generation. Restart intent remains pending
@@ -148,13 +151,19 @@ new generation. A missing reply after send is outcome unknown and is never retri
 for each authority, not `TRANSFER`; arbitrary children and pathname-selected executables inherit
 neither.
 
-The generic supervisor now retains in-memory desired state and host-tests controlled stop,
-stop-over-restart suppression, explicit re-arming, and failed-signal rollback. Live `Start` and `Stop`
-still return `Unsupported`. Logging is the planned first convergence pilot; filesystem providers must
-first gain generation-checked offlining that fails pending kernel proxy work and never carries an old
-endpoint queue into a replacement, while writable NullFS also requires orderly quiesce and flush.
-This adds no manager process, activation, definition loading, cross-reboot persistence, or new kernel
-behavior.
+Logging is the first live desired-state convergence pilot. PID 1 processes logging child events,
+mutation requests, readiness, and backoff in bounded steps; stop withdraws producer and observer
+routes before later resolutions are serviced, and start publishes only a fresh ready generation.
+A bounded readiness deadline force-terminates a starting child that never declares readiness, after
+which ordinary restart/backoff limits apply. Controlled stop does not charge failure policy, and
+start/stop success commits desired state without
+waiting for exit or readiness. PID 1 first requests cooperative termination and escalates after a
+bounded grace period with uncatchable, unblockable signal 9; the dedicated lifecycle image verifies
+that escalation, duplicate-restart `Busy`, and exact filesystem `Start`/`Stop` `Unsupported` policy.
+Filesystem providers must first gain generation-checked offlining that fails pending kernel proxy work
+and never carries an old endpoint queue into a replacement, while writable NullFS also requires
+orderly quiesce and flush. This adds no manager process, activation, definition loading, cross-reboot
+persistence, or new lifecycle syscall.
 
 ### Future service and session lifecycle
 

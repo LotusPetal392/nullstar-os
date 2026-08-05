@@ -25,7 +25,8 @@ experimentation, not production use or untrusted workloads.
   VFS writes
 - ELF64 ring-3 processes, file descriptors, pipes, `fork` with copy-on-write,
   transactional `exec`, parent/child waiting, environments, process groups,
-  terminal ownership, and a focused signal implementation
+  terminal ownership, and a focused signal implementation including uncatchable,
+  unblockable forced termination
 - bounded per-process capability tables with rights-reduced duplication and
   delegation, message endpoints, counted notifications, shared byte-memory
   objects, and explicit direct-child bootstrap grants
@@ -83,7 +84,9 @@ prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 | `cargo run` | Boot the normal image with the QEMU display enabled. |
 | `cargo run -- --headless` | Boot normally without a display; serial output only. |
 | `cargo run -- --boot-check` | Boot headlessly and exit after PID 1 launches the userspace shell. |
-| `cargo run -- --test` | Run the full headless smoke suite, including persistent FAT verification across two boots. |
+| `cargo run -- --test` | Run the full headless suite, including persistent FAT, NullFS replacement, and logging lifecycle verification. |
+| `cargo run -- --nullfs-restart-check` | Run only the targeted NullFS replacement and stale-descriptor check. |
+| `cargo run -- --logging-lifecycle-check` | Run only logging start/stop/restart, route replacement, restart fencing, forced termination, and readiness-timeout recovery checks. |
 | `cargo run -- --help` | Show all runner options. |
 
 The smoke runner copies its dedicated image to a temporary file before testing,
@@ -136,9 +139,10 @@ the complete suite:
 ./scripts/check-local.sh
 ```
 
-The full suite adds a normal-boot readiness check and the two-boot QEMU smoke
-test. It can take several minutes. Individual Cargo commands should generally
-include `--locked` so local results use the committed dependency graph.
+The full suite adds a normal-boot readiness check, the two-boot QEMU smoke
+test, NullFS replacement, and logging lifecycle convergence. It can take several
+minutes. Individual Cargo commands should generally include `--locked` so local
+results use the committed dependency graph.
 
 ## Repository layout
 

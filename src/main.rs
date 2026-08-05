@@ -62,9 +62,19 @@ const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-tes
 const LOGGING_COLLECTOR_RESTART_PASSED_MARKER: &str = "userspace init: logging collector ring, backpressure, redaction, and route generation isolation verified";
 const NULLFS_RESTART_PASSED_MARKER: &str =
     "userspace init: NullFS restart persistent VFS mutation and stale descriptors verified";
+const LOGGING_LIFECYCLE_MODE_MARKER: &str = "boot mode selected: logging-lifecycle-test";
+const LOGGING_LIFECYCLE_STOPPING_MARKER: &str = "logging stopping desired=stopped generation=1";
+const LOGGING_LIFECYCLE_STOPPED_MARKER: &str = "logging stopped desired=running";
+const LOGGING_LIFECYCLE_READY_MARKER: &str = "logging ready desired=running generation=2";
+const LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER: &str =
+    "userspace init: logging service termination grace expired; forcing exit";
+const LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER: &str =
+    "userspace init: logging service readiness deadline expired; forcing exit";
+const LOGGING_LIFECYCLE_PASSED_MARKER: &str = "userspace init: logging live start, stop, route withdrawal, restart fencing, and generation replacement verified";
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
 const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(300);
+const LOGGING_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Default)]
 struct NormalBootProgress {
@@ -138,11 +148,54 @@ impl NormalBootProgress {
 }
 
 #[derive(Debug, Default)]
+struct LoggingLifecycleProgress {
+    mode_selected: bool,
+    stopping_observed: bool,
+    stopped_observed: bool,
+    replacement_ready: bool,
+    force_termination_observed: bool,
+    readiness_timeout_observed: bool,
+    lifecycle_verified: bool,
+}
+
+impl LoggingLifecycleProgress {
+    fn observe(&mut self, line: &str) -> bool {
+        self.mode_selected |= line.contains(LOGGING_LIFECYCLE_MODE_MARKER);
+        self.stopping_observed |= line.contains(LOGGING_LIFECYCLE_STOPPING_MARKER);
+        self.stopped_observed |= line.contains(LOGGING_LIFECYCLE_STOPPED_MARKER);
+        self.replacement_ready |= line.contains(LOGGING_LIFECYCLE_READY_MARKER);
+        self.force_termination_observed |=
+            line.contains(LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER);
+        self.readiness_timeout_observed |=
+            line.contains(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER);
+        if self.mode_selected
+            && self.stopping_observed
+            && self.stopped_observed
+            && self.replacement_ready
+            && self.force_termination_observed
+            && self.readiness_timeout_observed
+            && line.contains(LOGGING_LIFECYCLE_PASSED_MARKER)
+        {
+            self.lifecycle_verified = true;
+        }
+
+        self.lifecycle_verified
+    }
+}
+
+#[derive(Debug, Default)]
 struct Options {
     headless: bool,
     boot_check: bool,
     test: bool,
     nullfs_restart_check: bool,
+    logging_lifecycle_check: bool,
+}
+
+impl Options {
+    fn boot_verification_selected(&self) -> bool {
+        self.boot_check || self.test || self.nullfs_restart_check || self.logging_lifecycle_check
+    }
 }
 
 fn main() -> ExitCode {
@@ -155,6 +208,8 @@ fn main() -> ExitCode {
         run_kernel_smoke_test(&options)
     } else if options.nullfs_restart_check {
         run_nullfs_restart_check(&options)
+    } else if options.logging_lifecycle_check {
+        run_logging_lifecycle_check(&options)
     } else if options.boot_check {
         run_normal_boot_check(&options)
     } else {
@@ -163,13 +218,17 @@ fn main() -> ExitCode {
 }
 
 fn parse_options() -> Result<Options, ExitCode> {
+    parse_options_from(env::args().skip(1))
+}
+
+fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Options, ExitCode> {
     let mut options = Options::default();
 
-    for argument in env::args().skip(1) {
+    for argument in arguments {
         match argument.as_str() {
             "--headless" => options.headless = true,
             "--boot-check" => {
-                if options.test || options.nullfs_restart_check {
+                if options.boot_verification_selected() {
                     eprintln!("only one boot verification mode may be selected");
                     print_usage();
                     return Err(ExitCode::from(2));
@@ -178,7 +237,7 @@ fn parse_options() -> Result<Options, ExitCode> {
                 options.headless = true;
             }
             "--test" => {
-                if options.boot_check || options.nullfs_restart_check {
+                if options.boot_verification_selected() {
                     eprintln!("only one boot verification mode may be selected");
                     print_usage();
                     return Err(ExitCode::from(2));
@@ -187,12 +246,21 @@ fn parse_options() -> Result<Options, ExitCode> {
                 options.headless = true;
             }
             "--nullfs-restart-check" => {
-                if options.boot_check || options.test {
+                if options.boot_verification_selected() {
                     eprintln!("only one boot verification mode may be selected");
                     print_usage();
                     return Err(ExitCode::from(2));
                 }
                 options.nullfs_restart_check = true;
+                options.headless = true;
+            }
+            "--logging-lifecycle-check" => {
+                if options.boot_verification_selected() {
+                    eprintln!("only one boot verification mode may be selected");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
+                options.logging_lifecycle_check = true;
                 options.headless = true;
             }
             "-h" | "--help" => {
@@ -211,11 +279,16 @@ fn parse_options() -> Result<Options, ExitCode> {
 }
 
 fn print_usage() {
-    println!("Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check]");
+    println!(
+        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --logging-lifecycle-check]"
+    );
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!("  --boot-check  Verify that PID 1 launches the userspace shell");
     println!(
         "  --nullfs-restart-check  Verify NullFS replacement, persistent VFS mutation, and stale descriptors"
+    );
+    println!(
+        "  --logging-lifecycle-check  Verify logging live start, stop, route withdrawal, and generation replacement"
     );
     println!(
         "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, process environments, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
@@ -243,7 +316,7 @@ fn qemu_command_for_image(options: &Options, image: &Path) -> Command {
         command.args(["-display", "none"]);
     }
 
-    if options.test || options.boot_check {
+    if options.boot_verification_selected() {
         command.args(["-no-reboot", "-no-shutdown"]);
     }
 
@@ -309,8 +382,9 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
         false
     };
     let restart_result = smoke_result && run_nullfs_restart_test(options);
+    let logging_result = restart_result && run_logging_lifecycle_test(options);
     let _ = fs::remove_file(&test_image);
-    if restart_result {
+    if logging_result {
         println!("QEMU kernel smoke test passed");
         ExitCode::SUCCESS
     } else {
@@ -325,6 +399,26 @@ fn run_nullfs_restart_check(options: &Options) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn run_logging_lifecycle_check(options: &Options) -> ExitCode {
+    if run_logging_lifecycle_test(options) {
+        println!("QEMU logging lifecycle check passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_logging_lifecycle_test(options: &Options) -> bool {
+    let image = Path::new(env!("LOGGING_LIFECYCLE_TEST_BIOS_IMAGE"));
+    let mut progress = LoggingLifecycleProgress::default();
+    run_qemu_until(
+        qemu_command_for_image(options, image),
+        "logging lifecycle check",
+        LOGGING_LIFECYCLE_TEST_TIMEOUT,
+        move |line| progress.observe(line),
+    )
 }
 
 fn run_nullfs_restart_test(options: &Options) -> bool {
@@ -561,6 +655,10 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
+        LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER, LOGGING_LIFECYCLE_MODE_MARKER,
+        LOGGING_LIFECYCLE_PASSED_MARKER, LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER,
+        LOGGING_LIFECYCLE_READY_MARKER, LOGGING_LIFECYCLE_STOPPED_MARKER,
+        LOGGING_LIFECYCLE_STOPPING_MARKER, LoggingLifecycleProgress,
         NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER, NORMAL_BOOT_INIT_MARKER,
         NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGCTL_MARKER,
         NORMAL_BOOT_LOGGING_IMPORT_MARKER, NORMAL_BOOT_LOGGING_PROBE_MARKER,
@@ -570,7 +668,7 @@ mod tests {
         NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SERVICE_CONTROL_MARKER, NORMAL_BOOT_SHELL_MARKER,
         NORMAL_BOOT_TMPFS_GENERATION_MARKER, NORMAL_BOOT_VFS_GENERATION_MARKER,
         NORMAL_BOOT_VFS_READINESS_MARKER, NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER,
-        NormalBootProgress,
+        NormalBootProgress, parse_options_from,
     };
 
     #[test]
@@ -607,5 +705,49 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_EARLY_LOG_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_READY_MARKER));
         assert!(!progress.observe("Interactive shell ready"));
+    }
+
+    #[test]
+    fn logging_lifecycle_requires_mode_transitions_and_final_marker() {
+        let mut progress = LoggingLifecycleProgress::default();
+
+        assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_MODE_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_STOPPING_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_STOPPED_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_READY_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER));
+        assert!(progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+    }
+
+    #[test]
+    fn logging_lifecycle_option_is_headless() {
+        let options = parse_options_from(["--logging-lifecycle-check".to_owned()])
+            .expect("logging lifecycle option should parse");
+
+        assert!(options.logging_lifecycle_check);
+        assert!(options.headless);
+    }
+
+    #[test]
+    fn boot_verification_modes_are_mutually_exclusive() {
+        let modes = [
+            "--boot-check",
+            "--test",
+            "--nullfs-restart-check",
+            "--logging-lifecycle-check",
+        ];
+
+        for (index, first) in modes.iter().enumerate() {
+            for second in &modes[index + 1..] {
+                assert!(
+                    parse_options_from([(*first).to_owned(), (*second).to_owned()]).is_err(),
+                    "{first} and {second} must be mutually exclusive"
+                );
+            }
+        }
     }
 }

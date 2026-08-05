@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.9, and a
+The ABI is experimental, but callers can query the current version, 1.12, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -218,6 +218,22 @@ direct children. Other targets return `EPERM`; missing or completed targets
 return `ESRCH`. Process-group signaling and shell job control continue to use
 the existing group-oriented syscall.
 
+ABI 1.12 defines the complete supported signal set:
+
+| Number | Name | Default action | Catchable | Blockable |
+| ---: | --- | --- | --- | --- |
+| `2` | `INTERRUPT` | terminate | yes | yes |
+| `9` | `KILL` | terminate immediately | no | no |
+| `15` | `TERMINATE` | terminate | yes | yes |
+| `18` | `CONTINUE` | continue | yes | yes |
+| `19` | `STOP` | stop | no | no |
+| `20` | `TERMINAL_STOP` | stop | yes | yes |
+
+Signal 9 is the supervisor's bounded forced-termination fallback. Installing a
+handler or ignore action for it returns `EINVAL`, and signal masks always clear
+its bit. It uses the existing direct-child and process-group signaling syscalls;
+ABI 1.12 adds no new syscall number.
+
 ## Version 1.6 pathname mutation
 
 | Number | Name | Arguments | Result |
@@ -294,6 +310,8 @@ filesystem-service or VFS syscalls.
   syscall 54 while preserving syscall 52 as unconditionally read-only.
 - ABI 1.10 adds exact, unique filesystem-UUID selection at syscall 55 without
   changing the ABI 1.9 syscall 54 contract.
+- ABI 1.12 adds uncatchable, unblockable signal 9 to the existing direct-child
+  and process-group signaling contracts.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

@@ -412,8 +412,9 @@ current four-service registry to `/sv` and trusted `ush` builtins.
 
 Possession of exact-`SEND` observation authority permits `List` and `Status`; request IDs, service IDs,
 provider generations, cursors, PIDs, and executable paths are data and grant no authority. A distinct
-exact-`SEND` mutation endpoint permits `Restart` only; `Start` and `Stop` return `Unsupported`, while
-mutation on the observation endpoint returns `AccessDenied`. The trusted shell receives separate
+exact-`SEND` mutation endpoint permits `Restart` for managed services and `Start`/`Stop` for logging;
+filesystem `Start`/`Stop` return `Unsupported`, while mutation on the observation endpoint returns
+`AccessDenied`. The trusted shell receives separate
 `SEND | DUPLICATE` grants but not `TRANSFER`, and ordinary shell children receive neither.
 
 A successful restart response commits intent rather than waiting for replacement readiness. The old

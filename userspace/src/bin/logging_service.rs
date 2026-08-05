@@ -9,7 +9,8 @@ use nswp_logging::{
 };
 use nswp_runtime::{Server, ServerEvent};
 use userspace::{
-    abi::INIT_PROCESS_ID,
+    abi::{INIT_PROCESS_ID, signal},
+    args::Args,
     early_log,
     ipc::{self, ObjectKind, Rights},
     logging_session::{
@@ -17,7 +18,7 @@ use userspace::{
         ServerIngressEvent, ServerTransport, SessionRole, admission_rejection,
     },
     service_route::receive_service_generation,
-    syscall,
+    syscall::{self, SignalAction},
 };
 
 userspace::entry!(rust_main);
@@ -236,7 +237,19 @@ impl SessionManager {
     }
 }
 
-extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
+extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+    let arguments = unsafe { Args::from_stack(initial_stack) };
+    let ignore_terminate = arguments.len() == 2 && arguments.get(1) == Some(b"--ignore-terminate");
+    let suppress_readiness =
+        arguments.len() == 2 && arguments.get(1) == Some(b"--suppress-readiness");
+    if !(arguments.len() == 1 || ignore_terminate || suppress_readiness) {
+        syscall::exit(1);
+    }
+    if ignore_terminate
+        && syscall::signal_action(signal::TERMINATE, Some(&SignalAction::IGNORE), None).is_err()
+    {
+        syscall::exit(1);
+    }
     if !matches!(
         ipc::info(READY_HANDLE),
         Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
@@ -275,7 +288,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(6);
     }
     let mut sessions = SessionManager::new();
-    if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err()
+    if (!suppress_readiness && ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err())
         || syscall::write_all(syscall::STDOUT, STARTED_MARKER).is_err()
     {
         syscall::exit(8);

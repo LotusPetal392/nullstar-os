@@ -7,7 +7,7 @@ use userspace::{
     heap::BumpHeap,
     ipc::{self, ObjectKind, Rights, Transfer},
     platform::{self, DirectoryEntry},
-    syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SpawnFlags},
+    syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
 
 userspace::entry!(rust_main);
@@ -150,6 +150,9 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || (supplementary_probes_enabled(argument) && !ordinary_descriptor_probe())
         || platform::getppid().is_err()
         || platform::kill(u64::MAX, signal::TERMINATE).err() != Some(platform::Errno::NO_PROCESS)
+        || SignalMask::from_bits(signal::bit(signal::KILL)) != Some(SignalMask::EMPTY)
+        || syscall::signal_action(signal::KILL, Some(&SignalAction::IGNORE), None).err()
+            != Some(syscall::Errno::INVALID_ARGUMENT)
     {
         return false;
     }

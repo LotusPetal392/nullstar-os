@@ -16,6 +16,7 @@ const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n"
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
+const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 
 const NULLFS_MBR_TYPE: u8 = 0x7f;
 const MBR_BYTES: usize = 512;
@@ -292,6 +293,13 @@ fn main() {
         .expect("failed to create NullFS restart-test BIOS disk image");
     append_nullfs_partition(&nullfs_restart_test_bios_image, &nullfs_fixture)
         .expect("failed to append NullFS partition to restart-test BIOS disk image");
+    let logging_lifecycle_test_bios_image =
+        output_directory.join("nullstar-os-logging-lifecycle-test-bios.img");
+    build_image(LOGGING_LIFECYCLE_TEST_BOOT_MODE)
+        .create_bios_image(&logging_lifecycle_test_bios_image)
+        .expect("failed to create logging lifecycle-test BIOS disk image");
+    append_nullfs_partition(&logging_lifecycle_test_bios_image, &nullfs_fixture)
+        .expect("failed to append NullFS partition to logging lifecycle-test BIOS disk image");
 
     println!("cargo:rustc-env=BIOS_IMAGE={}", bios_image.display());
     println!(
@@ -301,6 +309,10 @@ fn main() {
     println!(
         "cargo:rustc-env=NULLFS_RESTART_TEST_BIOS_IMAGE={}",
         nullfs_restart_test_bios_image.display()
+    );
+    println!(
+        "cargo:rustc-env=LOGGING_LIFECYCLE_TEST_BIOS_IMAGE={}",
+        logging_lifecycle_test_bios_image.display()
     );
 }
 
