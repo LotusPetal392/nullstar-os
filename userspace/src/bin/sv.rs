@@ -11,9 +11,14 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const OBSERVATION_GRANT_HANDLE: u64 = 1;
-const USAGE: &[u8] = b"usage: sv list | sv status SERVICE\n";
+const MUTATION_GRANT_HANDLE: u64 = 2;
+const USAGE: &[u8] = b"usage: sv list | sv status SERVICE | sv restart SERVICE\n";
 const UNKNOWN_SERVICE: &[u8] = b"sv: unknown service\n";
-const FAILURE: &[u8] = b"sv: observation failed\n";
+const FAILURE: &[u8] = b"sv: operation failed\n";
+const MUTATION_OUTCOME_UNKNOWN: &[u8] =
+    b"sv: restart outcome unknown; inspect service status before retrying\n";
+const MUTATION_COMMITTED_OUTPUT_FAILED: &[u8] =
+    b"sv: restart committed, but its result could not be printed\n";
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
@@ -25,12 +30,22 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             };
             sv::status(OBSERVATION_GRANT_HANDLE, service)
         }
+        (3, Some(b"restart"), Some(name)) => {
+            let Some(service) = sv::service_id(name) else {
+                fail(UNKNOWN_SERVICE, 64);
+            };
+            sv::restart(MUTATION_GRANT_HANDLE, service)
+        }
         _ => fail(USAGE, 64),
     };
-    if result.is_err() {
-        fail(FAILURE, 1);
+    match result {
+        Ok(()) => syscall::exit(0),
+        Err(sv::Error::MutationOutcomeUnknown) => fail(MUTATION_OUTCOME_UNKNOWN, 2),
+        Err(sv::Error::MutationCommittedButOutputFailed(_)) => {
+            fail(MUTATION_COMMITTED_OUTPUT_FAILED, 3)
+        }
+        Err(_) => fail(FAILURE, 1),
     }
-    syscall::exit(0)
 }
 
 fn fail(message: &[u8], code: u64) -> ! {

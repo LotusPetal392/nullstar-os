@@ -1,4 +1,4 @@
-//! Allocation-free, bounded client operations for read-only service observation.
+//! Allocation-free, bounded client operations for service observation and controlled restart.
 
 use service_control::{
     DesiredState, ListOutcome, ObservedState, RequestId, ServiceControlFailure,
@@ -31,6 +31,8 @@ pub enum Error {
     RequestIdExhausted,
     Begin(BeginError),
     Complete(CompleteError),
+    MutationOutcomeUnknown,
+    MutationCommittedButOutputFailed(syscall::Errno),
     Yield(syscall::Errno),
     UnexpectedServer { expected: u64, actual: u64 },
     UnexpectedResponse,
@@ -145,6 +147,55 @@ pub fn status(observation_grant: CapabilityHandle, service: ServiceId) -> Result
         .ok_or(Error::UnexpectedResponse)?;
     match target.outcome() {
         TargetOutcome::Record(record) => print_record(record),
+        TargetOutcome::Failure(failure) => Err(Error::ServiceFailure(failure)),
+    }
+}
+
+/// Commits one managed restart through a separately delegated exact-`SEND` mutation grant.
+///
+/// Success means the supervisor accepted restart intent, not that the replacement is ready. Once
+/// the request has been sent, any transport or validation failure is reported as outcome unknown
+/// and is never retried automatically.
+pub fn restart(mutation_grant: CapabilityHandle, service: ServiceId) -> Result<(), Error> {
+    let mut budgets = Budgets::new();
+    budgets.spend_request()?;
+    let mut request_ids = RequestIds::new();
+    let request_id = request_ids.take()?;
+    let mut exchange = match ControlExchange::begin_mutation(
+        mutation_grant,
+        request_id,
+        ServiceControlRequest::Restart { service },
+    ) {
+        Ok(exchange) => exchange,
+        Err(error) if error.request_was_sent() => return Err(Error::MutationOutcomeUnknown),
+        Err(error) => return Err(Error::Begin(error)),
+    };
+
+    let response = loop {
+        match exchange.try_complete() {
+            Ok(Some(reply)) if reply.server_process_id() == INIT_PROCESS_ID => {
+                break reply.response();
+            }
+            Ok(Some(_)) | Err(_) => return Err(Error::MutationOutcomeUnknown),
+            Ok(None) => {
+                if budgets.yields == 0 {
+                    return Err(Error::MutationOutcomeUnknown);
+                }
+                budgets.yields -= 1;
+                if syscall::yield_now().is_err() {
+                    return Err(Error::MutationOutcomeUnknown);
+                }
+            }
+        }
+    };
+    let target = response
+        .target_response()
+        .ok_or(Error::MutationOutcomeUnknown)?;
+    match target.outcome() {
+        TargetOutcome::Record(record) => print_record(record).map_err(|error| match error {
+            Error::Output(error) => Error::MutationCommittedButOutputFailed(error),
+            other => other,
+        }),
         TargetOutcome::Failure(failure) => Err(Error::ServiceFailure(failure)),
     }
 }

@@ -17,12 +17,12 @@ service-definition locations are described in
 
 It describes future architecture. The implemented system still uses a hard-coded PID 1 that directly
 launches the current services and shell. PID 1 also acts as the temporary broker for the first generic
-logging routes and as the read-only [`NSVC` v1 service-observation
+logging routes and as the temporary [`NSVC` v1 service-control
 server](../service-control-protocol.md); see [NullStar OS architecture](../architecture.md) and the
 [current service route protocol](../service-route-protocol.md). Native `/sv list`, `/sv status
-SERVICE`, and trusted shell builtins observe the current four-service registry through exact endpoint
-capabilities. Mutations are denied, and no separate manager, activation engine, or definition loader
-exists yet.
+SERVICE`, `/sv restart SERVICE`, and trusted shell builtins use separate exact endpoint authorities.
+Controlled restart is implemented without charging failure policy, but `start`, `stop`, persistent
+desired-state changes, a separate manager, activation, and definition loading remain future work.
 
 ## Design goals
 

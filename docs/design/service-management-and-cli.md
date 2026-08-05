@@ -230,11 +230,18 @@ capability. Possession of an exact-`SEND` observation endpoint, rather than know
 pathname, authorizes list and status.
 
 PID 1 currently serves a fixed registry for `logging`, `nullfs`, `tmpfs`, and `vfs`. `/sv list`, `/sv
-status SERVICE`, and trusted `ush` builtins are implemented. Valid mutation requests on the observation
-ingress receive `AccessDenied`; there is no mutation endpoint. The trusted shell receives only
-`SEND | DUPLICATE`, while standalone `/sv` works only when an authorized launcher installs exact
-`SEND` authority at handle `1`. This milestone adds no manager process, activation, definitions, or
-kernel changes.
+status SERVICE`, `/sv restart SERVICE`, and trusted `ush` builtins are implemented. Observation and
+mutation use separate endpoint objects. Mutation on the observation ingress receives `AccessDenied`;
+`Start` and `Stop` on the mutation ingress receive `Unsupported`.
+
+A successful restart commits intent and reports the old generation as terminating; it does not wait
+for replacement readiness. Controlled restart does not charge failure backoff or budget, and the
+replacement receives the next manager-owned generation. Restart intent remains pending until the
+replacement is ready and queued duplicate requests have received `Busy`. An unconfirmed sent mutation
+is outcome unknown and is not retried. The trusted shell receives separate `SEND | DUPLICATE` grants without
+`TRANSFER`; standalone `/sv` expects observation at handle `1` and mutation at handle `2`. This
+milestone adds no manager process, activation, definitions, persistent stopped state, or kernel
+changes.
 
 ## The `sv` command
 
@@ -242,11 +249,12 @@ kernel changes.
 protocol; it does not scan PIDs, edit packaged files, or send arbitrary signals as its primary
 mechanism.
 
-The implemented read-only commands are:
+The implemented commands are:
 
 ```text
 sv list
 sv status SERVICE
+sv restart SERVICE
 ```
 
 The next management commands should be:
@@ -254,7 +262,6 @@ The next management commands should be:
 ```text
 sv start <service>
 sv stop <service>
-sv restart <service>
 sv enable <service>
 sv disable <service>
 sv logs <service>
@@ -400,10 +407,10 @@ The name `ush` should not silently imply complete POSIX shell behavior.
 
 1. Add job containment, process-exit observation, and a versioned control protocol to the
    current supervisor. **Partly delivered:** the allocation-free, host-testable `NSVC` v1 codec and
-   PID 1 read-only registry fix the observation contract, but job containment remains.
+   PID 1 service registry fixes the observation contract, but job containment remains.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
-   delivered:** native `list` and `status` use capability-authorized IPC; mutation packets are
-   canonically denied and live mutation remains future work.
+   delivered:** native `list`, `status`, and restart-only mutation use separately authorized IPC;
+   persistent desired state plus live `start` and `stop` remain future work.
 3. Introduce the one-bootstrap-channel startup contract and stable service generations.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.

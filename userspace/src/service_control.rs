@@ -1,8 +1,8 @@
-//! Allocation-free native transport for read-only `NSVC` service observation.
+//! Allocation-free native transport for capability-separated `NSVC` service control.
 //!
-//! Client operations borrow an exact-`SEND` observation grant and own only a private reply
-//! receiver. Server operations own an exact-`RECEIVE` ingress and each accepted request owns the
-//! transferred reply sender until it is answered or dropped.
+//! Client operations borrow an exact-`SEND` observation or mutation grant and own only a private
+//! reply receiver. Server operations own an exact-`RECEIVE` ingress and each accepted request owns
+//! the transferred reply sender until it is answered or dropped.
 
 use service_control::{
     CorrelationError, DecodeError, Operation, RequestId, SERVICE_CONTROL_WIRE_BYTES,
@@ -73,7 +73,7 @@ pub fn service_name(service: service_control::ServiceId) -> Option<&'static [u8]
         .find_map(|(name, known_id)| (*known_id == service).then_some(*name))
 }
 
-/// Failure while creating and sending one observation request.
+/// Failure while creating and sending one authorized control request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BeginError {
     MutationNotAllowed { operation: Operation },
@@ -89,7 +89,14 @@ pub enum BeginError {
     CloseReplySource(ipc::Error),
 }
 
-/// Terminal failure while receiving and validating an observation response.
+impl BeginError {
+    /// Returns whether the request was atomically enqueued before this local failure occurred.
+    pub const fn request_was_sent(self) -> bool {
+        matches!(self, Self::CloseReplySource(_))
+    }
+}
+
+/// Terminal failure while receiving and validating a control response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompleteError {
     Receive(ipc::Error),
@@ -116,10 +123,11 @@ impl ControlReply {
     }
 }
 
-/// An in-progress read-only control exchange.
+/// An in-progress service-control exchange.
 ///
-/// The observation grant passed to [`Self::begin`] remains caller-owned. This value owns only the
-/// private exact-`RECEIVE` reply endpoint and closes it on every terminal path.
+/// The authority grant passed to [`Self::begin`] or [`Self::begin_mutation`] remains caller-owned.
+/// This value owns only the private exact-`RECEIVE` reply endpoint and closes it on every terminal
+/// path.
 pub struct ControlExchange {
     request: ServiceControlMessage,
     reply_receive: Option<CapabilityHandle>,
@@ -135,8 +143,26 @@ impl ControlExchange {
     ) -> Result<Self, BeginError> {
         ensure_observation(request)
             .map_err(|operation| BeginError::MutationNotAllowed { operation })?;
+        Self::begin_authorized(observation_grant, request_id, request)
+    }
 
-        let grant_info = ipc::info(observation_grant).map_err(BeginError::InspectGrant)?;
+    /// Sends one canonical mutation request through a separately delegated exact-`SEND` grant.
+    pub fn begin_mutation(
+        mutation_grant: CapabilityHandle,
+        request_id: RequestId,
+        request: ServiceControlRequest,
+    ) -> Result<Self, BeginError> {
+        ensure_mutation(request)
+            .map_err(|operation| BeginError::MutationNotAllowed { operation })?;
+        Self::begin_authorized(mutation_grant, request_id, request)
+    }
+
+    fn begin_authorized(
+        authority_grant: CapabilityHandle,
+        request_id: RequestId,
+        request: ServiceControlRequest,
+    ) -> Result<Self, BeginError> {
+        let grant_info = ipc::info(authority_grant).map_err(BeginError::InspectGrant)?;
         validate_endpoint(grant_info, Rights::SEND, false).map_err(BeginError::InvalidGrant)?;
 
         let reply_source = ipc::endpoint_create().map_err(BeginError::CreateReplyEndpoint)?;
@@ -193,7 +219,7 @@ impl ControlExchange {
 
         let request = ServiceControlMessage::request(request_id, request);
         if let Err(error) = ipc::send(
-            observation_grant,
+            authority_grant,
             &request.encode(),
             Some(Transfer {
                 handle: reply_source,
@@ -318,7 +344,7 @@ pub enum IngressError {
     InvalidReply(EndpointShapeError),
 }
 
-/// A read-only service-control ingress owning one exact-`RECEIVE` endpoint.
+/// A service-control ingress owning one exact-`RECEIVE` endpoint.
 pub struct ControlIngress {
     receive: Option<CapabilityHandle>,
     object_id: u64,
@@ -499,6 +525,17 @@ fn ensure_observation(request: ServiceControlRequest) -> Result<(), Operation> {
         ServiceControlRequest::Start { .. }
         | ServiceControlRequest::Stop { .. }
         | ServiceControlRequest::Restart { .. } => Err(request.operation()),
+    }
+}
+
+fn ensure_mutation(request: ServiceControlRequest) -> Result<(), Operation> {
+    match request {
+        ServiceControlRequest::Start { .. }
+        | ServiceControlRequest::Stop { .. }
+        | ServiceControlRequest::Restart { .. } => Ok(()),
+        ServiceControlRequest::List { .. } | ServiceControlRequest::Status { .. } => {
+            Err(request.operation())
+        }
     }
 }
 
@@ -707,12 +744,26 @@ mod tests {
             ServiceControlRequest::Restart { service: service() },
         ] {
             assert_eq!(ensure_observation(request), Err(request.operation()));
+            assert_eq!(ensure_mutation(request), Ok(()));
             let message = ServiceControlMessage::request(request_id(), request).encode();
             assert_eq!(
                 validate_request_envelope(&message, 9, Some(Rights::SEND)),
                 Ok((request_id(), request))
             );
         }
+        for request in [
+            ServiceControlRequest::List { cursor: 0 },
+            ServiceControlRequest::Status { service: service() },
+        ] {
+            assert_eq!(ensure_observation(request), Ok(()));
+            assert_eq!(ensure_mutation(request), Err(request.operation()));
+        }
+    }
+
+    #[test]
+    fn begin_errors_identify_the_post_send_cleanup_boundary() {
+        assert!(!BeginError::Send(ipc::Error::TRY_AGAIN).request_was_sent());
+        assert!(BeginError::CloseReplySource(ipc::Error::BAD_FILE_DESCRIPTOR).request_was_sent());
     }
 
     #[test]
