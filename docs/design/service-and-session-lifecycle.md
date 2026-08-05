@@ -21,8 +21,11 @@ logging routes and as the temporary [`NSVC` v1 service-control
 server](../service-control-protocol.md); see [NullStar OS architecture](../architecture.md) and the
 [current service route protocol](../service-route-protocol.md). Native `/sv list`, `/sv status
 SERVICE`, `/sv restart SERVICE`, and trusted shell builtins use separate exact endpoint authorities.
-Controlled restart is implemented without charging failure policy, but `start`, `stop`, persistent
-desired-state changes, a separate manager, activation, and definition loading remain future work.
+Controlled restart is implemented without charging failure policy. The generic supervisor now also
+owns host-tested in-memory desired state, controlled-stop accounting, stop-over-restart suppression,
+and explicit re-arming, but the native ingress does not yet expose `start` or `stop`. A separate
+manager, activation, definition loading, and cross-reboot desired-state persistence remain future
+work.
 
 ## Design goals
 

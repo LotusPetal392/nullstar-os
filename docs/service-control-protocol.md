@@ -135,7 +135,7 @@ A successful `Restart` response means PID 1 committed restart intent and accepte
 
 Once a mutation request has been sent, a missing, malformed, or untrusted response—or a local reply-handle cleanup failure after enqueue—is an outcome-unknown condition. The `sv` client never retries automatically. A confirmed commit followed by console-output failure is reported separately from outcome unknown. The caller may later use the observation endpoint to determine the current state, but observation cannot prove whether every transient effect of an earlier request occurred.
 
-PID 1's temporary registry contains `logging`, `nullfs`, `tmpfs`, and `vfs` in stable list order. Desired state is always `Running`. Every service reports the manager-issued generation assigned to that startup attempt rather than deriving lifecycle identity from its process ID. Stopped, backoff, and quarantined views omit generation where allowed by the wire contract.
+PID 1's temporary registry contains `logging`, `nullfs`, `tmpfs`, and `vfs` in stable list order. Live control currently leaves every service's desired state `Running`. The generic supervisor nevertheless owns the in-memory desired-state transition rules needed by the next milestone: controlled stop is distinct from failure, stop can suppress a pending restart, explicit start can re-arm bounded policy, and failed signal delivery can be rolled back. Because `Start` and `Stop` remain `Unsupported` at the ingress, these new transitions do not yet create intentionally stopped native services. Every service reports the manager-issued generation assigned to that startup attempt rather than deriving lifecycle identity from its process ID. Stopped, backoff, and quarantined views omit generation where allowed by the wire contract.
 
 The standalone `/sv` binary uses observation authority at handle `1` for `sv list` and `sv status SERVICE`, and mutation authority at handle `2` for `sv restart SERVICE`. The trusted `ush` builtins receive `SEND | DUPLICATE` observation authority at handle `2` and mutation authority at handle `3`, duplicate each down to exact `SEND` for one operation, and never receive `TRANSFER`. Pathname identity is not authorization.
 
@@ -144,7 +144,7 @@ The standalone `/sv` binary uses observation authority at handle `1` for `sv lis
 The current integration adds none of the following:
 
 - a separately restartable service-manager process;
-- live `start` or `stop`, persistent desired-state changes, or intentionally stopped services;
+- live `start` or `stop`, cross-reboot desired-state persistence, or intentionally stopped services;
 - service activation, dependency resolution, or a definition loader;
 - service launch, stop, readiness, health, or restart-policy changes beyond PID 1's existing hard-coded supervision;
 - channel activation or queued activation semantics;
@@ -152,6 +152,6 @@ The current integration adds none of the following:
 - NSWP negotiation or a general IDL-generated binding;
 - new kernel, syscall, endpoint, or attachment primitives.
 
-Those remain later lifecycle and service-management work. The present native deliverable is capability-separated observation and restart-only mutation over ordinary endpoints, backed by the allocation-free fixed-record contract and its host-testable canonical encoding, decoding, validation, and correlation rules.
+Those remain later lifecycle and service-management work. The present native deliverable is capability-separated observation and restart-only mutation over ordinary endpoints, backed by the allocation-free fixed-record contract and its host-testable canonical encoding, decoding, validation, correlation, and desired-state transition rules. Logging can become the first live start/stop pilot once PID 1 convergence is nonblocking. Filesystem services additionally require generation-checked provider offlining, deterministic failure of pending proxy requests, fresh generation endpoints, and an orderly writable-NullFS quiesce/flush boundary so old or uncertain operations are never replayed into a replacement.
 
 `NSVC` v1 is intentionally closed: unknown operations, states, statuses, flags, and nonzero reserved fields are rejected. Adding any of them requires a later protocol version and explicit version negotiation or binding rather than silently changing the meaning of a v1 record.

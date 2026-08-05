@@ -11,8 +11,9 @@ The complete process, job, activation, restart, session, application, login, and
 model is specified in
 [Service, session, and application lifecycle](service-and-session-lifecycle.md). The current
 [`NSVC` v1 milestone](../service-control-protocol.md) supplies a host-testable, allocation-free
-64-byte control codec plus native read-only observation through PID 1 and `sv`. It does not yet
-supply a separate manager or mutation authority.
+64-byte control codec plus capability-separated native observation and restart-only mutation through
+PID 1 and `sv`. The generic supervisor also models in-memory desired state and controlled stop, but
+live `start` and `stop` are not yet connected to the mutation ingress. There is no separate manager.
 
 ## PID 1 and the system service manager
 
@@ -238,10 +239,20 @@ A successful restart commits intent and reports the old generation as terminatin
 for replacement readiness. Controlled restart does not charge failure backoff or budget, and the
 replacement receives the next manager-owned generation. Restart intent remains pending until the
 replacement is ready and queued duplicate requests have received `Busy`. An unconfirmed sent mutation
-is outcome unknown and is not retried. The trusted shell receives separate `SEND | DUPLICATE` grants without
-`TRANSFER`; standalone `/sv` expects observation at handle `1` and mutation at handle `2`. This
-milestone adds no manager process, activation, definitions, persistent stopped state, or kernel
-changes.
+is outcome unknown and is not retried. The trusted shell receives separate `SEND | DUPLICATE` grants
+without `TRANSFER`; standalone `/sv` expects observation at handle `1` and mutation at handle `2`.
+
+The supervisor foundation now retains desired state across controlled exits within PID 1, classifies
+controlled stop separately from failure, permits stop to suppress a pending restart, re-arms bounded
+policy on explicit start, and can roll back a stop whose signal was not delivered. These transitions
+are host-tested but are not yet reachable through `/sv`; the live ingress continues returning
+`Unsupported` for `Start` and `Stop`.
+
+Logging is the first planned live start/stop pilot because its published routes can be withdrawn before
+termination. Filesystem services require generation-checked provider offlining first: pending kernel
+proxy requests must be failed and woken, old endpoint queues must never reach a replacement, and
+writable NullFS must quiesce and flush before forced termination. This milestone adds no manager
+process, activation, definitions, cross-reboot persistence, or kernel changes.
 
 ## The `sv` command
 

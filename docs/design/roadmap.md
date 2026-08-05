@@ -55,8 +55,11 @@ In the service-management implementation sequence, the
 64-byte codec, native endpoint transport, a temporary PID 1 registry, and implemented `sv list`, `sv
 status SERVICE`, and separately authorized `sv restart SERVICE`. Controlled restart advances the
 manager-owned generation without charging failure policy, while an unconfirmed mutation is never
-replayed. Jobs, a separate manager process, activation, definitions, persistent desired state, and
-live `sv start` and `sv stop` remain future work; this milestone required no kernel changes.
+replayed. The generic supervisor now also owns host-tested in-memory desired-state transitions for
+controlled stop, stop-over-restart, explicit re-arming, and rollback before those transitions are
+exposed through the live mutation ingress. Jobs, a separate manager process, activation, definitions,
+cross-reboot desired-state persistence, and live `sv start` and `sv stop` remain future work; these
+milestones required no kernel changes.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

@@ -146,8 +146,15 @@ budget, and assigns the replacement's next manager-owned generation. Restart int
 through replacement startup, so queued duplicate requests receive `Busy` rather than restarting the
 new generation. A missing reply after send is outcome unknown and is never retried automatically. The trusted shell holds only `SEND | DUPLICATE`
 for each authority, not `TRANSFER`; arbitrary children and pathname-selected executables inherit
-neither. This adds no manager process, activation, definition loading, persistent stopped state, or
-new kernel behavior.
+neither.
+
+The generic supervisor now retains in-memory desired state and host-tests controlled stop,
+stop-over-restart suppression, explicit re-arming, and failed-signal rollback. Live `Start` and `Stop`
+still return `Unsupported`. Logging is the planned first convergence pilot; filesystem providers must
+first gain generation-checked offlining that fails pending kernel proxy work and never carries an old
+endpoint queue into a replacement, while writable NullFS also requires orderly quiesce and flush.
+This adds no manager process, activation, definition loading, cross-reboot persistence, or new kernel
+behavior.
 
 ### Future service and session lifecycle
 
