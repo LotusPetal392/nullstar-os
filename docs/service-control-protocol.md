@@ -1,8 +1,8 @@
 # Service control protocol
 
-`NSVC` v1 is the allocation-free service-control contract and native observation transport. It defines canonical 64-byte request and response records for listing services, inspecting state, and requesting start, stop, or restart transitions.
+`NSVC` v1 is the allocation-free service-control contract and native endpoint transport. It defines canonical 64-byte request and response records for listing services, inspecting state, and requesting start, stop, or restart transitions.
 
-The current native integration is deliberately read-only. PID 1 temporarily owns a stable observation endpoint and exposes its four directly supervised services through `sv list` and `sv status SERVICE`. Valid mutation requests are decoded and receive canonical `AccessDenied` responses; they never change service state. A separately restartable service manager, live mutation authority, activation, and declarative definitions remain future work.
+PID 1 temporarily owns separate stable observation and mutation endpoints for its four directly supervised services. The observation endpoint serves `sv list` and `sv status SERVICE` and returns `AccessDenied` for mutations. The mutation endpoint implements `sv restart SERVICE`; `Start` and `Stop` return `Unsupported`. A separately restartable service manager, persistent stopped state, activation, and declarative definitions remain future work.
 
 ## Scope
 
@@ -69,7 +69,7 @@ Desired state is deliberately smaller:
 | `1` | `Stopped` | Policy wants the service stopped |
 | `2` | `Running` | Policy wants the service running and ready |
 
-A restart is an operation, not a persistent desired state. A future manager may move through `Stopping` and `Starting` while retaining desired state `Running`.
+A restart is an operation, not a persistent desired state. The current supervisor commits restart intent by moving the existing generation to `Terminating`, retains desired state `Running`, and later publishes the replacement as `Starting` and `Ready` under the next generation.
 
 Response status values are:
 
@@ -83,7 +83,7 @@ Response status values are:
 | `5` | `Exhausted` | A bounded manager resource needed for the operation is exhausted |
 | `6` | `Unsupported` | The receiver does not implement the requested operation |
 
-The codec validates and encodes these statuses. The current PID 1 observation receiver uses `NotFound` for unknown services or list cursors and `AccessDenied` for every mutation request.
+The codec validates and encodes these statuses. PID 1 uses `NotFound` for unknown services or list cursors, `AccessDenied` when mutation reaches the observation endpoint, `Unsupported` for `Start` and `Stop` on the mutation endpoint, `Busy` for a restart already pending or a failed signal request, and `InvalidState` when the target is not running.
 
 ## Canonical requests
 
@@ -125,22 +125,26 @@ Cursors are receiver-issued, monotonically ordered tokens. Clients do not genera
 
 ## Native transport and authority
 
-The wire record remains exactly 64 bytes. The native request transport adds one envelope capability: the client creates a fresh private reply endpoint, transfers an empty exact-`SEND` handle with the request, retains exact `RECEIVE`, and closes it on every terminal path. PID 1 owns an exact-`RECEIVE` duplicate of the stable observation ingress. A response carries no capability, is sent exactly once through the private reply endpoint, and must have a nonzero kernel-stamped server PID. The `sv` client additionally requires that PID to be PID 1 and validates exact request/response correlation.
+The wire record remains exactly 64 bytes. The native request transport adds one envelope capability: the client creates a fresh private reply endpoint, transfers an empty exact-`SEND` handle with the request, retains exact `RECEIVE`, and closes it on every terminal path. PID 1 owns exact-`RECEIVE` duplicates of the separate stable observation and mutation ingresses. A response carries no capability, is sent exactly once through the private reply endpoint, and must have a nonzero kernel-stamped server PID.
 
 Possession of an exact-`SEND` observation grant is the current source of authority to issue `List` and `Status`. Knowing a service ID, provider generation, cursor, request ID, operation number, executable path, or PID grants nothing. The observation grant remains caller-owned while each exchange owns only its private reply receiver. Malformed packets are consumed without terminating PID 1, and malformed or failed paths close transferred reply handles.
 
-Observation and mutation authority are intentionally separate. The current observation client refuses to originate `Start`, `Stop`, or `Restart`; if a valid mutation packet reaches PID 1's observation ingress through another client, PID 1 replies with `AccessDenied` without consulting service state. No mutation endpoint is currently exposed.
+Observation and mutation authority are separate endpoint objects. The observation client refuses to originate `Start`, `Stop`, or `Restart`; if a valid mutation packet reaches the observation ingress through another client, PID 1 replies with `AccessDenied` without consulting service state. A mutation client refuses `List` and `Status`. The mutation endpoint accepts `Restart`, while `Start` and `Stop` return `Unsupported`.
+
+A successful `Restart` response means PID 1 committed restart intent and accepted responsibility for replacing the service; it does not mean the replacement is ready. The response reports the old generation as `Terminating` with desired state `Running`. Controlled replacement uses zero failure backoff, does not consume the automatic failure-restart budget, and assigns the next manager-owned generation to the replacement. Intent remains pending through replacement startup; PID 1 drains queued mutations before clearing it, so a second restart queued during that interval returns `Busy` rather than applying to the new generation.
+
+Once a mutation request has been sent, a missing, malformed, or untrusted response—or a local reply-handle cleanup failure after enqueue—is an outcome-unknown condition. The `sv` client never retries automatically. A confirmed commit followed by console-output failure is reported separately from outcome unknown. The caller may later use the observation endpoint to determine the current state, but observation cannot prove whether every transient effect of an earlier request occurred.
 
 PID 1's temporary registry contains `logging`, `nullfs`, `tmpfs`, and `vfs` in stable list order. Desired state is always `Running`. Every service reports the manager-issued generation assigned to that startup attempt rather than deriving lifecycle identity from its process ID. Stopped, backoff, and quarantined views omit generation where allowed by the wire contract.
 
-The standalone `/sv` binary supports `sv list` and `sv status SERVICE` only when an authorized launcher installs observation authority at handle `1`. The trusted `ush` builtins receive `SEND | DUPLICATE` observation authority at handle `2`, duplicate it down to exact `SEND` for each operation, and never receive `TRANSFER`. Pathname identity is not authorization.
+The standalone `/sv` binary uses observation authority at handle `1` for `sv list` and `sv status SERVICE`, and mutation authority at handle `2` for `sv restart SERVICE`. The trusted `ush` builtins receive `SEND | DUPLICATE` observation authority at handle `2` and mutation authority at handle `3`, duplicate each down to exact `SEND` for one operation, and never receive `TRANSFER`. Pathname identity is not authorization.
 
 ## Explicit exclusions
 
 The current integration adds none of the following:
 
 - a separately restartable service-manager process;
-- mutation authority or live `start`, `stop`, and `restart` behavior;
+- live `start` or `stop`, persistent desired-state changes, or intentionally stopped services;
 - service activation, dependency resolution, or a definition loader;
 - service launch, stop, readiness, health, or restart-policy changes beyond PID 1's existing hard-coded supervision;
 - channel activation or queued activation semantics;
@@ -148,6 +152,6 @@ The current integration adds none of the following:
 - NSWP negotiation or a general IDL-generated binding;
 - new kernel, syscall, endpoint, or attachment primitives.
 
-Those remain later lifecycle and service-management work. The present native deliverable is read-only observation over ordinary endpoint capabilities, backed by the allocation-free fixed-record contract and its host-testable canonical encoding, decoding, validation, and correlation rules.
+Those remain later lifecycle and service-management work. The present native deliverable is capability-separated observation and restart-only mutation over ordinary endpoints, backed by the allocation-free fixed-record contract and its host-testable canonical encoding, decoding, validation, and correlation rules.
 
 `NSVC` v1 is intentionally closed: unknown operations, states, statuses, flags, and nonzero reserved fields are rejected. Adding any of them requires a later protocol version and explicit version negotiation or binding rather than silently changing the meaning of a v1 record.

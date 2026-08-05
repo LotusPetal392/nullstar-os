@@ -52,10 +52,11 @@ The detailed contract is in
 
 In the service-management implementation sequence, the
 [allocation-free `NSVC` v1 contract](../service-control-protocol.md) now provides a host-testable exact
-64-byte codec, native endpoint transport, a temporary PID 1 read-only registry, and implemented `sv
-list` and `sv status SERVICE` clients. Exact observation endpoint possession is authority; mutation
-packets are denied. Jobs, a separate manager process, activation, definitions, and live `sv start`,
-`stop`, and `restart` remain future work, and this milestone required no kernel changes.
+64-byte codec, native endpoint transport, a temporary PID 1 registry, and implemented `sv list`, `sv
+status SERVICE`, and separately authorized `sv restart SERVICE`. Controlled restart advances the
+manager-owned generation without charging failure policy, while an unconfirmed mutation is never
+replayed. Jobs, a separate manager process, activation, definitions, persistent desired state, and
+live `sv start` and `sv stop` remain future work; this milestone required no kernel changes.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

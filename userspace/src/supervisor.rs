@@ -28,6 +28,7 @@ pub enum ServiceState {
     Stopped,
     Starting,
     Running,
+    Restarting,
     Backoff,
     Failed,
 }
@@ -51,11 +52,18 @@ pub enum ServiceStatusDisposition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartRequestError {
+    AlreadyPending,
+    InvalidState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceRuntime {
     spec: ServiceSpec,
     process_id: Option<u64>,
     restart_count: u32,
     state: ServiceState,
+    controlled_restart_pending: bool,
 }
 
 impl ServiceRuntime {
@@ -65,6 +73,7 @@ impl ServiceRuntime {
             process_id: None,
             restart_count: 0,
             state: ServiceState::Stopped,
+            controlled_restart_pending: false,
         }
     }
 
@@ -84,6 +93,10 @@ impl ServiceRuntime {
         self.state
     }
 
+    pub const fn controlled_restart_pending(&self) -> bool {
+        self.controlled_restart_pending
+    }
+
     pub fn note_spawned(&mut self, process_id: u64) {
         self.process_id = Some(process_id);
         self.state = ServiceState::Starting;
@@ -91,6 +104,33 @@ impl ServiceRuntime {
 
     pub fn note_ready(&mut self) {
         self.state = ServiceState::Running;
+    }
+
+    pub fn request_restart(&mut self) -> Result<u64, RestartRequestError> {
+        if self.controlled_restart_pending {
+            return Err(RestartRequestError::AlreadyPending);
+        }
+        match (self.state, self.process_id) {
+            (ServiceState::Running, Some(process_id)) => {
+                self.state = ServiceState::Restarting;
+                self.controlled_restart_pending = true;
+                Ok(process_id)
+            }
+            _ => Err(RestartRequestError::InvalidState),
+        }
+    }
+
+    pub fn cancel_restart(&mut self) {
+        if self.state == ServiceState::Restarting {
+            self.state = ServiceState::Running;
+            self.controlled_restart_pending = false;
+        }
+    }
+
+    pub fn complete_restart(&mut self) {
+        if self.state == ServiceState::Running {
+            self.controlled_restart_pending = false;
+        }
     }
 
     pub fn observe_status(&mut self, status: u64) -> ServiceStatusDisposition {
@@ -101,14 +141,20 @@ impl ServiceRuntime {
         }
 
         self.process_id = None;
+        if self.state == ServiceState::Restarting {
+            self.state = ServiceState::Backoff;
+            return ServiceStatusDisposition::Restart { backoff_yields: 0 };
+        }
         if self.state == ServiceState::Starting
             && self.spec.fatal_startup_exit_status == Some(status)
         {
             self.state = ServiceState::Failed;
+            self.controlled_restart_pending = false;
             return ServiceStatusDisposition::Failed;
         }
         if self.restart_count >= self.spec.restart_limit {
             self.state = ServiceState::Failed;
+            self.controlled_restart_pending = false;
             return ServiceStatusDisposition::Failed;
         }
 
@@ -123,7 +169,7 @@ impl ServiceRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServiceRuntime, ServiceSpec, ServiceState, ServiceStatusDisposition,
+        RestartRequestError, ServiceRuntime, ServiceSpec, ServiceState, ServiceStatusDisposition,
         ShellStatusDisposition, shell_status_disposition,
     };
     use crate::abi::{child_status, signal};
@@ -178,6 +224,64 @@ mod tests {
         assert_eq!(service.state(), ServiceState::Starting);
         service.note_ready();
         assert_eq!(service.state(), ServiceState::Running);
+    }
+
+    #[test]
+    fn controlled_restart_is_distinct_from_failure_policy() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+
+        assert_eq!(service.request_restart(), Ok(7));
+        assert_eq!(service.state(), ServiceState::Restarting);
+        assert_eq!(
+            service.request_restart(),
+            Err(RestartRequestError::AlreadyPending)
+        );
+        assert_eq!(
+            service.observe_status(child_status::SIGNAL_BASE + signal::TERMINATE),
+            ServiceStatusDisposition::Restart { backoff_yields: 0 }
+        );
+        assert_eq!(service.restart_count(), 0);
+        assert_eq!(service.state(), ServiceState::Backoff);
+        assert!(service.controlled_restart_pending());
+
+        service.note_spawned(8);
+        service.note_ready();
+        assert_eq!(service.state(), ServiceState::Running);
+        assert_eq!(
+            service.request_restart(),
+            Err(RestartRequestError::AlreadyPending)
+        );
+        service.complete_restart();
+        assert!(!service.controlled_restart_pending());
+        assert_eq!(service.request_restart(), Ok(8));
+    }
+
+    #[test]
+    fn failed_restart_signal_can_restore_running_state() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+        assert_eq!(service.request_restart(), Ok(7));
+        service.cancel_restart();
+        assert_eq!(service.state(), ServiceState::Running);
+        assert_eq!(service.process_id(), Some(7));
+        assert!(!service.controlled_restart_pending());
+    }
+
+    #[test]
+    fn restart_requires_a_running_service() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        assert_eq!(
+            service.request_restart(),
+            Err(RestartRequestError::InvalidState)
+        );
+        service.note_spawned(7);
+        assert_eq!(
+            service.request_restart(),
+            Err(RestartRequestError::InvalidState)
+        );
     }
 
     #[test]

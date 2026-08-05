@@ -129,20 +129,25 @@ limit of 32 live endpoint objects, so route setup can fail under endpoint pressu
 The broker never replays service traffic. In particular, a one-way logging `Emit` whose processing
 became uncertain during failure is not submitted again automatically to a replacement generation.
 
-### Native service observation
+### Native service control
 
 The allocation-free [service control protocol](service-control-protocol.md) defines the host-testable
 `NSVC` v1 codec and its native endpoint adapter. Wire requests and responses remain exactly 64 bytes.
 Each native request transfers one fresh exact-`SEND` private reply endpoint; the correlated response
 carries no capability and must come from a nonzero kernel-stamped server PID.
 
-PID 1 temporarily owns the stable observation ingress and exposes its hard-coded `logging`, `nullfs`,
-`tmpfs`, and `vfs` supervisor state through `/sv list`, `/sv status SERVICE`, and trusted `ush`
-builtins. Possession of exact-`SEND` observation authority permits only list and status. Valid
-mutation packets receive canonical `AccessDenied`, and no mutation authority is exposed. The shell
-holds only `SEND | DUPLICATE`, not `TRANSFER`; arbitrary children and pathname-selected executables
-do not inherit authority. This adds no manager process, activation, definition loading, or new kernel
-behavior.
+PID 1 temporarily owns separate stable observation and mutation ingresses for its hard-coded
+`logging`, `nullfs`, `tmpfs`, and `vfs` services. Exact-`SEND` observation authority permits `/sv
+list` and `/sv status SERVICE`; mutation packets on that endpoint receive `AccessDenied`. Separate
+mutation authority permits `/sv restart SERVICE`; `Start` and `Stop` remain `Unsupported`.
+
+A committed restart reports the old generation as `Terminating`, uses no failure backoff or restart
+budget, and assigns the replacement's next manager-owned generation. Restart intent remains pending
+through replacement startup, so queued duplicate requests receive `Busy` rather than restarting the
+new generation. A missing reply after send is outcome unknown and is never retried automatically. The trusted shell holds only `SEND | DUPLICATE`
+for each authority, not `TRANSFER`; arbitrary children and pathname-selected executables inherit
+neither. This adds no manager process, activation, definition loading, persistent stopped state, or
+new kernel behavior.
 
 ### Future service and session lifecycle
 

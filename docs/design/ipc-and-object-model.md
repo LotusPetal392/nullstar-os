@@ -407,14 +407,21 @@ The [service control protocol](../service-control-protocol.md) is another bounde
 `NSVC` v1 provides an allocation-free, host-testable codec and native endpoint adapter for exact
 64-byte list, status, start, stop, and restart records. Each native request attaches one fresh empty
 exact-`SEND` private reply endpoint while the client retains exact `RECEIVE`; responses attach no
-capability. PID 1 temporarily owns the stable observation ingress and serves its current four-service
-registry to `/sv` and trusted `ush` builtins.
+capability. PID 1 temporarily owns separate stable observation and mutation ingresses and serves its
+current four-service registry to `/sv` and trusted `ush` builtins.
 
 Possession of exact-`SEND` observation authority permits `List` and `Status`; request IDs, service IDs,
-provider generations, cursors, PIDs, and executable paths are data and grant no authority. The trusted
-shell receives `SEND | DUPLICATE` but not `TRANSFER`, and ordinary shell children receive no grant.
-Valid mutation packets reaching this ingress receive `AccessDenied`. No mutation endpoint, separate
-manager, activation, or kernel change is part of the current integration.
+provider generations, cursors, PIDs, and executable paths are data and grant no authority. A distinct
+exact-`SEND` mutation endpoint permits `Restart` only; `Start` and `Stop` return `Unsupported`, while
+mutation on the observation endpoint returns `AccessDenied`. The trusted shell receives separate
+`SEND | DUPLICATE` grants but not `TRANSFER`, and ordinary shell children receive neither.
+
+A successful restart response commits intent rather than waiting for replacement readiness. The old
+generation becomes `Terminating`, controlled exit does not charge failure policy, and the replacement
+uses the next manager-owned generation. Intent remains pending through replacement startup, causing
+queued duplicates to receive `Busy`. Once sent, an unconfirmed mutation is outcome unknown and is not
+replayed. No separate manager, activation, persistent stopped state, or kernel change is part of
+the current integration.
 
 PID 1 is the temporary generation authority and owns separate allocation-free monotonic sequences for
 logging, NullFS, tmpfs, and VFS. Every startup attempt consumes a generation independent of process
