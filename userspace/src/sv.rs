@@ -1,4 +1,4 @@
-//! Allocation-free, bounded client operations for service observation and controlled restart.
+//! Allocation-free, bounded client operations for service observation and controlled mutation.
 
 use service_control::{
     DesiredState, ListOutcome, ObservedState, RequestId, ServiceControlFailure,
@@ -97,6 +97,23 @@ impl RequestIds {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mutation {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl Mutation {
+    const fn request(self, service: ServiceId) -> ServiceControlRequest {
+        match self {
+            Self::Start => ServiceControlRequest::Start { service },
+            Self::Stop => ServiceControlRequest::Stop { service },
+            Self::Restart => ServiceControlRequest::Restart { service },
+        }
+    }
+}
+
 /// Lists visible services over a borrowed exact-`SEND` observation grant.
 ///
 /// Records are printed as they arrive; no list is allocated or retained. The grant remains
@@ -151,12 +168,36 @@ pub fn status(observation_grant: CapabilityHandle, service: ServiceId) -> Result
     }
 }
 
-/// Commits one managed restart through a separately delegated exact-`SEND` mutation grant.
+/// Commits one managed start through a borrowed exact-`SEND` mutation grant.
 ///
-/// Success means the supervisor accepted restart intent, not that the replacement is ready. Once
-/// the request has been sent, any transport or validation failure is reported as outcome unknown
-/// and is never retried automatically.
+/// Success means the supervisor accepted running intent, not that the service is ready.
+pub fn start(mutation_grant: CapabilityHandle, service: ServiceId) -> Result<(), Error> {
+    mutate(mutation_grant, service, Mutation::Start)
+}
+
+/// Commits one managed stop through a borrowed exact-`SEND` mutation grant.
+///
+/// Success means the supervisor accepted stopped intent, not that the service has stopped.
+pub fn stop(mutation_grant: CapabilityHandle, service: ServiceId) -> Result<(), Error> {
+    mutate(mutation_grant, service, Mutation::Stop)
+}
+
+/// Commits one managed restart through a borrowed exact-`SEND` mutation grant.
+///
+/// Success means the supervisor accepted restart intent, not that the replacement is ready.
 pub fn restart(mutation_grant: CapabilityHandle, service: ServiceId) -> Result<(), Error> {
+    mutate(mutation_grant, service, Mutation::Restart)
+}
+
+/// Sends one mutation without retrying it.
+///
+/// Once the request has been sent, any transport or validation failure is reported as outcome
+/// unknown. The mutation grant remains caller-owned on every return path.
+fn mutate(
+    mutation_grant: CapabilityHandle,
+    service: ServiceId,
+    mutation: Mutation,
+) -> Result<(), Error> {
     let mut budgets = Budgets::new();
     budgets.spend_request()?;
     let mut request_ids = RequestIds::new();
@@ -164,7 +205,7 @@ pub fn restart(mutation_grant: CapabilityHandle, service: ServiceId) -> Result<(
     let mut exchange = match ControlExchange::begin_mutation(
         mutation_grant,
         request_id,
-        ServiceControlRequest::Restart { service },
+        mutation.request(service),
     ) {
         Ok(exchange) => exchange,
         Err(error) if error.request_was_sent() => return Err(Error::MutationOutcomeUnknown),
@@ -342,5 +383,22 @@ mod tests {
         assert_eq!(observed_name(ObservedState::Quarantined), b"quarantined");
         assert_eq!(desired_name(DesiredState::Running), b"running");
         assert_eq!(desired_name(DesiredState::Stopped), b"stopped");
+    }
+
+    #[test]
+    fn mutation_requests_cover_start_stop_and_restart() {
+        let service = LOGGING_SERVICE_ID;
+        assert_eq!(
+            Mutation::Start.request(service),
+            ServiceControlRequest::Start { service }
+        );
+        assert_eq!(
+            Mutation::Stop.request(service),
+            ServiceControlRequest::Stop { service }
+        );
+        assert_eq!(
+            Mutation::Restart.request(service),
+            ServiceControlRequest::Restart { service }
+        );
     }
 }

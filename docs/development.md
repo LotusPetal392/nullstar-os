@@ -59,11 +59,19 @@ Before publishing, run:
 ```
 
 The complete path additionally runs normal-boot readiness, the two-boot smoke suite,
-and the targeted NullFS replacement phase. The targeted fault path can be run directly:
+the targeted NullFS replacement phase, and logging lifecycle convergence. The targeted
+paths can be run directly:
 
 ```sh
-cargo +nightly-2026-02-01 run --locked --quiet -- --nullfs-restart-check
+cargo +nightly-2026-02-01 run --release --locked -- --nullfs-restart-check
+cargo +nightly-2026-02-01 run --release --locked -- --logging-lifecycle-check
 ```
+
+The logging lifecycle image validates live `start`, `stop`, and `restart`, immediate route
+withdrawal, fresh generation objects, duplicate-restart `Busy` fencing, exact filesystem
+`Start`/`Stop` `Unsupported` responses, escalation from cooperative termination to
+uncatchable forced termination after a bounded grace period, and repeated no-readiness
+failure through bounded restart/backoff into the terminal `Failed` state.
 
 QEMU must be available for integrated checks.
 

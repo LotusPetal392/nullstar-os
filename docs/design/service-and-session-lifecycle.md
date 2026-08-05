@@ -21,11 +21,15 @@ logging routes and as the temporary [`NSVC` v1 service-control
 server](../service-control-protocol.md); see [NullStar OS architecture](../architecture.md) and the
 [current service route protocol](../service-route-protocol.md). Native `/sv list`, `/sv status
 SERVICE`, `/sv restart SERVICE`, and trusted shell builtins use separate exact endpoint authorities.
-Controlled restart is implemented without charging failure policy. The generic supervisor now also
-owns host-tested in-memory desired state, controlled-stop accounting, stop-over-restart suppression,
-and explicit re-arming, but the native ingress does not yet expose `start` or `stop`. A separate
-manager, activation, definition loading, and cross-reboot desired-state persistence remain future
-work.
+Controlled restart is implemented without charging failure policy. Logging now also supports live
+`start` and `stop` through bounded PID 1 convergence: stop withdraws routes and converges without
+charging failure policy, while start creates and publishes only a fresh ready generation. Restart
+intent remains fenced through replacement startup, queued duplicates receive `Busy`, and PID 1
+escalates an uncooperative child to uncatchable signal 9 after a bounded grace period. Starting
+logging generations also have a bounded readiness deadline whose expiry enters normal restart and
+backoff policy rather than leaving the runtime in `Starting` indefinitely. Filesystem
+start/stop remains unsupported pending provider offlining and orderly quiesce. A separate manager,
+activation, definition loading, and cross-reboot desired-state persistence remain future work.
 
 ## Design goals
 

@@ -11,9 +11,9 @@ The complete process, job, activation, restart, session, application, login, and
 model is specified in
 [Service, session, and application lifecycle](service-and-session-lifecycle.md). The current
 [`NSVC` v1 milestone](../service-control-protocol.md) supplies a host-testable, allocation-free
-64-byte control codec plus capability-separated native observation and restart-only mutation through
-PID 1 and `sv`. The generic supervisor also models in-memory desired state and controlled stop, but
-live `start` and `stop` are not yet connected to the mutation ingress. There is no separate manager.
+64-byte control codec plus capability-separated native observation and mutation through PID 1 and
+`sv`. Restart is generic, while logging is the first live `start`/`stop` target using bounded
+convergence and generation-isolated route replacement. There is no separate manager.
 
 ## PID 1 and the system service manager
 
@@ -231,9 +231,10 @@ capability. Possession of an exact-`SEND` observation endpoint, rather than know
 pathname, authorizes list and status.
 
 PID 1 currently serves a fixed registry for `logging`, `nullfs`, `tmpfs`, and `vfs`. `/sv list`, `/sv
-status SERVICE`, `/sv restart SERVICE`, and trusted `ush` builtins are implemented. Observation and
-mutation use separate endpoint objects. Mutation on the observation ingress receives `AccessDenied`;
-`Start` and `Stop` on the mutation ingress receive `Unsupported`.
+status SERVICE`, `/sv restart SERVICE`, `/sv start logging`, `/sv stop logging`, and trusted `ush`
+builtins are implemented. Observation and mutation use separate endpoint objects. Mutation on the
+observation ingress receives `AccessDenied`; filesystem `Start` and `Stop` on the mutation ingress
+receive `Unsupported`.
 
 A successful restart commits intent and reports the old generation as terminating; it does not wait
 for replacement readiness. Controlled restart does not charge failure backoff or budget, and the
@@ -242,17 +243,23 @@ replacement is ready and queued duplicate requests have received `Busy`. An unco
 is outcome unknown and is not retried. The trusted shell receives separate `SEND | DUPLICATE` grants
 without `TRANSFER`; standalone `/sv` expects observation at handle `1` and mutation at handle `2`.
 
-The supervisor foundation now retains desired state across controlled exits within PID 1, classifies
-controlled stop separately from failure, permits stop to suppress a pending restart, re-arms bounded
-policy on explicit start, and can roll back a stop whose signal was not delivered. These transitions
-are host-tested but are not yet reachable through `/sv`; the live ingress continues returning
-`Unsupported` for `Start` and `Stop`.
+The supervisor retains desired state across controlled exits within PID 1, classifies controlled stop
+separately from failure, permits stop to suppress a pending restart, re-arms bounded policy on
+explicit start, and rolls back a stop whose signal was not delivered. Logging now exercises those
+transitions through `/sv`. Its steady-state startup, readiness, child-status, mutation, and backoff
+work is bounded; stop withdraws published routes before later resolutions are serviced, and start
+publishes fresh producer and observer objects only after accepted readiness. Restart intent remains
+fenced through replacement startup so queued duplicates receive `Busy`. PID 1 escalates an ignored
+cooperative termination request to uncatchable, unblockable signal 9 after a bounded grace period.
+A distinct readiness deadline force-terminates a live starting generation that never becomes ready;
+its final status then follows the ordinary bounded restart/backoff and failure policy.
 
-Logging is the first planned live start/stop pilot because its published routes can be withdrawn before
-termination. Filesystem services require generation-checked provider offlining first: pending kernel
+A successful start or stop response commits desired state; it does not wait for readiness or final
+exit. Filesystem services require generation-checked provider offlining first: pending kernel
 proxy requests must be failed and woken, old endpoint queues must never reach a replacement, and
 writable NullFS must quiesce and flush before forced termination. This milestone adds no manager
-process, activation, definitions, cross-reboot persistence, or kernel changes.
+process, activation, definitions, cross-reboot persistence, or new lifecycle syscall; the existing
+signal ABI now includes the forced-termination signal used for bounded escalation.
 
 ## The `sv` command
 
@@ -265,14 +272,14 @@ The implemented commands are:
 ```text
 sv list
 sv status SERVICE
+sv start SERVICE
+sv stop SERVICE
 sv restart SERVICE
 ```
 
 The next management commands should be:
 
 ```text
-sv start <service>
-sv stop <service>
 sv enable <service>
 sv disable <service>
 sv logs <service>
@@ -420,8 +427,9 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    current supervisor. **Partly delivered:** the allocation-free, host-testable `NSVC` v1 codec and
    PID 1 service registry fixes the observation contract, but job containment remains.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
-   delivered:** native `list`, `status`, and restart-only mutation use separately authorized IPC;
-   persistent desired state plus live `start` and `stop` remain future work.
+   delivered:** native `list`, `status`, and restart use separately authorized IPC, and logging has
+   live in-memory `start`/`stop`; filesystem convergence and cross-reboot desired state remain future
+   work.
 3. Introduce the one-bootstrap-channel startup contract and stable service generations.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.
