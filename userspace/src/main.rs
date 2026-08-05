@@ -3,7 +3,7 @@
 
 use nswp_logging::{LOGGING_OBSERVER_ROLE, LOGGING_PRODUCER_ROLE, LOGGING_SERVICE_ID};
 use service_control::{
-    DesiredState, ListResponse, ObservedState, ServiceControlFailure, ServiceControlRequest,
+    ListResponse, ObservedState, ServiceControlFailure, ServiceControlRequest,
     ServiceControlResponse, ServiceId, ServiceRecord, TargetResponse,
 };
 use service_route::{Authorizer, ProviderGeneration, ProviderGenerationSequence, RouteKey};
@@ -18,8 +18,8 @@ use userspace::{
     },
     service_route::{NativeRouteTable, RouteIngress, queue_service_generation},
     supervisor::{
-        RestartRequestError, ServiceRuntime, ServiceSpec, ServiceState, ServiceStatusDisposition,
-        ShellStatusDisposition, shell_status_disposition,
+        ReadyDisposition, RestartRequestError, ServiceRuntime, ServiceSpec, ServiceState,
+        ServiceStatusDisposition, ShellStatusDisposition, shell_status_disposition,
     },
     syscall::{self, ProcessId, STDERR, STDOUT, SpawnFlags},
     tmpfs::Mount,
@@ -574,11 +574,12 @@ fn service_record(
         ServiceState::Stopped => (ObservedState::Stopped, None),
         ServiceState::Starting => (ObservedState::Starting, Some(managed_generation)),
         ServiceState::Running => (ObservedState::Ready, Some(managed_generation)),
+        ServiceState::Stopping => (ObservedState::Stopping, Some(managed_generation)),
         ServiceState::Restarting => (ObservedState::Terminating, Some(managed_generation)),
         ServiceState::Backoff => (ObservedState::Stopped, None),
         ServiceState::Failed => (ObservedState::Quarantined, None),
     };
-    ServiceRecord::new(service, generation, observed, DesiredState::Running)
+    ServiceRecord::new(service, generation, observed, runtime.desired_state())
         .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
 }
 
@@ -934,6 +935,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         });
                         logging_service.complete_restart();
                     }
+                    ServiceStatusDisposition::Stopped => {}
                     ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
@@ -991,6 +993,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         });
                         nullfs_service.complete_restart();
                     }
+                    ServiceStatusDisposition::Stopped => {}
                     ServiceStatusDisposition::Failed => fail(NULLFS_SERVICE_FAILED),
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
@@ -1027,6 +1030,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         });
                         service.complete_restart();
                     }
+                    ServiceStatusDisposition::Stopped => {}
                     ServiceStatusDisposition::Failed => fail(SERVICE_FAILED),
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
@@ -1063,6 +1067,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         });
                         vfs_service.complete_restart();
                     }
+                    ServiceStatusDisposition::Stopped => {}
                     ServiceStatusDisposition::Failed => fail(VFS_SERVICE_FAILED),
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
@@ -1297,9 +1302,9 @@ fn run_nullfs_restart_probe(
             }
             Ok(status) => match registry.nullfs.observe_status(status.raw()) {
                 ServiceStatusDisposition::Restart { backoff_yields } => break backoff_yields,
-                ServiceStatusDisposition::WaitForNextEvent | ServiceStatusDisposition::Failed => {
-                    fail(NULLFS_RESTART_PROBE_FAILED)
-                }
+                ServiceStatusDisposition::WaitForNextEvent
+                | ServiceStatusDisposition::Stopped
+                | ServiceStatusDisposition::Failed => fail(NULLFS_RESTART_PROBE_FAILED),
             },
             Err(error) if error == syscall::Errno::INTERRUPTED => {}
             Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
@@ -1595,11 +1600,14 @@ fn start_logging_generation(
                                     continue 'attempt;
                                 }
                                 ServiceStatusDisposition::WaitForNextEvent
+                                | ServiceStatusDisposition::Stopped
                                 | ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
                             },
                         }
                     }
-                    service.note_ready();
+                    if service.note_ready() != ReadyDisposition::Accepted {
+                        fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+                    }
                     route_broker.publish(generation, producer_source, observer_source);
                     let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.ready);
                     return LoggingGeneration {
@@ -1629,7 +1637,9 @@ fn start_logging_generation(
                         backoff(backoff_yields);
                         break;
                     }
-                    ServiceStatusDisposition::Failed => fail(LOGGING_SERVICE_FAILED),
+                    ServiceStatusDisposition::Stopped | ServiceStatusDisposition::Failed => {
+                        fail(LOGGING_SERVICE_FAILED)
+                    }
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
@@ -1717,7 +1727,9 @@ fn start_service(
                     {
                         fail(messages.protocol_failed);
                     }
-                    service.note_ready();
+                    if service.note_ready() != ReadyDisposition::Accepted {
+                        fail(messages.protocol_failed);
+                    }
                     let _ = syscall::write_all(STDOUT, messages.ready);
                     return generation;
                 }
@@ -1733,7 +1745,9 @@ fn start_service(
                         backoff(backoff_yields);
                         break;
                     }
-                    ServiceStatusDisposition::Failed => fail(messages.failed),
+                    ServiceStatusDisposition::Stopped | ServiceStatusDisposition::Failed => {
+                        fail(messages.failed)
+                    }
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
@@ -2111,9 +2125,9 @@ fn wait_for_logging_service_restart(
             }
             Ok(status) => match service.observe_status(status.raw()) {
                 ServiceStatusDisposition::Restart { backoff_yields } => return backoff_yields,
-                ServiceStatusDisposition::WaitForNextEvent | ServiceStatusDisposition::Failed => {
-                    fail(LOGGING_COLLECTOR_RESTART_POLICY_FAILED)
-                }
+                ServiceStatusDisposition::WaitForNextEvent
+                | ServiceStatusDisposition::Stopped
+                | ServiceStatusDisposition::Failed => fail(LOGGING_COLLECTOR_RESTART_POLICY_FAILED),
             },
             Err(error) if error == syscall::Errno::TRY_AGAIN => {}
             Err(error) if error == syscall::Errno::INTERRUPTED => {}

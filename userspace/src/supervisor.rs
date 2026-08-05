@@ -1,3 +1,5 @@
+use service_control::DesiredState;
+
 use crate::abi::{child_status, signal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,7 @@ pub enum ServiceState {
     Stopped,
     Starting,
     Running,
+    Stopping,
     Restarting,
     Backoff,
     Failed,
@@ -47,6 +50,7 @@ pub struct ServiceSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceStatusDisposition {
     WaitForNextEvent,
+    Stopped,
     Restart { backoff_yields: u32 },
     Failed,
 }
@@ -58,12 +62,54 @@ pub enum RestartRequestError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartRequestError {
+    InvalidState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequestError {
+    InvalidState,
+    TransitionExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopCancelError {
+    NotRollbackCapable,
+    WrongService,
+    StaleTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyDisposition {
+    Accepted,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopRequest {
+    process_group: Option<u64>,
+    rollback_epoch: Option<u64>,
+    service: ServiceSpec,
+    previous_state: ServiceState,
+    previous_desired_state: DesiredState,
+    previous_restart_pending: bool,
+}
+
+impl StopRequest {
+    pub const fn process_group(self) -> Option<u64> {
+        self.process_group
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceRuntime {
     spec: ServiceSpec,
     process_id: Option<u64>,
     restart_count: u32,
     state: ServiceState,
+    desired_state: DesiredState,
     controlled_restart_pending: bool,
+    stop_transition_epoch: u64,
 }
 
 impl ServiceRuntime {
@@ -73,7 +119,9 @@ impl ServiceRuntime {
             process_id: None,
             restart_count: 0,
             state: ServiceState::Stopped,
+            desired_state: DesiredState::Running,
             controlled_restart_pending: false,
+            stop_transition_epoch: 0,
         }
     }
 
@@ -93,6 +141,16 @@ impl ServiceRuntime {
         self.state
     }
 
+    pub const fn desired_state(&self) -> DesiredState {
+        self.desired_state
+    }
+
+    pub const fn should_start(&self) -> bool {
+        matches!(self.desired_state, DesiredState::Running)
+            && matches!(self.state, ServiceState::Stopped)
+            && self.process_id.is_none()
+    }
+
     pub const fn controlled_restart_pending(&self) -> bool {
         self.controlled_restart_pending
     }
@@ -102,11 +160,117 @@ impl ServiceRuntime {
         self.state = ServiceState::Starting;
     }
 
-    pub fn note_ready(&mut self) {
-        self.state = ServiceState::Running;
+    pub fn note_ready(&mut self) -> ReadyDisposition {
+        if self.state == ServiceState::Starting
+            && self.desired_state == DesiredState::Running
+            && self.process_id.is_some()
+        {
+            self.state = ServiceState::Running;
+            ReadyDisposition::Accepted
+        } else {
+            ReadyDisposition::Stale
+        }
+    }
+
+    pub fn request_start(&mut self) -> Result<(), StartRequestError> {
+        if self.state == ServiceState::Failed && self.process_id.is_none() {
+            self.desired_state = DesiredState::Running;
+            self.state = ServiceState::Stopped;
+            self.restart_count = 0;
+            self.controlled_restart_pending = false;
+            return Ok(());
+        }
+        if self.desired_state == DesiredState::Running {
+            return Ok(());
+        }
+        match (self.state, self.process_id) {
+            (ServiceState::Stopped | ServiceState::Backoff, None) => {
+                self.desired_state = DesiredState::Running;
+                self.state = ServiceState::Stopped;
+                self.restart_count = 0;
+                self.controlled_restart_pending = false;
+                Ok(())
+            }
+            (ServiceState::Stopping, Some(_)) => {
+                self.desired_state = DesiredState::Running;
+                self.state = ServiceState::Restarting;
+                self.restart_count = 0;
+                self.controlled_restart_pending = true;
+                Ok(())
+            }
+            _ => Err(StartRequestError::InvalidState),
+        }
+    }
+
+    pub fn request_stop(&mut self) -> Result<StopRequest, StopRequestError> {
+        let request = StopRequest {
+            process_group: None,
+            rollback_epoch: None,
+            service: self.spec,
+            previous_state: self.state,
+            previous_desired_state: self.desired_state,
+            previous_restart_pending: self.controlled_restart_pending,
+        };
+        if self.desired_state == DesiredState::Stopped {
+            return Ok(request);
+        }
+
+        match (self.state, self.process_id) {
+            (ServiceState::Starting | ServiceState::Running, Some(process_group)) => {
+                let rollback_epoch = self
+                    .stop_transition_epoch
+                    .checked_add(1)
+                    .ok_or(StopRequestError::TransitionExhausted)?;
+                self.stop_transition_epoch = rollback_epoch;
+                self.desired_state = DesiredState::Stopped;
+                self.state = ServiceState::Stopping;
+                self.controlled_restart_pending = false;
+                Ok(StopRequest {
+                    process_group: Some(process_group),
+                    rollback_epoch: Some(rollback_epoch),
+                    ..request
+                })
+            }
+            (ServiceState::Restarting, Some(_)) => {
+                self.desired_state = DesiredState::Stopped;
+                self.state = ServiceState::Stopping;
+                self.controlled_restart_pending = false;
+                Ok(request)
+            }
+            (ServiceState::Stopped | ServiceState::Backoff | ServiceState::Failed, None) => {
+                self.desired_state = DesiredState::Stopped;
+                self.state = ServiceState::Stopped;
+                self.controlled_restart_pending = false;
+                Ok(request)
+            }
+            _ => Err(StopRequestError::InvalidState),
+        }
+    }
+
+    pub fn cancel_stop(&mut self, request: StopRequest) -> Result<(), StopCancelError> {
+        if request.service != self.spec {
+            return Err(StopCancelError::WrongService);
+        }
+        let Some(rollback_epoch) = request.rollback_epoch else {
+            return Err(StopCancelError::NotRollbackCapable);
+        };
+        if self.stop_transition_epoch != rollback_epoch
+            || self.state != ServiceState::Stopping
+            || self.desired_state != DesiredState::Stopped
+            || self.process_id != request.process_group
+        {
+            return Err(StopCancelError::StaleTransition);
+        }
+        self.state = request.previous_state;
+        self.desired_state = request.previous_desired_state;
+        self.controlled_restart_pending = request.previous_restart_pending;
+        Ok(())
     }
 
     pub fn request_restart(&mut self) -> Result<u64, RestartRequestError> {
+        if self.desired_state != DesiredState::Running {
+            return Err(RestartRequestError::InvalidState);
+        }
         if self.controlled_restart_pending {
             return Err(RestartRequestError::AlreadyPending);
         }
@@ -141,6 +305,11 @@ impl ServiceRuntime {
         }
 
         self.process_id = None;
+        if self.desired_state == DesiredState::Stopped || self.state == ServiceState::Stopping {
+            self.state = ServiceState::Stopped;
+            self.controlled_restart_pending = false;
+            return ServiceStatusDisposition::Stopped;
+        }
         if self.state == ServiceState::Restarting {
             self.state = ServiceState::Backoff;
             return ServiceStatusDisposition::Restart { backoff_yields: 0 };
@@ -168,9 +337,12 @@ impl ServiceRuntime {
 
 #[cfg(test)]
 mod tests {
+    use service_control::DesiredState;
+
     use super::{
-        RestartRequestError, ServiceRuntime, ServiceSpec, ServiceState, ServiceStatusDisposition,
-        ShellStatusDisposition, shell_status_disposition,
+        ReadyDisposition, RestartRequestError, ServiceRuntime, ServiceSpec, ServiceState,
+        ServiceStatusDisposition, ShellStatusDisposition, StopCancelError,
+        shell_status_disposition,
     };
     use crate::abi::{child_status, signal};
 
@@ -182,6 +354,11 @@ mod tests {
         restart_limit: 2,
         restart_backoff_yields: 8,
         fatal_startup_exit_status: Some(21),
+    };
+    const OTHER_SERVICE: ServiceSpec = ServiceSpec {
+        name: b"other",
+        command: b"/other-service",
+        ..TEST_SERVICE
     };
 
     #[test]
@@ -217,12 +394,25 @@ mod tests {
     }
 
     #[test]
+    fn enabled_service_initially_requires_convergence() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        assert_eq!(service.desired_state(), DesiredState::Running);
+        assert_eq!(service.state(), ServiceState::Stopped);
+        assert!(service.should_start());
+        assert_eq!(service.request_start(), Ok(()));
+        assert!(service.should_start());
+
+        service.note_spawned(7);
+        assert!(!service.should_start());
+    }
+
+    #[test]
     fn service_transitions_from_starting_to_running() {
         let mut service = ServiceRuntime::new(TEST_SERVICE);
         service.note_spawned(7);
         assert_eq!(service.process_id(), Some(7));
         assert_eq!(service.state(), ServiceState::Starting);
-        service.note_ready();
+        assert_eq!(service.note_ready(), ReadyDisposition::Accepted);
         assert_eq!(service.state(), ServiceState::Running);
     }
 
@@ -256,6 +446,148 @@ mod tests {
         service.complete_restart();
         assert!(!service.controlled_restart_pending());
         assert_eq!(service.request_restart(), Ok(8));
+    }
+
+    #[test]
+    fn controlled_stop_converges_without_charging_failure_policy() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+
+        let stop = service.request_stop().unwrap();
+        assert_eq!(stop.process_group(), Some(7));
+        assert_eq!(service.desired_state(), DesiredState::Stopped);
+        assert_eq!(service.state(), ServiceState::Stopping);
+        assert_eq!(service.request_stop().unwrap().process_group(), None);
+        assert_eq!(
+            service.observe_status(child_status::SIGNAL_BASE + signal::TERMINATE),
+            ServiceStatusDisposition::Stopped
+        );
+        assert_eq!(service.state(), ServiceState::Stopped);
+        assert_eq!(service.process_id(), None);
+        assert_eq!(service.restart_count(), 0);
+        assert!(!service.should_start());
+
+        assert_eq!(service.request_start(), Ok(()));
+        assert_eq!(service.desired_state(), DesiredState::Running);
+        assert!(service.should_start());
+        service.note_spawned(8);
+        service.note_ready();
+        assert_eq!(service.state(), ServiceState::Running);
+        assert_eq!(service.restart_count(), 0);
+    }
+
+    #[test]
+    fn failed_stop_signal_restores_the_exact_previous_state() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+        let stop = service.request_stop().unwrap();
+        assert_eq!(service.cancel_stop(stop), Ok(()));
+        assert_eq!(
+            service.cancel_stop(stop),
+            Err(StopCancelError::StaleTransition)
+        );
+        assert_eq!(service.desired_state(), DesiredState::Running);
+        assert_eq!(service.state(), ServiceState::Running);
+        assert_eq!(service.process_id(), Some(7));
+    }
+
+    #[test]
+    fn stop_rollback_rejects_finalized_superseded_and_foreign_transitions() {
+        let mut finalized = ServiceRuntime::new(TEST_SERVICE);
+        finalized.note_spawned(7);
+        finalized.note_ready();
+        let finalized_stop = finalized.request_stop().unwrap();
+        assert_eq!(
+            finalized.observe_status(child_status::SIGNAL_BASE + signal::TERMINATE),
+            ServiceStatusDisposition::Stopped
+        );
+        assert_eq!(
+            finalized.cancel_stop(finalized_stop),
+            Err(StopCancelError::StaleTransition)
+        );
+
+        let mut superseded = ServiceRuntime::new(TEST_SERVICE);
+        superseded.note_spawned(8);
+        superseded.note_ready();
+        let superseded_stop = superseded.request_stop().unwrap();
+        assert_eq!(superseded.request_start(), Ok(()));
+        assert_eq!(
+            superseded.cancel_stop(superseded_stop),
+            Err(StopCancelError::StaleTransition)
+        );
+
+        let mut foreign = ServiceRuntime::new(OTHER_SERVICE);
+        foreign.note_spawned(7);
+        foreign.note_ready();
+        assert_eq!(
+            foreign.cancel_stop(finalized_stop),
+            Err(StopCancelError::WrongService)
+        );
+    }
+
+    #[test]
+    fn readiness_after_stop_is_stale_and_does_not_republish_the_service() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        let stop = service.request_stop().unwrap();
+        assert_eq!(stop.process_group(), Some(7));
+        assert_eq!(service.note_ready(), ReadyDisposition::Stale);
+        assert_eq!(service.state(), ServiceState::Stopping);
+    }
+
+    #[test]
+    fn stop_overrides_a_controlled_restart_without_a_second_signal() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+        assert_eq!(service.request_restart(), Ok(7));
+
+        let stop = service.request_stop().unwrap();
+        assert_eq!(stop.process_group(), None);
+        assert_eq!(service.desired_state(), DesiredState::Stopped);
+        assert_eq!(service.state(), ServiceState::Stopping);
+        assert_eq!(
+            service.observe_status(child_status::SIGNAL_BASE + signal::TERMINATE),
+            ServiceStatusDisposition::Stopped
+        );
+        assert!(!service.controlled_restart_pending());
+        assert_eq!(service.restart_count(), 0);
+    }
+
+    #[test]
+    fn start_during_controlled_stop_schedules_one_zero_backoff_replacement() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        service.note_ready();
+        let stop = service.request_stop().unwrap();
+        assert_eq!(stop.process_group(), Some(7));
+        assert_eq!(service.request_start(), Ok(()));
+        assert_eq!(service.desired_state(), DesiredState::Running);
+        assert_eq!(service.state(), ServiceState::Restarting);
+        assert_eq!(
+            service.observe_status(child_status::SIGNAL_BASE + signal::TERMINATE),
+            ServiceStatusDisposition::Restart { backoff_yields: 0 }
+        );
+        assert_eq!(service.restart_count(), 0);
+    }
+
+    #[test]
+    fn stop_cancels_failure_backoff_and_explicit_start_rearms_the_budget() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        service.note_spawned(7);
+        assert_eq!(
+            service.observe_status(75),
+            ServiceStatusDisposition::Restart { backoff_yields: 8 }
+        );
+        assert_eq!(service.restart_count(), 1);
+        assert_eq!(service.request_stop().unwrap().process_group(), None);
+        assert_eq!(service.state(), ServiceState::Stopped);
+        assert_eq!(service.desired_state(), DesiredState::Stopped);
+        assert_eq!(service.request_start(), Ok(()));
+        assert_eq!(service.restart_count(), 0);
+        assert!(service.should_start());
     }
 
     #[test]
@@ -293,6 +625,34 @@ mod tests {
         assert_eq!(service.process_id(), None);
         assert_eq!(service.restart_count(), 0);
         assert_eq!(service.state(), ServiceState::Failed);
+        assert_eq!(service.desired_state(), DesiredState::Running);
+        assert_eq!(service.request_start(), Ok(()));
+        assert_eq!(service.state(), ServiceState::Stopped);
+        assert_eq!(service.restart_count(), 0);
+        assert!(service.should_start());
+    }
+
+    #[test]
+    fn explicit_start_rearms_an_exhausted_failure_budget() {
+        let mut service = ServiceRuntime::new(TEST_SERVICE);
+        for process_id in 7..=9 {
+            service.note_spawned(process_id);
+            let disposition = service.observe_status(1);
+            if process_id == 9 {
+                assert_eq!(disposition, ServiceStatusDisposition::Failed);
+            } else {
+                assert_eq!(
+                    disposition,
+                    ServiceStatusDisposition::Restart { backoff_yields: 8 }
+                );
+            }
+        }
+        assert_eq!(service.state(), ServiceState::Failed);
+        assert_eq!(service.restart_count(), 2);
+        assert_eq!(service.request_start(), Ok(()));
+        assert_eq!(service.state(), ServiceState::Stopped);
+        assert_eq!(service.restart_count(), 0);
+        assert!(service.should_start());
     }
 
     #[test]
