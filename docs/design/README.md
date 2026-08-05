@@ -41,6 +41,7 @@ authoritative when it differs from future design.
 
 - [Graphics stack and compositor](graphics-stack.md)
 - [Native graphics renderer and UI toolkit](graphics-renderer-and-toolkit.md)
+- [Appearance, theming, and display adaptation](appearance-and-theming.md)
 - [Freedesktop compatibility](freedesktop-compatibility.md)
 - [Media graph](media-graph.md)
 - [Control surfaces and application controllers](control-surfaces-and-controllers.md)
@@ -73,6 +74,11 @@ authoritative when it differs from future design.
 - Keep the logical namespace independent from physical storage layout.
 - Prevent one application, applet, plugin, driver, session, or service failure from
   exposing or destabilizing unrelated jobs.
+- Coordinate independently selectable appearance components through semantic tokens
+  rather than coupling them into one monolithic theme.
+- Let widgets own structure and semantics while declarative themes style stable
+  surfaces, keep display color adaptation separate, and make accessibility overrides
+  authoritative.
 - Use descriptive filesystem and service names that do not require historical Unix
   knowledge.
 - Keep current implementation documentation separate from future architectural intent.
