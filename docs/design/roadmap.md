@@ -60,9 +60,14 @@ policy. Logging restart retains a fence through replacement startup, rejects a q
 `Busy`, and escalates from cooperative termination to uncatchable signal 9 after a bounded grace
 period. A separate bounded readiness deadline prevents a live but unready logging child from holding
 replacement convergence indefinitely and feeds expiry into normal restart/backoff policy. Filesystem
-start/stop waits on provider-offline and quiesce semantics. Jobs, a separate manager
-process, activation, definitions, and cross-reboot desired-state persistence remain future work. No new
-lifecycle syscall was required, but the existing signal ABI gained the forced-termination signal.
+restart now has exact-generation provider offlining: after final child status, PID 1 offlines the old
+generation, fails and wakes its work, closes the old endpoint handle, creates a fresh endpoint object,
+and registers a strictly newer generation before releasing the restart fence. Tombstones reject stale
+replies, work, and close cleanup. Writable NullFS remains online until final exit because pre-exit
+quiesce and `SYNC` remain future work, so filesystem `Start` and `Stop` stay exactly `Unsupported`.
+`NSVC` v1 is unchanged. Jobs, a separate manager process, activation, definitions, and cross-reboot
+desired-state persistence remain future work. ABI 1.13 adds the narrow PID-1 provider-offlining
+syscall; the existing signal ABI supplies the forced-termination signal.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

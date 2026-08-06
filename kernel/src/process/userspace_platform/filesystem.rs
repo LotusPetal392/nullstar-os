@@ -21,6 +21,9 @@ fn platform_stat(
             current_stack_pointer,
         );
     }
+    if vfs_route_is_offline() {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
     if tmpfs_proxy_state().is_some() {
         match tmpfs_proxy_path(&path) {
             Ok(Some(_)) => {
@@ -89,6 +92,9 @@ fn platform_read_directory(
             current_stack_pointer,
         );
     }
+    if vfs_route_is_offline() {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
     if tmpfs_proxy_state().is_some() {
         match tmpfs_proxy_path(&path) {
             Ok(Some(TmpfsProxyPath::Directory)) => {
@@ -139,6 +145,9 @@ fn platform_chdir(
     if vfs_route_ready() {
         return vfs_route_chdir(process_id, &path, current_stack_pointer);
     }
+    if vfs_route_is_offline() {
+        return ControlOutcome::Ready(error_return(ERR_IO));
+    }
     let metadata = match vfs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -166,6 +175,9 @@ fn platform_unlink(
     };
     if vfs_route_ready() {
         return vfs_route_unlink(process_id, &path, current_stack_pointer);
+    }
+    if vfs_route_is_offline() {
+        return ControlOutcome::Ready(error_return(ERR_IO));
     }
     if tmpfs_proxy_state().is_some() {
         return match tmpfs_proxy_path(&path) {

@@ -221,6 +221,9 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
         abi::syscall::REGISTER_NULLFS_SERVICE => {
             platform_register_nullfs_service(process_id, registers.rdi, registers.rsi)
         }
+        abi::syscall::OFFLINE_FILESYSTEM_PROVIDER => {
+            platform_offline_filesystem_provider(process_id, registers.rdi, registers.rsi)
+        }
         abi::syscall::DUP => platform_dup(process_id, registers.rdi),
         abi::syscall::DUP2 => platform_dup2(process_id, registers.rdi, registers.rsi),
         abi::syscall::GETPPID => platform_getppid(process_id),
@@ -252,6 +255,7 @@ fn platform_syscall_number(number: u64) -> bool {
             | abi::syscall::REGISTER_TMPFS_SERVICE
             | abi::syscall::REGISTER_VFS_SERVICE
             | abi::syscall::REGISTER_NULLFS_SERVICE
+            | abi::syscall::OFFLINE_FILESYSTEM_PROVIDER
             | abi::syscall::UNLINK
             | abi::syscall::DUP
             | abi::syscall::DUP2
@@ -324,6 +328,9 @@ fn platform_open(
             descriptor,
             current_stack_pointer,
         );
+    }
+    if vfs_route_is_offline() {
+        return ControlOutcome::Ready(error_return(ERR_IO));
     }
     if tmpfs_proxy_state().is_some() {
         match tmpfs_proxy_path(&path) {
@@ -469,6 +476,41 @@ fn platform_register_vfs_service(process_id: u64, handle: u64, generation: u64) 
         return error_return(ERR_BAD_FILE_DESCRIPTOR);
     };
     match vfs_route_begin_registration(endpoint, generation) {
+        Ok(()) => 0,
+        Err(error) => error_return(error),
+    }
+}
+
+fn platform_offline_filesystem_provider(
+    process_id: u64,
+    provider: u64,
+    generation: u64,
+) -> u64 {
+    let generation = match crate::tmpfs_abi::validate_offline(
+        process_id,
+        INIT_PROCESS_ID,
+        provider,
+        generation,
+        abi::filesystem_provider::TMPFS,
+        abi::filesystem_provider::NULLFS,
+        abi::filesystem_provider::VFS,
+    ) {
+        Ok(generation) => generation,
+        Err(crate::tmpfs_abi::OfflineError::Permission) => {
+            return error_return(abi::errno::PERMISSION);
+        }
+        Err(
+            crate::tmpfs_abi::OfflineError::InvalidProvider
+            | crate::tmpfs_abi::OfflineError::InvalidGeneration,
+        ) => return error_return(ERR_INVALID_ARGUMENT),
+    };
+    let result = match provider {
+        abi::filesystem_provider::TMPFS => tmpfs_proxy_offline(generation),
+        abi::filesystem_provider::NULLFS => nullfs_proxy_offline(generation),
+        abi::filesystem_provider::VFS => vfs_route_offline(generation),
+        _ => unreachable!("offline validation accepted an unknown provider"),
+    };
+    match result {
         Ok(()) => 0,
         Err(error) => error_return(error),
     }

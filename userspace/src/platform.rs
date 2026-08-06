@@ -259,6 +259,36 @@ fn open_partition_endpoint(number: u64, partition_index: u32) -> Result<FileDesc
     decode(result)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilesystemProvider {
+    Tmpfs,
+    Nullfs,
+    Vfs,
+}
+
+impl FilesystemProvider {
+    const fn raw(self) -> u64 {
+        match self {
+            Self::Tmpfs => abi::filesystem_provider::TMPFS,
+            Self::Nullfs => abi::filesystem_provider::NULLFS,
+            Self::Vfs => abi::filesystem_provider::VFS,
+        }
+    }
+}
+
+pub fn offline_filesystem_provider(provider: FilesystemProvider, generation: u32) -> Result<()> {
+    let mut result = syscall::OFFLINE_FILESYSTEM_PROVIDER;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") provider.raw(),
+            in("rsi") generation as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
 pub fn register_nullfs_service(service: FileDescriptor, generation: u32) -> Result<()> {
     let mut result = syscall::REGISTER_NULLFS_SERVICE;
     unsafe {

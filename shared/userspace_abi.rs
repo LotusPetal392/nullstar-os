@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 12;
+pub const ABI_VERSION_MINOR: u64 = 13;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -77,6 +77,13 @@ pub mod syscall {
     pub const OPEN_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT: u64 = 55;
     pub const OPEN_KERNEL_EARLY_LOG_READER: u64 = 56;
     pub const KERNEL_EARLY_LOG_READ: u64 = 57;
+    pub const OFFLINE_FILESYSTEM_PROVIDER: u64 = 58;
+}
+
+pub mod filesystem_provider {
+    pub const TMPFS: u64 = 1;
+    pub const NULLFS: u64 = 2;
+    pub const VFS: u64 = 3;
 }
 
 pub mod capability {
@@ -96,6 +103,7 @@ pub mod capability {
     pub const READ_ONLY_BLOCK_DEVICE_ENDPOINTS: u64 = 1 << 13;
     pub const WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS: u64 = 1 << 14;
     pub const KERNEL_EARLY_LOG_READER: u64 = 1 << 15;
+    pub const FILESYSTEM_PROVIDER_OFFLINE: u64 = 1 << 16;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -113,7 +121,8 @@ pub mod capability {
         | PATH_MUTATION
         | READ_ONLY_BLOCK_DEVICE_ENDPOINTS
         | WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS
-        | KERNEL_EARLY_LOG_READER;
+        | KERNEL_EARLY_LOG_READER
+        | FILESYSTEM_PROVIDER_OFFLINE;
 
     pub const INVALID_HANDLE: u64 = 0;
 

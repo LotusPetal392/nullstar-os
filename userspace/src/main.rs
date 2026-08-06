@@ -134,6 +134,8 @@ const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
 const NULLFS_RESTART_PROBE_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
 const NULLFS_RESTART_PROBE_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
+const NULLFS_RESTART_PROBE_OFFLINE: &[u8] = b"nullfs-restart: offline failure observed";
+const NULLFS_RESTART_PROBE_REPLACEMENT: &[u8] = b"nullfs-restart: replacement registered";
 const NULLFS_RESTART_PROBE_PASSED: &[u8] =
     b"userspace init: NullFS restart persistent VFS mutation and stale descriptors verified\n";
 const NULLFS_RESTART_PROBE_FAILED: &[u8] = b"userspace init: NullFS restart probe failed\n";
@@ -1434,7 +1436,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut nullfs_service,
         &mut nullfs_generations,
         nullfs_readiness_endpoint,
-        nullfs_request_endpoint,
+        &mut nullfs_request_endpoint,
         &[nullfs_block_capability],
         &NULLFS_MESSAGES,
     );
@@ -1448,7 +1450,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
 
     let readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
-    let request_endpoint =
+    let mut request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let mut service = ServiceRuntime::new(TMPFS_SERVICE);
     let mut tmpfs_generations = ProviderGenerationSequence::new();
@@ -1456,7 +1458,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut service,
         &mut tmpfs_generations,
         readiness_endpoint,
-        request_endpoint,
+        &mut request_endpoint,
         &[],
         &TMPFS_MESSAGES,
     );
@@ -1464,7 +1466,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     run_tmpfs_probe(request_endpoint);
     let vfs_readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
-    let vfs_request_endpoint =
+    let mut vfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
     let mut vfs_service = ServiceRuntime::new(VFS_SERVICE);
     let mut vfs_generations = ProviderGenerationSequence::new();
@@ -1472,7 +1474,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         &mut vfs_service,
         &mut vfs_generations,
         vfs_readiness_endpoint,
-        vfs_request_endpoint,
+        &mut vfs_request_endpoint,
         &[],
         &VFS_MESSAGES,
     );
@@ -1626,12 +1628,21 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::WaitForNextEvent => {}
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Nullfs,
+                            nullfs_generation,
+                            NULLFS_SERVICE_FAILED,
+                        );
+                        ipc::close(nullfs_request_endpoint)
+                            .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
+                        nullfs_request_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
                         backoff(backoff_yields);
                         nullfs_generation = start_service(
                             &mut nullfs_service,
                             &mut nullfs_generations,
                             nullfs_readiness_endpoint,
-                            nullfs_request_endpoint,
+                            &mut nullfs_request_endpoint,
                             &[nullfs_block_capability],
                             &NULLFS_MESSAGES,
                         );
@@ -1648,8 +1659,24 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         });
                         nullfs_service.complete_restart();
                     }
-                    ServiceStatusDisposition::Stopped => {}
-                    ServiceStatusDisposition::Failed => fail(NULLFS_SERVICE_FAILED),
+                    ServiceStatusDisposition::Stopped => {
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Nullfs,
+                            nullfs_generation,
+                            NULLFS_SERVICE_FAILED,
+                        );
+                        ipc::close(nullfs_request_endpoint)
+                            .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
+                    }
+                    ServiceStatusDisposition::Failed => {
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Nullfs,
+                            nullfs_generation,
+                            NULLFS_SERVICE_FAILED,
+                        );
+                        let _ = ipc::close(nullfs_request_endpoint);
+                        fail(NULLFS_SERVICE_FAILED)
+                    }
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
@@ -1663,12 +1690,20 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::WaitForNextEvent => {}
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, SERVICE_RESTARTING);
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Tmpfs,
+                            tmpfs_generation,
+                            SERVICE_FAILED,
+                        );
+                        ipc::close(request_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
+                        request_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
                         backoff(backoff_yields);
                         tmpfs_generation = start_service(
                             &mut service,
                             &mut tmpfs_generations,
                             readiness_endpoint,
-                            request_endpoint,
+                            &mut request_endpoint,
                             &[],
                             &TMPFS_MESSAGES,
                         );
@@ -1685,8 +1720,23 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         });
                         service.complete_restart();
                     }
-                    ServiceStatusDisposition::Stopped => {}
-                    ServiceStatusDisposition::Failed => fail(SERVICE_FAILED),
+                    ServiceStatusDisposition::Stopped => {
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Tmpfs,
+                            tmpfs_generation,
+                            SERVICE_FAILED,
+                        );
+                        ipc::close(request_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
+                    }
+                    ServiceStatusDisposition::Failed => {
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Tmpfs,
+                            tmpfs_generation,
+                            SERVICE_FAILED,
+                        );
+                        let _ = ipc::close(request_endpoint);
+                        fail(SERVICE_FAILED)
+                    }
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
@@ -1700,12 +1750,21 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     ServiceStatusDisposition::WaitForNextEvent => {}
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, VFS_SERVICE_RESTARTING);
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Vfs,
+                            vfs_generation,
+                            VFS_SERVICE_FAILED,
+                        );
+                        ipc::close(vfs_request_endpoint)
+                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
+                        vfs_request_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
                         backoff(backoff_yields);
                         vfs_generation = start_service(
                             &mut vfs_service,
                             &mut vfs_generations,
                             vfs_readiness_endpoint,
-                            vfs_request_endpoint,
+                            &mut vfs_request_endpoint,
                             &[],
                             &VFS_MESSAGES,
                         );
@@ -1722,8 +1781,24 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         });
                         vfs_service.complete_restart();
                     }
-                    ServiceStatusDisposition::Stopped => {}
-                    ServiceStatusDisposition::Failed => fail(VFS_SERVICE_FAILED),
+                    ServiceStatusDisposition::Stopped => {
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Vfs,
+                            vfs_generation,
+                            VFS_SERVICE_FAILED,
+                        );
+                        ipc::close(vfs_request_endpoint)
+                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
+                    }
+                    ServiceStatusDisposition::Failed => {
+                        offline_filesystem_provider(
+                            platform::FilesystemProvider::Vfs,
+                            vfs_generation,
+                            VFS_SERVICE_FAILED,
+                        );
+                        let _ = ipc::close(vfs_request_endpoint);
+                        fail(VFS_SERVICE_FAILED)
+                    }
                 },
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
@@ -1872,10 +1947,9 @@ fn run_nullfs_restart_probe(
         .unwrap_or_else(|| fail(NULLFS_RESTART_PROBE_FAILED));
     let old_generation = registry.nullfs_generation;
     let restart_count = registry.nullfs.restart_count();
-    if ipc::info(*request_endpoint)
-        .map(|info| info.size)
-        .unwrap_or(1)
-        != 0
+    let old_endpoint_info =
+        ipc::info(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    if old_endpoint_info.size != 0
         || syscall::signal_process_group(old_service_process_id, signal::STOP).ok() != Some(1)
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
@@ -1994,6 +2068,41 @@ fn run_nullfs_restart_probe(
     if backoff_yields != 0 || registry.nullfs.restart_count() != restart_count {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
+    offline_filesystem_provider(
+        platform::FilesystemProvider::Nullfs,
+        old_generation,
+        NULLFS_RESTART_PROBE_FAILED,
+    );
+    offline_filesystem_provider(
+        platform::FilesystemProvider::Nullfs,
+        old_generation,
+        NULLFS_RESTART_PROBE_FAILED,
+    );
+    let mut offline = [0_u8; 64];
+    loop {
+        match ipc::try_receive(ready_endpoint, &mut offline) {
+            Ok(message) => {
+                if message.sender_process_id != probe_process_id
+                    || message.capability.is_some()
+                    || message.bytes != NULLFS_RESTART_PROBE_OFFLINE.len()
+                    || &offline[..message.bytes] != NULLFS_RESTART_PROBE_OFFLINE
+                {
+                    fail(NULLFS_RESTART_PROBE_FAILED);
+                }
+                break;
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+        if !matches!(
+            syscall::try_wait_child(probe_process_id),
+            Err(error) if error == syscall::Errno::TRY_AGAIN
+                || error == syscall::Errno::INTERRUPTED
+        ) {
+            fail(NULLFS_RESTART_PROBE_FAILED);
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    }
     let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
     backoff(backoff_yields);
 
@@ -2046,13 +2155,20 @@ fn run_nullfs_restart_probe(
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
 
-    let replacement_request_endpoint =
+    ipc::close(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let mut replacement_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    if ipc::info(replacement_request_endpoint)
+        .map(|info| info.object_id == old_endpoint_info.object_id)
+        .unwrap_or(true)
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
     let generation = start_service(
         registry.nullfs,
         generations,
         readiness_endpoint,
-        replacement_request_endpoint,
+        &mut replacement_request_endpoint,
         &[block_capability],
         &NULLFS_MESSAGES,
     );
@@ -2060,9 +2176,18 @@ fn run_nullfs_restart_probe(
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
     register_nullfs_proxy(generation, replacement_request_endpoint);
-    let stale_request_endpoint = *request_endpoint;
+    if platform::offline_filesystem_provider(
+        platform::FilesystemProvider::Nullfs,
+        u32::try_from(old_generation.get()).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED)),
+    )
+    .err()
+        != Some(platform::Errno::INVALID_ARGUMENT)
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    ipc::send(control_endpoint, NULLFS_RESTART_PROBE_REPLACEMENT, None)
+        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     *request_endpoint = replacement_request_endpoint;
-    ipc::close(stale_request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
 
     control.drain_mutation(ServiceRegistryMut {
         logging: &mut *registry.logging,
@@ -2112,6 +2237,17 @@ fn run_nullfs_restart_probe(
     ipc::close(ready_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     ipc::close(control_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     generation
+}
+
+fn offline_filesystem_provider(
+    provider: platform::FilesystemProvider,
+    service_generation: ProviderGeneration,
+    failure_message: &[u8],
+) {
+    let generation =
+        u32::try_from(service_generation.get()).unwrap_or_else(|_| fail(failure_message));
+    platform::offline_filesystem_provider(provider, generation)
+        .unwrap_or_else(|_| fail(failure_message));
 }
 
 fn register_nullfs_proxy(
@@ -2651,7 +2787,7 @@ fn start_service(
     service: &mut ServiceRuntime,
     generations: &mut ProviderGenerationSequence,
     readiness_endpoint: CapabilityHandle,
-    request_endpoint: CapabilityHandle,
+    request_endpoint: &mut CapabilityHandle,
     additional_capabilities: &[BootstrapCapability],
     messages: &ServiceMessages,
 ) -> ProviderGeneration {
@@ -2681,7 +2817,7 @@ fn start_service(
             != Some(READY_HANDLE)
             || ipc::grant_child(
                 process_id,
-                request_endpoint,
+                *request_endpoint,
                 Rights::RECEIVE,
                 REQUEST_HANDLE,
             )
@@ -2740,6 +2876,10 @@ fn start_service(
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, messages.restarting);
                         backoff(backoff_yields);
+                        ipc::close(*request_endpoint)
+                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
+                        *request_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
                         break;
                     }
                     ServiceStatusDisposition::Stopped | ServiceStatusDisposition::Failed => {

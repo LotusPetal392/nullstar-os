@@ -142,6 +142,38 @@ a replacement that remounts and runs normal recovery. `OUTCOME_UNKNOWN`, a
 failed service generation, and a lost reply are never permission to retry a
 mutation automatically; only an explicitly retryable status may be retried.
 
+## Provider offlining and replacement
+
+ABI 1.13 syscall 58 lets PID 1 offline one exact kernel filesystem-provider
+generation. Its provider selectors are tmpfs `1`, NullFS `2`, and VFS `3`; the
+expected generation must be a nonzero `u32`. An exact active match atomically
+becomes an offline tombstone retaining that generation. Repeating the exact
+tombstone is idempotent success. Unknown selectors, invalid generations, and
+stale or mismatched generations return `EINVAL`; non-PID-1 callers receive
+`EPERM`.
+
+The offline transition fails and wakes exact-generation blocked filesystem work
+with `EIO`, rejects stale replies and later stale work, and purges stale queued
+`CLOSE_NODE` work. It never replays mutations or rebinds an old open-file
+description. A replacement registration must carry a strictly newer generation
+and a fresh endpoint object, not another handle to the old object whose queue
+may still contain requests.
+
+Filesystem restart ordering is fixed:
+
+1. observe final child status;
+2. offline the exact old generation and preserve its tombstone;
+3. fail and wake that generation's blocked work and purge stale close work;
+4. close PID 1's old endpoint handle;
+5. create a fresh endpoint object;
+6. start and register the service under a strictly newer generation;
+7. complete the restart fence only after replacement startup succeeds.
+
+Writable NullFS remains registered until final child status. Withdrawing it
+before final exit would require a service-level quiesce and `SYNC` boundary that
+is not implemented yet; provider offlining does not claim clean-unmount or
+additional durability semantics.
+
 ## Target system namespace
 
 The initial system namespace is:
@@ -258,9 +290,11 @@ also disconnects its persistent session explicitly.
 The kernel proxy registration path now starts that migration: it queues
 `CONNECT` without blocking PID 1, validates the reply from the normal kernel
 poll loop, retains the persistent session reply endpoint, creates a kernel-owned
-4 KiB shared-memory window, and registers it with `ATTACH_BUFFER`. Service
-replacement releases the previous handshake endpoint, session endpoint, and
-bulk-window root before establishing the new generation.
+4 KiB shared-memory window, and registers it with `ATTACH_BUFFER`. Replacement
+no longer relies on registration to tear down the old proxy: PID 1 first
+offlines the exact old generation, and registration then requires a strictly
+newer generation and a fresh service endpoint object before establishing the
+new session.
 
 Kernel `/tmp` open, stat, read, write, and directory iteration now use the
 generic protocol. Open
@@ -356,10 +390,13 @@ state, so append, truncate, cross-handle `fstat`/`SEEK_END`, and open-unlinked
 access remain coherent and one alias cannot close the service node early. Final
 destruction queues one generation- and session-bound `CLOSE_NODE`.
 
-When PID 1 registers a replacement, the kernel releases the previous endpoint,
-session reply endpoint, and bulk buffer and fails old in-flight requests with
-`IO`. It never replays mutations or rebinds existing descriptions; old
-descriptors remain stale, and old-generation close tickets are discarded.
+When PID 1 offlines the exact old generation, the kernel preserves its
+tombstone, releases kernel-owned handshake, session-reply, and bulk-buffer
+state, and fails and wakes old in-flight requests with `IO` (`EIO` at the
+syscall boundary). It rejects stale replies and work and discards old-generation
+close tickets. Replacement registration cannot clear those protections unless
+it supplies both a strictly newer generation and a fresh endpoint object; old
+descriptors remain stale and mutations are never replayed or rebound.
 
 The direct service probe preserves read-only-session denial and exercises the
 service's broader writable protocol surface, including directory creation,

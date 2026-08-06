@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.12, and a
+The ABI is experimental, but callers can query the current version, 1.13, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -296,6 +296,36 @@ Read-only `WRITE` remains `READ_ONLY`, and read-only `FLUSH` remains
 extension. It grants raw partition authority only and does not enable writable
 filesystem-service or VFS syscalls.
 
+## Version 1.13 filesystem-provider offlining
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 58 | `OFFLINE_FILESYSTEM_PROVIDER` | `provider_kind`, `expected_generation` | zero |
+
+This PID-1-only operation removes one exact filesystem-provider incarnation from
+kernel routing. Provider kinds are `1` for tmpfs, `2` for NullFS, and `3` for
+VFS. The expected generation must be representable as a nonzero `u32`.
+
+An exact active-generation match atomically changes that provider to an offline
+tombstone retaining the generation. Repeating the call for that exact tombstone
+is an idempotent success. An unknown provider kind, zero or out-of-range
+generation, or stale or otherwise mismatched generation returns `EINVAL`.
+Callers other than PID 1 receive `EPERM`.
+
+Offlining fails and wakes blocked work belonging to that exact generation with
+`EIO`, rejects stale replies and later stale work, and purges queued close work
+for the old generation. Registration of a replacement must use a strictly newer
+generation and a fresh endpoint object; a new handle to the old endpoint object
+is not sufficient. The tombstone remains authoritative until that registration
+succeeds.
+
+Supervisor ordering is final child status, exact-generation offlining,
+failure/wakeup of old work, closure of PID 1's old endpoint handle, creation of
+a fresh endpoint object, startup and registration under the newer generation,
+and only then completion of the restart fence. Writable NullFS is not withdrawn
+before final child status because a pre-exit quiesce-and-sync protocol remains
+future work.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -312,6 +342,8 @@ filesystem-service or VFS syscalls.
   changing the ABI 1.9 syscall 54 contract.
 - ABI 1.12 adds uncatchable, unblockable signal 9 to the existing direct-child
   and process-group signaling contracts.
+- ABI 1.13 adds PID-1-only exact-generation filesystem-provider offlining at
+  syscall 58 without changing the filesystem or `NSVC` wire protocols.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are
