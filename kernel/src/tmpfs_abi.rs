@@ -7,6 +7,36 @@ pub enum RegistrationError {
     MissingSendRight,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfflineError {
+    Permission,
+    InvalidProvider,
+    InvalidGeneration,
+}
+
+pub fn validate_offline(
+    process_id: u64,
+    init_process_id: u64,
+    provider: u64,
+    generation: u64,
+    tmpfs_provider: u64,
+    nullfs_provider: u64,
+    vfs_provider: u64,
+) -> Result<u32, OfflineError> {
+    if process_id != init_process_id {
+        return Err(OfflineError::Permission);
+    }
+    if !matches!(provider, value if value == tmpfs_provider || value == nullfs_provider || value == vfs_provider)
+    {
+        return Err(OfflineError::InvalidProvider);
+    }
+    let generation = u32::try_from(generation).map_err(|_| OfflineError::InvalidGeneration)?;
+    if generation == 0 {
+        return Err(OfflineError::InvalidGeneration);
+    }
+    Ok(generation)
+}
+
 pub fn validate_registration(
     process_id: u64,
     init_process_id: u64,
@@ -64,11 +94,17 @@ pub fn valid_reply_envelope(envelope: ReplyEnvelope) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RegistrationError, ReplyEnvelope, valid_reply_envelope, validate_registration};
+    use super::{
+        OfflineError, RegistrationError, ReplyEnvelope, valid_reply_envelope, validate_offline,
+        validate_registration,
+    };
 
     const INIT: u64 = 1;
     const ENDPOINT: u64 = 1;
     const SEND: u64 = 1 << 1;
+    const TMPFS: u64 = 1;
+    const NULLFS: u64 = 2;
+    const VFS: u64 = 3;
 
     #[test]
     fn registration_requires_init_and_a_bounded_nonzero_generation() {
@@ -91,6 +127,38 @@ mod tests {
                 SEND
             ),
             Err(RegistrationError::InvalidGeneration)
+        );
+    }
+
+    #[test]
+    fn offline_requires_init_a_known_provider_and_a_bounded_nonzero_generation() {
+        assert_eq!(
+            validate_offline(2, INIT, TMPFS, 1, TMPFS, NULLFS, VFS),
+            Err(OfflineError::Permission)
+        );
+        assert_eq!(
+            validate_offline(INIT, INIT, 99, 1, TMPFS, NULLFS, VFS),
+            Err(OfflineError::InvalidProvider)
+        );
+        assert_eq!(
+            validate_offline(INIT, INIT, TMPFS, 0, TMPFS, NULLFS, VFS),
+            Err(OfflineError::InvalidGeneration)
+        );
+        assert_eq!(
+            validate_offline(
+                INIT,
+                INIT,
+                NULLFS,
+                u64::from(u32::MAX) + 1,
+                TMPFS,
+                NULLFS,
+                VFS
+            ),
+            Err(OfflineError::InvalidGeneration)
+        );
+        assert_eq!(
+            validate_offline(INIT, INIT, VFS, u64::from(u32::MAX), TMPFS, NULLFS, VFS),
+            Ok(u32::MAX)
         );
     }
 

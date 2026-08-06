@@ -12,8 +12,9 @@ model is specified in
 [Service, session, and application lifecycle](service-and-session-lifecycle.md). The current
 [`NSVC` v1 milestone](../service-control-protocol.md) supplies a host-testable, allocation-free
 64-byte control codec plus capability-separated native observation and mutation through PID 1 and
-`sv`. Restart is generic, while logging is the first live `start`/`stop` target using bounded
-convergence and generation-isolated route replacement. There is no separate manager.
+`sv`. Mutation is not restart-only: restart is generic, while logging is the first live
+`start`/`stop` target using bounded convergence and generation-isolated route replacement.
+Filesystem `Start` and `Stop` remain exactly `Unsupported`. There is no separate manager.
 
 ## PID 1 and the system service manager
 
@@ -254,12 +255,15 @@ cooperative termination request to uncatchable, unblockable signal 9 after a bou
 A distinct readiness deadline force-terminates a live starting generation that never becomes ready;
 its final status then follows the ordinary bounded restart/backoff and failure policy.
 
-A successful start or stop response commits desired state; it does not wait for readiness or final
-exit. Filesystem services require generation-checked provider offlining first: pending kernel
-proxy requests must be failed and woken, old endpoint queues must never reach a replacement, and
-writable NullFS must quiesce and flush before forced termination. This milestone adds no manager
-process, activation, definitions, cross-reboot persistence, or new lifecycle syscall; the existing
-signal ABI now includes the forced-termination signal used for bounded escalation.
+A successful logging start or stop response commits desired state; it does not wait for readiness or
+final exit. Filesystem restart now waits for final child status, offlines the exact old generation,
+fails and wakes its blocked proxy work, closes the old endpoint handle, creates a fresh endpoint
+object, and registers a strictly newer generation before completing the restart fence. The kernel
+retains the old generation as an offline tombstone, rejects stale replies and work, and purges stale
+close work. Writable NullFS is deliberately not withdrawn before final exit because pre-exit quiesce
+and `SYNC` remain future work. Filesystem `Start` and `Stop` therefore remain `Unsupported`, and
+`NSVC` v1 is unchanged. This milestone adds no manager process, activation, definitions, or
+cross-reboot persistence; ABI 1.13 adds only the PID-1 provider-offlining syscall.
 
 ## The `sv` command
 
@@ -427,9 +431,10 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    current supervisor. **Partly delivered:** the allocation-free, host-testable `NSVC` v1 codec and
    PID 1 service registry fixes the observation contract, but job containment remains.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
-   delivered:** native `list`, `status`, and restart use separately authorized IPC, and logging has
-   live in-memory `start`/`stop`; filesystem convergence and cross-reboot desired state remain future
-   work.
+   delivered:** native `list`, `status`, and restart use separately authorized IPC, logging has live
+   in-memory `start`/`stop`, and filesystem restart has exact-generation provider offlining;
+   filesystem live `start`/`stop`, writable pre-exit quiesce/`SYNC`, and cross-reboot desired state
+   remain future work.
 3. Introduce the one-bootstrap-channel startup contract and stable service generations.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.

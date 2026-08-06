@@ -39,8 +39,8 @@ Generated images use `/BOOTMODE` to select among:
 
 - `normal`, which starts services, PID 1, and the foreground userspace shell;
 - `smoke-test`, which runs deterministic subsystem probes and persistence checks;
-- `nullfs-restart-test`, which replaces the mounted NullFS service while a probe owns a
-  live descriptor and blocked read;
+- `nullfs-restart-test`, which offlines and replaces the mounted NullFS service while a
+  probe owns a live descriptor and blocked read;
 - `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
   generation replacement, restart fencing, filesystem mutation policy, and forced termination.
 
@@ -85,8 +85,8 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI. Shared numeric and structure definitions are included
-by both kernel and userspace.
+experimental NullStar syscall ABI, currently version 1.13. Shared numeric and structure
+definitions are included by both kernel and userspace.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh
@@ -160,10 +160,14 @@ start/stop success commits desired state without
 waiting for exit or readiness. PID 1 first requests cooperative termination and escalates after a
 bounded grace period with uncatchable, unblockable signal 9; the dedicated lifecycle image verifies
 that escalation, duplicate-restart `Busy`, and exact filesystem `Start`/`Stop` `Unsupported` policy.
-Filesystem providers must first gain generation-checked offlining that fails pending kernel proxy work
-and never carries an old endpoint queue into a replacement, while writable NullFS also requires
-orderly quiesce and flush. This adds no manager process, activation, definition loading, cross-reboot
-persistence, or new lifecycle syscall.
+Filesystem restart now waits for final child status, offlines the exact old generation through the
+PID-1-only ABI 1.13 syscall, fails and wakes that generation's blocked proxy work with `EIO`, closes
+the old endpoint handle, creates a fresh endpoint object, and starts and registers a strictly newer
+generation before completing the restart fence. The kernel preserves an offline generation tombstone,
+rejects stale replies and work, and purges stale close work. Writable NullFS remains online until final
+exit because orderly pre-exit quiesce and `SYNC` remain future work. Filesystem `Start` and `Stop`
+therefore remain exactly `Unsupported`; `NSVC` v1 is unchanged. This adds no manager process,
+activation, definition loading, or cross-reboot persistence.
 
 ### Future service and session lifecycle
 
@@ -290,8 +294,10 @@ successful generic `WRITE` reply retains the byte count in `value` and carries t
 authoritative resulting offset as eight little-endian inline bytes, including the EOF
 selected by append. Open descriptions for the same generation-, session-, and node-bound
 file share size state, preserving append, truncate, cross-handle `fstat`/`SEEK_END`, and
-open-unlinked coherence. Service replacement never replays or rebinds old descriptions;
-they remain stale.
+open-unlinked coherence. Exact-generation offlining fails and wakes blocked old work,
+purges stale close work, and never replays or rebinds old descriptions; they remain stale.
+The retained tombstone permits replacement registration only with a strictly newer
+generation and a fresh endpoint object.
 
 The public proxy validates canonical replies. `OUTCOME_UNKNOWN`, a malformed reply, or
 post-send uncertainty about a mutation maps to `IO`, quarantines that service

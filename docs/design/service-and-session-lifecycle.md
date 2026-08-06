@@ -27,9 +27,14 @@ charging failure policy, while start creates and publishes only a fresh ready ge
 intent remains fenced through replacement startup, queued duplicates receive `Busy`, and PID 1
 escalates an uncooperative child to uncatchable signal 9 after a bounded grace period. Starting
 logging generations also have a bounded readiness deadline whose expiry enters normal restart and
-backoff policy rather than leaving the runtime in `Starting` indefinitely. Filesystem
-start/stop remains unsupported pending provider offlining and orderly quiesce. A separate manager,
-activation, definition loading, and cross-reboot desired-state persistence remain future work.
+backoff policy rather than leaving the runtime in `Starting` indefinitely. Filesystem restart now
+offlines the exact old provider generation after final child status, fails and wakes old blocked work,
+closes the old endpoint handle, creates a fresh endpoint object, and registers a strictly newer
+generation before releasing the restart fence. The kernel retains an offline tombstone and rejects
+stale replies, work, and close cleanup. Filesystem `Start` and `Stop` remain exactly `Unsupported`;
+writable NullFS remains online until final exit because pre-exit quiesce and `SYNC` are still future
+work. `NSVC` v1 is unchanged. A separate manager, activation, definition loading, and cross-reboot
+desired-state persistence remain future work.
 
 ## Design goals
 
@@ -190,7 +195,9 @@ and every startup attempt consumes a generation independent of process IDs. PID 
 service in a strict one-use `NSGN` v1 record over a private receive-only bootstrap endpoint; the
 service validates PID 1, exact rights, no capability attachment, and canonical encoding before
 closing the handle and declaring readiness. The generation binds filesystem sessions and proxy
-registrations, while logging also binds its collector, `NSLS`, NSWP, and route publications. A
+registrations, while logging also binds its collector, `NSLS`, NSWP, and route publications. For a
+filesystem replacement, the kernel preserves the exact old generation as an offline tombstone and
+accepts registration only under a strictly newer generation with a fresh endpoint object. A
 restartable service manager must eventually own these sequences and receive their current state
 across replacement. The current contract provides no durable cross-boot persistence.
 

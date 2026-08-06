@@ -14,8 +14,9 @@ recovery, checking, deterministic image creation, and an explicitly enabled writ
 FUSE adapter. NullStar implements narrowly scoped raw writable block-device authority and
 a separately supervised service that mounts `nullfs-core` read-write and offers explicitly
 negotiated writable protocol sessions. PR C added a bounded writable kernel proxy and
-public create, write, truncate, append, and unlink. The generated primary volume is now
-selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `System/`,
+public create, write, truncate, append, and unlink. Exact-generation provider offlining
+now isolates failed or controlled replacement generations. The generated primary volume
+is selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `System/`,
 `Applications/`, and `Users/`. Namespace bindings, public `mkdir`/`rmdir`/rename, offline
 repair policy, and adoption of those backing trees remain future work.
 
@@ -27,7 +28,7 @@ repair policy, and adoption of those backing trees remain future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, bounded public mutation, and primary volume identity/layout implemented; namespace bindings next |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, bounded public mutation, provider offlining, and primary volume identity/layout implemented; namespace bindings next |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -264,14 +265,15 @@ open, descriptor write, unlink, `fstat`, seek, `read_directory`, and `chdir`. Pu
 
 Successful opens retain opaque, generation- and session-scoped service nodes in kernel
 open-file descriptions. Descriptor duplication and inheritance share the description,
-and only final destruction queues `CLOSE_NODE`. When supervision registers a
-replacement generation:
+and only final destruction queues `CLOSE_NODE`. After final child status, supervision
+offlines the exact old generation before registering a replacement:
 
-- old in-flight requests fail with `IO`;
+- old in-flight requests fail and wake with `IO` (`EIO` at the syscall boundary);
 - old descriptors remain stale instead of silently rebinding;
-- later stale I/O continues to fail with `IO`;
-- close tickets from the old generation are discarded rather than sent to the
-  replacement.
+- stale replies and later stale I/O continue to fail with `IO`;
+- close tickets from the old generation are purged rather than sent to the replacement;
+- the preserved tombstone permits registration only with a strictly newer generation and
+  a fresh endpoint object.
 
 The service adapter must continue to validate buffer bounds, file offsets, capacities,
 operation flags, reply byte counts, session ownership, and provider generation. It must
@@ -279,10 +281,12 @@ also preserve clean shutdown, dirty startup, replacement, and block-device-loss
 semantics without weakening the on-disk rules.
 
 Current normal-boot coverage includes direct protocol probes and mounted VFS probes
-through public syscalls. The dedicated `nullfs-restart-test` image stops a service with
-a live descriptor and queued read, registers a replacement on a fresh endpoint, and
-verifies deterministic cancellation, stale-handle behavior, safe close handling, and
-successful access through the replacement generation.
+through public syscalls. The dedicated `nullfs-restart-test` image observes final service
+status with a live descriptor and queued read, offlines the exact generation, fails and
+wakes the queued read, closes the old endpoint handle, creates a fresh endpoint object,
+and registers a strictly newer generation before releasing the restart fence. It verifies
+deterministic cancellation, stale-handle and stale-reply rejection, safe close-work
+purging, and successful access through the replacement generation.
 
 ```sh
 cargo run --locked --quiet -- --nullfs-restart-check
@@ -391,8 +395,8 @@ transaction and recovery semantics.
 
 Open descriptions for the same generation-, session-, and node-bound file share size
 state, preserving append, truncate, cross-handle `fstat`/`SEEK_END`, and open-unlinked
-coherence. Replacement
-leaves old descriptors stale and neither replays mutations nor rebinds descriptions.
+coherence. Exact-generation offlining leaves old descriptors stale and neither replays
+mutations nor rebinds descriptions.
 Public probes cover create, write, independent stale append, cross-handle `fstat` and
 `SEEK_END`, truncate, duplication, unlink while open, open-unlinked read/write, cleanup,
 persistence across service restart, and stale old descriptors.
@@ -458,7 +462,8 @@ only when the remaining integrated work demonstrates:
 
 - crash injection and remount recovery for service-backed mutations;
 - deterministic out-of-space and block-device-loss behavior;
-- clean shutdown ordering and dirty-start recovery;
+- pre-exit writable-service quiesce and `SYNC`, clean shutdown ordering, and dirty-start
+  recovery;
 - namespace binding, canonical-path, and file-identity behavior;
 - continued access to the bootstrap and recovery environment when the primary volume
   cannot mount;

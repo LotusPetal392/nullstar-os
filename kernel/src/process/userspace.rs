@@ -1064,6 +1064,7 @@ struct ActiveTmpfsClose {
 #[derive(Clone, Copy)]
 struct TmpfsProxyState {
     request_endpoint: Option<CapabilityObjectRef>,
+    retired_request_endpoint_id: u64,
     generation: u32,
     connect_reply_endpoint: Option<CapabilityObjectRef>,
     session_reply_endpoint: Option<CapabilityObjectRef>,
@@ -1081,6 +1082,7 @@ impl TmpfsProxyState {
     const fn new() -> Self {
         Self {
             request_endpoint: None,
+            retired_request_endpoint_id: 0,
             generation: 0,
             connect_reply_endpoint: None,
             session_reply_endpoint: None,
@@ -1119,6 +1121,7 @@ static NULLFS_NODE_SIZES: PreemptMutex<Vec<NullfsNodeSize>> = PreemptMutex::new(
 #[derive(Clone, Copy)]
 struct VfsRouteState {
     request_endpoint: Option<CapabilityObjectRef>,
+    retired_request_endpoint_id: u64,
     reply_endpoint: Option<CapabilityObjectRef>,
     generation: u32,
     ready: bool,
@@ -1130,6 +1133,7 @@ impl VfsRouteState {
     const fn new() -> Self {
         Self {
             request_endpoint: None,
+            retired_request_endpoint_id: 0,
             reply_endpoint: None,
             generation: 0,
             ready: false,
@@ -4861,6 +4865,15 @@ fn vfs_route_begin_registration(
     request_endpoint: CapabilityObjectRef,
     generation: u32,
 ) -> Result<(), i64> {
+    {
+        let state = VFS_ROUTE.lock();
+        if state.request_endpoint.is_some()
+            || generation <= state.generation
+            || request_endpoint.id <= state.retired_request_endpoint_id
+        {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+    }
     let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
     let mut request = vfs_protocol::Request::EMPTY;
     request.operation = vfs_protocol::operation::RESOLVE;
@@ -4922,6 +4935,52 @@ fn vfs_route_begin_registration(
     Ok(())
 }
 
+fn vfs_route_offline(generation: u32) -> Result<(), i64> {
+    let (request_endpoint, reply_endpoint) = {
+        let mut state = VFS_ROUTE.lock();
+        if state.generation != generation {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+        let Some(request_endpoint) = state.request_endpoint.take() else {
+            return Ok(());
+        };
+        state.retired_request_endpoint_id = request_endpoint.id;
+        let reply_endpoint = state.reply_endpoint.take();
+        state.ready = false;
+        state.active_request_id = 0;
+        (request_endpoint, reply_endpoint)
+    };
+    kernel_capability_root_remove(request_endpoint);
+    if let Some(reply_endpoint) = reply_endpoint {
+        tmpfs_proxy_release_reply_endpoint(reply_endpoint);
+    } else {
+        CAPABILITY_REGISTRY.lock().collect_garbage();
+    }
+    vfs_route_cancel_generation(generation);
+    Ok(())
+}
+
+fn vfs_route_cancel_generation(generation: u32) {
+    let pending: Vec<(u64, PendingVfsRequest)> = {
+        let mut manager = PROCESS_MANAGER.lock();
+        manager
+            .processes
+            .iter_mut()
+            .filter_map(|process| {
+                let request = process.pending_vfs_request.as_ref()?;
+                if request.generation != generation {
+                    return None;
+                }
+                process
+                    .pending_vfs_request
+                    .take()
+                    .map(|pending| (process.process_id, pending))
+            })
+            .collect()
+    };
+    vfs_route_fail_pending(pending);
+}
+
 fn vfs_route_cancel_stale_requests(generation: u32) {
     let pending: Vec<(u64, PendingVfsRequest)> = {
         let mut manager = PROCESS_MANAGER.lock();
@@ -4940,6 +4999,10 @@ fn vfs_route_cancel_stale_requests(generation: u32) {
             })
             .collect()
     };
+    vfs_route_fail_pending(pending);
+}
+
+fn vfs_route_fail_pending(pending: Vec<(u64, PendingVfsRequest)>) {
     for (process_id, pending) in pending {
         tmpfs_proxy_release_reply_endpoint(pending.reply_endpoint);
         if scheduler::with_process_address_space(process_id, || {
@@ -5012,6 +5075,11 @@ fn vfs_route_service_registration() -> bool {
 fn vfs_route_ready() -> bool {
     let state = *VFS_ROUTE.lock();
     state.request_endpoint.is_some() && state.generation != 0 && state.ready
+}
+
+fn vfs_route_is_offline() -> bool {
+    let state = *VFS_ROUTE.lock();
+    state.generation != 0 && (state.request_endpoint.is_none() || !state.ready)
 }
 
 fn vfs_is_declared_namespace_directory(path: &str) -> bool {
@@ -7374,12 +7442,30 @@ fn tmpfs_proxy_state() -> Option<TmpfsProxyState> {
     }
 }
 
+fn tmpfs_proxy_backend_is_current(
+    generation: u32,
+    session_id: u64,
+    session_generation: u64,
+) -> bool {
+    tmpfs_proxy_state().is_some_and(|state| {
+        state.generation == generation
+            && state.session_id == session_id
+            && state.session_generation == session_generation
+    })
+}
+
 fn tmpfs_proxy_begin_connect(
     request_endpoint: CapabilityObjectRef,
     legacy_generation: u32,
 ) -> Result<(), i64> {
-    if TMPFS_PROXY.lock().generation == legacy_generation {
-        return Err(ERR_INVALID_ARGUMENT);
+    {
+        let state = TMPFS_PROXY.lock();
+        if state.request_endpoint.is_some()
+            || legacy_generation <= state.generation
+            || request_endpoint.id <= state.retired_request_endpoint_id
+        {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
     }
     let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
     let mut request = filesystem_protocol::Request::EMPTY;
@@ -7456,6 +7542,92 @@ fn tmpfs_proxy_begin_connect(
     }
     wake_endpoint_waiter(request_endpoint);
     Ok(())
+}
+
+fn tmpfs_proxy_offline(generation: u32) -> Result<(), i64> {
+    let (request_endpoint, connect_reply_endpoint, session_reply_endpoint, bulk_buffer) = {
+        let mut state = TMPFS_PROXY.lock();
+        if state.generation != generation {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+        let Some(request_endpoint) = state.request_endpoint.take() else {
+            return Ok(());
+        };
+        state.retired_request_endpoint_id = request_endpoint.id;
+        let resources = (
+            request_endpoint,
+            state.connect_reply_endpoint.take(),
+            state.session_reply_endpoint.take(),
+            state.bulk_buffer.take(),
+        );
+        state.session_id = filesystem_protocol::INVALID_ID;
+        state.session_generation = 0;
+        state.session_features = 0;
+        state.bulk_buffer_attached = false;
+        state.active_request_id = filesystem_protocol::INVALID_ID;
+        state.active_close = None;
+        resources
+    };
+    drop(TMPFS_ABANDONED_REQUEST.lock().take());
+    TMPFS_CLOSE_QUEUE
+        .lock()
+        .retain(|ticket| ticket.generation != generation);
+    kernel_capability_root_remove(request_endpoint);
+    if let Some(endpoint) = connect_reply_endpoint {
+        tmpfs_proxy_release_reply_endpoint(endpoint);
+    }
+    if let Some(endpoint) = session_reply_endpoint
+        && Some(endpoint) != connect_reply_endpoint
+    {
+        tmpfs_proxy_release_reply_endpoint(endpoint);
+    }
+    if let Some(buffer) = bulk_buffer {
+        kernel_capability_root_remove(buffer);
+    }
+    CAPABILITY_REGISTRY.lock().collect_garbage();
+    tmpfs_proxy_cancel_generation(generation);
+    Ok(())
+}
+
+fn tmpfs_proxy_cancel_generation(generation: u32) {
+    let pending: Vec<(u64, PendingTmpfsProxyRequest)> = {
+        let mut manager = PROCESS_MANAGER.lock();
+        manager
+            .processes
+            .iter_mut()
+            .filter_map(|process| {
+                let request = process.pending_tmpfs_proxy.as_ref()?;
+                if request.request_generation != generation {
+                    return None;
+                }
+                process
+                    .pending_tmpfs_proxy
+                    .take()
+                    .map(|pending| (process.process_id, pending))
+            })
+            .collect()
+    };
+    for (process_id, pending) in pending {
+        if scheduler::with_process_address_space(process_id, || {
+            let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
+            registers.rax = error_return(ERR_IO);
+        })
+        .is_none()
+        {
+            continue;
+        }
+        let made_runnable = {
+            let mut manager = PROCESS_MANAGER.lock();
+            let Some(process) = manager.process_mut(process_id) else {
+                continue;
+            };
+            process.make_runnable();
+            true
+        };
+        if made_runnable {
+            let _ = scheduler::wake_process(process_id);
+        }
+    }
 }
 
 fn tmpfs_proxy_service_connect() -> bool {
@@ -7990,6 +8162,14 @@ fn tmpfs_proxy_enqueue_close(
     debug_assert_ne!(session_id, filesystem_protocol::INVALID_ID);
     debug_assert_ne!(session_generation, 0);
     debug_assert_ne!(node_id, filesystem_protocol::INVALID_ID);
+    let state = *TMPFS_PROXY.lock();
+    if state.request_endpoint.is_none()
+        || state.generation != generation
+        || state.session_id != session_id
+        || state.session_generation != session_generation
+    {
+        return;
+    }
     let mut queue = TMPFS_CLOSE_QUEUE.lock();
     assert!(
         queue.len() < MAX_PENDING_TMPFS_CLOSES,
@@ -8188,11 +8368,11 @@ fn tmpfs_proxy_begin_filesystem_request(
 ) -> Result<(), i64> {
     let (request_endpoint, reply_endpoint, legacy_generation, request_id) = {
         let mut state = TMPFS_PROXY.lock();
+        let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
         if !state.bulk_buffer_attached || state.active_request_id != filesystem_protocol::INVALID_ID
         {
             return Err(ERR_TRY_AGAIN);
         }
-        let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
         let reply_endpoint = state.session_reply_endpoint.ok_or(ERR_IO)?;
         if state.session_id == filesystem_protocol::INVALID_ID || state.session_generation == 0 {
             return Err(ERR_IO);
@@ -8921,9 +9101,14 @@ fn nullfs_proxy_begin_connect(
     request_endpoint: CapabilityObjectRef,
     generation: u32,
 ) -> Result<(), i64> {
-    let current_generation = NULLFS_PROXY.lock().generation;
-    if current_generation != 0 && generation <= current_generation {
-        return Err(ERR_INVALID_ARGUMENT);
+    {
+        let state = NULLFS_PROXY.lock();
+        if state.request_endpoint.is_some()
+            || generation <= state.generation
+            || request_endpoint.id <= state.retired_request_endpoint_id
+        {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
     }
     let reply_endpoint = tmpfs_proxy_create_reply_endpoint()?;
     let mut request = filesystem_protocol::Request::EMPTY;
@@ -8984,6 +9169,75 @@ fn nullfs_proxy_begin_connect(
     Ok(())
 }
 
+fn nullfs_proxy_offline(generation: u32) -> Result<(), i64> {
+    let (request_endpoint, connect_reply_endpoint, session_reply_endpoint, bulk_buffer) = {
+        let mut state = NULLFS_PROXY.lock();
+        if state.generation != generation {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+        let Some(request_endpoint) = state.request_endpoint.take() else {
+            return Ok(());
+        };
+        state.retired_request_endpoint_id = request_endpoint.id;
+        let resources = (
+            request_endpoint,
+            state.connect_reply_endpoint.take(),
+            state.session_reply_endpoint.take(),
+            state.bulk_buffer.take(),
+        );
+        state.session_id = filesystem_protocol::INVALID_ID;
+        state.session_generation = 0;
+        state.session_features = 0;
+        state.bulk_buffer_attached = false;
+        state.active_request_id = filesystem_protocol::INVALID_ID;
+        state.active_close = None;
+        resources
+    };
+    drop(NULLFS_ABANDONED_REQUEST.lock().take());
+    NULLFS_CLOSE_QUEUE
+        .lock()
+        .retain(|ticket| ticket.generation != generation);
+    NULLFS_NODE_SIZES
+        .lock()
+        .retain(|entry| entry.generation != generation);
+    kernel_capability_root_remove(request_endpoint);
+    if let Some(endpoint) = connect_reply_endpoint {
+        tmpfs_proxy_release_reply_endpoint(endpoint);
+    }
+    if let Some(endpoint) = session_reply_endpoint
+        && Some(endpoint) != connect_reply_endpoint
+    {
+        tmpfs_proxy_release_reply_endpoint(endpoint);
+    }
+    if let Some(buffer) = bulk_buffer {
+        kernel_capability_root_remove(buffer);
+    }
+    CAPABILITY_REGISTRY.lock().collect_garbage();
+    nullfs_proxy_cancel_generation(generation);
+    Ok(())
+}
+
+fn nullfs_proxy_cancel_generation(generation: u32) {
+    let pending: Vec<(u64, PendingNullfsProxyRequest)> = {
+        let mut manager = PROCESS_MANAGER.lock();
+        manager
+            .processes
+            .iter_mut()
+            .filter_map(|process| {
+                let request = process.pending_nullfs_proxy.as_ref()?;
+                if request.request_generation != generation {
+                    return None;
+                }
+                process
+                    .pending_nullfs_proxy
+                    .take()
+                    .map(|pending| (process.process_id, pending))
+            })
+            .collect()
+    };
+    nullfs_proxy_fail_pending(pending);
+}
+
 fn nullfs_proxy_cancel_stale_requests(generation: u32) {
     let pending: Vec<(u64, PendingNullfsProxyRequest)> = {
         let mut manager = PROCESS_MANAGER.lock();
@@ -9002,6 +9256,10 @@ fn nullfs_proxy_cancel_stale_requests(generation: u32) {
             })
             .collect()
     };
+    nullfs_proxy_fail_pending(pending);
+}
+
+fn nullfs_proxy_fail_pending(pending: Vec<(u64, PendingNullfsProxyRequest)>) {
     for (process_id, pending) in pending {
         if scheduler::with_process_address_space(process_id, || {
             let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
@@ -9270,6 +9528,7 @@ fn nullfs_proxy_submit_request(
 ) -> Result<(), i64> {
     let request_endpoint = cpu_interrupts::without_interrupts(|| -> Result<_, i64> {
         let mut state = NULLFS_PROXY.lock();
+        let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
         if !state.bulk_buffer_attached {
             return Err(ERR_TRY_AGAIN);
         }
@@ -9282,7 +9541,6 @@ fn nullfs_proxy_submit_request(
             }
             _ => {}
         }
-        let request_endpoint = state.request_endpoint.ok_or(ERR_IO)?;
         let reply_endpoint = state.session_reply_endpoint.ok_or(ERR_IO)?;
         if state.session_id == filesystem_protocol::INVALID_ID || state.session_generation == 0 {
             return Err(ERR_IO);
@@ -9632,6 +9890,14 @@ fn nullfs_proxy_enqueue_close(
     debug_assert_ne!(session_id, filesystem_protocol::INVALID_ID);
     debug_assert_ne!(session_generation, 0);
     debug_assert_ne!(node_id, filesystem_protocol::INVALID_ID);
+    let state = *NULLFS_PROXY.lock();
+    if state.request_endpoint.is_none()
+        || state.generation != generation
+        || state.session_id != session_id
+        || state.session_generation != session_generation
+    {
+        return;
+    }
     let mut queue = NULLFS_CLOSE_QUEUE.lock();
     assert!(
         queue.len() < MAX_PENDING_TMPFS_CLOSES,
@@ -11307,15 +11573,28 @@ fn syscall_seek(process_id: u64, descriptor: u64, offset: u64, whence: u64) -> u
     let signed = offset as i64;
     let new_offset = {
         let mut f = handle.lock();
-        if let OpenFileBackend::NullfsProxy {
-            generation,
-            session_id,
-            session_generation,
-            ..
-        } = f.backend
-            && !nullfs_proxy_backend_is_current(generation, session_id, session_generation)
-        {
-            return error_return(ERR_IO);
+        match f.backend {
+            OpenFileBackend::TmpfsProxy {
+                generation,
+                session_id,
+                session_generation,
+                ..
+            } if !tmpfs_proxy_backend_is_current(
+                generation,
+                session_id,
+                session_generation,
+            ) => return error_return(ERR_IO),
+            OpenFileBackend::NullfsProxy {
+                generation,
+                session_id,
+                session_generation,
+                ..
+            } if !nullfs_proxy_backend_is_current(
+                generation,
+                session_id,
+                session_generation,
+            ) => return error_return(ERR_IO),
+            _ => {}
         }
         let base = match whence {
             SEEK_SET => 0_i128,

@@ -32,10 +32,20 @@ fn platform_fstat(process_id: u64, descriptor: u64, stat_address: u64, stat_leng
         PlatformDescriptorSource::File(handle) => {
             let file = handle.lock();
             match file.backend {
-                OpenFileBackend::TmpfsProxy { .. } => abi::file::Stat {
-                    kind: abi::file::KIND_FILE,
-                    size: file.size,
-                    flags: 0,
+                OpenFileBackend::TmpfsProxy {
+                    generation,
+                    session_id,
+                    session_generation,
+                    ..
+                } => {
+                    if !tmpfs_proxy_backend_is_current(generation, session_id, session_generation) {
+                        return error_return(ERR_IO);
+                    }
+                    abi::file::Stat {
+                        kind: abi::file::KIND_FILE,
+                        size: file.size,
+                        flags: 0,
+                    }
                 },
                 OpenFileBackend::NullfsProxy {
                     generation,
