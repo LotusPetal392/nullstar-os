@@ -41,6 +41,16 @@ const PREFIXED_BYTES: &[u8] = b"NullStar public VFS ";
 const COMBINED_BYTES: &[u8] = b"NullStar public VFS append";
 const TRUNCATED_BYTES: &[u8] = b"short";
 const OPEN_UNLINKED_BYTES: &[u8] = b"alive";
+const NULLFS_EXEC_TARGET: &[u8] = b"/Applications/ExecProbe/bin/exec-target";
+const NULLFS_EXEC_SPAWN_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/exec-target spawn";
+const NULLFS_EXEC_MISSING_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/missing-target";
+const NULLFS_EXEC_NOT_DIRECTORY_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/exec-target/child";
+const NULLFS_EXEC_MALFORMED_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/malformed-target";
+const NULLFS_EXEC_FORK_PREFIX: &[u8] = b"/Applications/ExecProbe/bin/exec-target fork-exec ";
+const NULLFS_EXEC_PRESERVED_PATH: &[u8] = b"/tmp/nullfs-exec-preserved";
+const NULLFS_EXEC_CLOSED_PATH: &[u8] = b"/tmp/nullfs-exec-closed";
+const NULLFS_EXEC_SPAWN_STATUS: u64 = 41;
+const NULLFS_EXEC_FORK_STATUS: u64 = 42;
 
 const CASES: &[(&[u8], u32, u16, u16)] = &[
     (
@@ -338,6 +348,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
 
     probe_mounted_nullfs();
+    let executable_result = probe_nullfs_executable();
+    if executable_result != 0 {
+        syscall::exit(130 + executable_result);
+    }
     syscall::exit(0)
 }
 
@@ -724,6 +738,10 @@ fn probe_nullfs_restart() -> ! {
     {
         syscall::exit(100);
     }
+    let executable_result = probe_nullfs_executable();
+    if executable_result != 0 {
+        syscall::exit(130 + executable_result);
+    }
     let mut bytes = [0_u8; COMBINED_BYTES.len()];
     if syscall::read(stale, &mut bytes) != Err(syscall::Errno::IO)
         || !platform_failed_with(platform::fstat(stale), errno::IO)
@@ -771,6 +789,169 @@ fn probe_nullfs_restart() -> ! {
         syscall::exit(107);
     }
     syscall::exit(0)
+}
+
+fn probe_nullfs_executable() -> u64 {
+    let mut executable_kind = None;
+    for _ in 0..64 {
+        match platform::stat(NULLFS_EXEC_TARGET) {
+            Ok(stat) => {
+                executable_kind = Some(stat.kind);
+                break;
+            }
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return 1;
+                }
+            }
+            Err(_) => return 1,
+        }
+    }
+    if executable_kind != Some(file::KIND_FILE) {
+        return 1;
+    }
+
+    let malformed = match syscall::spawn_command(
+        NULLFS_EXEC_MALFORMED_COMMAND,
+        syscall::SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(process_id) => process_id,
+        Err(_) => return 8,
+    };
+    if syscall::wait_child(malformed)
+        .ok()
+        .map(|status| status.raw())
+        != Some(126)
+    {
+        return 8;
+    }
+
+    let spawned = match syscall::spawn_command(
+        NULLFS_EXEC_SPAWN_COMMAND,
+        syscall::SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(process_id) => process_id,
+        Err(_) => return 2,
+    };
+    if syscall::wait_child(spawned).ok().map(|status| status.raw())
+        != Some(NULLFS_EXEC_SPAWN_STATUS)
+    {
+        return 3;
+    }
+
+    let parent_process_id = match syscall::getpid() {
+        Ok(process_id) => process_id,
+        Err(_) => return 4,
+    };
+    let parent_process_group = match platform::get_process_group(0) {
+        Ok(process_group) if process_group == parent_process_id => process_group,
+        _ => return 5,
+    };
+    let child = match syscall::fork() {
+        Ok(process_id) => process_id,
+        Err(_) => return 6,
+    };
+    if child == 0 {
+        let preserved = syscall::open(
+            NULLFS_EXEC_PRESERVED_PATH,
+            syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE | syscall::OpenFlags::TRUNCATE,
+        )
+        .unwrap_or_else(|_| syscall::exit(128));
+        let closed = syscall::open(
+            NULLFS_EXEC_CLOSED_PATH,
+            syscall::OpenFlags::WRITE
+                | syscall::OpenFlags::CREATE
+                | syscall::OpenFlags::TRUNCATE
+                | syscall::OpenFlags::CLOSE_ON_EXEC,
+        )
+        .unwrap_or_else(|_| syscall::exit(129));
+        let child_process_id = syscall::getpid().unwrap_or_else(|_| syscall::exit(120));
+        let child_process_group =
+            platform::get_process_group(0).unwrap_or_else(|_| syscall::exit(121));
+        if child_process_id == parent_process_id
+            || child_process_group != parent_process_group
+            || child_process_id == child_process_group
+        {
+            syscall::exit(122);
+        }
+        match syscall::execve(NULLFS_EXEC_MISSING_COMMAND) {
+            Err(error) if error == syscall::Errno::NO_ENTRY => {}
+            _ => syscall::exit(123),
+        }
+        match syscall::execve(NULLFS_EXEC_NOT_DIRECTORY_COMMAND) {
+            Err(error) if i64::from(error.code()) == -errno::NOT_DIRECTORY => {}
+            _ => syscall::exit(131),
+        }
+        match syscall::execve(NULLFS_EXEC_MALFORMED_COMMAND) {
+            Err(error) if error == syscall::Errno::IO => {}
+            _ => syscall::exit(127),
+        }
+        if syscall::write_all(preserved, b"preserved before routed exec\n").is_err()
+            || syscall::write_all(closed, b"cloexec before routed exec\n").is_err()
+        {
+            syscall::exit(130);
+        }
+
+        let mut command = [0_u8; 128];
+        command[..NULLFS_EXEC_FORK_PREFIX.len()].copy_from_slice(NULLFS_EXEC_FORK_PREFIX);
+        let mut length = NULLFS_EXEC_FORK_PREFIX.len();
+        if !append_decimal(&mut command, &mut length, child_process_id)
+            || !append_byte(&mut command, &mut length, b' ')
+            || !append_decimal(&mut command, &mut length, child_process_group)
+            || !append_byte(&mut command, &mut length, b' ')
+            || !append_decimal(&mut command, &mut length, preserved)
+            || !append_byte(&mut command, &mut length, b' ')
+            || !append_decimal(&mut command, &mut length, closed)
+        {
+            syscall::exit(124);
+        }
+        if syscall::execve(&command[..length]).is_err() {
+            syscall::exit(125);
+        }
+        syscall::exit(126);
+    }
+
+    if syscall::wait_child(child).ok().map(|status| status.raw()) == Some(NULLFS_EXEC_FORK_STATUS) {
+        0
+    } else {
+        7
+    }
+}
+
+fn append_decimal(buffer: &mut [u8], length: &mut usize, mut value: u64) -> bool {
+    let mut digits = [0_u8; 20];
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for &digit in digits[..count].iter().rev() {
+        if !append_byte(buffer, length, digit) {
+            return false;
+        }
+    }
+    true
+}
+
+fn append_byte(buffer: &mut [u8], length: &mut usize, byte: u8) -> bool {
+    let Some(slot) = buffer.get_mut(*length) else {
+        return false;
+    };
+    *slot = byte;
+    *length += 1;
+    true
 }
 
 fn recover_public_probe_artifact() -> bool {

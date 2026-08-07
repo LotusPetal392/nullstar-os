@@ -827,6 +827,7 @@ struct PendingChildSpawn {
     new_process_group: bool,
     process_group_id: Option<u64>,
     stack_pointer: usize,
+    claimed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -840,6 +841,69 @@ struct PendingExec {
     path: String,
     arguments: Vec<String>,
     stack_pointer: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutableLoadOwner {
+    ChildSpawn,
+    Exec,
+}
+
+struct PendingExecutableLoad {
+    owner: ExecutableLoadOwner,
+    path: String,
+    stack_pointer: usize,
+    vfs_generation: u32,
+    backend_path: Option<String>,
+    provider_generation: u32,
+    session_id: u64,
+    session_generation: u64,
+    node_id: u64,
+    expected_size: usize,
+    bytes: Vec<u8>,
+    retry: Option<(filesystem_protocol::Request, PendingNullfsProxyOperation)>,
+    result: Option<Result<LoadedExecutable, i64>>,
+}
+
+impl PendingExecutableLoad {
+    fn new(owner: ExecutableLoadOwner, path: &str, stack_pointer: usize) -> Self {
+        Self {
+            owner,
+            path: String::from(path),
+            stack_pointer,
+            vfs_generation: 0,
+            backend_path: None,
+            provider_generation: 0,
+            session_id: filesystem_protocol::INVALID_ID,
+            session_generation: 0,
+            node_id: filesystem_protocol::INVALID_ID,
+            expected_size: 0,
+            bytes: Vec::new(),
+            retry: None,
+            result: None,
+        }
+    }
+
+    fn has_open_node(&self) -> bool {
+        self.provider_generation != 0
+            && self.session_id != filesystem_protocol::INVALID_ID
+            && self.session_generation != 0
+            && self.node_id != filesystem_protocol::INVALID_ID
+    }
+
+    fn take_close_ticket(&mut self) -> Option<PendingTmpfsClose> {
+        if !self.has_open_node() {
+            return None;
+        }
+        let ticket = PendingTmpfsClose {
+            generation: self.provider_generation,
+            session_id: self.session_id,
+            session_generation: self.session_generation,
+            node_id: self.node_id,
+        };
+        self.node_id = filesystem_protocol::INVALID_ID;
+        Some(ticket)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -969,6 +1033,7 @@ enum PendingTmpfsProxyOperation {
 #[derive(Clone)]
 struct PendingNullfsProxyRequest {
     reply_endpoint: CapabilityObjectRef,
+    request: filesystem_protocol::Request,
     request_operation: u16,
     request_generation: u32,
     request_id: u64,
@@ -994,6 +1059,23 @@ enum PendingNullfsProxyOperation {
         generation: u32,
         session_id: u64,
         session_generation: u64,
+    },
+    LoadExecutableOpen {
+        owner: ExecutableLoadOwner,
+        vfs_generation: u32,
+        generation: u32,
+        session_id: u64,
+        session_generation: u64,
+    },
+    LoadExecutableRead {
+        owner: ExecutableLoadOwner,
+        vfs_generation: u32,
+        generation: u32,
+        session_id: u64,
+        session_generation: u64,
+        node_id: u64,
+        offset: usize,
+        length: usize,
     },
     Read {
         handle: OpenFileHandle,
@@ -1038,6 +1120,10 @@ enum NullfsPathPurpose {
         options: vfs::OpenOptions,
         descriptor: u64,
         close_on_exec: bool,
+    },
+    LoadExecutable {
+        owner: ExecutableLoadOwner,
+        vfs_generation: u32,
     },
     ReadDirectory {
         start_index: usize,
@@ -1155,6 +1241,9 @@ enum PendingVfsOperation {
         stat_address: u64,
         stat_length: u64,
     },
+    LoadExecutable {
+        owner: ExecutableLoadOwner,
+    },
     ReadDirectory {
         start_index: usize,
         records_address: u64,
@@ -1270,6 +1359,7 @@ struct Process {
     pending_child_spawn: Option<PendingChildSpawn>,
     pending_child_wait: Option<PendingChildWait>,
     pending_exec: Option<PendingExec>,
+    pending_executable_load: Option<PendingExecutableLoad>,
     pending_fork: Option<PendingFork>,
     pending_cow_fault: Option<PendingCowFault>,
     signal_actions: [abi::signal_action::Action; SIGNAL_TABLE_SIZE],
@@ -2229,6 +2319,7 @@ fn spawn_with_mode(
         pending_child_spawn: None,
         pending_child_wait: None,
         pending_exec: None,
+        pending_executable_load: None,
         pending_fork: None,
         pending_cow_fault: None,
         signal_actions: [abi::signal_action::Action::DEFAULT; SIGNAL_TABLE_SIZE],
@@ -2726,10 +2817,11 @@ impl Runtime {
         })
     }
 
-    fn spawn_child(
+    fn spawn_child_loaded(
         &mut self,
         parent_process_id: u64,
         request: &PendingChildSpawn,
+        executable: &LoadedExecutable,
     ) -> Result<SpawnInfo, Error> {
         let (stdin_target, stdout_target, stderr_target, process_group_id, environment) =
             cpu_interrupts::without_interrupts(|| {
@@ -2739,6 +2831,15 @@ impl Runtime {
                     .iter()
                     .find(|process| process.process_id == parent_process_id)
                     .ok_or(Error::ProcessNotFound(parent_process_id))?;
+                if parent.state != ProcessState::Blocked
+                    || parent.pending_child_spawn.as_ref().is_none_or(|pending| {
+                        !pending.claimed
+                            || pending.stack_pointer != request.stack_pointer
+                            || pending.path != request.path
+                    })
+                {
+                    return Err(Error::InvalidArgument);
+                }
                 let stdin_target = resolve_stream_descriptor(
                     parent,
                     request.stdin_descriptor,
@@ -2788,15 +2889,6 @@ impl Runtime {
             release_stream_target(stdin_target, StreamAccess::Read);
             return Err(error);
         }
-        let executable = match elf::load(&request.path) {
-            Ok(executable) => executable,
-            Err(error) => {
-                release_stream_target(stderr_target, StreamAccess::Write);
-                release_stream_target(stdout_target, StreamAccess::Write);
-                release_stream_target(stdin_target, StreamAccess::Read);
-                return Err(error.into());
-            }
-        };
         let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
         argv.push(request.path.as_str());
         argv.extend(request.arguments.iter().map(String::as_str));
@@ -2805,7 +2897,7 @@ impl Runtime {
             SpawnRequest {
                 path: &request.path,
                 task_name: SHELL_PROCESS_TASK_NAME,
-                executable: &executable,
+                executable,
                 arguments: &argv,
                 environment: &environment,
                 foreground: request.foreground,
@@ -2987,6 +3079,7 @@ impl Runtime {
                 pending_child_spawn: None,
                 pending_child_wait: None,
                 pending_exec: None,
+                pending_executable_load: None,
                 pending_fork: None,
                 pending_cow_fault: None,
                 signal_actions: snapshot.signal_actions,
@@ -3292,7 +3385,7 @@ impl Runtime {
             PipeRead(PipeId),
             PipeWrite(PipeId),
             TmpfsProxy(PendingTmpfsProxyRequest),
-            NullfsProxy(PendingNullfsProxyRequest),
+            NullfsProxy(Box<PendingNullfsProxyRequest>),
             VfsRequest(PendingVfsRequest),
             Child,
         }
@@ -3321,9 +3414,31 @@ impl Runtime {
                         )
                     } else if let Some(pending) = process.pending_tmpfs_proxy.take() {
                         (pending.stack_pointer, InterruptedWait::TmpfsProxy(pending))
-                    } else if let Some(pending) = process.pending_nullfs_proxy.take() {
-                        (pending.stack_pointer, InterruptedWait::NullfsProxy(pending))
-                    } else if let Some(pending) = process.pending_vfs_request.take() {
+                    } else if process
+                        .pending_nullfs_proxy
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            nullfs_proxy_executable_owner(&pending.operation).is_none()
+                        })
+                    {
+                        let pending = process
+                            .pending_nullfs_proxy
+                            .take()
+                            .expect("checked pending NullFS request");
+                        (
+                            pending.stack_pointer,
+                            InterruptedWait::NullfsProxy(Box::new(pending)),
+                        )
+                    } else if process.pending_vfs_request.as_ref().is_some_and(|pending| {
+                        !matches!(
+                            pending.operation,
+                            PendingVfsOperation::LoadExecutable { .. }
+                        )
+                    }) {
+                        let pending = process
+                            .pending_vfs_request
+                            .take()
+                            .expect("checked pending VFS request");
                         (pending.stack_pointer, InterruptedWait::VfsRequest(pending))
                     } else if let Some(pending) = process.pending_child_wait.take() {
                         (pending.stack_pointer, InterruptedWait::Child)
@@ -3374,7 +3489,7 @@ impl Runtime {
                 tmpfs_proxy_abandon_pending(pending);
             }
             InterruptedWait::NullfsProxy(pending) => {
-                nullfs_proxy_abandon_pending(pending);
+                nullfs_proxy_abandon_pending(*pending);
             }
             InterruptedWait::VfsRequest(pending) => vfs_request_release(&pending),
             InterruptedWait::Child => {}
@@ -3599,6 +3714,7 @@ impl Runtime {
         &mut self,
         process_id: u64,
         mut request: PendingExec,
+        executable: &LoadedExecutable,
     ) -> Result<(), Error> {
         let context_pointer = request.stack_pointer;
         let environment = {
@@ -3615,7 +3731,6 @@ impl Runtime {
             process.environment.clone()
         };
 
-        let executable = elf::load(&request.path)?;
         let image = executable.image();
         let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
         argv.push(request.path.as_str());
@@ -3794,42 +3909,80 @@ impl Runtime {
         });
         let mut completed = 0usize;
         for (process_id, request) in requests {
-            match self.replace_process_image(process_id, request.clone()) {
-                Ok(()) => {
-                    completed = completed.saturating_add(1);
+            let executable = if executable_path_uses_service(&request.path) {
+                match poll_service_executable_load(
+                    process_id,
+                    ExecutableLoadOwner::Exec,
+                    &request.path,
+                    request.stack_pointer,
+                ) {
+                    ExecutableLoadPoll::Pending => continue,
+                    ExecutableLoadPoll::Ready(executable) => Ok(executable),
+                    ExecutableLoadPoll::Failed(error) => Err((error, None)),
                 }
-                Err(error) => {
-                    let return_value = error_return(process_error_number(&error));
-                    let should_wake = cpu_interrupts::without_interrupts(|| {
-                        let mut manager = PROCESS_MANAGER.lock();
-                        let Some(process) = manager.process_mut(process_id) else {
-                            return false;
-                        };
-                        if process.state != ProcessState::Blocked || process.pending_exec.is_none()
-                        {
-                            return false;
+            } else {
+                elf::load(&request.path).map_err(|error| {
+                    let error = Error::Elf(error);
+                    (process_error_number(&error), Some(error))
+                })
+            };
+            let failure = match executable {
+                Ok(executable) => {
+                    match self.replace_process_image(process_id, request.clone(), &executable) {
+                        Ok(()) => {
+                            completed = completed.saturating_add(1);
+                            continue;
                         }
-                        let registers =
-                            unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
-                        registers.rax = return_value;
-                        process.pending_exec = None;
-                        process.make_runnable();
-                        process.exec_failure_count = process.exec_failure_count.saturating_add(1);
-                        manager.exec_failures = manager.exec_failures.saturating_add(1);
-                        true
-                    });
-                    if should_wake && !scheduler::wake_process(process_id) {
-                        return Err(Error::ProcessNotFound(process_id));
+                        Err(error) => Some((process_error_number(&error), Some(error))),
                     }
-                    crate::serial_println!(
-                        "userspace process exec failed: pid={}, path={}, error={}",
-                        process_id,
-                        request.path,
-                        error
-                    );
-                    completed = completed.saturating_add(1);
                 }
+                Err(failure) => Some(failure),
+            };
+            let Some((error_number, diagnostic)) = failure else {
+                continue;
+            };
+            let return_value = error_return(error_number);
+            let should_wake = cpu_interrupts::without_interrupts(|| {
+                let mut manager = PROCESS_MANAGER.lock();
+                let Some(process) = manager.process_mut(process_id) else {
+                    return false;
+                };
+                if process.state != ProcessState::Blocked
+                    || process.pending_exec.as_ref().is_none_or(|pending| {
+                        pending.stack_pointer != request.stack_pointer
+                            || pending.path != request.path
+                    })
+                {
+                    return false;
+                }
+                let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
+                registers.rax = return_value;
+                process.pending_exec = None;
+                process.pending_executable_load = None;
+                process.make_runnable();
+                process.exec_failure_count = process.exec_failure_count.saturating_add(1);
+                manager.exec_failures = manager.exec_failures.saturating_add(1);
+                true
+            });
+            if should_wake && !scheduler::wake_process(process_id) {
+                return Err(Error::ProcessNotFound(process_id));
             }
+            if let Some(error) = diagnostic {
+                crate::serial_println!(
+                    "userspace process exec failed: pid={}, path={}, error={}",
+                    process_id,
+                    request.path,
+                    error
+                );
+            } else {
+                crate::serial_println!(
+                    "userspace process exec load failed: pid={}, path={}, errno={}",
+                    process_id,
+                    request.path,
+                    error_number
+                );
+            }
+            completed = completed.saturating_add(1);
         }
         Ok(completed)
     }
@@ -3955,7 +4108,7 @@ impl Runtime {
                     .map(|pending| (process.process_id, pending))
             })
             .collect();
-        let mut completed = 0;
+        let mut completed = 0usize;
         for (process_id, pending) in requests {
             let Some(reply) = vfs_request_take_reply(&pending) else {
                 continue;
@@ -3975,6 +4128,59 @@ impl Runtime {
                 }
                 process.pending_vfs_request = None;
             }
+            if let PendingVfsOperation::LoadExecutable { owner } = &pending.operation {
+                let owner = *owner;
+                match reply {
+                    Ok(reply)
+                        if reply.status == vfs_protocol::status::OK
+                            && reply.backend == vfs_protocol::backend::NULLFS =>
+                    {
+                        match vfs_nullfs_backend_path(&reply, &pending.path) {
+                            Ok(backend_path) => {
+                                if !executable_load_set_route(
+                                    process_id,
+                                    owner,
+                                    pending.stack_pointer,
+                                    pending.generation,
+                                    backend_path,
+                                ) {
+                                    crate::serial_println!(
+                                        "userspace executable route stale: pid={}, path={}",
+                                        process_id,
+                                        pending.path
+                                    );
+                                    executable_load_fail(
+                                        process_id,
+                                        owner,
+                                        pending.stack_pointer,
+                                        ERR_IO,
+                                    );
+                                }
+                            }
+                            Err(error) => executable_load_fail(
+                                process_id,
+                                owner,
+                                pending.stack_pointer,
+                                error,
+                            ),
+                        }
+                    }
+                    Ok(reply) if reply.status == vfs_protocol::status::NOT_FOUND => {
+                        executable_load_fail(
+                            process_id,
+                            owner,
+                            pending.stack_pointer,
+                            ERR_NO_ENTRY,
+                        );
+                    }
+                    Ok(_) | Err(_) => {
+                        executable_load_fail(process_id, owner, pending.stack_pointer, ERR_IO)
+                    }
+                }
+                completed = completed.saturating_add(1);
+                continue;
+            }
+
             let nullfs_backend_path = match &reply {
                 Ok(reply)
                     if reply.status == vfs_protocol::status::OK
@@ -4459,6 +4665,8 @@ impl Runtime {
         if quarantine {
             nullfs_proxy_quarantine(&pending);
         }
+        let executable_owner = nullfs_proxy_executable_owner(&pending.operation);
+
         let result = match reply {
             Ok(reply) if reply.status == filesystem_protocol::status::OK => {
                 nullfs_proxy_complete_success(
@@ -4468,12 +4676,43 @@ impl Runtime {
                     self.physical_memory_offset,
                 )
             }
+            Ok(reply)
+                if executable_owner.is_some()
+                    && reply.status == filesystem_protocol::status::TRY_AGAIN =>
+            {
+                executable_load_set_retry(
+                    process_id,
+                    executable_owner.expect("checked executable load owner"),
+                    pending.stack_pointer,
+                    pending.request,
+                    pending.operation.clone(),
+                );
+                Ok(())
+            }
+            Ok(reply) if executable_owner.is_some() => {
+                executable_load_fail(
+                    process_id,
+                    executable_owner.expect("checked executable load owner"),
+                    pending.stack_pointer,
+                    nullfs_proxy_status_errno(reply.status),
+                );
+                Ok(())
+            }
             Ok(reply) => nullfs_proxy_finish_process(
                 request_id,
                 process_id,
                 pending.stack_pointer,
                 error_return(nullfs_proxy_status_errno(reply.status)),
             ),
+            Err(error) if executable_owner.is_some() => {
+                executable_load_fail(
+                    process_id,
+                    executable_owner.expect("checked executable load owner"),
+                    pending.stack_pointer,
+                    error,
+                );
+                Ok(())
+            }
             Err(error) => nullfs_proxy_finish_process(
                 request_id,
                 process_id,
@@ -4495,26 +4734,88 @@ impl Runtime {
                     .filter_map(|process| {
                         process
                             .pending_child_spawn
-                            .clone()
+                            .as_ref()
+                            .filter(|request| !request.claimed)
+                            .cloned()
                             .map(|request| (process.process_id, request))
                     })
                     .collect()
             });
         let mut completed = 0usize;
         for (parent_process_id, request) in spawn_requests {
-            let result = self.spawn_child(parent_process_id, &request);
-            let return_value = match result {
-                Ok(info) => info.process_id,
-                Err(error) => error_return(process_error_number(&error)),
+            let executable = if executable_path_uses_service(&request.path) {
+                match poll_service_executable_load(
+                    parent_process_id,
+                    ExecutableLoadOwner::ChildSpawn,
+                    &request.path,
+                    request.stack_pointer,
+                ) {
+                    ExecutableLoadPoll::Pending => continue,
+                    ExecutableLoadPoll::Ready(executable) => Ok(executable),
+                    ExecutableLoadPoll::Failed(error) => Err(error),
+                }
+            } else {
+                elf::load(&request.path).map_err(|error| process_error_number(&Error::Elf(error)))
+            };
+            let claimed = {
+                let mut manager = PROCESS_MANAGER.lock();
+                let Some(process) = manager.process_mut(parent_process_id) else {
+                    continue;
+                };
+                if process.state != ProcessState::Blocked {
+                    false
+                } else if let Some(pending) = process.pending_child_spawn.as_mut() {
+                    if pending.claimed
+                        || pending.stack_pointer != request.stack_pointer
+                        || pending.path != request.path
+                    {
+                        false
+                    } else {
+                        pending.claimed = true;
+                        true
+                    }
+                } else {
+                    false
+                }
+            };
+            if !claimed {
+                continue;
+            }
+            let return_value = match executable {
+                Ok(executable) => {
+                    match self.spawn_child_loaded(parent_process_id, &request, &executable) {
+                        Ok(info) => info.process_id,
+                        Err(error) => error_return(process_error_number(&error)),
+                    }
+                }
+                Err(error) => {
+                    crate::serial_println!(
+                        "userspace child executable load failed: pid={}, path={}, errno={}",
+                        parent_process_id,
+                        request.path,
+                        error
+                    );
+                    error_return(error)
+                }
             };
             cpu_interrupts::without_interrupts(|| -> Result<(), Error> {
                 let mut manager = PROCESS_MANAGER.lock();
                 let process = manager
                     .process_mut(parent_process_id)
                     .ok_or(Error::ProcessNotFound(parent_process_id))?;
+                if process.state != ProcessState::Blocked
+                    || process.pending_child_spawn.as_ref().is_none_or(|pending| {
+                        !pending.claimed
+                            || pending.stack_pointer != request.stack_pointer
+                            || pending.path != request.path
+                    })
+                {
+                    return Ok(());
+                }
                 let registers = unsafe { &mut *(request.stack_pointer as *mut SavedRegisters) };
                 registers.rax = return_value;
                 process.pending_child_spawn = None;
+                process.pending_executable_load = None;
                 process.make_runnable();
                 if (return_value as i64) >= 0 {
                     process.child_spawn_count = process.child_spawn_count.saturating_add(1);
@@ -4985,6 +5286,7 @@ fn vfs_route_cancel_generation(generation: u32) {
             .collect()
     };
     vfs_route_fail_pending(pending);
+    executable_load_cancel_vfs_generations(generation, true);
 }
 
 fn vfs_route_cancel_stale_requests(generation: u32) {
@@ -5006,11 +5308,53 @@ fn vfs_route_cancel_stale_requests(generation: u32) {
             .collect()
     };
     vfs_route_fail_pending(pending);
+    executable_load_cancel_vfs_generations(generation, false);
+}
+
+fn executable_load_cancel_vfs_generations(generation: u32, matching: bool) {
+    let (abandoned, closes) = {
+        let mut manager = PROCESS_MANAGER.lock();
+        let mut abandoned = Vec::new();
+        let mut closes = Vec::new();
+        for process in &mut manager.processes {
+            let Some(load) = process.pending_executable_load.as_mut() else {
+                continue;
+            };
+            if load.vfs_generation == 0 || (load.vfs_generation == generation) != matching {
+                continue;
+            }
+            if let Some(close) = load.take_close_ticket() {
+                closes.push(close);
+            }
+            load.bytes.clear();
+            load.retry = None;
+            load.result = Some(Err(ERR_IO));
+            if process
+                .pending_nullfs_proxy
+                .as_ref()
+                .is_some_and(|pending| nullfs_proxy_executable_owner(&pending.operation).is_some())
+                && let Some(pending) = process.pending_nullfs_proxy.take()
+            {
+                abandoned.push(pending);
+            }
+        }
+        (abandoned, closes)
+    };
+    for close in closes {
+        nullfs_proxy_enqueue_close_ticket(close);
+    }
+    for pending in abandoned {
+        nullfs_proxy_abandon_pending(pending);
+    }
 }
 
 fn vfs_route_fail_pending(pending: Vec<(u64, PendingVfsRequest)>) {
     for (process_id, pending) in pending {
         tmpfs_proxy_release_reply_endpoint(pending.reply_endpoint);
+        if let PendingVfsOperation::LoadExecutable { owner } = pending.operation {
+            executable_load_fail(process_id, owner, pending.stack_pointer, ERR_IO);
+            continue;
+        }
         if scheduler::with_process_address_space(process_id, || {
             let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
             registers.rax = error_return(ERR_IO);
@@ -5271,6 +5615,226 @@ fn vfs_route_open(
 
 fn vfs_route_unlink(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
     vfs_route_request(process_id, path, PendingVfsOperation::Unlink, stack_pointer)
+}
+
+enum ExecutableLoadPoll {
+    Pending,
+    Ready(LoadedExecutable),
+    Failed(i64),
+}
+
+enum ExecutableLoadStart {
+    Vfs,
+    Nullfs {
+        backend_path: String,
+        vfs_generation: u32,
+    },
+    Retry {
+        request: filesystem_protocol::Request,
+        operation: PendingNullfsProxyOperation,
+    },
+    Complete {
+        result: Result<LoadedExecutable, i64>,
+        vfs_generation: u32,
+        provider_generation: u32,
+        session_id: u64,
+        session_generation: u64,
+    },
+}
+
+fn executable_path_uses_service(path: &str) -> bool {
+    path == "/Applications" || path.starts_with("/Applications/")
+}
+
+fn executable_load_fail(
+    process_id: u64,
+    owner: ExecutableLoadOwner,
+    stack_pointer: usize,
+    error: i64,
+) {
+    let close = {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            return;
+        };
+        let Some(load) = process.pending_executable_load.as_mut() else {
+            return;
+        };
+        if load.owner != owner || load.stack_pointer != stack_pointer {
+            return;
+        }
+        let close = load.take_close_ticket();
+        load.bytes.clear();
+        load.retry = None;
+        load.result = Some(Err(error));
+        close
+    };
+    if let Some(close) = close {
+        nullfs_proxy_enqueue_close_ticket(close);
+    }
+}
+
+fn executable_load_set_route(
+    process_id: u64,
+    owner: ExecutableLoadOwner,
+    stack_pointer: usize,
+    vfs_generation: u32,
+    backend_path: String,
+) -> bool {
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return false;
+    };
+    let Some(load) = process.pending_executable_load.as_mut() else {
+        return false;
+    };
+    if load.owner != owner || load.stack_pointer != stack_pointer || load.result.is_some() {
+        return false;
+    }
+    load.vfs_generation = vfs_generation;
+    load.backend_path = Some(backend_path);
+    true
+}
+
+fn executable_load_set_retry(
+    process_id: u64,
+    owner: ExecutableLoadOwner,
+    stack_pointer: usize,
+    request: filesystem_protocol::Request,
+    operation: PendingNullfsProxyOperation,
+) {
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return;
+    };
+    let Some(load) = process.pending_executable_load.as_mut() else {
+        return;
+    };
+    if load.owner == owner && load.stack_pointer == stack_pointer && load.result.is_none() {
+        load.retry = Some((request, operation));
+    }
+}
+
+fn poll_service_executable_load(
+    process_id: u64,
+    owner: ExecutableLoadOwner,
+    path: &str,
+    stack_pointer: usize,
+) -> ExecutableLoadPoll {
+    let action = {
+        let mut manager = PROCESS_MANAGER.lock();
+        let Some(process) = manager.process_mut(process_id) else {
+            return ExecutableLoadPoll::Failed(ERR_NO_PROCESS);
+        };
+        if process.pending_executable_load.is_none() {
+            process.pending_executable_load =
+                Some(PendingExecutableLoad::new(owner, path, stack_pointer));
+        }
+        let Some(load) = process.pending_executable_load.as_mut() else {
+            return ExecutableLoadPoll::Failed(ERR_IO);
+        };
+        if load.owner != owner || load.path != path || load.stack_pointer != stack_pointer {
+            let close = load.take_close_ticket();
+            process.pending_executable_load = None;
+            drop(manager);
+            if let Some(close) = close {
+                nullfs_proxy_enqueue_close_ticket(close);
+            }
+            return ExecutableLoadPoll::Failed(ERR_IO);
+        }
+        if let Some(result) = load.result.take() {
+            let complete = ExecutableLoadStart::Complete {
+                result,
+                vfs_generation: load.vfs_generation,
+                provider_generation: load.provider_generation,
+                session_id: load.session_id,
+                session_generation: load.session_generation,
+            };
+            process.pending_executable_load = None;
+            complete
+        } else if process.pending_vfs_request.is_some() || process.pending_nullfs_proxy.is_some() {
+            return ExecutableLoadPoll::Pending;
+        } else if let Some((request, operation)) = load.retry.take() {
+            ExecutableLoadStart::Retry { request, operation }
+        } else if load.vfs_generation == 0 {
+            ExecutableLoadStart::Vfs
+        } else {
+            let Some(backend_path) = load.backend_path.clone() else {
+                return ExecutableLoadPoll::Failed(ERR_IO);
+            };
+            ExecutableLoadStart::Nullfs {
+                backend_path,
+                vfs_generation: load.vfs_generation,
+            }
+        }
+    };
+
+    let outcome = match action {
+        ExecutableLoadStart::Vfs => vfs_route_request(
+            process_id,
+            path,
+            PendingVfsOperation::LoadExecutable { owner },
+            stack_pointer,
+        ),
+        ExecutableLoadStart::Nullfs {
+            backend_path,
+            vfs_generation,
+        } => nullfs_proxy_start_path(
+            process_id,
+            path,
+            &backend_path,
+            NullfsPathPurpose::LoadExecutable {
+                owner,
+                vfs_generation,
+            },
+            stack_pointer,
+        ),
+        ExecutableLoadStart::Retry { request, operation } => {
+            match nullfs_proxy_begin_request(process_id, request, operation.clone(), stack_pointer)
+            {
+                Ok(()) => ControlOutcome::Blocked,
+                Err(error) if error == ERR_TRY_AGAIN => {
+                    executable_load_set_retry(process_id, owner, stack_pointer, request, operation);
+                    ControlOutcome::Ready(error_return(ERR_TRY_AGAIN))
+                }
+                Err(error) => ControlOutcome::Ready(error_return(error)),
+            }
+        }
+        ExecutableLoadStart::Complete {
+            result,
+            vfs_generation,
+            provider_generation,
+            session_id,
+            session_generation,
+        } => {
+            let authority_current = vfs_route_generation_is_current(vfs_generation)
+                && nullfs_proxy_backend_is_current(
+                    provider_generation,
+                    session_id,
+                    session_generation,
+                );
+            return match result {
+                Ok(executable) if authority_current => ExecutableLoadPoll::Ready(executable),
+                Ok(_) => ExecutableLoadPoll::Failed(ERR_IO),
+                Err(error) => ExecutableLoadPoll::Failed(error),
+            };
+        }
+    };
+    match outcome {
+        ControlOutcome::Blocked => ExecutableLoadPoll::Pending,
+        ControlOutcome::Ready(result) if result as i64 == ERR_TRY_AGAIN => {
+            ExecutableLoadPoll::Pending
+        }
+        ControlOutcome::Ready(result) => {
+            let error = result as i64;
+            executable_load_fail(process_id, owner, stack_pointer, error);
+            let mut manager = PROCESS_MANAGER.lock();
+            if let Some(process) = manager.process_mut(process_id) {
+                process.pending_executable_load = None;
+            }
+            ExecutableLoadPoll::Failed(error)
+        }
+    }
 }
 
 fn vfs_complete_boot_open(
@@ -5685,6 +6249,11 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
         }
         if let Some(pending) = process.pending_vfs_request.take() {
             vfs_request_release(&pending);
+        }
+        if let Some(load) = process.pending_executable_load.as_mut()
+            && let Some(close) = load.take_close_ticket()
+        {
+            nullfs_proxy_enqueue_close_ticket(close);
         }
         let frames_reclaimed = release_owned_frames(&mut process.owned_frames, frame_allocator);
         debug_assert_eq!(process.task_id, task.task_id);
@@ -6181,6 +6750,7 @@ fn syscall_spawn_command(
         new_process_group,
         process_group_id,
         stack_pointer: current_stack_pointer,
+        claimed: false,
     });
     process.state = ProcessState::Blocked;
     ControlOutcome::Blocked
@@ -9311,6 +9881,7 @@ fn nullfs_proxy_cancel_generation(generation: u32) {
             .collect()
     };
     nullfs_proxy_fail_pending(pending);
+    executable_load_cancel_nullfs_generations(generation, true);
 }
 
 fn nullfs_proxy_cancel_stale_requests(generation: u32) {
@@ -9332,10 +9903,41 @@ fn nullfs_proxy_cancel_stale_requests(generation: u32) {
             .collect()
     };
     nullfs_proxy_fail_pending(pending);
+    executable_load_cancel_nullfs_generations(generation, false);
+}
+
+fn executable_load_cancel_nullfs_generations(generation: u32, matching: bool) {
+    let closes = {
+        let mut manager = PROCESS_MANAGER.lock();
+        let mut closes = Vec::new();
+        for process in &mut manager.processes {
+            let Some(load) = process.pending_executable_load.as_mut() else {
+                continue;
+            };
+            if load.provider_generation == 0 || (load.provider_generation == generation) != matching
+            {
+                continue;
+            }
+            if let Some(close) = load.take_close_ticket() {
+                closes.push(close);
+            }
+            load.bytes.clear();
+            load.retry = None;
+            load.result = Some(Err(ERR_IO));
+        }
+        closes
+    };
+    for close in closes {
+        nullfs_proxy_enqueue_close_ticket(close);
+    }
 }
 
 fn nullfs_proxy_fail_pending(pending: Vec<(u64, PendingNullfsProxyRequest)>) {
     for (process_id, pending) in pending {
+        if let Some(owner) = nullfs_proxy_executable_owner(&pending.operation) {
+            executable_load_fail(process_id, owner, pending.stack_pointer, ERR_IO);
+            continue;
+        }
         if scheduler::with_process_address_space(process_id, || {
             let registers = unsafe { &mut *(pending.stack_pointer as *mut SavedRegisters) };
             registers.rax = error_return(ERR_IO);
@@ -9630,19 +10232,28 @@ fn nullfs_proxy_submit_request(
         request.request_id = request_id;
         request.session_id = state.session_id;
         request.generation = state.session_generation;
-        if let PendingNullfsProxyOperation::Open {
-            generation,
-            session_id,
-            session_generation,
-            ..
-        } = &mut operation
-        {
-            *generation = state.generation;
-            *session_id = state.session_id;
-            *session_generation = state.session_generation;
+        match &mut operation {
+            PendingNullfsProxyOperation::Open {
+                generation,
+                session_id,
+                session_generation,
+                ..
+            }
+            | PendingNullfsProxyOperation::LoadExecutableOpen {
+                generation,
+                session_id,
+                session_generation,
+                ..
+            } => {
+                *generation = state.generation;
+                *session_id = state.session_id;
+                *session_generation = state.session_generation;
+            }
+            _ => {}
         }
         let pending = PendingNullfsProxyRequest {
             reply_endpoint,
+            request,
             request_operation: request.operation,
             request_generation: state.generation,
             request_id,
@@ -9764,8 +10375,11 @@ fn nullfs_proxy_decode_reply(
                 && reply.data == [0; filesystem_protocol::MAX_INLINE_DATA_BYTES]
         }
         filesystem_protocol::operation::OPEN => {
-            let valid = matches!(&pending.operation, PendingNullfsProxyOperation::Open { .. })
-                && reply.flags == 0
+            let valid = matches!(
+                &pending.operation,
+                PendingNullfsProxyOperation::Open { .. }
+                    | PendingNullfsProxyOperation::LoadExecutableOpen { .. }
+            ) && reply.flags == 0
                 && reply.node_id != filesystem_protocol::INVALID_ID
                 && matches!(
                     reply.node_kind,
@@ -9836,6 +10450,20 @@ fn nullfs_proxy_release_request(request_id: u64) {
     let mut state = NULLFS_PROXY.lock();
     if state.active_request_id == request_id {
         state.active_request_id = filesystem_protocol::INVALID_ID;
+    }
+}
+
+fn nullfs_proxy_executable_owner(
+    operation: &PendingNullfsProxyOperation,
+) -> Option<ExecutableLoadOwner> {
+    match operation {
+        PendingNullfsProxyOperation::Lookup {
+            purpose: NullfsPathPurpose::LoadExecutable { owner, .. },
+            ..
+        }
+        | PendingNullfsProxyOperation::LoadExecutableOpen { owner, .. }
+        | PendingNullfsProxyOperation::LoadExecutableRead { owner, .. } => Some(*owner),
+        _ => None,
     }
 }
 
@@ -9920,9 +10548,12 @@ fn nullfs_proxy_complete_abandoned(
         nullfs_proxy_quarantine(&abandoned);
     }
     match (abandoned.operation, reply) {
-        (PendingNullfsProxyOperation::Open { .. }, Ok(reply))
-            if reply.status == filesystem_protocol::status::OK
-                && reply.node_id != filesystem_protocol::INVALID_ID =>
+        (
+            PendingNullfsProxyOperation::Open { .. }
+            | PendingNullfsProxyOperation::LoadExecutableOpen { .. },
+            Ok(reply),
+        ) if reply.status == filesystem_protocol::status::OK
+            && reply.node_id != filesystem_protocol::INVALID_ID =>
         {
             nullfs_proxy_enqueue_close(
                 abandoned.request_generation,
@@ -9953,6 +10584,15 @@ fn nullfs_proxy_complete_abandoned(
         }
         _ => {}
     }
+}
+
+fn nullfs_proxy_enqueue_close_ticket(ticket: PendingTmpfsClose) {
+    nullfs_proxy_enqueue_close(
+        ticket.generation,
+        ticket.session_id,
+        ticket.session_generation,
+        ticket.node_id,
+    );
 }
 
 fn nullfs_proxy_enqueue_close(
@@ -10192,6 +10832,36 @@ fn nullfs_proxy_finish_owned_process(
     Ok(())
 }
 
+fn nullfs_proxy_continue_executable(
+    process_id: u64,
+    previous_request_id: u64,
+    request: filesystem_protocol::Request,
+    operation: PendingNullfsProxyOperation,
+    owner: ExecutableLoadOwner,
+    stack_pointer: usize,
+) -> Result<(), Error> {
+    match nullfs_proxy_submit_request(
+        process_id,
+        request,
+        operation.clone(),
+        stack_pointer,
+        Some(previous_request_id),
+        None,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error == ERR_TRY_AGAIN => {
+            executable_load_set_retry(process_id, owner, stack_pointer, request, operation);
+            nullfs_proxy_release_request(previous_request_id);
+            Ok(())
+        }
+        Err(error) => {
+            executable_load_fail(process_id, owner, stack_pointer, error);
+            nullfs_proxy_release_request(previous_request_id);
+            Ok(())
+        }
+    }
+}
+
 fn nullfs_proxy_continue(
     process_id: u64,
     previous_request_id: u64,
@@ -10215,6 +10885,55 @@ fn nullfs_proxy_continue(
             previous_request_id,
         ),
     }
+}
+
+fn nullfs_proxy_continue_path(
+    process_id: u64,
+    previous_request_id: u64,
+    request: filesystem_protocol::Request,
+    operation: PendingNullfsProxyOperation,
+    executable_owner: Option<ExecutableLoadOwner>,
+    stack_pointer: usize,
+) -> Result<(), Error> {
+    if let Some(owner) = executable_owner {
+        nullfs_proxy_continue_executable(
+            process_id,
+            previous_request_id,
+            request,
+            operation,
+            owner,
+            stack_pointer,
+        )
+    } else {
+        nullfs_proxy_continue(
+            process_id,
+            previous_request_id,
+            request,
+            operation,
+            stack_pointer,
+        )
+    }
+}
+
+fn nullfs_proxy_finish_path_error(
+    request_id: u64,
+    process_id: u64,
+    stack_pointer: usize,
+    executable_owner: Option<ExecutableLoadOwner>,
+    error: i64,
+) -> Result<(), Error> {
+    if let Some(owner) = executable_owner {
+        executable_load_fail(process_id, owner, stack_pointer, error);
+        nullfs_proxy_release_request(request_id);
+        Ok(())
+    } else {
+        nullfs_proxy_finish_process(request_id, process_id, stack_pointer, error_return(error))
+    }
+}
+
+fn vfs_route_generation_is_current(generation: u32) -> bool {
+    let state = *VFS_ROUTE.lock();
+    state.ready && state.generation == generation
 }
 
 fn nullfs_proxy_components(path: &str) -> Result<Vec<String>, i64> {
@@ -10310,6 +11029,20 @@ fn nullfs_proxy_named_operation(
                 session_generation: 0,
             }
         }
+        NullfsPathPurpose::LoadExecutable {
+            owner,
+            vfs_generation,
+        } => {
+            request.operation = filesystem_protocol::operation::OPEN;
+            request.flags = filesystem_protocol::request_flags::READ;
+            PendingNullfsProxyOperation::LoadExecutableOpen {
+                owner,
+                vfs_generation,
+                generation: 0,
+                session_id: filesystem_protocol::INVALID_ID,
+                session_generation: 0,
+            }
+        }
         NullfsPathPurpose::Unlink => {
             request.operation = filesystem_protocol::operation::UNLINK;
             PendingNullfsProxyOperation::Unlink
@@ -10322,7 +11055,9 @@ fn nullfs_proxy_named_operation(
 fn nullfs_proxy_resolves_parent(purpose: &NullfsPathPurpose) -> bool {
     matches!(
         purpose,
-        NullfsPathPurpose::Open { .. } | NullfsPathPurpose::Unlink
+        NullfsPathPurpose::Open { .. }
+            | NullfsPathPurpose::LoadExecutable { .. }
+            | NullfsPathPurpose::Unlink
     )
 }
 
@@ -10354,9 +11089,9 @@ fn nullfs_proxy_start_path(
                     },
                 ))
             }
-            NullfsPathPurpose::Open { .. } | NullfsPathPurpose::Unlink => {
-                ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
-            }
+            NullfsPathPurpose::Open { .. }
+            | NullfsPathPurpose::LoadExecutable { .. }
+            | NullfsPathPurpose::Unlink => ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY)),
             NullfsPathPurpose::Chdir => {
                 ControlOutcome::Ready(match platform_set_working_directory(process_id, path) {
                     Ok(()) => 0,
@@ -10689,23 +11424,29 @@ fn nullfs_proxy_complete_success(
             next_component,
             purpose,
         } => {
+            let executable_owner = match &purpose {
+                NullfsPathPurpose::LoadExecutable { owner, .. } => Some(*owner),
+                _ => None,
+            };
             if next_component > components.len() {
-                return nullfs_proxy_finish_process(
+                return nullfs_proxy_finish_path_error(
                     request_id,
                     process_id,
                     stack_pointer,
-                    error_return(ERR_IO),
+                    executable_owner,
+                    ERR_IO,
                 );
             }
             if nullfs_proxy_resolves_parent(&purpose)
                 && next_component == components.len().saturating_sub(1)
             {
                 if reply.node_kind != filesystem_protocol::node_kind::DIRECTORY {
-                    return nullfs_proxy_finish_process(
+                    return nullfs_proxy_finish_path_error(
                         request_id,
                         process_id,
                         stack_pointer,
-                        error_return(abi::errno::NOT_DIRECTORY),
+                        executable_owner,
+                        abi::errno::NOT_DIRECTORY,
                     );
                 }
                 let (request, operation) = match nullfs_proxy_named_operation(
@@ -10716,34 +11457,37 @@ fn nullfs_proxy_complete_success(
                 ) {
                     Ok(operation) => operation,
                     Err(error) => {
-                        return nullfs_proxy_finish_process(
+                        return nullfs_proxy_finish_path_error(
                             request_id,
                             process_id,
                             stack_pointer,
-                            error_return(error),
+                            executable_owner,
+                            error,
                         );
                     }
                 };
-                return nullfs_proxy_continue(
+                return nullfs_proxy_continue_path(
                     process_id,
                     request_id,
                     request,
                     operation,
+                    executable_owner,
                     stack_pointer,
                 );
             }
             if next_component < components.len() {
                 if reply.node_kind != filesystem_protocol::node_kind::DIRECTORY {
-                    return nullfs_proxy_finish_process(
+                    return nullfs_proxy_finish_path_error(
                         request_id,
                         process_id,
                         stack_pointer,
-                        error_return(abi::errno::NOT_DIRECTORY),
+                        executable_owner,
+                        abi::errno::NOT_DIRECTORY,
                     );
                 }
                 let request =
                     nullfs_proxy_lookup_request(reply.node_id, &components[next_component]);
-                return nullfs_proxy_continue(
+                return nullfs_proxy_continue_path(
                     process_id,
                     request_id,
                     request,
@@ -10753,6 +11497,7 @@ fn nullfs_proxy_complete_success(
                         next_component: next_component + 1,
                         purpose,
                     },
+                    executable_owner,
                     stack_pointer,
                 );
             }
@@ -10778,6 +11523,13 @@ fn nullfs_proxy_complete_success(
                     );
                     nullfs_proxy_finish_process(request_id, process_id, stack_pointer, result)
                 }
+                NullfsPathPurpose::LoadExecutable { owner, .. } => nullfs_proxy_finish_path_error(
+                    request_id,
+                    process_id,
+                    stack_pointer,
+                    Some(owner),
+                    ERR_IO,
+                ),
                 NullfsPathPurpose::Open { .. } | NullfsPathPurpose::Unlink => {
                     nullfs_proxy_finish_process(
                         request_id,
@@ -10912,6 +11664,262 @@ fn nullfs_proxy_complete_success(
                 }
             };
             nullfs_proxy_finish_process(request_id, process_id, stack_pointer, result)
+        }
+        PendingNullfsProxyOperation::LoadExecutableOpen {
+            owner,
+            vfs_generation,
+            generation,
+            session_id,
+            session_generation,
+        } => {
+            if !vfs_route_generation_is_current(vfs_generation)
+                || !nullfs_proxy_backend_is_current(generation, session_id, session_generation)
+            {
+                nullfs_proxy_enqueue_close(
+                    generation,
+                    session_id,
+                    session_generation,
+                    reply.node_id,
+                );
+                executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                return Ok(());
+            }
+            if reply.node_kind != filesystem_protocol::node_kind::FILE {
+                nullfs_proxy_enqueue_close(
+                    generation,
+                    session_id,
+                    session_generation,
+                    reply.node_id,
+                );
+                executable_load_fail(
+                    process_id,
+                    owner,
+                    stack_pointer,
+                    if reply.node_kind == filesystem_protocol::node_kind::DIRECTORY {
+                        ERR_IS_DIRECTORY
+                    } else {
+                        ERR_IO
+                    },
+                );
+                return Ok(());
+            }
+            let expected_size = match usize::try_from(reply.value) {
+                Ok(size) if size <= elf::MAX_EXECUTABLE_FILE_BYTES => size,
+                _ => {
+                    nullfs_proxy_enqueue_close(
+                        generation,
+                        session_id,
+                        session_generation,
+                        reply.node_id,
+                    );
+                    executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                    return Ok(());
+                }
+            };
+
+            let bytes = vec![0_u8; expected_size];
+            let initialized = {
+                let mut manager = PROCESS_MANAGER.lock();
+                if let Some(load) = manager
+                    .process_mut(process_id)
+                    .and_then(|process| process.pending_executable_load.as_mut())
+                    && load.owner == owner
+                    && load.stack_pointer == stack_pointer
+                    && load.vfs_generation == vfs_generation
+                    && load.result.is_none()
+                {
+                    load.provider_generation = generation;
+                    load.session_id = session_id;
+                    load.session_generation = session_generation;
+                    load.node_id = reply.node_id;
+                    load.expected_size = expected_size;
+                    load.bytes = bytes;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !initialized {
+                nullfs_proxy_enqueue_close(
+                    generation,
+                    session_id,
+                    session_generation,
+                    reply.node_id,
+                );
+                executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                return Ok(());
+            }
+            if expected_size == 0 {
+                executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                return Ok(());
+            }
+            let length = expected_size.min(FILESYSTEM_PROXY_BULK_BYTES);
+            let mut request = filesystem_protocol::Request::EMPTY;
+            request.operation = filesystem_protocol::operation::READ;
+            request.node_id = reply.node_id;
+            request.file_offset = 0;
+            request.bulk = filesystem_protocol::BulkBuffer {
+                buffer_id: 1,
+                offset: 0,
+                length: length as u64,
+            };
+            nullfs_proxy_continue_executable(
+                process_id,
+                request_id,
+                request,
+                PendingNullfsProxyOperation::LoadExecutableRead {
+                    owner,
+                    vfs_generation,
+                    generation,
+                    session_id,
+                    session_generation,
+                    node_id: reply.node_id,
+                    offset: 0,
+                    length,
+                },
+                owner,
+                stack_pointer,
+            )
+        }
+        PendingNullfsProxyOperation::LoadExecutableRead {
+            owner,
+            vfs_generation,
+            generation,
+            session_id,
+            session_generation,
+            node_id,
+            offset,
+            length,
+        } => {
+            let count = match usize::try_from(reply.value) {
+                Ok(count) if count != 0 && count <= length => count,
+                _ => {
+                    executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                    return Ok(());
+                }
+            };
+            if !vfs_route_generation_is_current(vfs_generation)
+                || !nullfs_proxy_backend_is_current(generation, session_id, session_generation)
+            {
+                executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                return Ok(());
+            }
+            let mut chunk = vec![0_u8; count];
+            if nullfs_proxy_bulk_read_at(0, &mut chunk).is_err() {
+                executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                return Ok(());
+            }
+            let next = {
+                let mut manager = PROCESS_MANAGER.lock();
+                let Some(process) = manager.process_mut(process_id) else {
+                    return Ok(());
+                };
+                let Some(load) = process.pending_executable_load.as_mut() else {
+                    return Ok(());
+                };
+                match offset.checked_add(count) {
+                    Some(end)
+                        if load.owner == owner
+                            && load.stack_pointer == stack_pointer
+                            && load.vfs_generation == vfs_generation
+                            && load.provider_generation == generation
+                            && load.session_id == session_id
+                            && load.session_generation == session_generation
+                            && load.node_id == node_id
+                            && end <= load.expected_size
+                            && load.result.is_none() =>
+                    {
+                        load.bytes[offset..end].copy_from_slice(&chunk);
+                        if end == load.expected_size {
+                            load.node_id = filesystem_protocol::INVALID_ID;
+                            Some((
+                                end,
+                                Some((load.path.clone(), core::mem::take(&mut load.bytes))),
+                            ))
+                        } else {
+                            Some((end, None))
+                        }
+                    }
+                    Some(_) | None => None,
+                }
+            };
+            let Some((next_offset, completed)) = next else {
+                executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                return Ok(());
+            };
+            if let Some((path, bytes)) = completed {
+                nullfs_proxy_enqueue_close(generation, session_id, session_generation, node_id);
+                let loaded = LoadedExecutable::from_bytes(&path, bytes).map_err(|error| {
+                    crate::serial_println!(
+                        "userspace executable validation failed: pid={}, path={}, error={}",
+                        process_id,
+                        path,
+                        error
+                    );
+                    ERR_IO
+                });
+                if loaded.is_ok() {
+                    crate::serial_println!(
+                        "userspace executable materialized: pid={}, path={}, bytes={}, generation={}",
+                        process_id,
+                        path,
+                        next_offset,
+                        generation
+                    );
+                }
+                let mut manager = PROCESS_MANAGER.lock();
+                if let Some(process) = manager.process_mut(process_id)
+                    && let Some(load) = process.pending_executable_load.as_mut()
+                    && load.owner == owner
+                    && load.stack_pointer == stack_pointer
+                    && load.vfs_generation == vfs_generation
+                    && load.result.is_none()
+                {
+                    load.result = Some(loaded);
+                }
+                return Ok(());
+            }
+            let remaining = {
+                let manager = PROCESS_MANAGER.lock();
+                manager
+                    .processes
+                    .iter()
+                    .find(|process| process.process_id == process_id)
+                    .and_then(|process| process.pending_executable_load.as_ref())
+                    .map(|load| load.expected_size.saturating_sub(next_offset))
+                    .unwrap_or(0)
+            };
+            if remaining == 0 {
+                executable_load_fail(process_id, owner, stack_pointer, ERR_IO);
+                return Ok(());
+            }
+            let next_length = remaining.min(FILESYSTEM_PROXY_BULK_BYTES);
+            let mut request = filesystem_protocol::Request::EMPTY;
+            request.operation = filesystem_protocol::operation::READ;
+            request.node_id = node_id;
+            request.file_offset = next_offset as u64;
+            request.bulk = filesystem_protocol::BulkBuffer {
+                buffer_id: 1,
+                offset: 0,
+                length: next_length as u64,
+            };
+            nullfs_proxy_continue_executable(
+                process_id,
+                request_id,
+                request,
+                PendingNullfsProxyOperation::LoadExecutableRead {
+                    owner,
+                    vfs_generation,
+                    generation,
+                    session_id,
+                    session_generation,
+                    node_id,
+                    offset: next_offset,
+                    length: next_length,
+                },
+                owner,
+                stack_pointer,
+            )
         }
         PendingNullfsProxyOperation::Read {
             handle,
