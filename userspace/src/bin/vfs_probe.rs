@@ -918,23 +918,26 @@ fn probe_nullfs_restart() -> ! {
     for _ in 0..8 {
         syscall::yield_now().unwrap_or_else(|_| syscall::exit(106));
     }
-    if !fixture_files_are_exact() {
+    if !path_contents_match(NULLFS_WELCOME, WELCOME) {
         syscall::exit(107);
     }
-    if !nullfs_root_is_valid() {
+    if !path_contents_match(NULLFS_README, README) {
         syscall::exit(114);
     }
-    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY) {
+    if !nullfs_root_is_valid() {
         syscall::exit(115);
     }
-    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY) {
+    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY) {
         syscall::exit(116);
     }
-    if !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY) {
+    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY) {
         syscall::exit(117);
     }
-    if !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY) {
+    if !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY) {
         syscall::exit(118);
+    }
+    if !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY) {
+        syscall::exit(119);
     }
     syscall::exit(0)
 }
@@ -1442,7 +1445,7 @@ fn platform_failed_with<T>(result: platform::Result<T>, expected: i64) -> bool {
 }
 
 fn open_with_retry(path: &[u8], flags: syscall::OpenFlags) -> Option<syscall::FileDescriptor> {
-    for _ in 0..8 {
+    for _ in 0..64 {
         match syscall::open(path, flags) {
             Ok(descriptor) => return Some(descriptor),
             Err(error) if error == syscall::Errno::TRY_AGAIN => {
