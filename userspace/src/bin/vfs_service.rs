@@ -19,7 +19,6 @@ const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: vfs";
-const APPLICATIONS_BACKING_PREFIX: &[u8] = b"/Applications";
 
 struct Route {
     path: &'static [u8],
@@ -36,42 +35,42 @@ const ROUTES: &[Route] = &[
     Route {
         path: b"/System/Applications",
         id: protocol::route::SYSTEM_APPLICATIONS,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/System/services",
         id: protocol::route::SYSTEM_SERVICES,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/System/drivers",
         id: protocol::route::SYSTEM_DRIVERS,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/System/var/log",
         id: protocol::route::SYSTEM_VAR_LOG,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/System/var",
         id: protocol::route::SYSTEM_VAR,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/System/config",
         id: protocol::route::SYSTEM_CONFIG,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/System/bin",
         id: protocol::route::SYSTEM_BIN,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/System/lib",
         id: protocol::route::SYSTEM_LIB,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/Applications",
@@ -91,7 +90,7 @@ const ROUTES: &[Route] = &[
     Route {
         path: b"/System",
         id: protocol::route::SYSTEM,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/Users",
@@ -188,11 +187,17 @@ fn resolve(request: &protocol::Request) -> protocol::Reply {
             reply.route_id = route.id;
             reply.backend = route.backend;
             reply.prefix_length = route.path.len() as u16;
-            if route.id == protocol::route::APPLICATIONS {
+            let backing_prefix = if route.backend == protocol::backend::NULLFS
+                && route.id != protocol::route::NULLSTAR_VOLUME
+            {
+                Some(route.path)
+            } else {
+                None
+            };
+            if let Some(backing_prefix) = backing_prefix {
                 reply.flags = protocol::reply_flags::BINDING;
-                reply.backing_prefix_length = APPLICATIONS_BACKING_PREFIX.len() as u16;
-                reply.backing_prefix[..APPLICATIONS_BACKING_PREFIX.len()]
-                    .copy_from_slice(APPLICATIONS_BACKING_PREFIX);
+                reply.backing_prefix_length = backing_prefix.len() as u16;
+                reply.backing_prefix[..backing_prefix.len()].copy_from_slice(backing_prefix);
             }
             return reply;
         }

@@ -18,11 +18,11 @@ public create, write, truncate, append, and unlink. Exact-generation provider of
 and private quiesce/clean-unmount coordination now give controlled NullFS restart a proven
 clean path plus a bounded KILL-and-dirty-recovery fallback. The generated primary volume is
 selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `System/`,
-`Applications/`, and `Users/`. The first non-bootstrap Phase 5 binding is implemented:
-canonical `/Applications` targets the selected provider's backend-root `Applications/`
-node while `/Volumes/NullStar/Applications` remains its raw administrative alias. Public
-`mkdir`/`rmdir`/rename, offline repair policy, and binding `/System` and `/Users` remain
-future work.
+`Applications/`, and `Users/`. Canonical `/System` and `/Applications` target matching
+nodes below the selected provider's backend root, while their `/Volumes/NullStar` paths
+remain raw administrative aliases. A static executable loads through `/System/bin` without
+making PID 1 or recovery depend on NullFS. Public `mkdir`/`rmdir`/rename, offline repair
+policy, `/Users` binding, and service-definition activation remain future work.
 
 ## Status summary
 
@@ -32,7 +32,7 @@ future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, bounded public mutation, controlled clean restart with dirty fallback, provider offlining, primary volume identity/layout, and the first non-bootstrap `/Applications` binding implemented; `/System`, `/Users`, and remaining acceptance work are incomplete |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, `/System` and `/Applications` bindings, and static `/System/bin` execution implemented; `/Users`, service-definition activation, and remaining acceptance work are incomplete |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -60,7 +60,7 @@ for exactly that UUID; zero matches fail with `NO_ENTRY` and multiple eligible m
 as ambiguous, without falling back to a partition index or label. The service mounts the
 core read-write, and the kernel proxy negotiates exactly `WRITE` and exposes a bounded
 writable VFS mount at `/Volumes/NullStar`. The VFS also projects that same provider's
-backend-root `/Applications` node at canonical `/Applications`.
+backend-root `/System` and `/Applications` nodes at their canonical paths.
 
 The accepted long-term direction is:
 
@@ -70,7 +70,7 @@ The accepted long-term direction is:
 ├── Applications/
 └── Users/
 
-/System         => namespace binding to the NullStar volume's System node       (planned)
+/System         => namespace binding to the NullStar volume's System node       (implemented)
 /Applications   => namespace binding to the NullStar volume's Applications node (implemented)
 /Users          => namespace binding to the NullStar volume's Users node         (planned)
 ```
@@ -307,18 +307,20 @@ cargo run --locked --quiet -- --nullfs-restart-check
 
 The FAT bootstrap path remains independent while the UUID-selected primary volume is
 available at `/Volumes/NullStar`. Its bounded public mutation surface, initial backing
-layout, first non-bootstrap `/Applications` binding, and controlled clean/dirty replacement
-paths are implemented. Binding `/System` and `/Users`, broader namespace mutation, and
-offline repair policy remain future work.
+layout, `/System` and `/Applications` bindings, static `/System/bin` execution, and
+controlled clean/dirty replacement paths are implemented. Binding `/Users`, activating
+service definitions from `/System`, broader namespace mutation, and offline repair policy
+remain future work.
 
 ## Phase 5: writable service and namespace adoption — in progress
 
 Phase 5 moves from a read-only public test mount to the accepted persistent-volume and
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
 operations, PR C's bounded public writable proxy, controlled quiesce/clean unmount with
-dirty-recovery fallback, stable primary-volume identity and layout, and the first
-non-bootstrap `/Applications` namespace binding are implemented. Phase 5 remains in
-progress; `/System`, `/Users`, and the remaining integrated acceptance work are incomplete.
+dirty-recovery fallback, stable primary-volume identity and layout, the `/System` and
+`/Applications` namespace bindings, and one static `/System/bin` executable are
+implemented. Phase 5 remains in progress; `/Users`, service-definition activation, and the
+remaining integrated acceptance work are incomplete.
 
 ### Raw writable block authority — implemented
 
@@ -418,10 +420,11 @@ remain exactly `Unsupported`, and `NSVC` v1 is unchanged.
 
 For each service generation, the kernel proxy requests exactly `WRITE` and requires the
 canonical `CONNECT` reply to include `session_features::WRITE`. The public
-`/Volumes/NullStar` mount and bound `/Applications` view support ordinary stat/read/open
-plus writable, create, truncate, and append open, descriptor write, unlink, `fstat`, seek,
-`read_directory`, and `chdir`. Public `mkdir`, `rmdir`, rename, and adoption of `/System`
-and `/Users` remain future.
+`/Volumes/NullStar` mount and bound `/System` and `/Applications` views support ordinary
+stat/read/open, `fstat`, seek, `read_directory`, and `chdir`. Writable, create, truncate,
+and append open, descriptor write, and unlink remain available outside the System backing
+subtree; canonical and raw public System paths return `READ_ONLY` for mutation. Public
+`mkdir`, `rmdir`, rename, and adoption of `/Users` remain future.
 
 The proxy reserves its single request before staging at most 4 KiB of write data. On
 success, generic `WRITE` keeps the byte count in `value` and returns the exact authoritative
@@ -461,10 +464,12 @@ returning an endpoint capability. Partition reordering and label changes therefo
 change selection. Missing, malformed, ineligible, or duplicate configured UUID candidates
 cannot cause an arbitrary volume to be mounted.
 
-All three directories remain visible below `/Volumes/NullStar`. `Applications/` is also
-projected at canonical `/Applications`; `System/` and `Users/` have no root binding yet.
+All three directories remain visible below `/Volumes/NullStar`. `System/` and
+`Applications/` are also projected at canonical `/System` and `/Applications`; `Users/`
+has no root binding yet. The generated System tree preserves the prior directory shape and
+contains a static executable fixture under `bin/`.
 
-### Namespace bindings — first non-bootstrap binding implemented
+### Namespace bindings — System and Applications implemented
 
 VFS namespace routing protocol version 2 carries binding metadata in a bounded 224-byte
 reply. It preserves route ID, backend, and matched canonical-prefix length and adds flags
@@ -472,26 +477,28 @@ plus a length-delimited, zero-padded backend-relative backing prefix. The VFS se
 the binding record; the kernel validates the exact known target and traverses it internally.
 The public filesystem protocol remains version 1, and `NSVC` remains version 1.
 
-The only implemented binding is canonical `/Applications` to the UUID-selected NullFS
-provider's backend-root `/Applications` node. `/Volumes/NullStar/Applications` remains the
-raw administrative alias. Working directories and open-file paths retain
-`/Applications/...`, while both views resolve the same underlying service node. The
-remaining required bindings are:
+The implemented bindings are canonical `/System` and `/Applications` to matching nodes
+below the UUID-selected NullFS provider's backend root. Matching paths below
+`/Volumes/NullStar` remain raw administrative aliases. Working directories and open-file
+paths retain canonical names, while raw and logical views resolve the same underlying
+service nodes. The remaining required binding is:
 
 ```text
-/System
 /Users
 ```
 
 The VFS must preserve canonical logical paths, stable volume-and-node identity, provider
 generation, mount policy, and authorization across every binding. The implemented raw
-`/Volumes/NullStar/Applications` view remains available for administration, but ordinary
-applications use the canonical path.
+views remain available for administration, but ordinary software uses canonical paths. The
+kernel also reapplies the system metadata flag in the canonical `/System` view without
+changing raw on-disk metadata, and it exposes both public views of the System subtree as
+read-only.
 
-The staged transition has bound one non-bootstrap tree first. Next work loads ordinary
-programs and service definitions through a future `/System` binding and then binds
-`/Users`. The synthetic root and bootstrap facilities must remain usable when the primary
-volume or service is unavailable.
+The staged transition has now bound `/System` and `/Applications`. A statically linked
+fixture launches through `/System/bin`; activating ordinary service definitions from
+`/System/services` remains future work. `/Users` is the final planned primary-tree binding.
+The synthetic root and bootstrap facilities remain usable when the primary volume or
+service is unavailable.
 
 ### Boot generations
 
@@ -503,18 +510,17 @@ Direct NullFS loading by the bootloader is not required for Phase 5.
 
 ### Remaining Phase 5 acceptance
 
-PR C, controlled restart, and the first `/Applications` binding supply bounded writable
-public-ABI, clean/dirty replacement, canonical-path, and cross-view identity coverage.
-They do not complete Phase 5. Completion still requires the remaining integrated work to
-demonstrate:
+PR C, controlled restart, `/System` and `/Applications` bindings, and static system
+execution supply bounded writable public-ABI, clean/dirty replacement, canonical-path,
+cross-view identity, and bootstrap-independence coverage. They do not complete Phase 5.
+Completion still requires the remaining integrated work to demonstrate:
 
-- `/System` and `/Users` binding, policy, canonical-path, and file-identity behavior;
+- `/Users` binding plus final policy, canonical-path, and file-identity behavior;
 - crash injection and remount recovery for service-backed mutations;
 - deterministic out-of-space and block-device-loss behavior;
 - continued access to the bootstrap and recovery environment when the primary volume
   cannot mount;
-- normal boot loading non-bootstrap programs and service definitions through
-  `/System`;
+- normal boot loading and activating service definitions through `/System`;
 - boot-generation synchronization and rollback without corrupting the previously
   selected generation.
 

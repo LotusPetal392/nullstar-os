@@ -43,6 +43,9 @@ const TRUNCATED_BYTES: &[u8] = b"short";
 const OPEN_UNLINKED_BYTES: &[u8] = b"alive";
 const NULLFS_EXEC_TARGET: &[u8] = b"/Applications/ExecProbe/bin/exec-target";
 const NULLFS_EXEC_SPAWN_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/exec-target spawn";
+const NULLFS_SYSTEM_EXEC_TARGET: &[u8] = b"/System/bin/exec-target";
+const NULLFS_SYSTEM_EXEC_TARGET_RAW: &[u8] = b"/Volumes/NullStar/System/bin/exec-target";
+const NULLFS_SYSTEM_EXEC_SPAWN_COMMAND: &[u8] = b"/System/bin/exec-target system-spawn";
 const NULLFS_EXEC_MISSING_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/missing-target";
 const NULLFS_EXEC_NOT_DIRECTORY_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/exec-target/child";
 const NULLFS_EXEC_MALFORMED_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/malformed-target";
@@ -74,49 +77,49 @@ const CASES: &[(&[u8], u32, u16, u16)] = &[
     (
         b"/System/config/boot",
         protocol::route::SYSTEM_CONFIG,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         14,
     ),
     (
         b"/System/var/log/kernel",
         protocol::route::SYSTEM_VAR_LOG,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         15,
     ),
     (
         b"/System/var/cache",
         protocol::route::SYSTEM_VAR,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         11,
     ),
     (
         b"/System/bin",
         protocol::route::SYSTEM_BIN,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         11,
     ),
     (
         b"/System/services",
         protocol::route::SYSTEM_SERVICES,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         16,
     ),
     (
         b"/System/drivers",
         protocol::route::SYSTEM_DRIVERS,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         15,
     ),
     (
         b"/System/lib",
         protocol::route::SYSTEM_LIB,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         11,
     ),
     (
         b"/System/Applications/Finder",
         protocol::route::SYSTEM_APPLICATIONS,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         20,
     ),
     (
@@ -384,6 +387,12 @@ fn probe_readiness() {
         ),
         (b"/tmp", protocol::route::TMP, protocol::backend::TMPFS, 4),
         (
+            b"/System",
+            protocol::route::SYSTEM,
+            protocol::backend::NULLFS,
+            7,
+        ),
+        (
             b"/Volumes/NullStar",
             protocol::route::NULLSTAR_VOLUME,
             protocol::backend::NULLFS,
@@ -403,7 +412,7 @@ fn probe_readiness() {
             syscall::exit(101);
         }
     }
-    for path in [b"/".as_slice(), b"/tmp", NULLFS_MOUNT] {
+    for path in [b"/".as_slice(), b"/tmp", b"/System", NULLFS_MOUNT] {
         if platform::stat(path).ok().map(|stat| stat.kind) != Some(file::KIND_DIRECTORY) {
             syscall::exit(102);
         }
@@ -427,13 +436,27 @@ fn probe_mounted_nullfs() {
 
     if !stat_matches(NULLFS_MOUNT, file::KIND_DIRECTORY, 0)
         || !stat_matches(b"/Applications", file::KIND_DIRECTORY, BLOCK_SIZE as u64)
+        || !stat_matches_flags(
+            b"/System",
+            file::KIND_DIRECTORY,
+            BLOCK_SIZE as u64,
+            file::FLAG_SYSTEM | file::FLAG_READ_ONLY,
+        )
+        || !stat_matches_flags(
+            b"/Volumes/NullStar/System",
+            file::KIND_DIRECTORY,
+            BLOCK_SIZE as u64,
+            file::FLAG_READ_ONLY,
+        )
     {
         syscall::exit(20);
     }
     if !directory_contains(NULLFS_MOUNT, &[b"System", b"Applications", b"Users"]) {
         syscall::exit(58);
     }
-    if !stat_matches(NULLFS_DOCS, file::KIND_DIRECTORY, BLOCK_SIZE as u64) {
+    if !system_directory_is_valid()
+        || !stat_matches(NULLFS_DOCS, file::KIND_DIRECTORY, BLOCK_SIZE as u64)
+    {
         syscall::exit(21);
     }
     if !stat_matches(NULLFS_WELCOME, file::KIND_FILE, WELCOME.len() as u64) {
@@ -520,7 +543,9 @@ fn probe_mounted_nullfs() {
     {
         syscall::exit(43);
     }
-    if platform::chdir(b"/Applications").is_err()
+    if platform::chdir(b"/System/var").is_err()
+        || platform::getcwd(&mut cwd).ok() != Some(b"/System/var".as_slice())
+        || platform::chdir(b"/Applications").is_err()
         || platform::getcwd(&mut cwd).ok() != Some(b"/Applications".as_slice())
         || platform::chdir(b"/").is_err()
         || platform::getcwd(&mut cwd).ok() != Some(b"/".as_slice())
@@ -811,6 +836,44 @@ fn probe_nullfs_executable() -> u64 {
         return 1;
     }
 
+    let system_stat = platform::stat(NULLFS_SYSTEM_EXEC_TARGET).ok();
+    let raw_system_stat = platform::stat(NULLFS_SYSTEM_EXEC_TARGET_RAW).ok();
+    if !matches!(
+        system_stat,
+        Some(file::Stat {
+            kind: file::KIND_FILE,
+            size,
+            flags,
+        }) if size != 0 && flags == (file::FLAG_SYSTEM | file::FLAG_READ_ONLY)
+    ) || !matches!(
+        (system_stat, raw_system_stat),
+        (
+            Some(file::Stat { size: canonical_size, .. }),
+            Some(file::Stat {
+                kind: file::KIND_FILE,
+                size: raw_size,
+                flags: file::FLAG_READ_ONLY,
+            }),
+        ) if canonical_size == raw_size
+    ) {
+        return 9;
+    }
+    let system_descriptor =
+        match open_with_retry(NULLFS_SYSTEM_EXEC_TARGET, syscall::OpenFlags::READ) {
+            Some(descriptor) => descriptor,
+            None => return 9,
+        };
+    if platform::fstat(system_descriptor).ok() != system_stat
+        || syscall::close(system_descriptor).is_err()
+    {
+        return 9;
+    }
+    if !system_mutation_is_denied(NULLFS_SYSTEM_EXEC_TARGET)
+        || !system_mutation_is_denied(NULLFS_SYSTEM_EXEC_TARGET_RAW)
+    {
+        return 12;
+    }
+
     let malformed = match syscall::spawn_command(
         NULLFS_EXEC_MALFORMED_COMMAND,
         syscall::SpawnFlags::NEW_PROCESS_GROUP,
@@ -845,6 +908,25 @@ fn probe_nullfs_executable() -> u64 {
         != Some(NULLFS_EXEC_SPAWN_STATUS)
     {
         return 3;
+    }
+
+    let system_spawned = match syscall::spawn_command(
+        NULLFS_SYSTEM_EXEC_SPAWN_COMMAND,
+        syscall::SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(process_id) => process_id,
+        Err(_) => return 10,
+    };
+    if syscall::wait_child(system_spawned)
+        .ok()
+        .map(|status| status.raw())
+        != Some(NULLFS_EXEC_SPAWN_STATUS)
+    {
+        return 11;
     }
 
     let parent_process_id = match syscall::getpid() {
@@ -1072,6 +1154,55 @@ fn nullfs_docs_is_valid() -> bool {
     false
 }
 
+fn system_directory_is_valid() -> bool {
+    const NAMES: &[&[u8]] = &[
+        b"config",
+        b"var",
+        b"bin",
+        b"services",
+        b"drivers",
+        b"lib",
+        b"Applications",
+    ];
+    let mut found = 0_u64;
+    let mut start_index = 0;
+    loop {
+        let mut entries = [platform::DirectoryEntry::EMPTY; 4];
+        let Some(count) = read_directory_with_retry(b"/System", start_index, &mut entries) else {
+            return false;
+        };
+        for entry in &entries[..count] {
+            if entry.kind != file::KIND_DIRECTORY
+                || entry.flags != (file::FLAG_SYSTEM | file::FLAG_READ_ONLY)
+            {
+                return false;
+            }
+            let Some(index) = NAMES.iter().position(|name| entry.name() == *name) else {
+                return false;
+            };
+            let bit = 1_u64 << index;
+            if found & bit != 0 {
+                return false;
+            }
+            found |= bit;
+        }
+        if count < entries.len() {
+            return found == (1_u64 << NAMES.len()) - 1;
+        }
+        start_index = match start_index.checked_add(count) {
+            Some(next) => next,
+            None => return false,
+        };
+    }
+}
+
+fn system_mutation_is_denied(path: &[u8]) -> bool {
+    syscall_failed_with(
+        syscall::open(path, syscall::OpenFlags::READ | syscall::OpenFlags::WRITE),
+        errno::READ_ONLY,
+    ) && platform_failed_with(platform::unlink(path), errno::READ_ONLY)
+}
+
 fn fixture_files_are_exact() -> bool {
     path_contents_match(NULLFS_WELCOME, WELCOME) && path_contents_match(NULLFS_README, README)
 }
@@ -1095,12 +1226,11 @@ fn descriptor_stat_matches(descriptor: syscall::FileDescriptor, size: u64) -> bo
 }
 
 fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
-    platform::stat(path).ok()
-        == Some(file::Stat {
-            kind,
-            size,
-            flags: 0,
-        })
+    stat_matches_flags(path, kind, size, 0)
+}
+
+fn stat_matches_flags(path: &[u8], kind: u64, size: u64, flags: u64) -> bool {
+    platform::stat(path).ok() == Some(file::Stat { kind, size, flags })
 }
 
 fn syscall_failed_with<T>(result: syscall::Result<T>, expected: i64) -> bool {
@@ -1252,11 +1382,20 @@ fn reply_binding_is_canonical(reply: &protocol::Reply) -> bool {
 }
 
 fn reply_binding_matches(reply: &protocol::Reply, route_id: u32) -> bool {
-    if route_id == protocol::route::APPLICATIONS {
-        reply.binding_prefix() == Ok(Some("/Applications"))
-    } else {
-        reply.binding_prefix() == Ok(None)
-    }
+    let expected = match route_id {
+        protocol::route::SYSTEM_APPLICATIONS => Some("/System/Applications"),
+        protocol::route::SYSTEM_SERVICES => Some("/System/services"),
+        protocol::route::SYSTEM_DRIVERS => Some("/System/drivers"),
+        protocol::route::SYSTEM_VAR_LOG => Some("/System/var/log"),
+        protocol::route::SYSTEM_VAR => Some("/System/var"),
+        protocol::route::SYSTEM_CONFIG => Some("/System/config"),
+        protocol::route::SYSTEM_BIN => Some("/System/bin"),
+        protocol::route::SYSTEM_LIB => Some("/System/lib"),
+        protocol::route::SYSTEM => Some("/System"),
+        protocol::route::APPLICATIONS => Some("/Applications"),
+        _ => None,
+    };
+    reply.binding_prefix() == Ok(expected)
 }
 
 fn query(path: &[u8], request_id: u32) -> Option<protocol::Reply> {

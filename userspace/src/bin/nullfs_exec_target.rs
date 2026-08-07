@@ -7,14 +7,17 @@ userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const TARGET_PATH: &[u8] = b"/Applications/ExecProbe/bin/exec-target";
+const SYSTEM_TARGET_PATH: &[u8] = b"/System/bin/exec-target";
 const SPAWN_MODE: &[u8] = b"spawn";
+const SYSTEM_SPAWN_MODE: &[u8] = b"system-spawn";
 const FORK_EXEC_MODE: &[u8] = b"fork-exec";
 const SPAWN_SUCCESS: u64 = 41;
 const FORK_EXEC_SUCCESS: u64 = 42;
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
-    if arguments.get(0) != Some(TARGET_PATH) {
+    let target_path = arguments.get(0);
+    if target_path != Some(TARGET_PATH) && target_path != Some(SYSTEM_TARGET_PATH) {
         syscall::exit(64);
     }
 
@@ -22,7 +25,15 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let process_group = platform::get_process_group(0).unwrap_or_else(|_| syscall::exit(2));
 
     if arguments.len() == 2 && arguments.get(1) == Some(SPAWN_MODE) {
-        if process_id == 0 || process_group != process_id {
+        if target_path != Some(TARGET_PATH) || process_id == 0 || process_group != process_id {
+            syscall::exit(3);
+        }
+        syscall::exit(SPAWN_SUCCESS);
+    }
+
+    if arguments.len() == 2 && arguments.get(1) == Some(SYSTEM_SPAWN_MODE) {
+        if target_path != Some(SYSTEM_TARGET_PATH) || process_id == 0 || process_group != process_id
+        {
             syscall::exit(3);
         }
         syscall::exit(SPAWN_SUCCESS);
