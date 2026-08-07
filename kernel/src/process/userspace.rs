@@ -29,7 +29,7 @@ use crate::{
 };
 
 use super::{
-    elf::{self, Image, ImageType, LoadSegment},
+    elf::{self, Image, ImageType, LoadSegment, LoadedExecutable},
     pipe::{self, PipeId},
     terminal,
 };
@@ -641,6 +641,7 @@ pub struct ProcessGroupInfo {
 pub enum Error {
     SchedulerNotOnBootstrapTask,
     UnsupportedImageType,
+    InvalidExecutableBytes,
     InvalidUserRange,
     KernelMappingUsesUserSlot(u64),
     AddressOverflow,
@@ -673,6 +674,9 @@ impl Error {
                 "userspace processes must be spawned from the bootstrap scheduler task"
             }
             Self::UnsupportedImageType => "the userspace loader requires an ET_EXEC image",
+            Self::InvalidExecutableBytes => {
+                "validated executable segment bytes are unavailable during image construction"
+            }
             Self::InvalidUserRange => "userspace virtual-address range is invalid",
             Self::KernelMappingUsesUserSlot(_) => {
                 "a required kernel mapping occupies the reserved userspace PML4 slot"
@@ -1872,8 +1876,8 @@ fn validate_kernel_context_pointer(process: &Process, context_pointer: usize) ->
 
 impl BuiltAddressSpace {
     fn build(
-        path: &str,
         image: &Image,
+        executable_bytes: &[u8],
         arguments: &[&str],
         environment: &[String],
         kernel_mapper: &mut OffsetPageTable<'_>,
@@ -1882,8 +1886,8 @@ impl BuiltAddressSpace {
     ) -> Result<Self, Error> {
         let mut tracking = TrackingFrameAllocator::new(frame_allocator);
         let result = Self::build_tracked(
-            path,
             image,
+            executable_bytes,
             arguments,
             environment,
             kernel_mapper,
@@ -1903,8 +1907,8 @@ impl BuiltAddressSpace {
     }
 
     fn build_tracked(
-        path: &str,
         image: &Image,
+        executable_bytes: &[u8],
         arguments: &[&str],
         environment: &[String],
         kernel_mapper: &mut OffsetPageTable<'_>,
@@ -1964,7 +1968,7 @@ impl BuiltAddressSpace {
                 physical_memory_offset,
                 &mut pages,
             )?;
-            copy_segment(path, segment, physical_memory_offset, &pages)?;
+            copy_segment(executable_bytes, segment, physical_memory_offset, &pages)?;
             ranges.push(UserRange {
                 start: segment.virtual_address,
                 end,
@@ -2030,7 +2034,7 @@ impl BuiltAddressSpace {
 pub fn spawn(
     path: &str,
     task_name: &'static str,
-    image: &Image,
+    executable: &LoadedExecutable,
     kernel_mapper: &mut OffsetPageTable<'_>,
     frame_allocator: &mut BootInfoFrameAllocator,
     physical_memory_offset: VirtAddr,
@@ -2038,7 +2042,7 @@ pub fn spawn(
     spawn_with_args(
         path,
         task_name,
-        image,
+        executable,
         &[path],
         kernel_mapper,
         frame_allocator,
@@ -2049,7 +2053,7 @@ pub fn spawn(
 pub fn spawn_with_args(
     path: &str,
     task_name: &'static str,
-    image: &Image,
+    executable: &LoadedExecutable,
     arguments: &[&str],
     kernel_mapper: &mut OffsetPageTable<'_>,
     frame_allocator: &mut BootInfoFrameAllocator,
@@ -2059,7 +2063,7 @@ pub fn spawn_with_args(
         SpawnRequest {
             path,
             task_name,
-            image,
+            executable,
             arguments,
             environment: &[],
             foreground: false,
@@ -2079,7 +2083,7 @@ pub fn spawn_with_args(
 struct SpawnRequest<'a> {
     path: &'a str,
     task_name: &'static str,
-    image: &'a Image,
+    executable: &'a LoadedExecutable,
     arguments: &'a [&'a str],
     environment: &'a [&'a str],
     foreground: bool,
@@ -2100,7 +2104,7 @@ fn spawn_with_mode(
     let SpawnRequest {
         path,
         task_name,
-        image,
+        executable,
         arguments,
         environment,
         foreground,
@@ -2149,9 +2153,10 @@ fn spawn_with_mode(
     }
 
     let environment = collect_environment(environment)?;
+    let image = executable.image();
     let mut address_space = BuiltAddressSpace::build(
-        path,
         image,
+        executable.bytes(),
         arguments,
         &environment,
         kernel_mapper,
@@ -2629,7 +2634,7 @@ impl Runtime {
         environment: &[&str],
         foreground: bool,
     ) -> Result<SpawnInfo, Error> {
-        let image = elf::validate(path)?;
+        let executable = elf::load(path)?;
         let mut argv = Vec::with_capacity(arguments.len().saturating_add(1));
         argv.push(path);
         argv.extend_from_slice(arguments);
@@ -2637,7 +2642,7 @@ impl Runtime {
             SpawnRequest {
                 path,
                 task_name: SHELL_PROCESS_TASK_NAME,
-                image: &image,
+                executable: &executable,
                 arguments: &argv,
                 environment,
                 foreground,
@@ -2661,7 +2666,7 @@ impl Runtime {
         stdin_pipe: Option<PipeId>,
         stdout_pipe: Option<PipeId>,
     ) -> Result<SpawnInfo, Error> {
-        let image = elf::validate(path)?;
+        let executable = elf::load(path)?;
         let mut argv = Vec::with_capacity(arguments.len().saturating_add(1));
         argv.push(path);
         argv.extend_from_slice(arguments);
@@ -2669,7 +2674,7 @@ impl Runtime {
             SpawnRequest {
                 path,
                 task_name: SHELL_PROCESS_TASK_NAME,
-                image: &image,
+                executable: &executable,
                 arguments: &argv,
                 environment: &[],
                 foreground: false,
@@ -2783,8 +2788,8 @@ impl Runtime {
             release_stream_target(stdin_target, StreamAccess::Read);
             return Err(error);
         }
-        let image = match elf::validate(&request.path) {
-            Ok(image) => image,
+        let executable = match elf::load(&request.path) {
+            Ok(executable) => executable,
             Err(error) => {
                 release_stream_target(stderr_target, StreamAccess::Write);
                 release_stream_target(stdout_target, StreamAccess::Write);
@@ -2800,7 +2805,7 @@ impl Runtime {
             SpawnRequest {
                 path: &request.path,
                 task_name: SHELL_PROCESS_TASK_NAME,
-                image: &image,
+                executable: &executable,
                 arguments: &argv,
                 environment: &environment,
                 foreground: request.foreground,
@@ -3610,13 +3615,14 @@ impl Runtime {
             process.environment.clone()
         };
 
-        let image = elf::validate(&request.path)?;
+        let executable = elf::load(&request.path)?;
+        let image = executable.image();
         let mut argv = Vec::with_capacity(request.arguments.len().saturating_add(1));
         argv.push(request.path.as_str());
         argv.extend(request.arguments.iter().map(String::as_str));
         let mut address_space = BuiltAddressSpace::build(
-            &request.path,
-            &image,
+            image,
+            executable.bytes(),
             &argv,
             &environment,
             &mut self.mapper,
@@ -4044,9 +4050,7 @@ impl Runtime {
                         pending.stack_pointer,
                     ))
                 }
-                (_, Ok(_), Some(Err(error))) => {
-                    Some(ControlOutcome::Ready(error_return(*error)))
-                }
+                (_, Ok(_), Some(Err(error))) => Some(ControlOutcome::Ready(error_return(*error))),
                 (_, Ok(reply), _) if reply.backend == vfs_protocol::backend::NULLFS => {
                     Some(ControlOutcome::Ready(error_return(ERR_IO)))
                 }
@@ -5571,7 +5575,10 @@ fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
         }
 }
 
-fn vfs_nullfs_backend_path(reply: &vfs_protocol::Reply, canonical_path: &str) -> Result<String, i64> {
+fn vfs_nullfs_backend_path(
+    reply: &vfs_protocol::Reply,
+    canonical_path: &str,
+) -> Result<String, i64> {
     if reply.flags == vfs_protocol::reply_flags::BINDING {
         let prefix_length = usize::from(reply.prefix_length);
         let suffix = canonical_path
@@ -6789,9 +6796,7 @@ enum DefaultSignalAction {
 
 fn default_signal_action(signal: u64) -> Option<DefaultSignalAction> {
     match signal {
-        SIGNAL_INTERRUPT | SIGNAL_KILL | SIGNAL_TERMINATE => {
-            Some(DefaultSignalAction::Terminate)
-        }
+        SIGNAL_INTERRUPT | SIGNAL_KILL | SIGNAL_TERMINATE => Some(DefaultSignalAction::Terminate),
         SIGNAL_STOP | SIGNAL_TERMINAL_STOP => Some(DefaultSignalAction::Stop),
         SIGNAL_CONTINUE => Some(DefaultSignalAction::Continue),
         _ => None,
@@ -10352,12 +10357,12 @@ fn nullfs_proxy_start_path(
             NullfsPathPurpose::Open { .. } | NullfsPathPurpose::Unlink => {
                 ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
             }
-            NullfsPathPurpose::Chdir => ControlOutcome::Ready(
-                match platform_set_working_directory(process_id, path) {
+            NullfsPathPurpose::Chdir => {
+                ControlOutcome::Ready(match platform_set_working_directory(process_id, path) {
                     Ok(()) => 0,
                     Err(error) => error_return(error),
-                },
-            ),
+                })
+            }
             NullfsPathPurpose::ReadDirectory {
                 start_index,
                 records_address,
@@ -11675,21 +11680,17 @@ fn syscall_seek(process_id: u64, descriptor: u64, offset: u64, whence: u64) -> u
                 session_id,
                 session_generation,
                 ..
-            } if !tmpfs_proxy_backend_is_current(
-                generation,
-                session_id,
-                session_generation,
-            ) => return error_return(ERR_IO),
+            } if !tmpfs_proxy_backend_is_current(generation, session_id, session_generation) => {
+                return error_return(ERR_IO);
+            }
             OpenFileBackend::NullfsProxy {
                 generation,
                 session_id,
                 session_generation,
                 ..
-            } if !nullfs_proxy_backend_is_current(
-                generation,
-                session_id,
-                session_generation,
-            ) => return error_return(ERR_IO),
+            } if !nullfs_proxy_backend_is_current(generation, session_id, session_generation) => {
+                return error_return(ERR_IO);
+            }
             _ => {}
         }
         let base = match whence {
@@ -12052,7 +12053,7 @@ fn map_range(
 }
 
 fn copy_segment(
-    path: &str,
+    executable_bytes: &[u8],
     segment: &LoadSegment,
     physical_memory_offset: VirtAddr,
     pages: &[UserPage],
@@ -12085,7 +12086,14 @@ fn copy_segment(
             .file_offset
             .checked_add(copied)
             .ok_or(Error::AddressOverflow)?;
-        vfs::read_exact_at(path, file_offset, destination)?;
+        let source_start = usize::try_from(file_offset).map_err(|_| Error::AddressOverflow)?;
+        let source_end = source_start
+            .checked_add(chunk)
+            .ok_or(Error::AddressOverflow)?;
+        let source = executable_bytes
+            .get(source_start..source_end)
+            .ok_or(Error::InvalidExecutableBytes)?;
+        destination.copy_from_slice(source);
         copied = copied
             .checked_add(chunk as u64)
             .ok_or(Error::AddressOverflow)?;

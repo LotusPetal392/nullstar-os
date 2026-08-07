@@ -638,14 +638,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     let process_frame_baseline = frame_allocator.allocated_frame_count();
-    let process_probe_image = match elf::validate("/process-probe") {
+    let process_probe_image = match elf::load("/process-probe") {
         Ok(image) => image,
         Err(error) => {
             serial_println!("userspace process-probe validation failed: {error}");
             hlt_loop();
         }
     };
-    let fault_image = match elf::validate("/fault-probe") {
+    let fault_image = match elf::load("/fault-probe") {
         Ok(image) => image,
         Err(error) => {
             serial_println!("userspace fault-probe validation failed: {error}");
