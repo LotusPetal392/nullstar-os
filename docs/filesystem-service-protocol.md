@@ -58,13 +58,12 @@ exactly `BINDING`, carries a canonical length-delimited backing prefix, and zero
 unused byte. The unmatched suffix begins at `prefix_length` in the canonical request path
 and is appended to the backing prefix for internal backend traversal.
 
-The implemented bindings are canonical `/System` and `/Applications` to matching paths
-relative to the UUID-selected NullFS provider's backend root. The VFS service owns these
+The implemented bindings are canonical `/System`, `/Applications`, and `/Users` to matching
+paths relative to the UUID-selected NullFS provider's backend root. The VFS service owns these
 binding records; the kernel validates each exact route, NullFS backend, binding flag, and
 backing prefix before traversing it internally. This is not a general service-controlled
 redirect. Matching paths below `/Volumes/NullStar` remain raw administrative aliases,
-while cwd and open-file paths retain canonical names. `/Users` remains synthetic and
-unbound.
+while cwd and open-file paths retain canonical names.
 
 This routing change does not alter public filesystem protocol version 1, its `Request`,
 `Reply`, or operations, the public file-descriptor ABI, or `NSVC` version 1.
@@ -278,8 +277,9 @@ services or volumes provide parts of it:
 - `/System` is bound to the primary NullFS provider's backend-root `/System` node and
   contains configuration, persistent logs, core programs, service definitions, userspace
   drivers, libraries, and system applications; bootstrap services remain independent;
-- `/Users` is currently synthetic and unbound; it is planned to contain per-user home
-  directories and user-owned data;
+- `/Users` is bound to the primary NullFS provider's backend-root `/Users` node and contains
+  per-user home directories and user-owned data; the integration fixture includes the
+  accepted `Profile/{config,cache,state,data,logs,runtime}` layout;
 - `/Applications` is bound to the primary NullFS provider's backend-root `/Applications`
   node; `/System/Applications` is now provided through the `/System` binding and is
   intended for applications delivered as part of the system;
@@ -289,12 +289,12 @@ services or volumes provide parts of it:
   request the same display name.
 
 Mount traversal must be component-based. Looking up `dev` or `tmp` beneath the root returns
-a mount-root node owned by the selected service. `/Users` remains in the synthetic
-namespace, while `/System` and `/Applications` select the generation-scoped NullFS proxy
-and internally begin at matching backend-root nodes. Clients do not need to know that the
-selected backend belongs to a different service, and their cwd and open-file paths remain
-canonical. The current VFS service owns longest-prefix routing and binding records; moving
-stable vnode handles and all open-file ownership into userspace remains later work.
+a mount-root node owned by the selected service. `/System`, `/Applications`, and `/Users`
+select the generation-scoped NullFS proxy and internally begin at matching backend-root
+nodes. Clients do not need to know that the selected backend belongs to a different
+service, and their cwd and open-file paths remain canonical. The current VFS service owns
+longest-prefix routing and binding records; moving stable vnode handles and all open-file
+ownership into userspace remains later work.
 
 The root filesystem, `/dev`, and `/tmp` are boot namespace entries and do not
 also appear beneath `/Volumes`. Mounting and unmounting a child of `/Volumes`
@@ -336,8 +336,9 @@ overloading generic flags or inline data.
 5. Put FAT behind the same protocol.
 6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
    service. (read-write service mount, explicitly writable direct sessions, bounded public
-   VFS create/write/truncate/append/unlink, and the first `/Applications` namespace binding
-   complete; `/System`, `/Users`, and broader adoption remain)
+   VFS create/write/truncate/append/unlink, all three primary-volume namespace bindings,
+   and static `/System/bin` execution complete; service-definition activation and broader
+   acceptance remain)
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
 
@@ -410,7 +411,7 @@ directory. The root
 listing merges boot-filesystem entries with `/dev`, `/tmp`, `/System`, `/Users`,
 `/Applications`, and `/Volumes`, suppressing backing-store name collisions.
 Unresolved descendants remain absent until a filesystem or service is mounted there. The
-VFS-owned `/System` and `/Applications` bindings select NullFS and return matching
+VFS-owned `/System`, `/Applications`, and `/Users` bindings select NullFS and return matching
 backend-root paths as zero-padded backing prefixes. The kernel checks those exact known
 targets before dispatch and appends canonical suffixes only for internal traversal. Route
 replies for every other entry carry no binding metadata and are checked against the
@@ -446,14 +447,14 @@ connect with flags `0` still receive read-only sessions; raw block authority,
 filesystem-session authority, and public VFS policy remain separate.
 
 Without adding a NullFS-specific application ABI, `/Volumes/NullStar` and the bound
-`/System` and `/Applications` views support ordinary public `stat`, read, open, `fstat`,
+`/System`, `/Applications`, and `/Users` views support ordinary public `stat`, read, open, `fstat`,
 seek, `read_directory`, and `chdir`. Writable, create, truncate, and append opens,
 descriptor `write`, and unlink remain available outside the System backing subtree;
 canonical and raw public System paths return `READ_ONLY` for mutation. Canonical path
 resolution happens before VFS routing, so cwd-relative operations continue to reach the
 selected backend while retaining logical paths. Raw matching paths below
 `/Volumes/NullStar` remain administrative views of the same nodes. Public `mkdir`, `rmdir`,
-rename, and binding `/Users` remain future work.
+and rename remain future work.
 
 Before copying a public write's source bytes, the proxy reserves its sole
 outstanding request; it then stages at most 4 KiB in the registered window. A
@@ -480,8 +481,8 @@ descriptors remain stale and mutations are never replayed or rebound.
 
 The direct service probe preserves read-only-session denial and exercises the
 service's broader writable protocol surface, including directory creation,
-`rmdir`, and rename. Public probes separately cover canonical `/Applications` mutation,
-cross-view visibility and identity, canonical cwd behavior, create, write, independent
-stale append, cross-handle `fstat` and `SEEK_END`, truncate, duplication, unlink while
-open, open-unlinked read/write, cleanup, persistence across service restart, stale old
-descriptors, and continued bootstrap availability.
+`rmdir`, and rename. Public probes separately cover canonical `/Applications` and `/Users`
+mutation, cross-view visibility and identity, canonical cwd behavior, create, write,
+independent stale append, cross-handle `fstat` and `SEEK_END`, truncate, duplication,
+unlink while open, open-unlinked read/write, cleanup, persistence across service restart,
+stale old descriptors, and continued bootstrap availability.

@@ -95,7 +95,7 @@ const ROUTES: &[Route] = &[
     Route {
         path: b"/Users",
         id: protocol::route::USERS,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: b"/tmp",

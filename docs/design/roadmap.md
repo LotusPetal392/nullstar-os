@@ -98,25 +98,25 @@ See [Capability-based application sandboxing](application-sandboxing.md).
 
 ## Namespace and persistent storage
 
-The first two namespace bindings are implemented, but namespace adoption and NullFS Phase
-5 are not complete. VFS namespace-routing protocol version 2 uses a bounded 224-byte reply
-with explicit binding metadata. The VFS service owns exact `/System` and `/Applications`
-records targeting matching nodes below the UUID-selected NullFS provider's backend root.
-Raw matching paths below `/Volumes/NullStar` remain administrative aliases, while cwd and
-open-file paths remain canonical. `/Users` remains synthetic and unbound. Public
-filesystem protocol v1 and `NSVC` v1 are unchanged.
+All three primary-volume namespace bindings are implemented, but NullFS Phase 5 acceptance
+is not complete. VFS namespace-routing protocol version 2 uses a bounded 224-byte reply
+with explicit binding metadata. The VFS service owns exact `/System`, `/Applications`, and
+`/Users` records targeting matching nodes below the UUID-selected NullFS provider's backend
+root. Raw matching paths below `/Volumes/NullStar` remain administrative aliases, while cwd
+and open-file paths remain canonical. Public filesystem protocol v1 and `NSVC` v1 are
+unchanged.
 
 - **Implemented:** preserve the VFS as owner of a synthetic logical root.
 - **Implemented:** give the primary NullFS volume a stable UUID and human-facing
   `/Volumes/NullStar` identity.
 - **Implemented:** populate `System`, `Applications`, and `Users` trees on the primary
   volume.
-- **Partially implemented:** project persistent trees through namespace bindings rather
-  than symbolic links; `/System` and `/Applications` are bound, while `/Users` remains.
+- **Implemented:** project all three persistent trees through namespace bindings rather
+  than symbolic links.
 - **Current coverage:** preserve canonical paths and underlying node identity across raw
   and bound views; enforce read-only System policy, test system metadata flags, a static
-  `/System/bin` executable, canonical application mutation, stale descriptors across
-  service restart, and bootstrap availability.
+  `/System/bin` executable, canonical application and user-profile mutation, stale
+  descriptors across service restart, and bootstrap availability.
 - **Implemented foundation:** writable NullStar filesystem-service authority, controlled
   shutdown ordering, clean/dirty recovery, and bounded public mutation; broader
   administrative tooling remains.
