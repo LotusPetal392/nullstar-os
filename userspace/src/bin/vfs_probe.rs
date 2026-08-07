@@ -918,14 +918,23 @@ fn probe_nullfs_restart() -> ! {
     for _ in 0..8 {
         syscall::yield_now().unwrap_or_else(|_| syscall::exit(106));
     }
-    if !fixture_files_are_exact()
-        || !nullfs_root_is_valid()
-        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
-        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY)
-        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
-        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
-    {
+    if !fixture_files_are_exact() {
         syscall::exit(107);
+    }
+    if !nullfs_root_is_valid() {
+        syscall::exit(114);
+    }
+    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY) {
+        syscall::exit(115);
+    }
+    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY) {
+        syscall::exit(116);
+    }
+    if !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY) {
+        syscall::exit(117);
+    }
+    if !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY) {
+        syscall::exit(118);
     }
     syscall::exit(0)
 }
@@ -1372,7 +1381,7 @@ fn path_contents_match(path: &[u8], expected: &[u8]) -> bool {
 }
 
 fn descriptor_stat_matches(descriptor: syscall::FileDescriptor, size: u64) -> bool {
-    platform::fstat(descriptor).ok()
+    fstat_with_retry(descriptor).ok()
         == Some(file::Stat {
             kind: file::KIND_FILE,
             size,
@@ -1400,6 +1409,20 @@ fn stat_with_retry(path: &[u8]) -> platform::Result<file::Stat> {
 
 fn stat_failed_with_retry(path: &[u8], expected: platform::Errno) -> bool {
     matches!(stat_with_retry(path), Err(error) if error == expected)
+}
+
+fn fstat_with_retry(descriptor: syscall::FileDescriptor) -> platform::Result<file::Stat> {
+    for _ in 0..64 {
+        match platform::fstat(descriptor) {
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
+    Err(platform::Errno::TRY_AGAIN)
 }
 
 fn stat_matches_flags(path: &[u8], kind: u64, size: u64, flags: u64) -> bool {
