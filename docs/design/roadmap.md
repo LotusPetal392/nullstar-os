@@ -98,14 +98,13 @@ See [Capability-based application sandboxing](application-sandboxing.md).
 
 ## Namespace and persistent storage
 
-The first non-bootstrap namespace binding is implemented, but namespace adoption and
-NullFS Phase 5 are not complete. VFS namespace-routing protocol version 2 uses a bounded
-224-byte reply with explicit binding metadata. The VFS service owns the binding record;
-the kernel currently accepts only canonical `/Applications` to the UUID-selected NullFS
-provider's backend-root `/Applications` node. `/Volumes/NullStar/Applications` remains the
-raw administrative alias, canonical cwd and open-file paths remain `/Applications/...`,
-and `/System` and `/Users` remain synthetic and unbound. Public filesystem protocol v1 and
-`NSVC` v1 are unchanged.
+The first two namespace bindings are implemented, but namespace adoption and NullFS Phase
+5 are not complete. VFS namespace-routing protocol version 2 uses a bounded 224-byte reply
+with explicit binding metadata. The VFS service owns exact `/System` and `/Applications`
+records targeting matching nodes below the UUID-selected NullFS provider's backend root.
+Raw matching paths below `/Volumes/NullStar` remain administrative aliases, while cwd and
+open-file paths remain canonical. `/Users` remains synthetic and unbound. Public
+filesystem protocol v1 and `NSVC` v1 are unchanged.
 
 - **Implemented:** preserve the VFS as owner of a synthetic logical root.
 - **Implemented:** give the primary NullFS volume a stable UUID and human-facing
@@ -113,16 +112,17 @@ and `/System` and `/Users` remain synthetic and unbound. Public filesystem proto
 - **Implemented:** populate `System`, `Applications`, and `Users` trees on the primary
   volume.
 - **Partially implemented:** project persistent trees through namespace bindings rather
-  than symbolic links; `/Applications` is bound, while `/System` and `/Users` remain.
-- **First-stage coverage:** preserve canonical paths and underlying node identity across
-  `/Applications` and `/Volumes/NullStar/Applications`; tests cover canonical mutation,
-  cross-view visibility and identity, stale descriptors across service restart, and
-  bootstrap availability.
+  than symbolic links; `/System` and `/Applications` are bound, while `/Users` remains.
+- **Current coverage:** preserve canonical paths and underlying node identity across raw
+  and bound views; enforce read-only System policy, test system metadata flags, a static
+  `/System/bin` executable, canonical application mutation, stale descriptors across
+  service restart, and bootstrap availability.
 - **Implemented foundation:** writable NullStar filesystem-service authority, controlled
   shutdown ordering, clean/dirty recovery, and bounded public mutation; broader
   administrative tooling remains.
-- **Future:** load non-bootstrap programs and service definitions through the bound
-  `/System` tree.
+- **Partially implemented:** load non-bootstrap programs and service definitions through
+  the bound `/System` tree; static executable loading is proven, while definition loading
+  and activation remain future work.
 - **Future:** treat `/System/boot` as the canonical source of boot generations and
   initially mirror the selected generation to a firmware-readable bootstrap partition.
 - **Ongoing requirement:** retain an independent bootstrap and recovery environment

@@ -60,7 +60,7 @@ fn platform_fstat(process_id: u64, descriptor: u64, stat_address: u64, stat_leng
                     abi::file::Stat {
                         kind: abi::file::KIND_FILE,
                         size: open_file_size(&file),
-                        flags: 0,
+                        flags: nullfs_proxy_path_flags(&file.path),
                     }
                 }
                 OpenFileBackend::Vfs => {

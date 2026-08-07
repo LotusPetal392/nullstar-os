@@ -227,25 +227,27 @@ owns the longest-prefix namespace table and validates the layout during boot.
 
 The distinct VFS namespace-routing protocol is version 2. Its bounded 224-byte `Reply`
 preserves `route_id`, `backend`, and `prefix_length` and adds flags plus a 192-byte,
-zero-padded backend-relative `backing_prefix`. The VFS service owns the binding record. The
-kernel accepts only the exact known `/Applications` target, combines its `/Applications`
-backing prefix with the unmatched canonical suffix, and traverses the selected NullFS
-provider internally; it does not expose a general service-directed redirect mechanism.
+zero-padded backend-relative `backing_prefix`. The VFS service owns the binding records.
+The kernel accepts only the exact known `/System` and `/Applications` targets, combines
+each matching backing prefix with the unmatched canonical suffix, and traverses the
+selected NullFS provider internally; it does not expose a general service-directed
+redirect mechanism.
 
 `stat`, path-based `read_directory`, `chdir`, descriptor-producing `open`, descriptor
 `read` and `write`, and `unlink` cross the VFS routing boundary. Service-backed open-file
 descriptions retain exactly one generation- and session-bound node reference until their
-final shared owner disappears. Working-directory and open-file paths reached through the
-binding remain canonical `/Applications/...` paths rather than being rewritten to the raw
-volume alias.
+final shared owner disappears. Working-directory and open-file paths reached through a
+binding retain canonical `/System/...` or `/Applications/...` names rather than being
+rewritten to raw volume aliases. Metadata and directory records reached canonically below
+`/System` retain the system flag; the raw administrative view does not acquire it.
 
-The rooted namespace currently includes synthetic `/dev`, service-backed `/tmp`, the
-synthetic and still-unbound system hierarchy under `/System`, synthetic and still-unbound
-homes under `/Users`, the NullFS-backed `/Applications` binding, and named filesystems
-below `/Volumes`. `/Applications` is the first implemented non-bootstrap namespace binding:
-it targets the UUID-selected NullFS provider's backend-root `/Applications` node, while
-`/Volumes/NullStar/Applications` remains the raw administrative alias. The implemented
-mount layout is not the accepted final physical-storage layout; see
+The rooted namespace currently includes synthetic `/dev`, service-backed `/tmp`,
+NullFS-backed `/System` and `/Applications` bindings, synthetic and still-unbound homes
+under `/Users`, and named filesystems below `/Volumes`. The two implemented bindings target
+the UUID-selected NullFS provider's matching backend-root nodes, while
+`/Volumes/NullStar/System` and `/Volumes/NullStar/Applications` remain raw administrative
+aliases. The implemented mount layout is not the accepted final physical-storage layout;
+see
 [Filesystem namespace and boot direction](design/filesystem-namespace.md).
 
 ### Future device filesystem and drivers
@@ -298,10 +300,12 @@ directory `rmdir` and unsafe rename replacement remain restricted.
 
 The kernel NullFS proxy requests exactly `WRITE` and accepts a service generation only
 when `CONNECT` returns `session_features::WRITE`. The public `/Volumes/NullStar` mount and
-the bound `/Applications` view support ordinary `stat`, read, open, `fstat`, seek,
-directory reads, and `chdir`, plus writable, create, truncate, and append opens, descriptor
-writes, and unlink. Public `mkdir`, `rmdir`, rename, and adoption of `/System` and `/Users`
-remain future work; direct flags-zero sessions remain read-only.
+the bound `/System` and `/Applications` views support ordinary `stat`, read, open, `fstat`,
+seek, directory reads, and `chdir`. Writable, create, truncate, and append opens,
+descriptor writes, and unlink remain available outside the System backing subtree;
+canonical and raw public System paths reject mutation with `READ_ONLY`. Public `mkdir`,
+`rmdir`, rename, and adoption of `/Users` remain future work; direct flags-zero sessions
+remain read-only.
 
 The proxy reserves its single request before staging at most 4 KiB for a write. A
 successful generic `WRITE` reply retains the byte count in `value` and carries the exact
@@ -331,13 +335,13 @@ Normal boot retains raw read-only coverage plus non-destructive writable-endpoin
 identity, bounds, and flush checks. Filesystem-level probes provide durable mutation
 coverage without using allocatable file data as raw scratch space.
 The generated 4 MiB primary volume is exposed at `/Volumes/NullStar` and contains
-`System/`, `Applications/`, and `Users/`. Only `Applications/` is currently projected into
-the root namespace, at canonical `/Applications`; `/System` and `/Users` remain synthetic
-and unbound. Public probes exercise mutation through the canonical view, visibility and
-identity through the raw and canonical views, canonical cwd behavior, persistence and
-stale old descriptors across service restart, stopped-service timeout/KILL replacement
-through dirty recovery, and continued bootstrap availability. Remaining namespace adoption
-is tracked in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
+`System/`, `Applications/`, and `Users/`. `System/` and `Applications/` are projected at
+their canonical root paths; `/Users` remains synthetic and unbound. Public probes exercise
+canonical and raw view identity, canonical cwd behavior, system metadata flags, a static
+executable launched through `/System/bin`, persistence and stale old descriptors across
+service restart, stopped-service timeout/KILL replacement through dirty recovery, and
+continued bootstrap availability. Remaining namespace adoption is tracked in the
+[NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
 

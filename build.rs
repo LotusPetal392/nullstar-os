@@ -341,9 +341,36 @@ fn build_nullfs_fixture(exec_target_path: &Path) -> Vec<u8> {
         nullfs_primary_volume::DISPLAY_NAME,
     )
     .expect("failed to format NullFS fixture");
-    image
+    let system = image
         .create_directory(1, "System", 0o755)
         .expect("failed to create NullFS System directory");
+    image
+        .create_directory(system, "config", 0o755)
+        .expect("failed to create NullFS System config directory");
+    let system_var = image
+        .create_directory(system, "var", 0o755)
+        .expect("failed to create NullFS System var directory");
+    image
+        .create_directory(system_var, "log", 0o755)
+        .expect("failed to create NullFS System log directory");
+    let system_bin = image
+        .create_directory(system, "bin", 0o755)
+        .expect("failed to create NullFS System bin directory");
+    image
+        .create_directory(system, "services", 0o755)
+        .expect("failed to create NullFS System services directory");
+    image
+        .create_directory(system, "drivers", 0o755)
+        .expect("failed to create NullFS System drivers directory");
+    image
+        .create_directory(system, "lib", 0o755)
+        .expect("failed to create NullFS System lib directory");
+    image
+        .create_directory(system, "Applications", 0o755)
+        .expect("failed to create NullFS System Applications directory");
+    image
+        .create_file(system_bin, "exec-target", &exec_target, 0o755)
+        .expect("failed to create NullFS system exec-target artifact");
     let applications = image
         .create_directory(1, "Applications", 0o755)
         .expect("failed to create NullFS Applications directory");

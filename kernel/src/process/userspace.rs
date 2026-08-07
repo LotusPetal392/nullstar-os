@@ -1098,6 +1098,7 @@ enum PendingNullfsProxyOperation {
         capacity: usize,
         records: Vec<abi::file::DirectoryEntry>,
         cookie: u64,
+        flags: u64,
     },
     Unlink,
 }
@@ -5436,21 +5437,7 @@ fn vfs_route_is_offline() -> bool {
 }
 
 fn vfs_is_declared_namespace_directory(path: &str) -> bool {
-    matches!(
-        path,
-        "/dev"
-            | "/System"
-            | "/System/config"
-            | "/System/var"
-            | "/System/var/log"
-            | "/System/bin"
-            | "/System/services"
-            | "/System/drivers"
-            | "/System/lib"
-            | "/System/Applications"
-            | "/Users"
-            | "/Volumes"
-    )
+    matches!(path, "/dev" | "/Users" | "/Volumes")
 }
 
 fn vfs_routed_boot_directory(
@@ -5494,25 +5481,7 @@ fn vfs_routed_namespace_directory(
     capacity: usize,
 ) -> ControlOutcome {
     let names: &[&str] = match path {
-        "/System" => &[
-            "config",
-            "var",
-            "bin",
-            "services",
-            "drivers",
-            "lib",
-            "Applications",
-        ],
-        "/System/var" => &["log"],
-        "/dev"
-        | "/System/config"
-        | "/System/var/log"
-        | "/System/bin"
-        | "/System/services"
-        | "/System/drivers"
-        | "/System/lib"
-        | "/System/Applications"
-        | "/Users" => &[],
+        "/dev" | "/Users" => &[],
         "/Volumes" => &[nullfs_primary_volume::DISPLAY_NAME],
         _ => return ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY)),
     };
@@ -5528,7 +5497,11 @@ fn vfs_namespace_directory_record(name: &str, system: bool) -> abi::file::Direct
     let mut record = abi::file::DirectoryEntry {
         kind: abi::file::KIND_DIRECTORY,
         size: 0,
-        flags: if system { abi::file::FLAG_SYSTEM } else { 0 },
+        flags: if system {
+            abi::file::FLAG_SYSTEM | abi::file::FLAG_READ_ONLY
+        } else {
+            0
+        },
         name_length: bytes.len() as u64,
         name: [0; abi::file::DIRECTORY_ENTRY_NAME_CAPACITY],
     };
@@ -5643,7 +5616,7 @@ enum ExecutableLoadStart {
 }
 
 fn executable_path_uses_service(path: &str) -> bool {
-    path == "/Applications" || path.starts_with("/Applications/")
+    vfs_path_has_prefix(path, "/Applications") || vfs_path_has_prefix(path, "/System")
 }
 
 fn executable_load_fail(
@@ -6021,50 +5994,64 @@ fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
         (
             "/System/Applications",
             vfs_protocol::route::SYSTEM_APPLICATIONS,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/Applications"),
         )
     } else if vfs_path_has_prefix(path, "/System/services") {
         (
             "/System/services",
             vfs_protocol::route::SYSTEM_SERVICES,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/services"),
         )
     } else if vfs_path_has_prefix(path, "/System/drivers") {
         (
             "/System/drivers",
             vfs_protocol::route::SYSTEM_DRIVERS,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/drivers"),
         )
     } else if vfs_path_has_prefix(path, "/System/var/log") {
         (
             "/System/var/log",
             vfs_protocol::route::SYSTEM_VAR_LOG,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/var/log"),
         )
     } else if vfs_path_has_prefix(path, "/System/config") {
         (
             "/System/config",
             vfs_protocol::route::SYSTEM_CONFIG,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/config"),
         )
     } else if vfs_path_has_prefix(path, "/System/bin") {
         (
             "/System/bin",
             vfs_protocol::route::SYSTEM_BIN,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/bin"),
         )
     } else if vfs_path_has_prefix(path, "/System/lib") {
         (
             "/System/lib",
             vfs_protocol::route::SYSTEM_LIB,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/lib"),
+        )
+    } else if vfs_path_has_prefix(path, "/System/var") {
+        (
+            "/System/var",
+            vfs_protocol::route::SYSTEM_VAR,
+            vfs_protocol::backend::NULLFS,
+            Some("/System/var"),
+        )
+    } else if vfs_path_has_prefix(path, "/System") {
+        (
+            "/System",
+            vfs_protocol::route::SYSTEM,
+            vfs_protocol::backend::NULLFS,
+            Some("/System"),
         )
     } else if vfs_path_has_prefix(path, "/Applications") {
         (
@@ -6084,20 +6071,6 @@ fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
         (
             "/Volumes",
             vfs_protocol::route::VOLUMES,
-            vfs_protocol::backend::NAMESPACE,
-            None,
-        )
-    } else if vfs_path_has_prefix(path, "/System/var") {
-        (
-            "/System/var",
-            vfs_protocol::route::SYSTEM_VAR,
-            vfs_protocol::backend::NAMESPACE,
-            None,
-        )
-    } else if vfs_path_has_prefix(path, "/System") {
-        (
-            "/System",
-            vfs_protocol::route::SYSTEM,
             vfs_protocol::backend::NAMESPACE,
             None,
         )
@@ -10963,6 +10936,23 @@ fn nullfs_proxy_components(path: &str) -> Result<Vec<String>, i64> {
     Ok(components)
 }
 
+fn nullfs_proxy_path_flags(path: &str) -> u64 {
+    if vfs_path_has_prefix(path, "/System") {
+        abi::file::FLAG_SYSTEM | abi::file::FLAG_READ_ONLY
+    } else if path
+        .strip_prefix(NULLFS_MOUNT_PATH)
+        .is_some_and(|suffix| vfs_path_has_prefix(suffix, "/System"))
+    {
+        abi::file::FLAG_READ_ONLY
+    } else {
+        0
+    }
+}
+
+fn nullfs_proxy_path_is_read_only(backend_path: &str) -> bool {
+    vfs_path_has_prefix(backend_path, "/System")
+}
+
 fn nullfs_proxy_lookup_request(parent: u64, name: &str) -> filesystem_protocol::Request {
     let mut request = filesystem_protocol::Request::EMPTY;
     request.operation = filesystem_protocol::operation::LOOKUP;
@@ -11112,6 +11102,7 @@ fn nullfs_proxy_start_path(
                     capacity,
                     records: Vec::new(),
                     cookie: 0,
+                    flags: nullfs_proxy_path_flags(path),
                 };
                 match nullfs_proxy_begin_request(process_id, request, operation, stack_pointer) {
                     Ok(()) => ControlOutcome::Blocked,
@@ -11174,6 +11165,11 @@ fn nullfs_proxy_open(
     descriptor: u64,
     stack_pointer: usize,
 ) -> ControlOutcome {
+    if nullfs_proxy_path_is_read_only(backend_path)
+        && (options.write || options.create || options.truncate || options.append)
+    {
+        return ControlOutcome::Ready(error_return(ERR_READ_ONLY));
+    }
     nullfs_proxy_start_path(
         process_id,
         path,
@@ -11230,6 +11226,9 @@ fn nullfs_proxy_unlink(
     backend_path: &str,
     stack_pointer: usize,
 ) -> ControlOutcome {
+    if nullfs_proxy_path_is_read_only(backend_path) {
+        return ControlOutcome::Ready(error_return(ERR_READ_ONLY));
+    }
     nullfs_proxy_start_path(
         process_id,
         path,
@@ -11518,7 +11517,7 @@ fn nullfs_proxy_complete_success(
                         abi::file::Stat {
                             kind,
                             size: reply.value,
-                            flags: 0,
+                            flags: nullfs_proxy_path_flags(&path),
                         },
                     );
                     nullfs_proxy_finish_process(request_id, process_id, stack_pointer, result)
@@ -11564,6 +11563,7 @@ fn nullfs_proxy_complete_success(
                             capacity,
                             records: Vec::new(),
                             cookie: 0,
+                            flags: nullfs_proxy_path_flags(&path),
                         },
                         stack_pointer,
                     )
@@ -12033,6 +12033,7 @@ fn nullfs_proxy_complete_success(
             capacity,
             mut records,
             cookie,
+            flags,
         } => {
             let entry_size = size_of::<filesystem_protocol::DirectoryEntry>();
             let maximum = FILESYSTEM_PROXY_BULK_BYTES / entry_size;
@@ -12092,7 +12093,7 @@ fn nullfs_proxy_complete_success(
                     let mut record = abi::file::DirectoryEntry {
                         kind,
                         size: 0,
-                        flags: 0,
+                        flags,
                         name_length: name_length as u64,
                         name: [0; abi::file::DIRECTORY_ENTRY_NAME_CAPACITY],
                     };
@@ -12171,6 +12172,7 @@ fn nullfs_proxy_complete_success(
                     capacity,
                     records,
                     cookie: previous_cookie,
+                    flags,
                 },
                 stack_pointer,
             )

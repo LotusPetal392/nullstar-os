@@ -48,6 +48,13 @@ mod tests {
         reply.backing_prefix[..APPLICATIONS.len()].copy_from_slice(APPLICATIONS);
         assert_eq!(reply.binding_prefix(), Ok(Some("/Applications")));
 
+        const SYSTEM: &[u8] = b"/System";
+        let mut system_reply = protocol::Reply::EMPTY;
+        system_reply.flags = protocol::reply_flags::BINDING;
+        system_reply.backing_prefix_length = SYSTEM.len() as u16;
+        system_reply.backing_prefix[..SYSTEM.len()].copy_from_slice(SYSTEM);
+        assert_eq!(system_reply.binding_prefix(), Ok(Some("/System")));
+
         let mut malformed = reply;
         malformed.backing_prefix_length = u16::MAX;
         assert_eq!(
@@ -96,5 +103,7 @@ mod tests {
             "/Applications"
         ));
         assert!(!protocol::path_has_prefix("/Application", "/Applications"));
+        assert!(protocol::path_has_prefix("/System/bin", "/System"));
+        assert!(!protocol::path_has_prefix("/Systematic", "/System"));
     }
 }
