@@ -778,8 +778,8 @@ fn probe_user_namespace_mutation() {
     if !descriptor_stat_matches(raw, USER_PROBE_BYTES.len() as u64)
         || !read_matches(raw, USER_PROBE_BYTES)
         || !unlink_with_retry(NULLFS_USER_PROBE_RAW)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
         || syscall::seek(canonical, syscall::SeekFrom::Start(0)).ok() != Some(0)
         || !read_matches(canonical, USER_PROBE_BYTES)
     {
@@ -900,8 +900,8 @@ fn probe_nullfs_restart() -> ! {
     if !descriptor_stat_matches(replacement_user, USER_RESTART_BYTES.len() as u64)
         || !read_matches(replacement_user, USER_RESTART_BYTES)
         || !unlink_with_retry(NULLFS_USER_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         syscall::exit(113);
     }
@@ -922,8 +922,8 @@ fn probe_nullfs_restart() -> ! {
         || !nullfs_root_is_valid()
         || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
         || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         syscall::exit(107);
     }
@@ -1208,8 +1208,8 @@ fn recover_user_probe_artifact() -> bool {
     };
     if !read_matches(descriptor, expected)
         || !unlink_with_retry(NULLFS_USER_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_USER_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         let _ = syscall::close(descriptor);
         return false;
@@ -1396,6 +1396,10 @@ fn stat_with_retry(path: &[u8]) -> platform::Result<file::Stat> {
         }
     }
     Err(platform::Errno::TRY_AGAIN)
+}
+
+fn stat_failed_with_retry(path: &[u8], expected: platform::Errno) -> bool {
+    matches!(stat_with_retry(path), Err(error) if error == expected)
 }
 
 fn stat_matches_flags(path: &[u8], kind: u64, size: u64, flags: u64) -> bool {
