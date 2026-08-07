@@ -287,6 +287,7 @@ dependencies = [
  "noto-sans-mono-bitmap",
  "nswp-logging",
  "nullfs-format",
+ "nullstar-executable",
  "pc-keyboard",
  "pic8259",
  "spin 0.10.1",
@@ -495,6 +496,10 @@ dependencies = [
  "nullfs-format",
  "userspace",
 ]
+
+[[package]]
+name = "nullstar-executable"
+version = "0.1.0"
 
 [[package]]
 name = "nullstar-os"
