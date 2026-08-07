@@ -1186,7 +1186,7 @@ fn recover_public_probe_artifact() -> bool {
 }
 
 fn recover_user_probe_artifact() -> bool {
-    let stat = match platform::stat(NULLFS_USER_PROBE) {
+    let stat = match stat_with_retry(NULLFS_USER_PROBE) {
         Ok(stat) => stat,
         Err(error) if error == platform::Errno::NO_ENTRY => return true,
         Err(_) => return false,
@@ -1382,6 +1382,20 @@ fn descriptor_stat_matches(descriptor: syscall::FileDescriptor, size: u64) -> bo
 
 fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
     stat_matches_flags(path, kind, size, 0)
+}
+
+fn stat_with_retry(path: &[u8]) -> platform::Result<file::Stat> {
+    for _ in 0..64 {
+        match platform::stat(path) {
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
+    Err(platform::Errno::TRY_AGAIN)
 }
 
 fn stat_matches_flags(path: &[u8], kind: u64, size: u64, flags: u64) -> bool {
