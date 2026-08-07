@@ -256,14 +256,20 @@ A distinct readiness deadline force-terminates a live starting generation that n
 its final status then follows the ordinary bounded restart/backoff and failure policy.
 
 A successful logging start or stop response commits desired state; it does not wait for readiness or
-final exit. Filesystem restart now waits for final child status, offlines the exact old generation,
-fails and wakes its blocked proxy work, closes the old endpoint handle, creates a fresh endpoint
-object, and registers a strictly newer generation before completing the restart fence. The kernel
-retains the old generation as an offline tombstone, rejects stale replies and work, and purges stale
-close work. Writable NullFS is deliberately not withdrawn before final exit because pre-exit quiesce
-and `SYNC` remain future work. Filesystem `Start` and `Stop` therefore remain `Unsupported`, and
-`NSVC` v1 is unchanged. This milestone adds no manager process, activation, definitions, or
-cross-reboot persistence; ABI 1.13 adds only the PID-1 provider-offlining syscall.
+final exit. Controlled NullFS restart is also asynchronous. PID 1 queues private `NFLC` v1 `QUIESCE`
+behind earlier work on the existing FIFO request endpoint. Exact `QUIESCED` lets it offline that exact
+generation, waking tail work with `EIO`, before it queues `UNMOUNT`. The service closes core open
+handles, syncs and publishes a clean superblock through `try_unmount`, emits exact
+`CLEAN_UNMOUNTED`, and exits `0`. PID 1 requires both the exact clean event and final exit `0`, then
+uses a fresh endpoint and strictly newer generation before completing the restart fence.
+
+Timeout, malformed or mismatched events, capability-bearing events, lifecycle failure, or early or
+nonzero exit cannot prove durability. PID 1 exact-generation offlines, forces KILL/reap when needed,
+and lets the replacement perform dirty recovery. Controlled restart charges no failure backoff or
+budget. Filesystem `Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and the public
+filesystem version 1 request/reply operation set are unchanged. This milestone adds no manager
+process, activation, definitions, or cross-reboot persistence; ABI 1.13 remains the narrow PID-1
+provider-offlining syscall.
 
 ## The `sv` command
 
@@ -432,9 +438,9 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    PID 1 service registry fixes the observation contract, but job containment remains.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
    delivered:** native `list`, `status`, and restart use separately authorized IPC, logging has live
-   in-memory `start`/`stop`, and filesystem restart has exact-generation provider offlining;
-   filesystem live `start`/`stop`, writable pre-exit quiesce/`SYNC`, and cross-reboot desired state
-   remain future work.
+   in-memory `start`/`stop`, and NullFS restart has exact-generation quiesce, clean unmount, forced
+   dirty-recovery fallback, and provider replacement; filesystem live `start`/`stop` and cross-reboot
+   desired state remain future work.
 3. Introduce the one-bootstrap-channel startup contract and stable service generations.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.

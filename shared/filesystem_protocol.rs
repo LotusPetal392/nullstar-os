@@ -34,6 +34,105 @@ pub mod operation {
     pub const SYNC: u16 = 19;
 }
 
+pub mod lifecycle {
+    pub const MAGIC: [u8; 4] = *b"NFLC";
+    pub const VERSION: u16 = 1;
+    pub const MESSAGE_BYTES: usize = 24;
+
+    pub mod kind {
+        pub const QUIESCE: u16 = 1;
+        pub const QUIESCED: u16 = 2;
+        pub const UNMOUNT: u16 = 3;
+        pub const CLEAN_UNMOUNTED: u16 = 4;
+        pub const FAILED: u16 = 5;
+
+        pub const fn known(value: u16) -> bool {
+            matches!(
+                value,
+                QUIESCE | QUIESCED | UNMOUNT | CLEAN_UNMOUNTED | FAILED
+            )
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Message {
+        pub kind: u16,
+        pub generation: u64,
+        pub transition_id: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DecodeError {
+        Length,
+        Magic,
+        Version,
+        Kind,
+        Generation,
+        Transition,
+    }
+
+    impl Message {
+        pub const fn new(kind: u16, generation: u64, transition_id: u64) -> Option<Self> {
+            if !kind::known(kind) || generation == 0 || transition_id == 0 {
+                return None;
+            }
+            Some(Self {
+                kind,
+                generation,
+                transition_id,
+            })
+        }
+
+        pub fn encode(self) -> [u8; MESSAGE_BYTES] {
+            let mut bytes = [0; MESSAGE_BYTES];
+            bytes[..4].copy_from_slice(&MAGIC);
+            bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
+            bytes[6..8].copy_from_slice(&self.kind.to_le_bytes());
+            bytes[8..16].copy_from_slice(&self.generation.to_le_bytes());
+            bytes[16..24].copy_from_slice(&self.transition_id.to_le_bytes());
+            bytes
+        }
+
+        pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+            if bytes.len() != MESSAGE_BYTES {
+                return Err(DecodeError::Length);
+            }
+            if bytes[..4] != MAGIC {
+                return Err(DecodeError::Magic);
+            }
+            let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+            if version != VERSION {
+                return Err(DecodeError::Version);
+            }
+            let kind = u16::from_le_bytes([bytes[6], bytes[7]]);
+            if !kind::known(kind) {
+                return Err(DecodeError::Kind);
+            }
+            let generation = u64::from_le_bytes(
+                bytes[8..16]
+                    .try_into()
+                    .expect("validated lifecycle generation width"),
+            );
+            if generation == 0 {
+                return Err(DecodeError::Generation);
+            }
+            let transition_id = u64::from_le_bytes(
+                bytes[16..24]
+                    .try_into()
+                    .expect("validated lifecycle transition width"),
+            );
+            if transition_id == 0 {
+                return Err(DecodeError::Transition);
+            }
+            Ok(Self {
+                kind,
+                generation,
+                transition_id,
+            })
+        }
+    }
+}
+
 pub mod status {
     pub const OK: i32 = 0;
     pub const INVALID: i32 = 1;
@@ -224,6 +323,59 @@ pub fn decode_write_reply_offset(reply: &Reply) -> Option<u64> {
     let mut bytes = [0; WRITE_REPLY_OFFSET_BYTES];
     bytes.copy_from_slice(&reply.data[..WRITE_REPLY_OFFSET_BYTES]);
     Some(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::lifecycle::{self, DecodeError, Message, kind};
+
+    #[test]
+    fn lifecycle_message_has_a_canonical_golden_encoding() {
+        let message = Message::new(
+            kind::QUIESCE,
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+        )
+        .unwrap();
+        assert_eq!(
+            message.encode(),
+            [
+                b'N', b'F', b'L', b'C', 1, 0, 1, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17,
+                0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+            ]
+        );
+        assert_eq!(Message::decode(&message.encode()), Ok(message));
+        assert_eq!(lifecycle::MESSAGE_BYTES, 24);
+        assert_eq!(super::VERSION, 1);
+    }
+
+    #[test]
+    fn lifecycle_message_rejects_noncanonical_fields() {
+        assert_eq!(Message::new(0, 1, 1), None);
+        assert_eq!(Message::new(kind::QUIESCE, 0, 1), None);
+        assert_eq!(Message::new(kind::QUIESCE, 1, 0), None);
+
+        let valid = Message::new(kind::UNMOUNT, 7, 9).unwrap().encode();
+        assert_eq!(
+            Message::decode(&valid[..valid.len() - 1]),
+            Err(DecodeError::Length)
+        );
+        let mut invalid = valid;
+        invalid[0] ^= 1;
+        assert_eq!(Message::decode(&invalid), Err(DecodeError::Magic));
+        invalid = valid;
+        invalid[4] = 2;
+        assert_eq!(Message::decode(&invalid), Err(DecodeError::Version));
+        invalid = valid;
+        invalid[6..8].copy_from_slice(&99_u16.to_le_bytes());
+        assert_eq!(Message::decode(&invalid), Err(DecodeError::Kind));
+        invalid = valid;
+        invalid[8..16].fill(0);
+        assert_eq!(Message::decode(&invalid), Err(DecodeError::Generation));
+        invalid = valid;
+        invalid[16..24].fill(0);
+        assert_eq!(Message::decode(&invalid), Err(DecodeError::Transition));
+    }
 }
 
 #[repr(C)]

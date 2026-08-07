@@ -5,8 +5,9 @@ userspace filesystem-service contract defined in
 `shared/filesystem_protocol.rs`. Generic sessions, opaque node handles, and
 registered bulk buffers are active for tmpfs and NullFS. NullFS supports
 explicitly negotiated direct writable sessions and a bounded writable public VFS
-proxy. The public file-descriptor ABI remains unchanged while kernel proxies
-bridge the migration.
+proxy. The public filesystem protocol remains `VERSION = 1`: its `Request` and
+`Reply` layouts and operation set are unchanged. The public file-descriptor ABI
+also remains unchanged while kernel proxies bridge the migration.
 
 ## Design goals
 
@@ -159,20 +160,51 @@ description. A replacement registration must carry a strictly newer generation
 and a fresh endpoint object, not another handle to the old object whose queue
 may still contain requests.
 
-Filesystem restart ordering is fixed:
+### Private NullFS lifecycle frame
 
-1. observe final child status;
-2. offline the exact old generation and preserve its tombstone;
-3. fail and wake that generation's blocked work and purge stale close work;
-4. close PID 1's old endpoint handle;
-5. create a fresh endpoint object;
-6. start and register the service under a strictly newer generation;
-7. complete the restart fence only after replacement startup succeeds.
+Controlled NullFS replacement uses a private lifecycle frame; it does not add a
+public filesystem operation or change the version 1 `Request` or `Reply`.
+Every lifecycle frame is exactly 24 bytes:
 
-Writable NullFS remains registered until final child status. Withdrawing it
-before final exit would require a service-level quiesce and `SYNC` boundary that
-is not implemented yet; provider offlining does not claim clean-unmount or
-additional durability semantics.
+| Byte range | Size | Field | Encoding and constraint |
+| --- | ---: | --- | --- |
+| `0..4` | 4 | magic | ASCII `NFLC` |
+| `4..6` | 2 | version | little-endian `u16`, exactly `1` |
+| `6..8` | 2 | kind | little-endian `u16`, one value below |
+| `8..16` | 8 | service generation | little-endian nonzero `u64` |
+| `16..24` | 8 | transition ID | little-endian nonzero `u64` |
+
+Kind values are `1` `QUIESCE`, `2` `QUIESCED`, `3` `UNMOUNT`, `4`
+`CLEAN_UNMOUNTED`, and `5` `FAILED`. Frames are canonical only at the exact
+length and carry no capability. PID 1 queues requests on the existing FIFO
+filesystem request endpoint; the service returns events on its private
+supervisor endpoint. Generation and transition ID bind every event to one exact
+restart attempt.
+
+Controlled NullFS restart is asynchronous and ordered:
+
+1. PID 1 commits restart intent without charging failure backoff or budget, then
+   queues `QUIESCE` behind work already on the old generation's request endpoint.
+2. The service completes those earlier requests, consumes `QUIESCE`, enters the
+   quiesced state, and emits exact `QUIESCED`. It processes no later public
+   filesystem operations while quiesced.
+3. After validating the sender, kind, generation, transition ID, exact frame, and
+   lack of an attached capability, PID 1 offlines that exact provider generation.
+   The kernel wakes and fails tail work with `EIO` and preserves the tombstone.
+4. PID 1 queues `UNMOUNT` with the same generation and transition ID. The service
+   closes every core open handle, calls `try_unmount` to sync and publish a clean
+   superblock, emits exact `CLEAN_UNMOUNTED`, and exits with status `0`.
+5. PID 1 accepts the clean path only after observing both that exact event and
+   final exit status `0`, in either arrival order. It then closes the old endpoint,
+   creates a fresh endpoint object, and starts and registers a strictly newer
+   generation before completing the restart fence.
+
+A timeout, malformed or mismatched event, attached event capability, `FAILED`,
+early exit, or nonzero exit is not durability proof. PID 1 offlines the exact
+generation, forces termination with `KILL` when the child is still live, reaps it,
+and replaces it through normal dirty mount recovery. Repeating an already
+completed exact-generation offline is harmless. This controlled restart boundary
+does not implement live filesystem `Start` or `Stop`.
 
 ## Target system namespace
 

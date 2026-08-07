@@ -39,8 +39,8 @@ Generated images use `/BOOTMODE` to select among:
 
 - `normal`, which starts services, PID 1, and the foreground userspace shell;
 - `smoke-test`, which runs deterministic subsystem probes and persistence checks;
-- `nullfs-restart-test`, which offlines and replaces the mounted NullFS service while a
-  probe owns a live descriptor and blocked read;
+- `nullfs-restart-test`, which validates NullFS's clean quiesce/unmount replacement and a
+  stopped-service timeout/KILL replacement through dirty recovery;
 - `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
   generation replacement, restart fencing, filesystem mutation policy, and forced termination.
 
@@ -160,14 +160,16 @@ start/stop success commits desired state without
 waiting for exit or readiness. PID 1 first requests cooperative termination and escalates after a
 bounded grace period with uncatchable, unblockable signal 9; the dedicated lifecycle image verifies
 that escalation, duplicate-restart `Busy`, and exact filesystem `Start`/`Stop` `Unsupported` policy.
-Filesystem restart now waits for final child status, offlines the exact old generation through the
-PID-1-only ABI 1.13 syscall, fails and wakes that generation's blocked proxy work with `EIO`, closes
-the old endpoint handle, creates a fresh endpoint object, and starts and registers a strictly newer
-generation before completing the restart fence. The kernel preserves an offline generation tombstone,
-rejects stale replies and work, and purges stale close work. Writable NullFS remains online until final
-exit because orderly pre-exit quiesce and `SYNC` remain future work. Filesystem `Start` and `Stop`
-therefore remain exactly `Unsupported`; `NSVC` v1 is unchanged. This adds no manager process,
-activation, definition loading, or cross-reboot persistence.
+Controlled NullFS restart queues private `NFLC` v1 `QUIESCE` behind earlier FIFO requests. Exact
+`QUIESCED` lets PID 1 offline that provider generation and wake tail work with `EIO`; `UNMOUNT` then
+closes core handles, syncs and publishes a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits
+`0`. Only that exact event plus final exit `0` proves the clean path. Timeout, malformed or wrong
+lifecycle traffic, a capability-bearing event, failure, or early/nonzero exit triggers exact-generation
+offlining, KILL/reap, and dirty recovery. Replacement uses a fresh endpoint and strictly newer
+generation before fence completion, and controlled restart does not charge failure policy. Filesystem
+`Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and the public filesystem version 1
+`Request`/`Reply` operations are unchanged. This adds no manager process, activation, definition
+loading, or cross-reboot persistence.
 
 ### Future service and session lifecycle
 
@@ -299,6 +301,15 @@ purges stale close work, and never replays or rebinds old descriptions; they rem
 The retained tombstone permits replacement registration only with a strictly newer
 generation and a fresh endpoint object.
 
+Controlled restart uses a separate private exact 24-byte `NFLC` version 1 frame, not a
+public filesystem operation. PID 1 queues `QUIESCE` behind earlier endpoint work; after the
+service completes it and emits exact `QUIESCED`, PID 1 offlines the generation so no tail
+public operation runs. `UNMOUNT` makes the service close all core open handles and call
+`try_unmount`, including sync and clean-superblock publication, before exact
+`CLEAN_UNMOUNTED` and exit `0`. Both are required for clean-path proof. Any timeout,
+invalid or capability-bearing event, lifecycle failure, or early/nonzero exit converges
+through exact-generation offlining, KILL/reap, and dirty mount recovery.
+
 The public proxy validates canonical replies. `OUTCOME_UNKNOWN`, a malformed reply, or
 post-send uncertainty about a mutation maps to `IO`, quarantines that service
 generation, and is never automatically retried. These rules do not add durability beyond
@@ -311,8 +322,9 @@ The generated 4 MiB primary volume is exposed at `/Volumes/NullStar` and contain
 `System/`, `Applications/`, and `Users/`, but those trees are not yet bound into the root
 namespace. Public probes cover create, write, independent stale append, cross-handle
 `fstat` and `SEEK_END`, truncate, descriptor duplication, unlink while open,
-open-unlinked read and write, cleanup, persistence across service restart, and stale old
-descriptors. Namespace bindings are the next integration work described in the
+open-unlinked read and write, cleanup, persistence across clean service restart, stale old
+descriptors, and stopped-service timeout/KILL replacement through dirty recovery. Namespace
+bindings are the next integration work described in the
 [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
