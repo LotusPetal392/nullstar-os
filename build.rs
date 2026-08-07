@@ -17,6 +17,7 @@ const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
+const MAX_EXECUTABLE_FILE_BYTES: usize = 1024 * 1024;
 
 const NULLFS_MBR_TYPE: u8 = 0x7f;
 const MBR_BYTES: usize = 512;
@@ -140,6 +141,10 @@ fn main() {
     let userspace_exec_target = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_exec_target")
             .expect("userspace exec-target artifact path was not set"),
+    );
+    let userspace_nullfs_exec_target = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_nullfs_exec_target")
+            .expect("userspace NullFS exec-target artifact path was not set"),
     );
     let userspace_fork_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_fork_probe")
@@ -273,7 +278,7 @@ fn main() {
         image
     };
 
-    let nullfs_fixture = build_nullfs_fixture();
+    let nullfs_fixture = build_nullfs_fixture(&userspace_nullfs_exec_target);
     let bios_image = output_directory.join("nullstar-os-bios.img");
     build_image(NORMAL_BOOT_MODE)
         .create_bios_image(&bios_image)
@@ -316,7 +321,18 @@ fn main() {
     );
 }
 
-fn build_nullfs_fixture() -> Vec<u8> {
+fn build_nullfs_fixture(exec_target_path: &Path) -> Vec<u8> {
+    let exec_target =
+        fs::read(exec_target_path).expect("failed to read userspace NullFS exec-target artifact");
+    assert!(
+        !exec_target.is_empty(),
+        "userspace NullFS exec-target artifact was empty"
+    );
+    assert!(
+        exec_target.len() <= MAX_EXECUTABLE_FILE_BYTES,
+        "userspace NullFS exec-target artifact exceeded the 1 MiB executable limit"
+    );
+
     let device = MemoryBlockDevice::new(BLOCK_SIZE, nullfs_primary_volume::CAPACITY_BLOCKS)
         .expect("failed to allocate NullFS fixture device");
     let mut image = ImageBuilder::new(
@@ -325,11 +341,32 @@ fn build_nullfs_fixture() -> Vec<u8> {
         nullfs_primary_volume::DISPLAY_NAME,
     )
     .expect("failed to format NullFS fixture");
-    for directory in ["System", "Applications", "Users"] {
-        image
-            .create_directory(1, directory, 0o755)
-            .unwrap_or_else(|_| panic!("failed to create NullFS {directory} directory"));
-    }
+    image
+        .create_directory(1, "System", 0o755)
+        .expect("failed to create NullFS System directory");
+    let applications = image
+        .create_directory(1, "Applications", 0o755)
+        .expect("failed to create NullFS Applications directory");
+    image
+        .create_directory(1, "Users", 0o755)
+        .expect("failed to create NullFS Users directory");
+    let exec_probe = image
+        .create_directory(applications, "ExecProbe", 0o755)
+        .expect("failed to create NullFS ExecProbe directory");
+    let exec_probe_bin = image
+        .create_directory(exec_probe, "bin", 0o755)
+        .expect("failed to create NullFS ExecProbe bin directory");
+    image
+        .create_file(exec_probe_bin, "exec-target", &exec_target, 0o755)
+        .expect("failed to create NullFS exec-target artifact");
+    image
+        .create_file(
+            exec_probe_bin,
+            "malformed-target",
+            b"not an ELF image\n",
+            0o755,
+        )
+        .expect("failed to create malformed NullFS executable fixture");
     let docs = image
         .create_directory(1, "docs", 0o755)
         .expect("failed to create NullFS fixture directory");

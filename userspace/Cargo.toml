@@ -171,6 +171,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "nullfs_exec_target"
+path = "src/bin/nullfs_exec_target.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "fork_probe"
 path = "src/bin/fork_probe.rs"
 test = false

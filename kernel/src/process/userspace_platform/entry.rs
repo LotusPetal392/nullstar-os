@@ -364,7 +364,10 @@ fn platform_register_tmpfs_service(process_id: u64, handle: u64, generation: u64
     let (entry, endpoint) = {
         let registry = CAPABILITY_REGISTRY.lock();
         let entry = registry.entry(process_id, handle);
-        (entry.map(|entry| (entry.object.kind, entry.rights)), entry.map(|entry| entry.object))
+        (
+            entry.map(|entry| (entry.object.kind, entry.rights)),
+            entry.map(|entry| entry.object),
+        )
     };
     let generation = match crate::tmpfs_abi::validate_registration(
         process_id,
@@ -481,11 +484,7 @@ fn platform_register_vfs_service(process_id: u64, handle: u64, generation: u64) 
     }
 }
 
-fn platform_offline_filesystem_provider(
-    process_id: u64,
-    provider: u64,
-    generation: u64,
-) -> u64 {
+fn platform_offline_filesystem_provider(process_id: u64, provider: u64, generation: u64) -> u64 {
     let generation = match crate::tmpfs_abi::validate_offline(
         process_id,
         INIT_PROCESS_ID,
@@ -575,8 +574,10 @@ fn platform_spawn_command(
     if process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
+        || process.pending_executable_load.is_some()
         || process.pending_fork.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_nullfs_proxy.is_some()
         || process.pending_vfs_request.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
@@ -591,6 +592,7 @@ fn platform_spawn_command(
         new_process_group,
         process_group_id,
         stack_pointer: current_stack_pointer,
+        claimed: false,
     });
     process.state = ProcessState::Blocked;
     ControlOutcome::Blocked
@@ -619,10 +621,12 @@ fn platform_execve(
         || process.pending_pipe_read.is_some()
         || process.pending_pipe_write.is_some()
         || process.pending_tmpfs_proxy.is_some()
+        || process.pending_nullfs_proxy.is_some()
         || process.pending_vfs_request.is_some()
         || process.pending_child_spawn.is_some()
         || process.pending_child_wait.is_some()
         || process.pending_exec.is_some()
+        || process.pending_executable_load.is_some()
         || process.pending_fork.is_some()
     {
         return ControlOutcome::Ready(error_return(ERR_IO));
@@ -644,9 +648,7 @@ fn platform_parse_command_line(
     let Some(program) = words.next() else {
         return Err(ERR_INVALID_ARGUMENT);
     };
-    let path = if program.starts_with('/') {
-        String::from(program)
-    } else if program.contains('/') {
+    let path = if program.starts_with('/') || program.contains('/') {
         platform_resolve_path(process_id, program)?
     } else {
         let mut path = String::from("/");
@@ -669,19 +671,24 @@ fn platform_parse_command_line(
 }
 
 fn platform_resolve_path(process_id: u64, path: &str) -> Result<String, i64> {
-    let directory = platform_working_directory(process_id);
-    let separator = usize::from(directory != "/");
-    let capacity = directory
-        .len()
-        .checked_add(separator)
-        .and_then(|length| length.checked_add(path.len()))
-        .ok_or(abi::errno::NAME_TOO_LONG)?;
-    let mut candidate = String::with_capacity(capacity);
-    candidate.push_str(&directory);
-    if separator != 0 {
-        candidate.push('/');
-    }
-    candidate.push_str(path);
+    let candidate = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        let directory = platform_working_directory(process_id);
+        let separator = usize::from(directory != "/");
+        let capacity = directory
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(path.len()))
+            .ok_or(abi::errno::NAME_TOO_LONG)?;
+        let mut candidate = String::with_capacity(capacity);
+        candidate.push_str(&directory);
+        if separator != 0 {
+            candidate.push('/');
+        }
+        candidate.push_str(path);
+        candidate
+    };
 
     let mut components = Vec::new();
     for component in candidate.split('/') {
