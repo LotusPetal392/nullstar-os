@@ -712,8 +712,8 @@ fn probe_public_nullfs_mutation() {
 
     let surviving = platform::dup(truncated).unwrap_or_else(|_| syscall::exit(83));
     if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         syscall::exit(84);
     }
@@ -882,8 +882,8 @@ fn probe_nullfs_restart() -> ! {
         syscall::exit(101);
     }
     if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         syscall::exit(102);
     }
@@ -920,8 +920,8 @@ fn probe_nullfs_restart() -> ! {
     }
     if !fixture_files_are_exact()
         || !nullfs_root_is_valid()
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY)
         || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
         || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
@@ -1177,7 +1177,7 @@ fn recover_public_probe_artifact() -> bool {
     };
     if !read_matches(descriptor, expected)
         || !unlink_with_retry(NULLFS_PUBLIC_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
     {
         let _ = syscall::close(descriptor);
         return false;
