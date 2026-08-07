@@ -131,6 +131,9 @@ const VFS_READINESS_PROBE_PASSED: &[u8] = b"userspace init: vfs readiness passed
 const VFS_FULL_PROBE_COMMAND: &[u8] = b"/vfs-probe full";
 const VFS_FULL_PROBE_FAILED: &[u8] = b"userspace init: full vfs probe failed\n";
 const VFS_FULL_PROBE_PASSED: &[u8] = b"userspace init: full vfs probe passed\n";
+const VFS_BOOTSTRAP_PROBE_COMMAND: &[u8] = b"/vfs-probe bootstrap";
+const VFS_BOOTSTRAP_PROBE_PASSED: &[u8] =
+    b"userspace init: bootstrap VFS remained available while NullFS was offline\n";
 const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
 const NULLFS_RESTART_PROBE_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
@@ -2023,6 +2026,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             &mut nullfs_generations,
             &mut nullfs_readiness_endpoint,
             &mut nullfs_request_endpoint,
+            vfs_request_endpoint,
             nullfs_block_capability,
         );
         run_service_control_probe(
@@ -2426,6 +2430,7 @@ fn run_nullfs_restart_probe(
     generations: &mut ProviderGenerationSequence,
     readiness_endpoint: &mut CapabilityHandle,
     request_endpoint: &mut CapabilityHandle,
+    vfs_request_endpoint: CapabilityHandle,
     block_capability: BootstrapCapability,
 ) -> ProviderGeneration {
     let ready_endpoint =
@@ -2565,6 +2570,13 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
+
+    run_probe(
+        VFS_BOOTSTRAP_PROBE_COMMAND,
+        vfs_request_endpoint,
+        VFS_FULL_PROBE_FAILED,
+        VFS_BOOTSTRAP_PROBE_PASSED,
+    );
 
     let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
     ipc::close(*readiness_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));

@@ -3969,50 +3969,53 @@ impl Runtime {
                 }
                 process.pending_vfs_request = None;
             }
-            let nullfs_outcome = match (&pending.operation, &reply) {
+            let nullfs_backend_path = match &reply {
+                Ok(reply)
+                    if reply.status == vfs_protocol::status::OK
+                        && reply.backend == vfs_protocol::backend::NULLFS =>
+                {
+                    Some(vfs_nullfs_backend_path(reply, &pending.path))
+                }
+                _ => None,
+            };
+            let nullfs_outcome = match (&pending.operation, &reply, &nullfs_backend_path) {
                 (
                     PendingVfsOperation::Stat {
                         stat_address,
                         stat_length,
                     },
-                    Ok(reply),
-                ) if reply.status == vfs_protocol::status::OK
-                    && reply.backend == vfs_protocol::backend::NULLFS =>
-                {
-                    Some(nullfs_proxy_stat(
-                        process_id,
-                        &pending.path,
-                        *stat_address,
-                        *stat_length,
-                        pending.stack_pointer,
-                    ))
-                }
+                    Ok(_),
+                    Some(Ok(backend_path)),
+                ) => Some(nullfs_proxy_stat(
+                    process_id,
+                    &pending.path,
+                    backend_path,
+                    *stat_address,
+                    *stat_length,
+                    pending.stack_pointer,
+                )),
                 (
                     PendingVfsOperation::ReadDirectory {
                         start_index,
                         records_address,
                         capacity,
                     },
-                    Ok(reply),
-                ) if reply.status == vfs_protocol::status::OK
-                    && reply.backend == vfs_protocol::backend::NULLFS =>
-                {
-                    Some(nullfs_proxy_read_directory(
-                        process_id,
-                        &pending.path,
-                        *start_index,
-                        *records_address,
-                        *capacity,
-                        pending.stack_pointer,
-                    ))
-                }
-                (PendingVfsOperation::Chdir, Ok(reply))
-                    if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::NULLFS =>
-                {
+                    Ok(_),
+                    Some(Ok(backend_path)),
+                ) => Some(nullfs_proxy_read_directory(
+                    process_id,
+                    &pending.path,
+                    backend_path,
+                    *start_index,
+                    *records_address,
+                    *capacity,
+                    pending.stack_pointer,
+                )),
+                (PendingVfsOperation::Chdir, Ok(_), Some(Ok(backend_path))) => {
                     Some(nullfs_proxy_chdir(
                         process_id,
                         &pending.path,
+                        backend_path,
                         pending.stack_pointer,
                     ))
                 }
@@ -4022,30 +4025,29 @@ impl Runtime {
                         close_on_exec,
                         descriptor,
                     },
-                    Ok(reply),
-                ) if reply.status == vfs_protocol::status::OK
-                    && reply.backend == vfs_protocol::backend::NULLFS =>
-                {
-                    Some(nullfs_proxy_open(
-                        process_id,
-                        &pending.path,
-                        *options,
-                        *close_on_exec,
-                        *descriptor,
-                        pending.stack_pointer,
-                    ))
-                }
-                (PendingVfsOperation::Unlink, Ok(reply))
-                    if reply.status == vfs_protocol::status::OK
-                        && reply.backend == vfs_protocol::backend::NULLFS =>
-                {
+                    Ok(_),
+                    Some(Ok(backend_path)),
+                ) => Some(nullfs_proxy_open(
+                    process_id,
+                    &pending.path,
+                    backend_path,
+                    *options,
+                    *close_on_exec,
+                    *descriptor,
+                    pending.stack_pointer,
+                )),
+                (PendingVfsOperation::Unlink, Ok(_), Some(Ok(backend_path))) => {
                     Some(nullfs_proxy_unlink(
                         process_id,
                         &pending.path,
+                        backend_path,
                         pending.stack_pointer,
                     ))
                 }
-                (_, Ok(reply)) if reply.backend == vfs_protocol::backend::NULLFS => {
+                (_, Ok(_), Some(Err(error))) => {
+                    Some(ControlOutcome::Ready(error_return(*error)))
+                }
+                (_, Ok(reply), _) if reply.backend == vfs_protocol::backend::NULLFS => {
                     Some(ControlOutcome::Ready(error_return(ERR_IO)))
                 }
                 _ => None,
@@ -5057,7 +5059,10 @@ fn vfs_route_service_registration() -> bool {
             && reply.route_id == vfs_protocol::route::ROOT
             && reply.backend == vfs_protocol::backend::BOOT_FILESYSTEM
             && reply.prefix_length == 1
+            && reply.backing_prefix_length == 0
+            && reply.flags == 0
             && reply.reserved == [0; 8]
+            && reply.backing_prefix == [0; vfs_protocol::MAX_PATH_BYTES]
     } else {
         false
     };
@@ -5096,7 +5101,6 @@ fn vfs_is_declared_namespace_directory(path: &str) -> bool {
             | "/System/lib"
             | "/System/Applications"
             | "/Users"
-            | "/Applications"
             | "/Volumes"
     )
 }
@@ -5160,8 +5164,7 @@ fn vfs_routed_namespace_directory(
         | "/System/drivers"
         | "/System/lib"
         | "/System/Applications"
-        | "/Users"
-        | "/Applications" => &[],
+        | "/Users" => &[],
         "/Volumes" => &[nullfs_primary_volume::DISPLAY_NAME],
         _ => return ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY)),
     };
@@ -5426,116 +5429,183 @@ fn vfs_request_take_reply(pending: &PendingVfsRequest) -> Option<Result<vfs_prot
 }
 
 fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
+    if !vfs_protocol::status::known(reply.status) {
+        return false;
+    }
+    let binding = reply.binding_prefix();
+    let empty_backing = binding == Ok(None);
     if reply.status == vfs_protocol::status::NOT_FOUND {
-        return reply.route_id == 0 && reply.backend == 0 && reply.prefix_length == 0;
+        return reply.route_id == 0
+            && reply.backend == 0
+            && reply.prefix_length == 0
+            && empty_backing;
+    }
+    if reply.status == vfs_protocol::status::INVALID {
+        return reply.route_id == 0
+            && reply.backend == 0
+            && reply.prefix_length == 0
+            && empty_backing;
     }
     if reply.status != vfs_protocol::status::OK {
-        return true;
+        return false;
     }
     let expected = if vfs_path_has_prefix(path, "/System/Applications") {
         (
             "/System/Applications",
             vfs_protocol::route::SYSTEM_APPLICATIONS,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System/services") {
         (
             "/System/services",
             vfs_protocol::route::SYSTEM_SERVICES,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System/drivers") {
         (
             "/System/drivers",
             vfs_protocol::route::SYSTEM_DRIVERS,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System/var/log") {
         (
             "/System/var/log",
             vfs_protocol::route::SYSTEM_VAR_LOG,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System/config") {
         (
             "/System/config",
             vfs_protocol::route::SYSTEM_CONFIG,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System/bin") {
         (
             "/System/bin",
             vfs_protocol::route::SYSTEM_BIN,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System/lib") {
         (
             "/System/lib",
             vfs_protocol::route::SYSTEM_LIB,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/Applications") {
         (
             "/Applications",
             vfs_protocol::route::APPLICATIONS,
-            vfs_protocol::backend::NAMESPACE,
+            vfs_protocol::backend::NULLFS,
+            Some("/Applications"),
         )
     } else if vfs_path_has_prefix(path, nullfs_primary_volume::MOUNT_PATH) {
         (
             nullfs_primary_volume::MOUNT_PATH,
             vfs_protocol::route::NULLSTAR_VOLUME,
             vfs_protocol::backend::NULLFS,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/Volumes") {
         (
             "/Volumes",
             vfs_protocol::route::VOLUMES,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System/var") {
         (
             "/System/var",
             vfs_protocol::route::SYSTEM_VAR,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/System") {
         (
             "/System",
             vfs_protocol::route::SYSTEM,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/Users") {
         (
             "/Users",
             vfs_protocol::route::USERS,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/tmp") {
         (
             "/tmp",
             vfs_protocol::route::TMP,
             vfs_protocol::backend::TMPFS,
+            None,
         )
     } else if vfs_path_has_prefix(path, "/dev") {
         (
             "/dev",
             vfs_protocol::route::DEV,
             vfs_protocol::backend::NAMESPACE,
+            None,
         )
     } else {
         (
             "/",
             vfs_protocol::route::ROOT,
             vfs_protocol::backend::BOOT_FILESYSTEM,
+            None,
         )
     };
     reply.route_id == expected.1
         && reply.backend == expected.2
         && usize::from(reply.prefix_length) == expected.0.len()
+        && match expected.3 {
+            Some(backing_prefix) => binding == Ok(Some(backing_prefix)),
+            None => empty_backing,
+        }
+}
+
+fn vfs_nullfs_backend_path(reply: &vfs_protocol::Reply, canonical_path: &str) -> Result<String, i64> {
+    if reply.flags == vfs_protocol::reply_flags::BINDING {
+        let prefix_length = usize::from(reply.prefix_length);
+        let suffix = canonical_path
+            .get(prefix_length..)
+            .ok_or(ERR_INVALID_ARGUMENT)?;
+        if !suffix.is_empty() && !suffix.starts_with('/') {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+        let backing_prefix = reply
+            .binding_prefix()
+            .map_err(|_| ERR_INVALID_ARGUMENT)?
+            .ok_or(ERR_INVALID_ARGUMENT)?;
+        let mut backend_path = String::from(backing_prefix);
+        backend_path.push_str(suffix);
+        if backend_path.len() > vfs_protocol::MAX_PATH_BYTES {
+            return Err(abi::errno::NAME_TOO_LONG);
+        }
+        Ok(backend_path)
+    } else if reply.route_id == vfs_protocol::route::NULLSTAR_VOLUME {
+        let suffix = canonical_path
+            .strip_prefix(NULLFS_MOUNT_PATH)
+            .ok_or(ERR_INVALID_ARGUMENT)?;
+        Ok(if suffix.is_empty() {
+            String::from("/")
+        } else {
+            String::from(suffix)
+        })
+    } else {
+        Err(ERR_INVALID_ARGUMENT)
+    }
 }
 
 fn vfs_path_has_prefix(path: &str, prefix: &str) -> bool {
-    path == prefix || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+    vfs_protocol::path_has_prefix(path, prefix)
 }
 
 fn vfs_request_release(pending: &PendingVfsRequest) {
@@ -10143,13 +10213,10 @@ fn nullfs_proxy_continue(
 }
 
 fn nullfs_proxy_components(path: &str) -> Result<Vec<String>, i64> {
-    if path == NULLFS_MOUNT_PATH {
+    if path == "/" {
         return Ok(Vec::new());
     }
-    let Some(relative) = path.strip_prefix(NULLFS_MOUNT_PATH) else {
-        return Err(ERR_INVALID_ARGUMENT);
-    };
-    let Some(relative) = relative.strip_prefix('/') else {
+    let Some(relative) = path.strip_prefix('/') else {
         return Err(ERR_INVALID_ARGUMENT);
     };
     if relative.is_empty() {
@@ -10257,13 +10324,14 @@ fn nullfs_proxy_resolves_parent(purpose: &NullfsPathPurpose) -> bool {
 fn nullfs_proxy_start_path(
     process_id: u64,
     path: &str,
+    backend_path: &str,
     purpose: NullfsPathPurpose,
     stack_pointer: usize,
 ) -> ControlOutcome {
     if nullfs_proxy_state().is_none() {
         return ControlOutcome::Ready(error_return(ERR_IO));
     }
-    let components = match nullfs_proxy_components(path) {
+    let components = match nullfs_proxy_components(backend_path) {
         Ok(components) => components,
         Err(error) => return ControlOutcome::Ready(error_return(error)),
     };
@@ -10285,7 +10353,7 @@ fn nullfs_proxy_start_path(
                 ControlOutcome::Ready(error_return(ERR_IS_DIRECTORY))
             }
             NullfsPathPurpose::Chdir => ControlOutcome::Ready(
-                match platform_set_working_directory(process_id, NULLFS_MOUNT_PATH) {
+                match platform_set_working_directory(process_id, path) {
                     Ok(()) => 0,
                     Err(error) => error_return(error),
                 },
@@ -10343,6 +10411,7 @@ fn nullfs_proxy_start_path(
 fn nullfs_proxy_stat(
     process_id: u64,
     path: &str,
+    backend_path: &str,
     address: u64,
     length: u64,
     stack_pointer: usize,
@@ -10350,6 +10419,7 @@ fn nullfs_proxy_stat(
     nullfs_proxy_start_path(
         process_id,
         path,
+        backend_path,
         NullfsPathPurpose::Stat { address, length },
         stack_pointer,
     )
@@ -10358,6 +10428,7 @@ fn nullfs_proxy_stat(
 fn nullfs_proxy_open(
     process_id: u64,
     path: &str,
+    backend_path: &str,
     options: vfs::OpenOptions,
     close_on_exec: bool,
     descriptor: u64,
@@ -10366,6 +10437,7 @@ fn nullfs_proxy_open(
     nullfs_proxy_start_path(
         process_id,
         path,
+        backend_path,
         NullfsPathPurpose::Open {
             options,
             descriptor,
@@ -10378,6 +10450,7 @@ fn nullfs_proxy_open(
 fn nullfs_proxy_read_directory(
     process_id: u64,
     path: &str,
+    backend_path: &str,
     start_index: usize,
     records_address: u64,
     capacity: usize,
@@ -10386,6 +10459,7 @@ fn nullfs_proxy_read_directory(
     nullfs_proxy_start_path(
         process_id,
         path,
+        backend_path,
         NullfsPathPurpose::ReadDirectory {
             start_index,
             records_address,
@@ -10395,12 +10469,34 @@ fn nullfs_proxy_read_directory(
     )
 }
 
-fn nullfs_proxy_chdir(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
-    nullfs_proxy_start_path(process_id, path, NullfsPathPurpose::Chdir, stack_pointer)
+fn nullfs_proxy_chdir(
+    process_id: u64,
+    path: &str,
+    backend_path: &str,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    nullfs_proxy_start_path(
+        process_id,
+        path,
+        backend_path,
+        NullfsPathPurpose::Chdir,
+        stack_pointer,
+    )
 }
 
-fn nullfs_proxy_unlink(process_id: u64, path: &str, stack_pointer: usize) -> ControlOutcome {
-    nullfs_proxy_start_path(process_id, path, NullfsPathPurpose::Unlink, stack_pointer)
+fn nullfs_proxy_unlink(
+    process_id: u64,
+    path: &str,
+    backend_path: &str,
+    stack_pointer: usize,
+) -> ControlOutcome {
+    nullfs_proxy_start_path(
+        process_id,
+        path,
+        backend_path,
+        NullfsPathPurpose::Unlink,
+        stack_pointer,
+    )
 }
 
 fn nullfs_proxy_read(

@@ -304,7 +304,8 @@ fn platform_working_directory(process_id: u64) -> String {
     if vfs_route_ready()
         && (vfs_is_declared_namespace_directory(&candidate)
             || nullfs_proxy_state().is_some()
-                && vfs_path_has_prefix(&candidate, NULLFS_MOUNT_PATH))
+                && (vfs_path_has_prefix(&candidate, NULLFS_MOUNT_PATH)
+                    || vfs_path_has_prefix(&candidate, "/Applications")))
     {
         return candidate;
     }
