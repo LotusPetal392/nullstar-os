@@ -19,6 +19,7 @@ const SERVICE_HANDLE: u64 = 1;
 const RESTART_CONTROL_HANDLE: u64 = 2;
 const READINESS_MODE: &[u8] = b"readiness";
 const FULL_MODE: &[u8] = b"full";
+const BOOTSTRAP_MODE: &[u8] = b"bootstrap";
 const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
 const NULLFS_RESTART_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
@@ -29,7 +30,8 @@ const NULLFS_DOCS: &[u8] = b"/Volumes/NullStar/docs";
 const NULLFS_WELCOME: &[u8] = b"/Volumes/NullStar/welcome.txt";
 const NULLFS_README: &[u8] = b"/Volumes/NullStar/docs/readme.txt";
 const NULLFS_MISSING: &[u8] = b"/Volumes/NullStar/missing";
-const NULLFS_PUBLIC_PROBE: &[u8] = b"/Volumes/NullStar/nullstar-vfs-probe-v1.bin";
+const NULLFS_PUBLIC_PROBE: &[u8] = b"/Applications/nullstar-vfs-probe-v1.bin";
+const NULLFS_PUBLIC_PROBE_RAW: &[u8] = b"/Volumes/NullStar/Applications/nullstar-vfs-probe-v1.bin";
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
 const README: &[u8] = b"This volume is a deterministic NullFS integration fixture.\n";
 const INITIAL_BYTES: &[u8] = b"NullStar public VFS";
@@ -116,7 +118,7 @@ const CASES: &[(&[u8], u32, u16, u16)] = &[
     (
         b"/Applications/App",
         protocol::route::APPLICATIONS,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         13,
     ),
     (
@@ -147,7 +149,8 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let readiness = arguments.len() == 2 && arguments.get(1) == Some(READINESS_MODE);
     let full =
         arguments.len() == 1 || (arguments.len() == 2 && arguments.get(1) == Some(FULL_MODE));
-    if !readiness && !full {
+    let bootstrap = arguments.len() == 2 && arguments.get(1) == Some(BOOTSTRAP_MODE);
+    if !readiness && !full && !bootstrap {
         syscall::exit(57);
     }
     if !matches!(
@@ -160,6 +163,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         probe_readiness();
         syscall::exit(0);
     }
+    if bootstrap {
+        probe_bootstrap();
+        syscall::exit(0);
+    }
     for (index, &(path, route_id, backend, prefix_length)) in CASES.iter().enumerate() {
         let reply = match query(path, index as u32 + 1) {
             Some(reply) => reply,
@@ -169,6 +176,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             || reply.route_id != route_id
             || reply.backend != backend
             || reply.prefix_length != prefix_length
+            || !reply_binding_matches(&reply, route_id)
         {
             syscall::exit(3);
         }
@@ -333,6 +341,25 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     syscall::exit(0)
 }
 
+fn probe_bootstrap() {
+    let reply = query(b"/hello.txt", 1).unwrap_or_else(|| syscall::exit(110));
+    if reply.status != protocol::status::OK
+        || reply.route_id != protocol::route::ROOT
+        || reply.backend != protocol::backend::BOOT_FILESYSTEM
+        || reply.prefix_length != 1
+        || !reply_binding_matches(&reply, protocol::route::ROOT)
+        || platform::stat(b"/hello.txt").ok().map(|stat| stat.kind) != Some(file::KIND_FILE)
+    {
+        syscall::exit(111);
+    }
+    let descriptor = syscall::open(b"/hello.txt", syscall::OpenFlags::READ)
+        .unwrap_or_else(|_| syscall::exit(112));
+    let mut byte = [0_u8; 1];
+    if syscall::read(descriptor, &mut byte).ok() != Some(1) || syscall::close(descriptor).is_err() {
+        syscall::exit(113);
+    }
+}
+
 fn probe_readiness() {
     const READINESS_CASES: &[(&[u8], u32, u16, u16)] = &[
         (
@@ -357,6 +384,7 @@ fn probe_readiness() {
             || reply.route_id != route_id
             || reply.backend != backend
             || reply.prefix_length != prefix_length
+            || !reply_binding_matches(&reply, route_id)
         {
             syscall::exit(101);
         }
@@ -383,7 +411,9 @@ fn probe_mounted_nullfs() {
         syscall::exit(19);
     }
 
-    if !stat_matches(NULLFS_MOUNT, file::KIND_DIRECTORY, 0) {
+    if !stat_matches(NULLFS_MOUNT, file::KIND_DIRECTORY, 0)
+        || !stat_matches(b"/Applications", file::KIND_DIRECTORY, BLOCK_SIZE as u64)
+    {
         syscall::exit(20);
     }
     if !directory_contains(NULLFS_MOUNT, &[b"System", b"Applications", b"Users"]) {
@@ -476,7 +506,11 @@ fn probe_mounted_nullfs() {
     {
         syscall::exit(43);
     }
-    if platform::chdir(b"/").is_err() || platform::getcwd(&mut cwd).ok() != Some(b"/".as_slice()) {
+    if platform::chdir(b"/Applications").is_err()
+        || platform::getcwd(&mut cwd).ok() != Some(b"/Applications".as_slice())
+        || platform::chdir(b"/").is_err()
+        || platform::getcwd(&mut cwd).ok() != Some(b"/".as_slice())
+    {
         syscall::exit(45);
     }
 
@@ -537,7 +571,7 @@ fn probe_public_nullfs_mutation() {
     }
     if !descriptor_stat_matches(created, INITIAL_BYTES.len() as u64)
         || !stat_matches(
-            NULLFS_PUBLIC_PROBE,
+            NULLFS_PUBLIC_PROBE_RAW,
             file::KIND_FILE,
             INITIAL_BYTES.len() as u64,
         )
@@ -551,7 +585,7 @@ fn probe_public_nullfs_mutation() {
     }
 
     let observer = open_with_retry(
-        NULLFS_PUBLIC_PROBE,
+        NULLFS_PUBLIC_PROBE_RAW,
         syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
     )
     .unwrap_or_else(|| syscall::exit(76));
@@ -570,7 +604,7 @@ fn probe_public_nullfs_mutation() {
         || syscall::seek(observer, syscall::SeekFrom::End(0)).ok()
             != Some(COMBINED_BYTES.len() as u64)
         || !stat_matches(
-            NULLFS_PUBLIC_PROBE,
+            NULLFS_PUBLIC_PROBE_RAW,
             file::KIND_FILE,
             COMBINED_BYTES.len() as u64,
         )
@@ -609,6 +643,7 @@ fn probe_public_nullfs_mutation() {
     let surviving = platform::dup(truncated).unwrap_or_else(|_| syscall::exit(83));
     if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
         || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
     {
         syscall::exit(84);
     }
@@ -699,7 +734,7 @@ fn probe_nullfs_restart() -> ! {
         syscall::exit(98);
     }
     let replacement = open_with_retry(
-        NULLFS_PUBLIC_PROBE,
+        NULLFS_PUBLIC_PROBE_RAW,
         syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
     )
     .unwrap_or_else(|| syscall::exit(100));
@@ -710,6 +745,7 @@ fn probe_nullfs_restart() -> ! {
     }
     if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
         || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
     {
         syscall::exit(102);
     }
@@ -730,6 +766,7 @@ fn probe_nullfs_restart() -> ! {
     if !fixture_files_are_exact()
         || !nullfs_root_is_valid()
         || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
     {
         syscall::exit(107);
     }
@@ -1029,6 +1066,18 @@ fn directory_contains(path: &[u8], names: &[&[u8]]) -> bool {
     found == (1_u64 << names.len()) - 1
 }
 
+fn reply_binding_is_canonical(reply: &protocol::Reply) -> bool {
+    reply.binding_prefix().is_ok()
+}
+
+fn reply_binding_matches(reply: &protocol::Reply, route_id: u32) -> bool {
+    if route_id == protocol::route::APPLICATIONS {
+        reply.binding_prefix() == Ok(Some("/Applications"))
+    } else {
+        reply.binding_prefix() == Ok(None)
+    }
+}
+
 fn query(path: &[u8], request_id: u32) -> Option<protocol::Reply> {
     let reply_endpoint = ipc::endpoint_create().ok()?;
     let mut request = protocol::Request {
@@ -1068,6 +1117,7 @@ fn query(path: &[u8], request_id: u32) -> Option<protocol::Reply> {
     (reply.version == protocol::VERSION
         && reply.operation == protocol::operation::RESOLVE
         && reply.request_id == request_id
-        && reply.reserved == [0; 8])
-        .then_some(reply)
+        && reply.reserved == [0; 8]
+        && reply_binding_is_canonical(&reply))
+    .then_some(reply)
 }

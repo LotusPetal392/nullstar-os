@@ -19,12 +19,18 @@ const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: vfs";
+const APPLICATIONS_BACKING_PREFIX: &[u8] = b"/Applications";
 
 struct Route {
     path: &'static [u8],
     id: u32,
     backend: u16,
 }
+
+const _: () =
+    assert!(size_of::<protocol::Request>() <= userspace::abi::limits::MAX_IPC_MESSAGE_BYTES);
+const _: () =
+    assert!(size_of::<protocol::Reply>() <= userspace::abi::limits::MAX_IPC_MESSAGE_BYTES);
 
 const ROUTES: &[Route] = &[
     Route {
@@ -70,7 +76,7 @@ const ROUTES: &[Route] = &[
     Route {
         path: b"/Applications",
         id: protocol::route::APPLICATIONS,
-        backend: protocol::backend::NAMESPACE,
+        backend: protocol::backend::NULLFS,
     },
     Route {
         path: nullfs_primary_volume::MOUNT_PATH.as_bytes(),
@@ -182,6 +188,12 @@ fn resolve(request: &protocol::Request) -> protocol::Reply {
             reply.route_id = route.id;
             reply.backend = route.backend;
             reply.prefix_length = route.path.len() as u16;
+            if route.id == protocol::route::APPLICATIONS {
+                reply.flags = protocol::reply_flags::BINDING;
+                reply.backing_prefix_length = APPLICATIONS_BACKING_PREFIX.len() as u16;
+                reply.backing_prefix[..APPLICATIONS_BACKING_PREFIX.len()]
+                    .copy_from_slice(APPLICATIONS_BACKING_PREFIX);
+            }
             return reply;
         }
     }

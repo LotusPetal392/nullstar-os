@@ -29,6 +29,46 @@ Node IDs are meaningful only within one session generation. A client must
 discard every node and buffer ID after receiving `STALE_SESSION` or observing a
 replacement generation.
 
+## VFS namespace-routing protocol
+
+The VFS service uses a separate namespace-routing protocol in
+`shared/vfs_protocol.rs`; it is not the public filesystem-service protocol. Namespace
+routing is now `VERSION = 2`. A request carries a canonical absolute path, and the service
+returns its longest matching route. The version 2 reply remains bounded at exactly 224
+bytes:
+
+| Byte range | Size | Field | Constraint |
+| --- | ---: | --- | --- |
+| `0..2` | 2 | version | little-endian `u16`, exactly `2` |
+| `2..4` | 2 | operation | little-endian `u16`, `RESOLVE` |
+| `4..8` | 4 | request ID | little-endian `u32`, echoed |
+| `8..12` | 4 | status | little-endian `i32` |
+| `12..16` | 4 | route ID | preserved stable route identity |
+| `16..18` | 2 | backend | preserved backend class |
+| `18..20` | 2 | prefix length | bytes matched in the canonical path |
+| `20..22` | 2 | backing-prefix length | used bytes in `backing_prefix` |
+| `22..24` | 2 | flags | only `BINDING` is currently assigned |
+| `24..32` | 8 | reserved | zero |
+| `32..224` | 192 | backing prefix | backend-relative path followed by zero padding |
+
+Version 2 therefore preserves the version 1 `route_id`, `backend`, and `prefix_length`
+contract while adding explicit binding metadata. An ordinary route has flags and
+backing-prefix length zero and an entirely zero backing-prefix array. A binding reply sets
+exactly `BINDING`, carries a canonical length-delimited backing prefix, and zero-fills every
+unused byte. The unmatched suffix begins at `prefix_length` in the canonical request path
+and is appended to the backing prefix for internal backend traversal.
+
+The only implemented binding is canonical `/Applications` to `/Applications` relative to
+the UUID-selected NullFS provider's backend root. The VFS service owns this binding record;
+the kernel validates the exact route, NullFS backend, binding flag, and backing prefix
+before traversing it internally. This is not a general service-controlled redirect.
+`/Volumes/NullStar/Applications` remains the raw administrative alias to the same node,
+while cwd and open-file paths retain canonical `/Applications/...` names. `/System` and
+`/Users` remain synthetic and unbound.
+
+This routing change does not alter public filesystem protocol version 1, its `Request`,
+`Reply`, or operations, the public file-descriptor ABI, or `NSVC` version 1.
+
 ## Session bootstrap
 
 Endpoint messages can transfer only one capability. The legacy tmpfs protocol
@@ -235,24 +275,27 @@ services or volumes provide parts of it:
   stored as ordinary disk files;
 - `/tmp` is the volatile tmpfs mount and loses its contents across service or
   system restart;
-- `/System` belongs to the system volume and contains configuration, persistent
-  logs, core programs, service executables, userspace drivers, libraries, and
-  system applications;
-- `/Users` contains per-user home directories and user-owned data;
-- `/Applications` contains applications installed for all users, while
-  `/System/Applications` contains applications delivered as part of the system;
+- `/System` is currently a synthetic, unbound hierarchy; it is planned to belong to the
+  system volume and contain configuration, persistent logs, core programs, service
+  executables, userspace drivers, libraries, and system applications;
+- `/Users` is currently synthetic and unbound; it is planned to contain per-user home
+  directories and user-owned data;
+- `/Applications` is the first implemented non-bootstrap binding and targets the primary
+  NullFS provider's backend-root `/Applications` node; `/System/Applications` remains
+  synthetic and is intended for applications delivered as part of the system;
 - `/Volumes` contains the user-visible mount points for additional local,
   removable, and network filesystems. Each child name is a volume name exposed
   by the VFS, with deterministic disambiguation when multiple mounted volumes
   request the same display name.
 
 Mount traversal must be component-based. Looking up `dev` or `tmp` beneath the
-root returns a mount-root node owned by the selected service, while lookup of
-`System`, `Users`, or `Applications` continues on the native root filesystem.
-Clients do not need to know that the selected backend belongs to a different
-service. The current VFS service owns longest-prefix routing and the kernel
-chains the operation into the selected generation-scoped proxy; moving stable
-vnode handles and all open-file ownership into userspace remains later work.
+root returns a mount-root node owned by the selected service. `/System` and
+`/Users` currently remain in the synthetic namespace, while `/Applications`
+selects the generation-scoped NullFS proxy and internally begins at that backend's
+`/Applications` node. Clients do not need to know that the selected backend belongs to a
+different service, and their cwd and open-file paths remain canonical. The current VFS
+service owns longest-prefix routing and the binding record; moving stable vnode handles
+and all open-file ownership into userspace remains later work.
 
 The root filesystem, `/dev`, and `/tmp` are boot namespace entries and do not
 also appear beneath `/Volumes`. Mounting and unmounting a child of `/Volumes`
@@ -293,9 +336,9 @@ overloading generic flags or inline data.
    broader open-file ownership migration remains)
 5. Put FAT behind the same protocol.
 6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
-   service. (read-write service mount, explicitly writable direct sessions, and
-   bounded public VFS create/write/truncate/append/unlink complete; namespace
-   identity and bindings remain)
+   service. (read-write service mount, explicitly writable direct sessions, bounded public
+   VFS create/write/truncate/append/unlink, and the first `/Applications` namespace binding
+   complete; `/System`, `/Users`, and broader adoption remain)
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
 
@@ -344,11 +387,12 @@ remain owned until their late reply is drained so they cannot be mistaken for a
 later close reply.
 
 The first part of migration step 4 is now present as a separately supervised
-`/vfs-service`. Its versioned protocol accepts canonical absolute paths and
-returns the longest matching namespace prefix, a stable route ID, and a backend
-class. PID 1 starts and monitors the service independently of tmpfs, and
-`/vfs-probe` verifies the complete target namespace plus `/tmp` backend
-selection during normal boot. PID 1 now registers each VFS service generation
+`/vfs-service`. Its version 2 protocol accepts canonical absolute paths and returns the
+longest matching namespace prefix, a stable route ID, a backend class, and canonical
+binding metadata in a bounded 224-byte reply. PID 1 starts and monitors the service
+independently of tmpfs, and `/vfs-probe` verifies the declared namespace, binding
+canonicality, `/tmp` backend selection, and bootstrap availability during normal boot.
+PID 1 now registers each VFS service generation
 with the kernel, which retains the endpoint and asynchronously validates a
 versioned root-route handshake. `stat` is the first syscall to use
 per-operation routing: the kernel blocks on a generation-bound route reply,
@@ -368,8 +412,11 @@ directory. The root
 listing merges boot-filesystem entries with `/dev`, `/tmp`, `/System`, `/Users`,
 `/Applications`, and `/Volumes`, suppressing backing-store name collisions.
 Unresolved descendants remain absent until a filesystem or service is mounted
-there. Route replies are checked against the kernel's expected longest-prefix
-result before backend dispatch.
+there. `/Applications` is the first exception: the VFS-owned binding selects NullFS and
+returns backend-root `/Applications` as its zero-padded backing prefix. The kernel checks
+that exact known target before dispatch and appends the canonical suffix only for internal
+traversal. Route replies for every other entry carry no binding metadata and are checked
+against the kernel's expected longest-prefix result before backend dispatch.
 
 Tmpfs separates namespace linkage from node lifetime: unlink removes the name
 immediately while existing open node-ID descriptions remain readable and
@@ -400,12 +447,14 @@ and attaches one kernel-owned 4 KiB shared-memory buffer. Direct clients that
 connect with flags `0` still receive read-only sessions; raw block authority,
 filesystem-session authority, and public VFS policy remain separate.
 
-Without adding a NullFS-specific application ABI, `/Volumes/NullStar`
-supports ordinary public `stat`, read, open, `fstat`, seek, `read_directory`, and
-`chdir`, plus writable, create, truncate, and append opens, descriptor `write`,
-and unlink. Canonical path resolution happens before VFS routing, so cwd-relative
-operations continue to reach the mount. Public `mkdir`, `rmdir`, rename, and
-broader namespace adoption remain future work.
+Without adding a NullFS-specific application ABI, `/Volumes/NullStar` and the bound
+`/Applications` view support ordinary public `stat`, read, open, `fstat`, seek,
+`read_directory`, and `chdir`, plus writable, create, truncate, and append opens,
+descriptor `write`, and unlink. Canonical path resolution happens before VFS routing, so
+cwd-relative operations continue to reach the selected backend while retaining
+`/Applications/...` paths. `/Volumes/NullStar/Applications` remains the raw administrative
+view of the same nodes. Public `mkdir`, `rmdir`, rename, and binding `/System` and `/Users`
+remain future work.
 
 Before copying a public write's source bytes, the proxy reserves its sole
 outstanding request; it then stages at most 4 KiB in the registered window. A
@@ -432,7 +481,8 @@ descriptors remain stale and mutations are never replayed or rebound.
 
 The direct service probe preserves read-only-session denial and exercises the
 service's broader writable protocol surface, including directory creation,
-`rmdir`, and rename. Public probes separately cover create, write, independent
-stale append, cross-handle `fstat` and `SEEK_END`, truncate, duplication, unlink
-while open, open-unlinked read/write, cleanup, persistence across service
-restart, and stale old descriptors.
+`rmdir`, and rename. Public probes separately cover canonical `/Applications` mutation,
+cross-view visibility and identity, canonical cwd behavior, create, write, independent
+stale append, cross-handle `fstat` and `SEEK_END`, truncate, duplication, unlink while
+open, open-unlinked read/write, cleanup, persistence across service restart, stale old
+descriptors, and continued bootstrap availability.

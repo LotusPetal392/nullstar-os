@@ -176,11 +176,13 @@ images, and launches QEMU.
   `WRITE` session feature, and exposes bounded create, write, truncate, append,
   and unlink through the UUID-selected 4 MiB primary volume at
   `/Volumes/NullStar`; stat, read, open, `fstat`, seek, directory reads, and
-  `chdir` also remain available. The volume contains the future backing trees
-  `System/`, `Applications/`, and `Users/`, but no root namespace bindings exist
-  yet. Direct flags-zero sessions stay read-only, and raw block authority, session
-  authority, and public VFS policy remain separate. Public `mkdir`, `rmdir`,
-  rename, broader namespace adoption, and offline repair remain future work.
+  `chdir` also remain available. The volume contains `System/`, `Applications/`,
+  and `Users/`; `/Applications` is the first implemented namespace binding and
+  retains its canonical path while using the volume's `Applications/` node.
+  `/System` and `/Users` remain synthetic and unbound. Direct flags-zero sessions
+  stay read-only, and raw block authority, session authority, and public VFS
+  policy remain separate. Public `mkdir`, `rmdir`, rename, broader namespace
+  adoption, and offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`
