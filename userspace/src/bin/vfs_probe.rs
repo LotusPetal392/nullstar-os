@@ -915,7 +915,7 @@ fn probe_nullfs_restart() -> ! {
     {
         syscall::exit(105);
     }
-    for _ in 0..8 {
+    for _ in 0..64 {
         syscall::yield_now().unwrap_or_else(|_| syscall::exit(106));
     }
     if !path_contents_match(NULLFS_WELCOME, WELCOME) {
@@ -1445,7 +1445,7 @@ fn platform_failed_with<T>(result: platform::Result<T>, expected: i64) -> bool {
 }
 
 fn open_with_retry(path: &[u8], flags: syscall::OpenFlags) -> Option<syscall::FileDescriptor> {
-    for _ in 0..64 {
+    for _ in 0..8 {
         match syscall::open(path, flags) {
             Ok(descriptor) => return Some(descriptor),
             Err(error) if error == syscall::Errno::TRY_AGAIN => {
