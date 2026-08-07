@@ -5,6 +5,7 @@ use nullfs_core::{Error as CoreError, Filesystem, NodeAttributes as CoreNodeAttr
 use nullfs_format::{BLOCK_SIZE, NodeKind, Timestamp};
 use nullfs_service::state::{NodeIdentity, NodeMap, NodeMapError, OpenRecord, OpenTable};
 use userspace::{
+    abi::INIT_PROCESS_ID,
     filesystem::protocol,
     filesystem_service::{BufferSlot, Error as SessionError, NodeReferenceError, SessionTable},
     ipc::{self, ObjectKind, ReceivedCapability, Rights},
@@ -45,6 +46,12 @@ pub fn serve<D: BlockDevice>(
     server.run()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServeState {
+    Serving,
+    Quiesced { transition_id: u64 },
+}
+
 struct FilesystemServer<D> {
     filesystem: Filesystem<D>,
     generation: u64,
@@ -56,17 +63,107 @@ struct FilesystemServer<D> {
 impl<D: BlockDevice> FilesystemServer<D> {
     fn run(&mut self) -> ! {
         let mut request_bytes = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
+        let mut state = ServeState::Serving;
         loop {
             let message = match ipc::receive(REQUEST_HANDLE, &mut request_bytes) {
                 Ok(message) => message,
                 Err(_) => fail(31, b"nullfs: request receive failed\n"),
             };
+            if message.bytes == protocol::lifecycle::MESSAGE_BYTES {
+                self.dispatch_lifecycle(
+                    &request_bytes[..message.bytes],
+                    message.sender_process_id,
+                    message.capability,
+                    &mut state,
+                );
+                continue;
+            }
+            if state != ServeState::Serving {
+                close_capability(message.capability);
+                continue;
+            }
             if message.bytes != size_of::<protocol::Request>() {
                 close_capability(message.capability);
                 continue;
             }
             self.dispatch(&request_bytes, message.capability);
         }
+    }
+
+    fn dispatch_lifecycle(
+        &mut self,
+        bytes: &[u8],
+        sender_process_id: u64,
+        capability: Option<ReceivedCapability>,
+        state: &mut ServeState,
+    ) {
+        let has_capability = capability.is_some();
+        close_capability(capability);
+        if sender_process_id != INIT_PROCESS_ID {
+            return;
+        }
+        if has_capability {
+            fail(36, b"nullfs: lifecycle capability forbidden\n");
+        }
+        let message = protocol::lifecycle::Message::decode(bytes)
+            .unwrap_or_else(|_| fail(36, b"nullfs: invalid lifecycle request\n"));
+        if message.generation != self.generation {
+            self.fail_lifecycle(message.transition_id);
+        }
+        match (*state, message.kind) {
+            (ServeState::Serving, protocol::lifecycle::kind::QUIESCE) => {
+                *state = ServeState::Quiesced {
+                    transition_id: message.transition_id,
+                };
+                self.send_lifecycle(protocol::lifecycle::kind::QUIESCED, message.transition_id);
+            }
+            (ServeState::Quiesced { transition_id }, protocol::lifecycle::kind::QUIESCE)
+                if transition_id == message.transition_id =>
+            {
+                self.send_lifecycle(protocol::lifecycle::kind::QUIESCED, transition_id);
+            }
+            (ServeState::Quiesced { transition_id }, protocol::lifecycle::kind::UNMOUNT)
+                if transition_id == message.transition_id =>
+            {
+                if self.close_all_open_handles().is_err() || self.filesystem.try_unmount().is_err()
+                {
+                    self.fail_lifecycle(transition_id);
+                }
+                self.send_lifecycle(protocol::lifecycle::kind::CLEAN_UNMOUNTED, transition_id);
+                syscall::exit(0)
+            }
+            _ => self.fail_lifecycle(message.transition_id),
+        }
+    }
+
+    fn close_all_open_handles(&mut self) -> Result<(), ()> {
+        while let Some((index, record)) = self.opens.first() {
+            self.filesystem.close_node(record.handle).map_err(|_| ())?;
+            if self.opens.remove(index) != Some(record) || self.filesystem.is_poisoned() {
+                return Err(());
+            }
+            self.retire_if_reclaimed(record.handle.node, record.handle.generation);
+        }
+        Ok(())
+    }
+
+    fn send_lifecycle(&self, kind: u16, transition_id: u64) {
+        let message = protocol::lifecycle::Message::new(kind, self.generation, transition_id)
+            .unwrap_or_else(|| fail(36, b"nullfs: invalid lifecycle response\n"));
+        if ipc::send(crate::READY_HANDLE, &message.encode(), None).is_err() {
+            fail(36, b"nullfs: lifecycle response failed\n");
+        }
+    }
+
+    fn fail_lifecycle(&self, transition_id: u64) -> ! {
+        if let Some(message) = protocol::lifecycle::Message::new(
+            protocol::lifecycle::kind::FAILED,
+            self.generation,
+            transition_id,
+        ) {
+            let _ = ipc::send(crate::READY_HANDLE, &message.encode(), None);
+        }
+        fail(36, b"nullfs: lifecycle transition failed\n")
     }
 
     fn dispatch(&mut self, request_bytes: &[u8], capability: Option<ReceivedCapability>) {

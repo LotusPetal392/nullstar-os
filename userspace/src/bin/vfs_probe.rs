@@ -22,8 +22,7 @@ const FULL_MODE: &[u8] = b"full";
 const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
 const NULLFS_RESTART_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
-const NULLFS_RESTART_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
-const NULLFS_RESTART_OFFLINE: &[u8] = b"nullfs-restart: offline failure observed";
+
 const NULLFS_RESTART_REPLACEMENT: &[u8] = b"nullfs-restart: replacement registered";
 const NULLFS_MOUNT: &[u8] = nullfs_primary_volume::MOUNT_PATH.as_bytes();
 const NULLFS_DOCS: &[u8] = b"/Volumes/NullStar/docs";
@@ -685,36 +684,19 @@ fn probe_nullfs_restart() -> ! {
     };
     if message.sender_process_id != 1
         || message.capability.is_some()
-        || message.bytes != NULLFS_RESTART_BEGIN_READ.len()
-        || &control[..message.bytes] != NULLFS_RESTART_BEGIN_READ
+        || message.bytes != NULLFS_RESTART_REPLACEMENT.len()
+        || &control[..message.bytes] != NULLFS_RESTART_REPLACEMENT
     {
-        syscall::exit(97);
+        syscall::exit(100);
     }
-
     let mut bytes = [0_u8; COMBINED_BYTES.len()];
     if syscall::read(stale, &mut bytes) != Err(syscall::Errno::IO)
         || !platform_failed_with(platform::fstat(stale), errno::IO)
         || syscall::seek(stale, syscall::SeekFrom::Start(0)) != Err(syscall::Errno::IO)
         || syscall::seek(stale, syscall::SeekFrom::Current(0)) != Err(syscall::Errno::IO)
         || syscall::seek(stale, syscall::SeekFrom::End(0)) != Err(syscall::Errno::IO)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::IO)
     {
         syscall::exit(98);
-    }
-    if ipc::send(SERVICE_HANDLE, NULLFS_RESTART_OFFLINE, None).is_err() {
-        syscall::exit(99);
-    }
-
-    let message = match ipc::receive(RESTART_CONTROL_HANDLE, &mut control) {
-        Ok(message) => message,
-        Err(_) => syscall::exit(100),
-    };
-    if message.sender_process_id != 1
-        || message.capability.is_some()
-        || message.bytes != NULLFS_RESTART_REPLACEMENT.len()
-        || &control[..message.bytes] != NULLFS_RESTART_REPLACEMENT
-    {
-        syscall::exit(100);
     }
     let replacement = open_with_retry(
         NULLFS_PUBLIC_PROBE,

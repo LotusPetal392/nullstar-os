@@ -59,15 +59,17 @@ withdrawal, fresh route objects, and manager-owned generation replacement withou
 policy. Logging restart retains a fence through replacement startup, rejects a queued duplicate with
 `Busy`, and escalates from cooperative termination to uncatchable signal 9 after a bounded grace
 period. A separate bounded readiness deadline prevents a live but unready logging child from holding
-replacement convergence indefinitely and feeds expiry into normal restart/backoff policy. Filesystem
-restart now has exact-generation provider offlining: after final child status, PID 1 offlines the old
-generation, fails and wakes its work, closes the old endpoint handle, creates a fresh endpoint object,
-and registers a strictly newer generation before releasing the restart fence. Tombstones reject stale
-replies, work, and close cleanup. Writable NullFS remains online until final exit because pre-exit
-quiesce and `SYNC` remain future work, so filesystem `Start` and `Stop` stay exactly `Unsupported`.
-`NSVC` v1 is unchanged. Jobs, a separate manager process, activation, definitions, and cross-reboot
-desired-state persistence remain future work. ABI 1.13 adds the narrow PID-1 provider-offlining
-syscall; the existing signal ABI supplies the forced-termination signal.
+replacement convergence indefinitely and feeds expiry into normal restart/backoff policy. Controlled
+NullFS restart now queues a private `NFLC` v1 `QUIESCE` marker behind earlier FIFO work. Exact
+`QUIESCED` lets PID 1 offline the exact generation and wake tail work with `EIO`; `UNMOUNT` then closes
+core handles, syncs and publishes a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits `0`.
+Only that exact event plus final exit `0` proves a clean path. Timeout, invalid lifecycle traffic,
+failure, or early/nonzero exit triggers exact-generation offlining, KILL/reap, and dirty recovery.
+Replacement still uses a fresh endpoint and strictly newer generation, and controlled restart charges
+no failure budget. Filesystem `Start` and `Stop` stay exactly `Unsupported`; `NSVC` v1 and the public
+filesystem version 1 `Request`/`Reply` operations are unchanged. Jobs, a separate manager process,
+activation, definitions, and cross-reboot desired-state persistence remain future work. ABI 1.13 adds
+the narrow PID-1 provider-offlining syscall; the existing signal ABI supplies forced termination.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

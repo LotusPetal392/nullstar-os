@@ -11,6 +11,7 @@ use service_route::{Authorizer, ProviderGeneration, ProviderGenerationSequence, 
 use userspace::{
     abi::{INIT_PROCESS_ID, signal},
     early_log,
+    filesystem::protocol as filesystem_protocol,
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
     service_control::{
@@ -133,8 +134,7 @@ const VFS_FULL_PROBE_PASSED: &[u8] = b"userspace init: full vfs probe passed\n";
 const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
 const NULLFS_RESTART_PROBE_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
-const NULLFS_RESTART_PROBE_BEGIN_READ: &[u8] = b"nullfs-restart: begin stale read";
-const NULLFS_RESTART_PROBE_OFFLINE: &[u8] = b"nullfs-restart: offline failure observed";
+
 const NULLFS_RESTART_PROBE_REPLACEMENT: &[u8] = b"nullfs-restart: replacement registered";
 const NULLFS_RESTART_PROBE_PASSED: &[u8] =
     b"userspace init: NullFS restart persistent VFS mutation and stale descriptors verified\n";
@@ -171,6 +171,9 @@ const LOGGING_TERMINATION_GRACE_YIELDS: u32 = 64;
 const LOGGING_READINESS_GRACE_YIELDS: u32 = 2_048;
 const LOGGING_TEST_READINESS_GRACE_YIELDS: u32 = 64;
 const LOGGING_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
+const NULLFS_QUIESCE_GRACE_YIELDS: u32 = 2_048;
+const NULLFS_TEST_QUIESCE_GRACE_YIELDS: u32 = 8;
+const NULLFS_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
 
@@ -341,11 +344,483 @@ struct ServiceRegistryMut<'a> {
     vfs_generation: ProviderGeneration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NullfsLifecyclePhase {
+    Idle,
+    WaitQuiesced {
+        process_id: ProcessId,
+        generation: ProviderGeneration,
+        transition_id: u64,
+        yields_remaining: u32,
+    },
+    QueueUnmount {
+        process_id: ProcessId,
+        generation: ProviderGeneration,
+        transition_id: u64,
+        yields_remaining: u32,
+    },
+    WaitCleanExit {
+        process_id: ProcessId,
+        generation: ProviderGeneration,
+        transition_id: u64,
+        yields_remaining: u32,
+        clean_seen: bool,
+        final_status: Option<u64>,
+    },
+    ForceWait {
+        process_id: ProcessId,
+        generation: ProviderGeneration,
+        attempts_remaining: u32,
+    },
+}
+
+struct NullfsLifecycle {
+    phase: NullfsLifecyclePhase,
+    next_transition_id: u64,
+    last_exit_was_clean: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NullfsRestartRequestError {
+    AlreadyPending,
+    InvalidState,
+    Busy,
+}
+
+impl NullfsLifecycle {
+    const fn new() -> Self {
+        Self {
+            phase: NullfsLifecyclePhase::Idle,
+            next_transition_id: 1,
+            last_exit_was_clean: false,
+        }
+    }
+
+    fn request_restart(
+        &mut self,
+        service: &mut ServiceRuntime,
+        generation: ProviderGeneration,
+        request_endpoint: CapabilityHandle,
+    ) -> Result<(), NullfsRestartRequestError> {
+        if self.phase != NullfsLifecyclePhase::Idle {
+            return Err(NullfsRestartRequestError::AlreadyPending);
+        }
+        let process_id = match service.request_restart() {
+            Ok(process_id) => process_id,
+            Err(RestartRequestError::AlreadyPending) => {
+                return Err(NullfsRestartRequestError::AlreadyPending);
+            }
+            Err(RestartRequestError::InvalidState) => {
+                return Err(NullfsRestartRequestError::InvalidState);
+            }
+        };
+        let transition_id = self.next_transition_id;
+        self.next_transition_id = transition_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .unwrap_or_else(|| fail(NULLFS_SERVICE_PROTOCOL_FAILED));
+        let message = filesystem_protocol::lifecycle::Message::new(
+            filesystem_protocol::lifecycle::kind::QUIESCE,
+            generation.get(),
+            transition_id,
+        )
+        .unwrap_or_else(|| fail(NULLFS_SERVICE_PROTOCOL_FAILED));
+        if ipc::send(request_endpoint, &message.encode(), None).is_err() {
+            service.cancel_restart();
+            return Err(NullfsRestartRequestError::Busy);
+        }
+        self.last_exit_was_clean = false;
+        self.phase = NullfsLifecyclePhase::WaitQuiesced {
+            process_id,
+            generation,
+            transition_id,
+            yields_remaining: NULLFS_QUIESCE_GRACE_YIELDS,
+        };
+        Ok(())
+    }
+
+    fn advance(
+        &mut self,
+        current_process_id: Option<ProcessId>,
+        current_generation: ProviderGeneration,
+        readiness_endpoint: CapabilityHandle,
+        request_endpoint: CapabilityHandle,
+    ) -> Option<u64> {
+        if self.phase == NullfsLifecyclePhase::Idle {
+            let status = current_process_id.and_then(try_wait_final_status);
+            if status.is_some() {
+                self.last_exit_was_clean = false;
+            }
+            return status;
+        }
+
+        let (process_id, generation) = match self.phase {
+            NullfsLifecyclePhase::Idle => unreachable!(),
+            NullfsLifecyclePhase::WaitQuiesced {
+                process_id,
+                generation,
+                ..
+            }
+            | NullfsLifecyclePhase::QueueUnmount {
+                process_id,
+                generation,
+                ..
+            }
+            | NullfsLifecyclePhase::WaitCleanExit {
+                process_id,
+                generation,
+                ..
+            }
+            | NullfsLifecyclePhase::ForceWait {
+                process_id,
+                generation,
+                ..
+            } => (process_id, generation),
+        };
+        if current_process_id != Some(process_id) || current_generation != generation {
+            fail(NULLFS_SERVICE_PROTOCOL_FAILED);
+        }
+
+        self.receive_event(readiness_endpoint);
+        if let NullfsLifecyclePhase::WaitCleanExit {
+            clean_seen: true,
+            final_status: Some(0),
+            ..
+        } = self.phase
+        {
+            self.phase = NullfsLifecyclePhase::Idle;
+            self.last_exit_was_clean = true;
+            return Some(0);
+        }
+
+        if let NullfsLifecyclePhase::QueueUnmount {
+            process_id,
+            generation,
+            transition_id,
+            yields_remaining,
+        } = self.phase
+        {
+            let message = filesystem_protocol::lifecycle::Message::new(
+                filesystem_protocol::lifecycle::kind::UNMOUNT,
+                generation.get(),
+                transition_id,
+            )
+            .unwrap_or_else(|| fail(NULLFS_SERVICE_PROTOCOL_FAILED));
+            match ipc::send(request_endpoint, &message.encode(), None) {
+                Ok(()) => {
+                    self.phase = NullfsLifecyclePhase::WaitCleanExit {
+                        process_id,
+                        generation,
+                        transition_id,
+                        yields_remaining: NULLFS_QUIESCE_GRACE_YIELDS,
+                        clean_seen: false,
+                        final_status: None,
+                    };
+                }
+                Err(error) if error == ipc::Error::TRY_AGAIN && yields_remaining != 0 => {
+                    self.phase = NullfsLifecyclePhase::QueueUnmount {
+                        process_id,
+                        generation,
+                        transition_id,
+                        yields_remaining: yields_remaining - 1,
+                    };
+                }
+                Err(_) => self.begin_force(process_id, generation),
+            }
+        }
+
+        let final_status_pending = !matches!(
+            self.phase,
+            NullfsLifecyclePhase::WaitCleanExit {
+                final_status: Some(_),
+                ..
+            }
+        );
+        if final_status_pending && let Some(status) = try_wait_final_status(process_id) {
+            match self.phase {
+                NullfsLifecyclePhase::WaitCleanExit {
+                    process_id,
+                    generation,
+                    transition_id,
+                    yields_remaining,
+                    clean_seen,
+                    ..
+                } if status == 0 && clean_seen => {
+                    self.phase = NullfsLifecyclePhase::Idle;
+                    self.last_exit_was_clean = true;
+                    return Some(status);
+                }
+                NullfsLifecyclePhase::WaitCleanExit {
+                    process_id,
+                    generation,
+                    transition_id,
+                    yields_remaining,
+                    clean_seen,
+                    ..
+                } if status == 0 => {
+                    self.phase = NullfsLifecyclePhase::WaitCleanExit {
+                        process_id,
+                        generation,
+                        transition_id,
+                        yields_remaining,
+                        clean_seen,
+                        final_status: Some(status),
+                    };
+                }
+                _ => {
+                    offline_filesystem_provider(
+                        platform::FilesystemProvider::Nullfs,
+                        generation,
+                        NULLFS_SERVICE_FAILED,
+                    );
+                    self.phase = NullfsLifecyclePhase::Idle;
+                    self.last_exit_was_clean = false;
+                    return Some(status);
+                }
+            }
+        }
+
+        match self.phase {
+            NullfsLifecyclePhase::WaitQuiesced {
+                process_id,
+                generation,
+                transition_id: _,
+                yields_remaining: 0,
+            } => self.begin_force(process_id, generation),
+            NullfsLifecyclePhase::WaitQuiesced {
+                process_id,
+                generation,
+                transition_id,
+                yields_remaining,
+            } => {
+                self.phase = NullfsLifecyclePhase::WaitQuiesced {
+                    process_id,
+                    generation,
+                    transition_id,
+                    yields_remaining: yields_remaining - 1,
+                };
+            }
+            NullfsLifecyclePhase::WaitCleanExit {
+                process_id: _,
+                generation: _,
+                transition_id: _,
+                yields_remaining: 0,
+                clean_seen: _,
+                final_status: Some(status),
+            } => {
+                self.phase = NullfsLifecyclePhase::Idle;
+                self.last_exit_was_clean = false;
+                return Some(status);
+            }
+            NullfsLifecyclePhase::WaitCleanExit {
+                process_id,
+                generation,
+                transition_id: _,
+                yields_remaining: 0,
+                ..
+            } => self.begin_force(process_id, generation),
+            NullfsLifecyclePhase::WaitCleanExit {
+                process_id,
+                generation,
+                transition_id,
+                yields_remaining,
+                clean_seen,
+                final_status,
+            } => {
+                self.phase = NullfsLifecyclePhase::WaitCleanExit {
+                    process_id,
+                    generation,
+                    transition_id,
+                    yields_remaining: yields_remaining - 1,
+                    clean_seen,
+                    final_status,
+                };
+            }
+            NullfsLifecyclePhase::ForceWait {
+                process_id: _,
+                generation: _,
+                attempts_remaining: 0,
+            } => fail(NULLFS_SERVICE_FAILED),
+            NullfsLifecyclePhase::ForceWait {
+                process_id,
+                generation,
+                attempts_remaining,
+            } => {
+                let _ = syscall::signal_process_group(process_id, signal::KILL);
+                self.phase = NullfsLifecyclePhase::ForceWait {
+                    process_id,
+                    generation,
+                    attempts_remaining: attempts_remaining - 1,
+                };
+            }
+            NullfsLifecyclePhase::Idle | NullfsLifecyclePhase::QueueUnmount { .. } => {}
+        }
+        None
+    }
+
+    fn receive_event(&mut self, readiness_endpoint: CapabilityHandle) {
+        let mut bytes = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
+        let received = match ipc::try_receive(readiness_endpoint, &mut bytes) {
+            Ok(received) => received,
+            Err(error) if error == ipc::Error::TRY_AGAIN => return,
+            Err(_) => fail(NULLFS_SERVICE_PROTOCOL_FAILED),
+        };
+        let expected_process = match self.phase {
+            NullfsLifecyclePhase::Idle => return,
+            NullfsLifecyclePhase::WaitQuiesced { process_id, .. }
+            | NullfsLifecyclePhase::QueueUnmount { process_id, .. }
+            | NullfsLifecyclePhase::WaitCleanExit { process_id, .. }
+            | NullfsLifecyclePhase::ForceWait { process_id, .. } => process_id,
+        };
+        let capability_valid = if let Some(capability) = received.capability {
+            let _ = ipc::close(capability.handle);
+            false
+        } else {
+            true
+        };
+        let message = filesystem_protocol::lifecycle::Message::decode(&bytes[..received.bytes]);
+        if received.sender_process_id != expected_process || !capability_valid {
+            self.force_current();
+            return;
+        }
+        let Ok(message) = message else {
+            self.force_current();
+            return;
+        };
+        match self.phase {
+            NullfsLifecyclePhase::WaitQuiesced {
+                process_id,
+                generation,
+                transition_id,
+                ..
+            } if message.kind == filesystem_protocol::lifecycle::kind::QUIESCED
+                && message.generation == generation.get()
+                && message.transition_id == transition_id =>
+            {
+                offline_filesystem_provider(
+                    platform::FilesystemProvider::Nullfs,
+                    generation,
+                    NULLFS_SERVICE_FAILED,
+                );
+                self.phase = NullfsLifecyclePhase::QueueUnmount {
+                    process_id,
+                    generation,
+                    transition_id,
+                    yields_remaining: NULLFS_QUIESCE_GRACE_YIELDS,
+                };
+            }
+            NullfsLifecyclePhase::WaitCleanExit {
+                process_id,
+                generation,
+                transition_id,
+                yields_remaining,
+                final_status,
+                ..
+            } if message.kind == filesystem_protocol::lifecycle::kind::CLEAN_UNMOUNTED
+                && message.generation == generation.get()
+                && message.transition_id == transition_id =>
+            {
+                self.phase = NullfsLifecyclePhase::WaitCleanExit {
+                    process_id,
+                    generation,
+                    transition_id,
+                    yields_remaining,
+                    clean_seen: true,
+                    final_status,
+                };
+            }
+            _ => self.force_current(),
+        }
+    }
+
+    fn force_current(&mut self) {
+        let (process_id, generation) = match self.phase {
+            NullfsLifecyclePhase::Idle => return,
+            NullfsLifecyclePhase::WaitQuiesced {
+                process_id,
+                generation,
+                ..
+            }
+            | NullfsLifecyclePhase::QueueUnmount {
+                process_id,
+                generation,
+                ..
+            }
+            | NullfsLifecyclePhase::WaitCleanExit {
+                process_id,
+                generation,
+                ..
+            }
+            | NullfsLifecyclePhase::ForceWait {
+                process_id,
+                generation,
+                ..
+            } => (process_id, generation),
+        };
+        self.begin_force(process_id, generation);
+    }
+
+    fn begin_force(&mut self, process_id: ProcessId, generation: ProviderGeneration) {
+        offline_filesystem_provider(
+            platform::FilesystemProvider::Nullfs,
+            generation,
+            NULLFS_SERVICE_FAILED,
+        );
+        let _ = syscall::write_all(
+            STDOUT,
+            b"userspace init: NullFS quiesce failed; forcing dirty recovery\n",
+        );
+        let _ = syscall::signal_process_group(process_id, signal::KILL);
+        self.phase = NullfsLifecyclePhase::ForceWait {
+            process_id,
+            generation,
+            attempts_remaining: NULLFS_FORCE_TERMINATION_ATTEMPTS,
+        };
+        self.last_exit_was_clean = false;
+    }
+
+    fn shorten_quiesce_grace_for_test(&mut self) {
+        let NullfsLifecyclePhase::WaitQuiesced {
+            process_id,
+            generation,
+            transition_id,
+            ..
+        } = self.phase
+        else {
+            fail(NULLFS_RESTART_PROBE_FAILED);
+        };
+        self.phase = NullfsLifecyclePhase::WaitQuiesced {
+            process_id,
+            generation,
+            transition_id,
+            yields_remaining: NULLFS_TEST_QUIESCE_GRACE_YIELDS,
+        };
+    }
+
+    const fn last_exit_was_clean(&self) -> bool {
+        self.last_exit_was_clean
+    }
+}
+
+fn try_wait_final_status(process_id: ProcessId) -> Option<u64> {
+    match syscall::try_wait_child(process_id) {
+        Ok(status) if status.continued() || status.stopped_signal().is_some() => None,
+        Ok(status) => Some(status.raw()),
+        Err(error)
+            if error == syscall::Errno::TRY_AGAIN || error == syscall::Errno::INTERRUPTED =>
+        {
+            None
+        }
+        Err(_) => fail(NULLFS_SERVICE_FAILED),
+    }
+}
+
 struct ServiceControlState {
     observation_source: CapabilityHandle,
     observation_ingress: ControlIngress,
     mutation_source: CapabilityHandle,
     mutation_ingress: ControlIngress,
+    nullfs_lifecycle: NullfsLifecycle,
 }
 
 impl ServiceControlState {
@@ -367,6 +842,7 @@ impl ServiceControlState {
             observation_ingress,
             mutation_source,
             mutation_ingress,
+            nullfs_lifecycle: NullfsLifecycle::new(),
         }
     }
 
@@ -382,7 +858,11 @@ impl ServiceControlState {
         }
     }
 
-    fn pump_mutation(&mut self, registry: ServiceRegistryMut<'_>) -> usize {
+    fn pump_mutation(
+        &mut self,
+        registry: ServiceRegistryMut<'_>,
+        nullfs_request_endpoint: CapabilityHandle,
+    ) -> usize {
         let mut processed = 0;
         for _ in 0..SERVICE_CONTROL_PUMP_BUDGET {
             let request = match self.mutation_ingress.try_accept() {
@@ -406,24 +886,33 @@ impl ServiceControlState {
                     vfs: &mut *registry.vfs,
                     vfs_generation: registry.vfs_generation,
                 },
+                &mut self.nullfs_lifecycle,
+                nullfs_request_endpoint,
             );
             let _ = request.reply(response);
         }
         processed
     }
 
-    fn drain_mutation(&mut self, registry: ServiceRegistryMut<'_>) {
+    fn drain_mutation(
+        &mut self,
+        registry: ServiceRegistryMut<'_>,
+        nullfs_request_endpoint: CapabilityHandle,
+    ) {
         loop {
-            let processed = self.pump_mutation(ServiceRegistryMut {
-                logging: &mut *registry.logging,
-                logging_generation: registry.logging_generation,
-                nullfs: &mut *registry.nullfs,
-                nullfs_generation: registry.nullfs_generation,
-                tmpfs: &mut *registry.tmpfs,
-                tmpfs_generation: registry.tmpfs_generation,
-                vfs: &mut *registry.vfs,
-                vfs_generation: registry.vfs_generation,
-            });
+            let processed = self.pump_mutation(
+                ServiceRegistryMut {
+                    logging: &mut *registry.logging,
+                    logging_generation: registry.logging_generation,
+                    nullfs: &mut *registry.nullfs,
+                    nullfs_generation: registry.nullfs_generation,
+                    tmpfs: &mut *registry.tmpfs,
+                    tmpfs_generation: registry.tmpfs_generation,
+                    vfs: &mut *registry.vfs,
+                    vfs_generation: registry.vfs_generation,
+                },
+                nullfs_request_endpoint,
+            );
             if processed < SERVICE_CONTROL_PUMP_BUDGET {
                 break;
             }
@@ -499,6 +988,8 @@ fn service_control_response(
 fn service_mutation_response(
     request: ServiceControlRequest,
     registry: ServiceRegistryMut<'_>,
+    nullfs_lifecycle: &mut NullfsLifecycle,
+    nullfs_request_endpoint: CapabilityHandle,
 ) -> ServiceControlResponse {
     match request {
         ServiceControlRequest::List { cursor } => ServiceControlResponse::list(
@@ -539,7 +1030,13 @@ fn service_mutation_response(
             let response = if service == CONTROL_LOGGING_SERVICE_ID {
                 request_service_restart(service, registry.logging, registry.logging_generation)
             } else if service == NULLFS_SERVICE_ID {
-                request_service_restart(service, registry.nullfs, registry.nullfs_generation)
+                request_nullfs_restart(
+                    service,
+                    registry.nullfs,
+                    registry.nullfs_generation,
+                    nullfs_lifecycle,
+                    nullfs_request_endpoint,
+                )
             } else if service == TMPFS_SERVICE_ID {
                 request_service_restart(service, registry.tmpfs, registry.tmpfs_generation)
             } else if service == VFS_SERVICE_ID {
@@ -549,6 +1046,24 @@ fn service_mutation_response(
             };
             ServiceControlResponse::restart(response)
                 .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROTOCOL_FAILED))
+        }
+    }
+}
+
+fn request_nullfs_restart(
+    service: ServiceId,
+    runtime: &mut ServiceRuntime,
+    generation: ProviderGeneration,
+    lifecycle: &mut NullfsLifecycle,
+    request_endpoint: CapabilityHandle,
+) -> TargetResponse {
+    match lifecycle.request_restart(runtime, generation, request_endpoint) {
+        Ok(()) => TargetResponse::success(service_record(service, runtime, generation)),
+        Err(NullfsRestartRequestError::AlreadyPending | NullfsRestartRequestError::Busy) => {
+            TargetResponse::failure(service, ServiceControlFailure::Busy)
+        }
+        Err(NullfsRestartRequestError::InvalidState) => {
+            TargetResponse::failure(service, ServiceControlFailure::InvalidState)
         }
     }
 }
@@ -1421,7 +1936,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     ) {
         fail(NULLFS_SERVICE_BOOTSTRAP_FAILED);
     }
-    let nullfs_readiness_endpoint =
+    let mut nullfs_readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
     let mut nullfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
@@ -1435,7 +1950,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let mut nullfs_generation = start_service(
         &mut nullfs_service,
         &mut nullfs_generations,
-        nullfs_readiness_endpoint,
+        &mut nullfs_readiness_endpoint,
         &mut nullfs_request_endpoint,
         &[nullfs_block_capability],
         &NULLFS_MESSAGES,
@@ -1448,7 +1963,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     );
     register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
 
-    let readiness_endpoint =
+    let mut readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let mut request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
@@ -1457,14 +1972,14 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let mut tmpfs_generation = start_service(
         &mut service,
         &mut tmpfs_generations,
-        readiness_endpoint,
+        &mut readiness_endpoint,
         &mut request_endpoint,
         &[],
         &TMPFS_MESSAGES,
     );
     register_tmpfs_proxy(tmpfs_generation, request_endpoint);
     run_tmpfs_probe(request_endpoint);
-    let vfs_readiness_endpoint =
+    let mut vfs_readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
     let mut vfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
@@ -1473,7 +1988,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let mut vfs_generation = start_service(
         &mut vfs_service,
         &mut vfs_generations,
-        vfs_readiness_endpoint,
+        &mut vfs_readiness_endpoint,
         &mut vfs_request_endpoint,
         &[],
         &VFS_MESSAGES,
@@ -1506,7 +2021,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 vfs_generation,
             },
             &mut nullfs_generations,
-            nullfs_readiness_endpoint,
+            &mut nullfs_readiness_endpoint,
             &mut nullfs_request_endpoint,
             nullfs_block_capability,
         );
@@ -1585,16 +2100,19 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         );
         let logging_restart_ready = logging_service.state() == ServiceState::Running
             && logging_service.controlled_restart_pending();
-        let mutation_count = service_control.pump_mutation(ServiceRegistryMut {
-            logging: &mut logging_service,
-            logging_generation: logging_lifecycle.generation(),
-            nullfs: &mut nullfs_service,
-            nullfs_generation,
-            tmpfs: &mut service,
-            tmpfs_generation,
-            vfs: &mut vfs_service,
-            vfs_generation,
-        });
+        let mutation_count = service_control.pump_mutation(
+            ServiceRegistryMut {
+                logging: &mut logging_service,
+                logging_generation: logging_lifecycle.generation(),
+                nullfs: &mut nullfs_service,
+                nullfs_generation,
+                tmpfs: &mut service,
+                tmpfs_generation,
+                vfs: &mut vfs_service,
+                vfs_generation,
+            },
+            nullfs_request_endpoint,
+        );
         sync_logging_routes(&logging_service, &mut logging_lifecycle, &mut route_broker);
         if logging_restart_ready
             && mutation_count < SERVICE_CONTROL_PUMP_BUDGET
@@ -1622,32 +2140,41 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         });
         route_broker.pump();
 
-        if let Some(service_process_id) = nullfs_service.process_id() {
-            match syscall::try_wait_child(service_process_id) {
-                Ok(status) => match nullfs_service.observe_status(status.raw()) {
-                    ServiceStatusDisposition::WaitForNextEvent => {}
-                    ServiceStatusDisposition::Restart { backoff_yields } => {
-                        let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
-                        offline_filesystem_provider(
-                            platform::FilesystemProvider::Nullfs,
-                            nullfs_generation,
-                            NULLFS_SERVICE_FAILED,
-                        );
-                        ipc::close(nullfs_request_endpoint)
-                            .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
-                        nullfs_request_endpoint = ipc::endpoint_create()
-                            .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
-                        backoff(backoff_yields);
-                        nullfs_generation = start_service(
-                            &mut nullfs_service,
-                            &mut nullfs_generations,
-                            nullfs_readiness_endpoint,
-                            &mut nullfs_request_endpoint,
-                            &[nullfs_block_capability],
-                            &NULLFS_MESSAGES,
-                        );
-                        register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
-                        service_control.drain_mutation(ServiceRegistryMut {
+        if let Some(status) = service_control.nullfs_lifecycle.advance(
+            nullfs_service.process_id(),
+            nullfs_generation,
+            nullfs_readiness_endpoint,
+            nullfs_request_endpoint,
+        ) {
+            match nullfs_service.observe_status(status) {
+                ServiceStatusDisposition::WaitForNextEvent => {}
+                ServiceStatusDisposition::Restart { backoff_yields } => {
+                    let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
+                    offline_filesystem_provider(
+                        platform::FilesystemProvider::Nullfs,
+                        nullfs_generation,
+                        NULLFS_SERVICE_FAILED,
+                    );
+                    ipc::close(nullfs_readiness_endpoint)
+                        .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
+                    ipc::close(nullfs_request_endpoint)
+                        .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
+                    nullfs_readiness_endpoint = ipc::endpoint_create()
+                        .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
+                    nullfs_request_endpoint = ipc::endpoint_create()
+                        .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
+                    backoff(backoff_yields);
+                    nullfs_generation = start_service(
+                        &mut nullfs_service,
+                        &mut nullfs_generations,
+                        &mut nullfs_readiness_endpoint,
+                        &mut nullfs_request_endpoint,
+                        &[nullfs_block_capability],
+                        &NULLFS_MESSAGES,
+                    );
+                    register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
+                    service_control.drain_mutation(
+                        ServiceRegistryMut {
                             logging: &mut logging_service,
                             logging_generation: logging_lifecycle.generation(),
                             nullfs: &mut nullfs_service,
@@ -1656,31 +2183,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             tmpfs_generation,
                             vfs: &mut vfs_service,
                             vfs_generation,
-                        });
-                        nullfs_service.complete_restart();
-                    }
-                    ServiceStatusDisposition::Stopped => {
-                        offline_filesystem_provider(
-                            platform::FilesystemProvider::Nullfs,
-                            nullfs_generation,
-                            NULLFS_SERVICE_FAILED,
-                        );
-                        ipc::close(nullfs_request_endpoint)
-                            .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
-                    }
-                    ServiceStatusDisposition::Failed => {
-                        offline_filesystem_provider(
-                            platform::FilesystemProvider::Nullfs,
-                            nullfs_generation,
-                            NULLFS_SERVICE_FAILED,
-                        );
-                        let _ = ipc::close(nullfs_request_endpoint);
-                        fail(NULLFS_SERVICE_FAILED)
-                    }
-                },
-                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
-                Err(error) if error == syscall::Errno::INTERRUPTED => {}
-                Err(_) => fail(NULLFS_SERVICE_FAILED),
+                        },
+                        nullfs_request_endpoint,
+                    );
+                    nullfs_service.complete_restart();
+                }
+                ServiceStatusDisposition::Stopped => {
+                    offline_filesystem_provider(
+                        platform::FilesystemProvider::Nullfs,
+                        nullfs_generation,
+                        NULLFS_SERVICE_FAILED,
+                    );
+                    ipc::close(nullfs_readiness_endpoint)
+                        .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
+                    ipc::close(nullfs_request_endpoint)
+                        .unwrap_or_else(|_| fail(NULLFS_SERVICE_FAILED));
+                }
+                ServiceStatusDisposition::Failed => {
+                    offline_filesystem_provider(
+                        platform::FilesystemProvider::Nullfs,
+                        nullfs_generation,
+                        NULLFS_SERVICE_FAILED,
+                    );
+                    let _ = ipc::close(nullfs_readiness_endpoint);
+                    let _ = ipc::close(nullfs_request_endpoint);
+                    fail(NULLFS_SERVICE_FAILED)
+                }
             }
         }
 
@@ -1695,29 +2223,35 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             tmpfs_generation,
                             SERVICE_FAILED,
                         );
+                        ipc::close(readiness_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
                         ipc::close(request_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
+                        readiness_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
                         request_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
                         backoff(backoff_yields);
                         tmpfs_generation = start_service(
                             &mut service,
                             &mut tmpfs_generations,
-                            readiness_endpoint,
+                            &mut readiness_endpoint,
                             &mut request_endpoint,
                             &[],
                             &TMPFS_MESSAGES,
                         );
                         register_tmpfs_proxy(tmpfs_generation, request_endpoint);
-                        service_control.drain_mutation(ServiceRegistryMut {
-                            logging: &mut logging_service,
-                            logging_generation: logging_lifecycle.generation(),
-                            nullfs: &mut nullfs_service,
-                            nullfs_generation,
-                            tmpfs: &mut service,
-                            tmpfs_generation,
-                            vfs: &mut vfs_service,
-                            vfs_generation,
-                        });
+                        service_control.drain_mutation(
+                            ServiceRegistryMut {
+                                logging: &mut logging_service,
+                                logging_generation: logging_lifecycle.generation(),
+                                nullfs: &mut nullfs_service,
+                                nullfs_generation,
+                                tmpfs: &mut service,
+                                tmpfs_generation,
+                                vfs: &mut vfs_service,
+                                vfs_generation,
+                            },
+                            nullfs_request_endpoint,
+                        );
                         service.complete_restart();
                     }
                     ServiceStatusDisposition::Stopped => {
@@ -1726,6 +2260,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             tmpfs_generation,
                             SERVICE_FAILED,
                         );
+                        ipc::close(readiness_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
                         ipc::close(request_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
                     }
                     ServiceStatusDisposition::Failed => {
@@ -1734,6 +2269,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             tmpfs_generation,
                             SERVICE_FAILED,
                         );
+                        let _ = ipc::close(readiness_endpoint);
                         let _ = ipc::close(request_endpoint);
                         fail(SERVICE_FAILED)
                     }
@@ -1755,30 +2291,37 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             vfs_generation,
                             VFS_SERVICE_FAILED,
                         );
+                        ipc::close(vfs_readiness_endpoint)
+                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
                         ipc::close(vfs_request_endpoint)
                             .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
+                        vfs_readiness_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
                         vfs_request_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
                         backoff(backoff_yields);
                         vfs_generation = start_service(
                             &mut vfs_service,
                             &mut vfs_generations,
-                            vfs_readiness_endpoint,
+                            &mut vfs_readiness_endpoint,
                             &mut vfs_request_endpoint,
                             &[],
                             &VFS_MESSAGES,
                         );
                         register_vfs_router(vfs_generation, vfs_request_endpoint);
-                        service_control.drain_mutation(ServiceRegistryMut {
-                            logging: &mut logging_service,
-                            logging_generation: logging_lifecycle.generation(),
-                            nullfs: &mut nullfs_service,
-                            nullfs_generation,
-                            tmpfs: &mut service,
-                            tmpfs_generation,
-                            vfs: &mut vfs_service,
-                            vfs_generation,
-                        });
+                        service_control.drain_mutation(
+                            ServiceRegistryMut {
+                                logging: &mut logging_service,
+                                logging_generation: logging_lifecycle.generation(),
+                                nullfs: &mut nullfs_service,
+                                nullfs_generation,
+                                tmpfs: &mut service,
+                                tmpfs_generation,
+                                vfs: &mut vfs_service,
+                                vfs_generation,
+                            },
+                            nullfs_request_endpoint,
+                        );
                         vfs_service.complete_restart();
                     }
                     ServiceStatusDisposition::Stopped => {
@@ -1787,6 +2330,8 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             vfs_generation,
                             VFS_SERVICE_FAILED,
                         );
+                        ipc::close(vfs_readiness_endpoint)
+                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
                         ipc::close(vfs_request_endpoint)
                             .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
                     }
@@ -1796,6 +2341,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             vfs_generation,
                             VFS_SERVICE_FAILED,
                         );
+                        let _ = ipc::close(vfs_readiness_endpoint);
                         let _ = ipc::close(vfs_request_endpoint);
                         fail(VFS_SERVICE_FAILED)
                     }
@@ -1878,7 +2424,7 @@ fn run_nullfs_restart_probe(
     control: &mut ServiceControlState,
     registry: ServiceRegistryMut<'_>,
     generations: &mut ProviderGenerationSequence,
-    readiness_endpoint: CapabilityHandle,
+    readiness_endpoint: &mut CapabilityHandle,
     request_endpoint: &mut CapabilityHandle,
     block_capability: BootstrapCapability,
 ) -> ProviderGeneration {
@@ -1931,11 +2477,7 @@ fn run_nullfs_restart_probe(
             Err(error) if error == ipc::Error::TRY_AGAIN => {}
             Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
         }
-        if !matches!(
-            syscall::try_wait_child(probe_process_id),
-            Err(error) if error == syscall::Errno::TRY_AGAIN
-                || error == syscall::Errno::INTERRUPTED
-        ) {
+        if try_wait_final_status(probe_process_id).is_some() {
             fail(NULLFS_RESTART_PROBE_FAILED);
         }
         syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
@@ -1949,52 +2491,6 @@ fn run_nullfs_restart_probe(
     let restart_count = registry.nullfs.restart_count();
     let old_endpoint_info =
         ipc::info(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    if old_endpoint_info.size != 0
-        || syscall::signal_process_group(old_service_process_id, signal::STOP).ok() != Some(1)
-    {
-        fail(NULLFS_RESTART_PROBE_FAILED);
-    }
-    loop {
-        match syscall::wait_child(old_service_process_id) {
-            Ok(status) if status.stopped_signal() == Some(signal::STOP) => {
-                if registry.nullfs.observe_status(status.raw())
-                    != ServiceStatusDisposition::WaitForNextEvent
-                {
-                    fail(NULLFS_RESTART_PROBE_FAILED);
-                }
-                break;
-            }
-            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
-            Ok(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-            Err(error) if error == syscall::Errno::INTERRUPTED => {}
-            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-        }
-    }
-
-    ipc::send(control_endpoint, NULLFS_RESTART_PROBE_BEGIN_READ, None)
-        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    let mut request_queued = false;
-    for _ in 0..256 {
-        match ipc::info(*request_endpoint) {
-            Ok(info) if info.size != 0 => {
-                request_queued = true;
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-        }
-        if !matches!(
-            syscall::try_wait_child(probe_process_id),
-            Err(error) if error == syscall::Errno::TRY_AGAIN
-                || error == syscall::Errno::INTERRUPTED
-        ) {
-            fail(NULLFS_RESTART_PROBE_FAILED);
-        }
-        syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    }
-    if !request_queued {
-        fail(NULLFS_RESTART_PROBE_FAILED);
-    }
 
     let restart_barrier =
         syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
@@ -2019,26 +2515,25 @@ fn run_nullfs_restart_probe(
 
     let mut restart_requested = false;
     for _ in 0..256 {
-        control.pump_mutation(ServiceRegistryMut {
-            logging: &mut *registry.logging,
-            logging_generation: registry.logging_generation,
-            nullfs: &mut *registry.nullfs,
-            nullfs_generation: registry.nullfs_generation,
-            tmpfs: &mut *registry.tmpfs,
-            tmpfs_generation: registry.tmpfs_generation,
-            vfs: &mut *registry.vfs,
-            vfs_generation: registry.vfs_generation,
-        });
+        control.pump_mutation(
+            ServiceRegistryMut {
+                logging: &mut *registry.logging,
+                logging_generation: registry.logging_generation,
+                nullfs: &mut *registry.nullfs,
+                nullfs_generation: registry.nullfs_generation,
+                tmpfs: &mut *registry.tmpfs,
+                tmpfs_generation: registry.tmpfs_generation,
+                vfs: &mut *registry.vfs,
+                vfs_generation: registry.vfs_generation,
+            },
+            *request_endpoint,
+        );
         if registry.nullfs.state() == ServiceState::Restarting {
             restart_requested = true;
             break;
         }
-        match syscall::try_wait_child(restart_process_id) {
-            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
-            Ok(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-            Err(error) if error == syscall::Errno::TRY_AGAIN => {}
-            Err(error) if error == syscall::Errno::INTERRUPTED => {}
-            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        if try_wait_final_status(restart_process_id).is_some() {
+            fail(NULLFS_RESTART_PROBE_FAILED);
         }
         syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     }
@@ -2046,125 +2541,45 @@ fn run_nullfs_restart_probe(
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
 
-    let backoff_yields = loop {
-        match syscall::wait_child(old_service_process_id) {
-            Ok(status) if status.continued() || status.stopped_signal().is_some() => {
-                if registry.nullfs.observe_status(status.raw())
-                    != ServiceStatusDisposition::WaitForNextEvent
-                {
-                    fail(NULLFS_RESTART_PROBE_FAILED);
-                }
-            }
-            Ok(status) => match registry.nullfs.observe_status(status.raw()) {
-                ServiceStatusDisposition::Restart { backoff_yields } => break backoff_yields,
-                ServiceStatusDisposition::WaitForNextEvent
-                | ServiceStatusDisposition::Stopped
-                | ServiceStatusDisposition::Failed => fail(NULLFS_RESTART_PROBE_FAILED),
-            },
-            Err(error) if error == syscall::Errno::INTERRUPTED => {}
-            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-        }
-    };
-    if backoff_yields != 0 || registry.nullfs.restart_count() != restart_count {
-        fail(NULLFS_RESTART_PROBE_FAILED);
-    }
-    offline_filesystem_provider(
-        platform::FilesystemProvider::Nullfs,
-        old_generation,
-        NULLFS_RESTART_PROBE_FAILED,
-    );
-    offline_filesystem_provider(
-        platform::FilesystemProvider::Nullfs,
-        old_generation,
-        NULLFS_RESTART_PROBE_FAILED,
-    );
-    let mut offline = [0_u8; 64];
-    loop {
-        match ipc::try_receive(ready_endpoint, &mut offline) {
-            Ok(message) => {
-                if message.sender_process_id != probe_process_id
-                    || message.capability.is_some()
-                    || message.bytes != NULLFS_RESTART_PROBE_OFFLINE.len()
-                    || &offline[..message.bytes] != NULLFS_RESTART_PROBE_OFFLINE
-                {
-                    fail(NULLFS_RESTART_PROBE_FAILED);
-                }
-                break;
-            }
-            Err(error) if error == ipc::Error::TRY_AGAIN => {}
-            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-        }
-        if !matches!(
-            syscall::try_wait_child(probe_process_id),
-            Err(error) if error == syscall::Errno::TRY_AGAIN
-                || error == syscall::Errno::INTERRUPTED
+    let status = loop {
+        if let Some(status) = control.nullfs_lifecycle.advance(
+            registry.nullfs.process_id(),
+            old_generation,
+            *readiness_endpoint,
+            *request_endpoint,
         ) {
+            break status;
+        }
+        if try_wait_final_status(probe_process_id).is_some() {
             fail(NULLFS_RESTART_PROBE_FAILED);
         }
         syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    }
-    let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
-    backoff(backoff_yields);
-
-    let queued_restart_barrier =
-        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    let queued_restart_process_id = syscall::spawn_command_with_barrier(
-        SV_RESTART_NULLFS_COMMAND,
-        SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &queued_restart_barrier,
-    )
-    .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    if ipc::grant_child(
-        queued_restart_process_id,
-        control.mutation_source,
-        Rights::SEND,
-        2,
-    )
-    .ok()
-        != Some(2)
+    };
+    if status != 0
+        || !control.nullfs_lifecycle.last_exit_was_clean()
+        || registry.nullfs.observe_status(status)
+            != (ServiceStatusDisposition::Restart { backoff_yields: 0 })
+        || registry.nullfs.restart_count() != restart_count
+        || registry.nullfs.process_id().is_some()
+        || old_service_process_id == 0
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
-    queued_restart_barrier
-        .release()
-        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    let mut queued_during_restart = false;
-    for _ in 0..256 {
-        match ipc::info(control.mutation_source) {
-            Ok(info) if info.size != 0 => {
-                queued_during_restart = true;
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-        }
-        if !matches!(
-            syscall::try_wait_child(queued_restart_process_id),
-            Err(error) if error == syscall::Errno::TRY_AGAIN
-                || error == syscall::Errno::INTERRUPTED
-        ) {
-            fail(NULLFS_RESTART_PROBE_FAILED);
-        }
-        syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    }
-    if !queued_during_restart {
-        fail(NULLFS_RESTART_PROBE_FAILED);
-    }
 
+    let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
+    ipc::close(*readiness_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     ipc::close(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    *readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     let mut replacement_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     if ipc::info(replacement_request_endpoint)
-        .map(|info| info.object_id == old_endpoint_info.object_id)
+        .map(|info| info.object_id <= old_endpoint_info.object_id)
         .unwrap_or(true)
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
-    let generation = start_service(
+    let mut generation = start_service(
         registry.nullfs,
         generations,
         readiness_endpoint,
@@ -2185,20 +2600,21 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
-    ipc::send(control_endpoint, NULLFS_RESTART_PROBE_REPLACEMENT, None)
-        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     *request_endpoint = replacement_request_endpoint;
 
-    control.drain_mutation(ServiceRegistryMut {
-        logging: &mut *registry.logging,
-        logging_generation: registry.logging_generation,
-        nullfs: &mut *registry.nullfs,
-        nullfs_generation: generation,
-        tmpfs: &mut *registry.tmpfs,
-        tmpfs_generation: registry.tmpfs_generation,
-        vfs: &mut *registry.vfs,
-        vfs_generation: registry.vfs_generation,
-    });
+    control.drain_mutation(
+        ServiceRegistryMut {
+            logging: &mut *registry.logging,
+            logging_generation: registry.logging_generation,
+            nullfs: &mut *registry.nullfs,
+            nullfs_generation: generation,
+            tmpfs: &mut *registry.tmpfs,
+            tmpfs_generation: registry.tmpfs_generation,
+            vfs: &mut *registry.vfs,
+            vfs_generation: registry.vfs_generation,
+        },
+        *request_endpoint,
+    );
     registry.nullfs.complete_restart();
     if registry.nullfs.state() != ServiceState::Running
         || registry.nullfs.controlled_restart_pending()
@@ -2206,15 +2622,8 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
-    loop {
-        match syscall::wait_child(queued_restart_process_id) {
-            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
-            Ok(status) if !status.success() => break,
-            Ok(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-            Err(error) if error == syscall::Errno::INTERRUPTED => {}
-            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
-        }
-    }
+    ipc::send(control_endpoint, NULLFS_RESTART_PROBE_REPLACEMENT, None)
+        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
 
     loop {
         match syscall::wait_child(probe_process_id) {
@@ -2236,6 +2645,159 @@ fn run_nullfs_restart_probe(
     }
     ipc::close(ready_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     ipc::close(control_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+
+    let forced_process_id = registry
+        .nullfs
+        .process_id()
+        .unwrap_or_else(|| fail(NULLFS_RESTART_PROBE_FAILED));
+    if syscall::signal_process_group(forced_process_id, signal::STOP).ok() != Some(1) {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    loop {
+        match syscall::wait_child(forced_process_id) {
+            Ok(status) if status.stopped_signal() == Some(signal::STOP) => {
+                if registry.nullfs.observe_status(status.raw())
+                    != ServiceStatusDisposition::WaitForNextEvent
+                {
+                    fail(NULLFS_RESTART_PROBE_FAILED);
+                }
+                break;
+            }
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+    }
+
+    let forced_barrier =
+        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let forced_restart_process_id = syscall::spawn_command_with_barrier(
+        SV_RESTART_NULLFS_COMMAND,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &forced_barrier,
+    )
+    .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    if ipc::grant_child(
+        forced_restart_process_id,
+        control.mutation_source,
+        Rights::SEND,
+        2,
+    )
+    .ok()
+        != Some(2)
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    forced_barrier
+        .release()
+        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let mut forced_requested = false;
+    for _ in 0..256 {
+        control.pump_mutation(
+            ServiceRegistryMut {
+                logging: &mut *registry.logging,
+                logging_generation: registry.logging_generation,
+                nullfs: &mut *registry.nullfs,
+                nullfs_generation: generation,
+                tmpfs: &mut *registry.tmpfs,
+                tmpfs_generation: registry.tmpfs_generation,
+                vfs: &mut *registry.vfs,
+                vfs_generation: registry.vfs_generation,
+            },
+            *request_endpoint,
+        );
+        if registry.nullfs.state() == ServiceState::Restarting {
+            forced_requested = true;
+            break;
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    }
+    if !forced_requested {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    control.nullfs_lifecycle.shorten_quiesce_grace_for_test();
+
+    let forced_status = loop {
+        if let Some(status) = control.nullfs_lifecycle.advance(
+            registry.nullfs.process_id(),
+            generation,
+            *readiness_endpoint,
+            *request_endpoint,
+        ) {
+            break status;
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    };
+    if forced_status == 0
+        || control.nullfs_lifecycle.last_exit_was_clean()
+        || registry.nullfs.observe_status(forced_status)
+            != (ServiceStatusDisposition::Restart { backoff_yields: 0 })
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+
+    let forced_old_generation = generation;
+    let forced_endpoint_info =
+        ipc::info(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    ipc::close(*readiness_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    ipc::close(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    *readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let mut forced_replacement_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    if ipc::info(forced_replacement_endpoint)
+        .map(|info| info.object_id <= forced_endpoint_info.object_id)
+        .unwrap_or(true)
+    {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    generation = start_service(
+        registry.nullfs,
+        generations,
+        readiness_endpoint,
+        &mut forced_replacement_endpoint,
+        &[block_capability],
+        &NULLFS_MESSAGES,
+    );
+    if generation.get() != forced_old_generation.get().saturating_add(1) {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
+    register_nullfs_proxy(generation, forced_replacement_endpoint);
+    *request_endpoint = forced_replacement_endpoint;
+    control.drain_mutation(
+        ServiceRegistryMut {
+            logging: &mut *registry.logging,
+            logging_generation: registry.logging_generation,
+            nullfs: &mut *registry.nullfs,
+            nullfs_generation: generation,
+            tmpfs: &mut *registry.tmpfs,
+            tmpfs_generation: registry.tmpfs_generation,
+            vfs: &mut *registry.vfs,
+            vfs_generation: registry.vfs_generation,
+        },
+        *request_endpoint,
+    );
+    registry.nullfs.complete_restart();
+    run_probe(
+        NULLFS_READINESS_PROBE_COMMAND,
+        *request_endpoint,
+        NULLFS_RESTART_PROBE_FAILED,
+        b"userspace init: NullFS dirty recovery restart passed\n",
+    );
+    loop {
+        match syscall::wait_child(forced_restart_process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(status) if status.success() => break,
+            Ok(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => fail(NULLFS_RESTART_PROBE_FAILED),
+        }
+    }
     generation
 }
 
@@ -2786,7 +3348,7 @@ fn advance_logging_lifecycle(
 fn start_service(
     service: &mut ServiceRuntime,
     generations: &mut ProviderGenerationSequence,
-    readiness_endpoint: CapabilityHandle,
+    readiness_endpoint: &mut CapabilityHandle,
     request_endpoint: &mut CapabilityHandle,
     additional_capabilities: &[BootstrapCapability],
     messages: &ServiceMessages,
@@ -2813,7 +3375,7 @@ fn start_service(
         )
         .unwrap_or_else(|_| fail(messages.failed));
         service.note_spawned(process_id);
-        if ipc::grant_child(process_id, readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
+        if ipc::grant_child(process_id, *readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
             != Some(READY_HANDLE)
             || ipc::grant_child(
                 process_id,
@@ -2851,7 +3413,7 @@ fn start_service(
 
         let mut ready_buffer = [0_u8; 64];
         loop {
-            match ipc::try_receive(readiness_endpoint, &mut ready_buffer) {
+            match ipc::try_receive(*readiness_endpoint, &mut ready_buffer) {
                 Ok(message) => {
                     if message.sender_process_id != process_id
                         || message.capability.is_some()
@@ -2876,7 +3438,11 @@ fn start_service(
                     ServiceStatusDisposition::Restart { backoff_yields } => {
                         let _ = syscall::write_all(STDOUT, messages.restarting);
                         backoff(backoff_yields);
+                        ipc::close(*readiness_endpoint)
+                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
                         ipc::close(*request_endpoint)
+                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
+                        *readiness_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(messages.bootstrap_failed));
                         *request_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(messages.bootstrap_failed));

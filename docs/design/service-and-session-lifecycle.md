@@ -27,14 +27,17 @@ charging failure policy, while start creates and publishes only a fresh ready ge
 intent remains fenced through replacement startup, queued duplicates receive `Busy`, and PID 1
 escalates an uncooperative child to uncatchable signal 9 after a bounded grace period. Starting
 logging generations also have a bounded readiness deadline whose expiry enters normal restart and
-backoff policy rather than leaving the runtime in `Starting` indefinitely. Filesystem restart now
-offlines the exact old provider generation after final child status, fails and wakes old blocked work,
-closes the old endpoint handle, creates a fresh endpoint object, and registers a strictly newer
-generation before releasing the restart fence. The kernel retains an offline tombstone and rejects
-stale replies, work, and close cleanup. Filesystem `Start` and `Stop` remain exactly `Unsupported`;
-writable NullFS remains online until final exit because pre-exit quiesce and `SYNC` are still future
-work. `NSVC` v1 is unchanged. A separate manager, activation, definition loading, and cross-reboot
-desired-state persistence remain future work.
+backoff policy rather than leaving the runtime in `Starting` indefinitely. Controlled NullFS restart
+now queues a private `NFLC` v1 `QUIESCE` marker behind earlier FIFO requests. The service finishes
+those requests and processes no later public operations after exact `QUIESCED`; PID 1 then offlines the
+exact generation, waking tail work with `EIO`, and sends `UNMOUNT`. The service closes core handles,
+uses `try_unmount` to sync and publish a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits
+`0`. PID 1 requires both the exact event and final exit `0` before fresh-endpoint, newer-generation
+replacement. Invalid lifecycle traffic, timeout, failure, or early/nonzero exit uses exact-generation
+offlining, KILL/reap, and dirty recovery. Controlled restart does not charge failure policy. Filesystem
+`Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and public filesystem version 1 operations
+are unchanged. A separate manager, activation, definition loading, and cross-reboot desired-state
+persistence remain future work.
 
 ## Design goals
 

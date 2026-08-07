@@ -253,6 +253,13 @@ impl OpenTable {
         self.records.iter().position(Option::is_none)
     }
 
+    pub fn first(&self) -> Option<(usize, OpenRecord)> {
+        self.records
+            .iter()
+            .enumerate()
+            .find_map(|(index, record)| record.map(|record| (index, record)))
+    }
+
     pub fn insert_at(&mut self, index: usize, record: OpenRecord) -> Result<(), OpenTableError> {
         let slot = self
             .records
@@ -544,5 +551,13 @@ mod tests {
         assert_eq!(record.handle.id, 2);
         assert_eq!(opens.remove(index), Some(record));
         assert_eq!(opens.count_for_session(7, 5), 0);
+
+        let mut drained = Vec::new();
+        while let Some((index, record)) = opens.first() {
+            assert_eq!(opens.remove(index), Some(record));
+            drained.push(record.handle.id);
+        }
+        assert_eq!(drained, vec![3]);
+        assert_eq!(opens.first(), None);
     }
 }

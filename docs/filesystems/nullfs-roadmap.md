@@ -15,10 +15,12 @@ FUSE adapter. NullStar implements narrowly scoped raw writable block-device auth
 a separately supervised service that mounts `nullfs-core` read-write and offers explicitly
 negotiated writable protocol sessions. PR C added a bounded writable kernel proxy and
 public create, write, truncate, append, and unlink. Exact-generation provider offlining
-now isolates failed or controlled replacement generations. The generated primary volume
-is selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `System/`,
-`Applications/`, and `Users/`. Namespace bindings, public `mkdir`/`rmdir`/rename, offline
-repair policy, and adoption of those backing trees remain future work.
+and private quiesce/clean-unmount coordination now give controlled NullFS restart a proven
+clean path plus a bounded KILL-and-dirty-recovery fallback. The generated primary volume is
+selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `System/`,
+`Applications/`, and `Users/`. Namespace bindings are the next Phase 5 item; public
+`mkdir`/`rmdir`/rename, offline repair policy, and adoption of those backing trees remain
+future work.
 
 ## Status summary
 
@@ -28,7 +30,7 @@ repair policy, and adoption of those backing trees remain future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, bounded public mutation, provider offlining, and primary volume identity/layout implemented; namespace bindings next |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, bounded public mutation, controlled clean restart with dirty fallback, provider offlining, and primary volume identity/layout implemented; namespace bindings next |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -265,10 +267,12 @@ open, descriptor write, unlink, `fstat`, seek, `read_directory`, and `chdir`. Pu
 
 Successful opens retain opaque, generation- and session-scoped service nodes in kernel
 open-file descriptions. Descriptor duplication and inheritance share the description,
-and only final destruction queues `CLOSE_NODE`. After final child status, supervision
-offlines the exact old generation before registering a replacement:
+and only final destruction queues `CLOSE_NODE`. During controlled NullFS restart, PID 1
+queues a private `QUIESCE` marker behind earlier endpoint work. After exact `QUIESCED`, it
+offlines that provider generation before asking the quiesced service to unmount:
 
-- old in-flight requests fail and wake with `IO` (`EIO` at the syscall boundary);
+- earlier requests complete, while tail work fails and wakes with `IO` (`EIO` at the
+  syscall boundary);
 - old descriptors remain stale instead of silently rebinding;
 - stale replies and later stale I/O continue to fail with `IO`;
 - close tickets from the old generation are purged rather than sent to the replacement;
@@ -281,12 +285,13 @@ also preserve clean shutdown, dirty startup, replacement, and block-device-loss
 semantics without weakening the on-disk rules.
 
 Current normal-boot coverage includes direct protocol probes and mounted VFS probes
-through public syscalls. The dedicated `nullfs-restart-test` image observes final service
-status with a live descriptor and queued read, offlines the exact generation, fails and
-wakes the queued read, closes the old endpoint handle, creates a fresh endpoint object,
-and registers a strictly newer generation before releasing the restart fence. It verifies
-deterministic cancellation, stale-handle and stale-reply rejection, safe close-work
-purging, and successful access through the replacement generation.
+through public syscalls. The dedicated `nullfs-restart-test` image now validates two
+controlled replacements. The first proves exact `QUIESCED`, exact `CLEAN_UNMOUNTED`, final
+exit `0`, stale-descriptor `EIO`, persisted data, and access through a fresh endpoint at a
+strictly newer generation. The second stops the service so it cannot
+consume `QUIESCE`, then validates timeout, exact-generation offlining, KILL/reap, and a
+replacement mount through dirty recovery. Neither controlled restart charges the failure
+budget.
 
 ```sh
 cargo run --locked --quiet -- --nullfs-restart-check
@@ -294,16 +299,18 @@ cargo run --locked --quiet -- --nullfs-restart-check
 ```
 
 The FAT bootstrap path remains independent while the UUID-selected primary volume is
-available at `/Volumes/NullStar`. Its bounded public mutation surface and initial backing
-layout are implemented; root namespace bindings, broader namespace mutation, and an
-independent recovery path remain future work.
+available at `/Volumes/NullStar`. Its bounded public mutation surface, initial backing
+layout, and controlled clean/dirty replacement paths are implemented; root namespace
+bindings are next, while broader namespace mutation and offline repair policy remain
+future work.
 
 ## Phase 5: writable service and namespace adoption — in progress
 
 Phase 5 moves from a read-only public test mount to the accepted persistent-volume and
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
-operations, PR C's bounded public writable proxy, and stable primary-volume identity and
-layout are implemented. Namespace bindings are next.
+operations, PR C's bounded public writable proxy, controlled quiesce/clean unmount with
+dirty-recovery fallback, and stable primary-volume identity and layout are implemented.
+Namespace bindings are next.
 
 ### Raw writable block authority — implemented
 
@@ -376,6 +383,28 @@ can leave behind.
 Direct flags-zero sessions remain read-only. PR C changes only the kernel proxy's exact
 session request and public VFS policy; it does not merge raw block authority, filesystem
 session authority, and public path authority.
+
+### Controlled restart quiesce and clean unmount — implemented
+
+The public filesystem protocol remains version 1 with unchanged `Request`, `Reply`, and
+operation definitions. Controlled restart instead uses a private exact 24-byte `NFLC`
+version 1 frame carrying a kind plus nonzero service generation and transition ID, all
+multibyte fields little-endian. Its kinds are `QUIESCE`, `QUIESCED`, `UNMOUNT`,
+`CLEAN_UNMOUNTED`, and `FAILED`; lifecycle events carry no capability.
+
+PID 1 asynchronously queues `QUIESCE` on the existing FIFO request endpoint behind earlier
+work. The service completes that work, enters a state that processes no later public
+operations, and emits exact `QUIESCED`. PID 1 then offlines the exact generation so tail
+work wakes with `EIO`, queues `UNMOUNT`, and waits while the service closes all core open
+handles and calls `try_unmount`, including sync and clean-superblock publication. Only the
+combination of exact `CLEAN_UNMOUNTED` and final exit `0` proves the clean path; replacement
+uses a fresh endpoint and a strictly newer generation.
+
+Any timeout, malformed or wrong event, attached event capability, lifecycle `FAILED`, or
+early or nonzero exit takes the non-clean path: exact-generation offline, KILL/reap as
+needed, and replacement mount through dirty recovery. Controlled restart does not charge
+the failure budget. This is not live filesystem stop/start: filesystem `Start` and `Stop`
+remain exactly `Unsupported`, and `NSVC` v1 is unchanged.
 
 ### Public writable proxy (PR C) — implemented and bounded
 
@@ -457,14 +486,13 @@ Direct NullFS loading by the bootloader is not required for Phase 5.
 
 ### Remaining Phase 5 acceptance
 
-PR C supplies bounded writable public-ABI and replacement coverage. Phase 5 is complete
-only when the remaining integrated work demonstrates:
+PR C and the controlled-restart milestone supply bounded writable public-ABI and
+clean/dirty replacement coverage. Namespace binding is next; Phase 5 is complete only when
+the remaining integrated work demonstrates:
 
+- namespace binding, canonical-path, and file-identity behavior;
 - crash injection and remount recovery for service-backed mutations;
 - deterministic out-of-space and block-device-loss behavior;
-- pre-exit writable-service quiesce and `SYNC`, clean shutdown ordering, and dirty-start
-  recovery;
-- namespace binding, canonical-path, and file-identity behavior;
 - continued access to the bootstrap and recovery environment when the primary volume
   cannot mount;
 - normal boot loading non-bootstrap programs and service definitions through
