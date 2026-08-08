@@ -126,8 +126,9 @@ unchanged.
   discovery, enablement, dependency resolution, and a separate manager remain future work.
 - **Future:** treat `/System/boot` as the canonical source of boot generations and
   initially mirror the selected generation to a firmware-readable bootstrap partition.
-- **Ongoing requirement:** retain an independent bootstrap and recovery environment
-  whenever persistent bindings are unavailable.
+- **Implemented acceptance gate:** a generated image with no primary NullFS partition proves exact
+  UUID lookup failure and handoff to the independently available emergency kernel shell. Retaining
+  that recovery independence remains an ongoing requirement.
 
 ## Driver and device evolution
 

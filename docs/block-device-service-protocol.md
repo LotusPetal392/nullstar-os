@@ -144,7 +144,9 @@ write, exercises `FLUSH`, and disconnects without modifying allocatable filesyst
 data. Durable writes are covered through NullFS transactions and the public VFS
 mutation probes instead of a raw scratch sector. The read-only FAT buffer-transfer,
 range-rejection, write-denial, unsupported-flush, writable NullFS bounds, and
-disconnect-cleanup probes remain active.
+disconnect-cleanup probes remain active. A separate generated image omits the primary NullFS
+partition entirely. In that mode PID 1 requires exact `NO_ENTRY` for the configured UUID and enters
+the independent emergency recovery path without falling back to partition index or label.
 
 PID 1 explicitly launches `/nullfs-service --writable` and gives it a send-only
 handle to the writable raw NullFS endpoint. The service requires
