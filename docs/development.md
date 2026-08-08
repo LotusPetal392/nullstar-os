@@ -59,8 +59,8 @@ Before publishing, run:
 ```
 
 The complete path additionally runs normal-boot readiness, the two-boot smoke suite,
-the targeted NullFS replacement phase, out-of-space, block-device-loss, and crash/remount recovery,
-unavailable-primary recovery, and logging lifecycle convergence. The targeted paths can be run
+the targeted NullFS replacement phase, out-of-space, block-device-loss, crash/remount recovery,
+three-boot boot-generation rollback, unavailable-primary recovery, and logging lifecycle convergence. The targeted paths can be run
 directly:
 
 ```sh
@@ -68,6 +68,7 @@ cargo +nightly-2026-02-01 run --release --locked -- --nullfs-restart-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-out-of-space-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-block-device-loss-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-crash-recovery-check
+cargo +nightly-2026-02-01 run --release --locked -- --nullfs-boot-generation-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-unavailable-check
 cargo +nightly-2026-02-01 run --release --locked -- --logging-lifecycle-check
 ```
@@ -89,6 +90,12 @@ sending the filesystem reply. PID 1 requires exit status 37, offlines the exact 
 wakes the original non-retried syscall with `EIO`, and starts a fresh generation. The replacement
 completes dirty mount recovery before the probe verifies stale descriptors, exact single-copy durable
 content through canonical and raw views, cleanup, and independent FAT access.
+
+The boot-generation runner uses one private disposable image for three consecutive boots. The first
+boot writes and verifies generation 2 in the inactive FAT slot before publishing the canonical
+`/System/boot/selection` record and writing `BOOTSEL.BIN` last. The second boot verifies both stores,
+rolls back to generation 1, and records generation 2 as failed without overwriting either slot. The
+third boot proves that the rollback, both canonical generations, and both firmware artifacts survived.
 
 The unavailable-primary image contains no NullFS partition. It requires exact `NO_ENTRY` for the
 configured filesystem UUID, a specific PID 1 recovery handoff, exact PID 1 exit code `78`, kernel

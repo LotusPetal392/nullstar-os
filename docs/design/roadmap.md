@@ -98,8 +98,8 @@ See [Capability-based application sandboxing](application-sandboxing.md).
 
 ## Namespace and persistent storage
 
-All three primary-volume namespace bindings are implemented, but NullFS Phase 5 acceptance
-is not complete. VFS namespace-routing protocol version 2 uses a bounded 224-byte reply
+All three primary-volume namespace bindings and the bounded NullFS Phase 5 acceptance gates
+are implemented. VFS namespace-routing protocol version 2 uses a bounded 224-byte reply
 with explicit binding metadata. The VFS service owns exact `/System`, `/Applications`, and
 `/Users` records targeting matching nodes below the UUID-selected NullFS provider's backend
 root. Raw matching paths below `/Volumes/NullStar` remain administrative aliases, while cwd
@@ -122,15 +122,20 @@ unchanged.
   image proves exact data-block and inode exhaustion, continued reads, reclamation, and subsequent
   public mutation. Exact UUID- and generation-fenced block-endpoint offlining now proves explicit
   `EIO`, uncertain-mutation fail-stop, stale filesystem-generation failure, and bootstrap continuity.
-  A capability-gated post-commit/pre-reply service crash now proves non-retried public `EIO`, exact
-  old-generation offlining, dirty remount, stale descriptors, and single-copy durable recovery;
-  boot-generation rollback and broader administrative tooling remain.
+  A capability-gated post-commit/pre-reply service crash proves non-retried public `EIO`, exact
+  old-generation offlining, dirty remount, stale descriptors, and single-copy durable recovery.
+  A separate three-boot disposable-image gate stages a generation into the inactive firmware slot,
+  selects it through canonical and mirrored checksummed records, rolls back, and verifies both
+  retained generations without modifying the generated source image.
 - **Partially implemented:** load non-bootstrap programs and service definitions through
   the bound `/System` tree; static executable loading, the bounded allocation-free
   definition parser, and one policy-pinned PID 1 activation pilot are implemented. General
   discovery, enablement, dependency resolution, and a separate manager remain future work.
-- **Future:** treat `/System/boot` as the canonical source of boot generations and
-  initially mirror the selected generation to a firmware-readable bootstrap partition.
+- **Implemented acceptance foundation:** `/System/boot` contains deterministic retained
+  generations and one canonical version 1 selection record. The targeted synchronizer mirrors two
+  artifact slots plus the selector to firmware-readable FAT and proves selection and rollback across
+  three boots. Production manifests, authenticated health, attempt policy, redundant selectors, and
+  an ordinary long-running synchronization service remain future work.
 - **Implemented acceptance gate:** a generated image with no primary NullFS partition proves exact
   UUID lookup failure and handoff to the independently available emergency kernel shell. Retaining
   that recovery independence remains an ongoing requirement.

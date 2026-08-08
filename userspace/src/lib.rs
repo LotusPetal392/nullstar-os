@@ -46,6 +46,13 @@ pub mod definition_service_probe {
     ));
 }
 
+pub mod boot_generation_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/boot_generation_fixture.rs"
+    ));
+}
+
 /// Defines the raw ELF entry point for a Rust userspace program.
 ///
 /// The supplied function receives the original kernel-built initial stack pointer.

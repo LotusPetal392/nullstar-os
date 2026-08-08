@@ -22,7 +22,9 @@ selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `Sys
 selected provider's backend root, while matching `/Volumes/NullStar` paths remain raw
 administrative aliases. A static executable loads through `/System/bin`, and writable user
 profile state persists through controlled service replacement without making PID 1 or
-recovery depend on NullFS. A fully allocated service image proves deterministic data-block and inode
+recovery depend on NullFS. A three-boot disposable-image gate now stages a second boot generation,
+publishes canonical and FAT selectors in order, rolls back to the retained healthy generation, and
+verifies that both canonical generations and firmware slots remain exact. A fully allocated service image proves deterministic data-block and inode
 exhaustion, continued reads, resource reclamation, and subsequent mutation through the public VFS
 ABI. A generated no-primary-volume image proves exact UUID lookup failure hands control to the
 independently available emergency kernel shell. One policy-pinned PID 1 pilot
@@ -39,7 +41,7 @@ future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, deterministic out-of-space, block-device-loss, and service-crash recovery handling, unavailable-primary recovery proof, static `/System/bin` execution, the bounded service-definition parser, and one policy-pinned PID 1 activation pilot are implemented; boot-generation acceptance and general service management remain incomplete |
+| 5 | Writable service and namespace adoption | Implemented; bounded acceptance covers raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary layout and bindings, managed user profiles, deterministic exhaustion, block-device-loss and service-crash recovery, unavailable-primary recovery, static `/System/bin` execution, one definition-backed activation pilot, and three-boot boot-generation synchronization and rollback |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -319,7 +321,7 @@ policy-pinned activation path through canonical `/System/services` are implement
 definition discovery and enablement, broader namespace mutation, and offline repair policy remain
 future work.
 
-## Phase 5: writable service and namespace adoption — in progress
+## Phase 5: writable service and namespace adoption — implemented
 
 Phase 5 moves from a read-only public test mount to the accepted persistent-volume and
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
@@ -327,9 +329,10 @@ operations, PR C's bounded public writable proxy, controlled quiesce/clean unmou
 dirty-recovery fallback, stable primary-volume identity and layout, all three primary-tree
 namespace bindings, managed user-profile layout, deterministic out-of-space, block-device-loss, and
 service-crash recovery handling, unavailable-primary recovery, static `/System/bin` execution, the bounded allocation-free
-service-definition parser, and one policy-pinned definition-backed PID 1 activation pilot are
-implemented. Phase 5 remains in progress; general service management and the
-remaining integrated acceptance work are incomplete.
+service-definition parser, one policy-pinned definition-backed PID 1 activation pilot, and
+three-boot boot-generation synchronization and rollback are implemented. General service discovery,
+enablement, dependency management, production boot health policy, and administrative tooling remain
+future work, but they are not part of the bounded Phase 5 acceptance gate.
 
 ### Raw writable block authority — implemented
 
@@ -548,27 +551,24 @@ replacement. General discovery, enablement, dependencies, and a separate service
 future work. The synthetic root and bootstrap facilities remain usable when the primary volume or
 service is unavailable.
 
-### Boot generations
+### Boot generations — implemented acceptance foundation
 
-After the namespace is reliable, `/System/boot` should become the canonical source for
-complete versioned boot generations. An updater stages and verifies a generation,
-commits it durably, atomically selects it, retains a known-good previous generation,
-and mirrors the selected artifacts to the firmware-readable bootstrap partition.
-Direct NullFS loading by the bootloader is not required for Phase 5.
+`/System/boot` now contains deterministic retained boot-artifact fixtures and one fixed checksummed
+selection record carrying selected and previous state together. A capability-gated probe receives the
+direct writable NullFS endpoint before the normal service mounts it. Across three boots of one private
+disposable image it:
 
-### Remaining Phase 5 acceptance
+1. verifies generation 1, writes generation 2 to inactive `BOOT1.BIN`, reads it back, and confirms
+   `BOOTSEL.BIN` still selects generation 1 before publishing the canonical selector and FAT selector;
+2. verifies generation 2 is selected in both stores, preserves `BOOT0.BIN`, and rolls the selector
+   back to healthy generation 1 while retaining failed generation 2;
+3. verifies the rollback, both canonical generations, and both firmware slots persisted exactly.
 
-PR C, controlled restart, all three primary-tree bindings, static system execution, and the
-policy-pinned definition-backed activation pilot, deterministic out-of-space, block-device-loss, and
-service-crash recovery gates, and unavailable-primary recovery gate supply bounded writable
-public-ABI, clean/dirty replacement, canonical-path, cross-view identity, bootstrap-independence,
-normal-boot `/System/services` activation, exact data/inode exhaustion with reclamation, explicit
-provider-loss failure without hanging or uncertain retry, a post-commit/pre-reply crash with exact
-old-generation `EIO` and single-copy durable remount recovery, and missing-primary recovery coverage.
-They do not complete Phase 5. Completion still requires the remaining integrated work to demonstrate:
-
-- boot-generation synchronization and rollback without corrupting the previously
-  selected generation.
+This completes the Phase 5 acceptance requirement for boot-generation synchronization and rollback
+without corrupting the previously selected generation. Direct NullFS loading by the bootloader is not
+required. Production manifest authentication, attempt counting, authenticated health confirmation,
+redundant torn-write-safe selectors, and the ordinary Magnetar/synchronization service remain future
+hardening and product work.
 
 ## Phase 6: hardening and native-volume features — planned
 
