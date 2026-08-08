@@ -135,6 +135,9 @@ const VFS_FULL_PROBE_PASSED: &[u8] = b"userspace init: full vfs probe passed\n";
 const VFS_BOOTSTRAP_PROBE_COMMAND: &[u8] = b"/vfs-probe bootstrap";
 const VFS_BOOTSTRAP_PROBE_PASSED: &[u8] =
     b"userspace init: bootstrap VFS remained available while NullFS was offline\n";
+const VFS_OUT_OF_SPACE_PROBE_COMMAND: &[u8] = b"/vfs-probe out-of-space";
+const VFS_OUT_OF_SPACE_PROBE_FAILED: &[u8] = b"userspace init: NullFS out-of-space probe failed\n";
+const VFS_OUT_OF_SPACE_PROBE_PASSED: &[u8] = b"userspace init: NullFS data and inode exhaustion, service continuity, and resource reclamation verified\n";
 const DEFINITION_SERVICE_LOADING: &[u8] =
     b"userspace init: loading service definition from /System/services\n";
 const DEFINITION_SERVICE_STARTING: &[u8] = b"userspace init: starting definition-backed service\n";
@@ -161,6 +164,7 @@ const LOGGING_LIFECYCLE_TEST_PASSED: &[u8] = b"userspace init: logging live star
 const LOGGING_LIFECYCLE_TEST_FAILED: &[u8] = b"userspace init: logging lifecycle test failed\n";
 const BOOT_MODE_PATH: &[u8] = b"/BOOTMODE";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
+const NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE: &[u8] = b"nullfs-out-of-space-test\n";
 const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const BOOT_MODE_PROBE_FAILED: &[u8] = b"userspace init: unable to read boot mode\n";
@@ -2467,6 +2471,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     }
     let boot_mode = init_boot_mode();
     let nullfs_restart_test = boot_mode == InitBootMode::NullfsRestartTest;
+    let nullfs_out_of_space_test = boot_mode == InitBootMode::NullfsOutOfSpaceTest;
     let logging_lifecycle_test = boot_mode == InitBootMode::LoggingLifecycleTest;
     if boot_mode == InitBootMode::NullfsUnavailableTest {
         match platform::open_writable_nullfs_block_device_endpoint(
@@ -2689,6 +2694,13 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 vfs: &vfs_service,
                 vfs_generation,
             },
+        );
+    } else if nullfs_out_of_space_test {
+        run_probe(
+            VFS_OUT_OF_SPACE_PROBE_COMMAND,
+            vfs_request_endpoint,
+            VFS_OUT_OF_SPACE_PROBE_FAILED,
+            VFS_OUT_OF_SPACE_PROBE_PASSED,
         );
     } else {
         run_probe(
@@ -3090,6 +3102,7 @@ enum InitBootMode {
     Normal,
     SmokeTest,
     NullfsRestartTest,
+    NullfsOutOfSpaceTest,
     NullfsUnavailableTest,
     LoggingLifecycleTest,
 }
@@ -3105,6 +3118,9 @@ fn init_boot_mode() -> InitBootMode {
         b"normal" | b"normal\n" => InitBootMode::Normal,
         b"smoke-test" | b"smoke-test\n" => InitBootMode::SmokeTest,
         b"nullfs-restart-test" | NULLFS_RESTART_TEST_BOOT_MODE => InitBootMode::NullfsRestartTest,
+        b"nullfs-out-of-space-test" | NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE => {
+            InitBootMode::NullfsOutOfSpaceTest
+        }
         b"nullfs-unavailable-test" | NULLFS_UNAVAILABLE_TEST_BOOT_MODE => {
             InitBootMode::NullfsUnavailableTest
         }

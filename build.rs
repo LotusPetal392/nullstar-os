@@ -3,7 +3,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use nullfs_blockdev::MemoryBlockDevice;
+use nullfs_blockdev::{BlockDevice, MemoryBlockDevice};
+use nullfs_core::Filesystem;
 use nullfs_format::BLOCK_SIZE;
 use nullfs_testkit::ImageBuilder;
 
@@ -21,6 +22,7 @@ const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n"
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
+const NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE: &[u8] = b"nullfs-out-of-space-test\n";
 const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const MAX_EXECUTABLE_FILE_BYTES: usize = 1024 * 1024;
@@ -311,6 +313,17 @@ fn main() {
         .expect("failed to create NullFS restart-test BIOS disk image");
     append_nullfs_partition(&nullfs_restart_test_bios_image, &nullfs_fixture)
         .expect("failed to append NullFS partition to restart-test BIOS disk image");
+    let nullfs_out_of_space_fixture = build_exhausted_nullfs_fixture(&nullfs_fixture);
+    let nullfs_out_of_space_test_bios_image =
+        output_directory.join("nullstar-os-nullfs-out-of-space-test-bios.img");
+    build_image(NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE)
+        .create_bios_image(&nullfs_out_of_space_test_bios_image)
+        .expect("failed to create NullFS out-of-space-test BIOS disk image");
+    append_nullfs_partition(
+        &nullfs_out_of_space_test_bios_image,
+        &nullfs_out_of_space_fixture,
+    )
+    .expect("failed to append exhausted NullFS partition to out-of-space-test BIOS disk image");
     let nullfs_unavailable_test_bios_image =
         output_directory.join("nullstar-os-nullfs-unavailable-test-bios.img");
     build_image(NULLFS_UNAVAILABLE_TEST_BOOT_MODE)
@@ -332,6 +345,10 @@ fn main() {
     println!(
         "cargo:rustc-env=NULLFS_RESTART_TEST_BIOS_IMAGE={}",
         nullfs_restart_test_bios_image.display()
+    );
+    println!(
+        "cargo:rustc-env=NULLFS_OUT_OF_SPACE_TEST_BIOS_IMAGE={}",
+        nullfs_out_of_space_test_bios_image.display()
     );
     println!(
         "cargo:rustc-env=NULLFS_UNAVAILABLE_TEST_BIOS_IMAGE={}",
@@ -538,6 +555,80 @@ fn build_nullfs_fixture(exec_target_path: &Path, definition_service_path: &Path)
     image
         .finish()
         .expect("failed to finalize NullFS fixture")
+        .bytes()
+        .to_vec()
+}
+
+fn build_exhausted_nullfs_fixture(fixture: &[u8]) -> Vec<u8> {
+    assert!(
+        !fixture.is_empty() && fixture.len().is_multiple_of(BLOCK_SIZE),
+        "base NullFS fixture must contain complete filesystem blocks"
+    );
+    let block_count = u64::try_from(fixture.len() / BLOCK_SIZE)
+        .expect("base NullFS fixture block count exceeded u64");
+    let mut device = MemoryBlockDevice::new(BLOCK_SIZE, block_count)
+        .expect("failed to allocate exhausted NullFS fixture device");
+    device
+        .write_blocks(0, fixture)
+        .expect("failed to copy base NullFS fixture");
+    let mut filesystem = Filesystem::mount_read_write(device)
+        .expect("failed to mount exhausted NullFS fixture read-write");
+    let applications = filesystem
+        .lookup(filesystem.root(), b"Applications")
+        .expect("failed to find exhausted fixture Applications directory");
+    let filler = filesystem
+        .create(applications, b"out-of-space-fill", 0o600)
+        .expect("failed to create exhausted fixture data filler");
+
+    let mut inode_index = 0_u64;
+    while filesystem
+        .statistics()
+        .expect("failed to inspect exhausted fixture inode capacity")
+        .free_inodes
+        != 0
+    {
+        let name = format!("inode-fill-{inode_index:04}");
+        filesystem
+            .create(applications, name.as_bytes(), 0o600)
+            .unwrap_or_else(|error| {
+                panic!("failed to consume fixture inode {inode_index}: {error}")
+            });
+        inode_index = inode_index
+            .checked_add(1)
+            .expect("exhausted fixture inode index overflowed");
+    }
+
+    let data = [0xa5_u8; BLOCK_SIZE];
+    let mut offset = 0_u64;
+    while filesystem
+        .statistics()
+        .expect("failed to inspect exhausted fixture data capacity")
+        .free_data_blocks
+        != 0
+    {
+        assert_eq!(
+            filesystem
+                .write(filler, offset, &data)
+                .expect("failed to consume exhausted fixture data block"),
+            data.len(),
+            "exhausted fixture data fill completed partially"
+        );
+        offset = offset
+            .checked_add(BLOCK_SIZE as u64)
+            .expect("exhausted fixture data offset overflowed");
+    }
+
+    let statistics = filesystem
+        .statistics()
+        .expect("failed to inspect completed exhausted fixture");
+    assert_eq!(statistics.free_inodes, 0, "fixture retained a free inode");
+    assert_eq!(
+        statistics.free_data_blocks, 0,
+        "fixture retained a free data block"
+    );
+    filesystem
+        .unmount()
+        .expect("failed to cleanly unmount exhausted NullFS fixture")
         .bytes()
         .to_vec()
 }

@@ -34,6 +34,7 @@ repository = "https://github.com/LotusPetal392/nullstar-os"
 [build-dependencies]
 bootloader = "0.11.15"
 nullfs-blockdev = { path = "crates/nullfs-blockdev", features = ["memory"] }
+nullfs-core = { path = "crates/nullfs-core" }
 nullfs-format = { path = "crates/nullfs-format" }
 nullfs-testkit = { path = "crates/nullfs-testkit" }
 service-definition = { path = "crates/service-definition" }

@@ -508,6 +508,7 @@ dependencies = [
  "bootloader",
  "kernel",
  "nullfs-blockdev",
+ "nullfs-core",
  "nullfs-format",
  "nullfs-service",
  "nullfs-testkit",

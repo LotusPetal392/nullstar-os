@@ -485,4 +485,6 @@ service's broader writable protocol surface, including directory creation,
 mutation, cross-view visibility and identity, canonical cwd behavior, create, write,
 independent stale append, cross-handle `fstat` and `SEEK_END`, truncate, duplication,
 unlink while open, open-unlinked read/write, cleanup, persistence across service restart,
-stale old descriptors, and continued bootstrap availability.
+stale old descriptors, and continued bootstrap availability. A dedicated fully allocated image
+also proves exact public-ABI `NO_SPACE` for existing-file growth and new-inode creation, unchanged
+existing metadata, continued reads, resource reclamation, and successful mutation afterward.

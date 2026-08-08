@@ -118,8 +118,9 @@ unchanged.
   `/System/bin` executable, canonical application and user-profile mutation, stale
   descriptors across service restart, and bootstrap availability.
 - **Implemented foundation:** writable NullStar filesystem-service authority, controlled
-  shutdown ordering, clean/dirty recovery, and bounded public mutation; broader
-  administrative tooling remains.
+  shutdown ordering, clean/dirty recovery, and bounded public mutation. A fully allocated service
+  image proves exact data-block and inode exhaustion, continued reads, reclamation, and subsequent
+  public mutation; block-device-loss injection and broader administrative tooling remain.
 - **Partially implemented:** load non-bootstrap programs and service definitions through
   the bound `/System` tree; static executable loading, the bounded allocation-free
   definition parser, and one policy-pinned PID 1 activation pilot are implemented. General

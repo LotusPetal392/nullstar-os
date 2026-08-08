@@ -5,6 +5,7 @@ pub enum BootMode {
     Normal,
     SmokeTest,
     NullfsRestartTest,
+    NullfsOutOfSpaceTest,
     NullfsUnavailableTest,
     LoggingLifecycleTest,
 }
@@ -15,6 +16,9 @@ impl BootMode {
             b"normal" | b"normal\n" => Some(Self::Normal),
             b"smoke-test" | b"smoke-test\n" => Some(Self::SmokeTest),
             b"nullfs-restart-test" | b"nullfs-restart-test\n" => Some(Self::NullfsRestartTest),
+            b"nullfs-out-of-space-test" | b"nullfs-out-of-space-test\n" => {
+                Some(Self::NullfsOutOfSpaceTest)
+            }
             b"nullfs-unavailable-test" | b"nullfs-unavailable-test\n" => {
                 Some(Self::NullfsUnavailableTest)
             }
@@ -34,6 +38,7 @@ impl BootMode {
             Self::Normal => "normal",
             Self::SmokeTest => "smoke-test",
             Self::NullfsRestartTest => "nullfs-restart-test",
+            Self::NullfsOutOfSpaceTest => "nullfs-out-of-space-test",
             Self::NullfsUnavailableTest => "nullfs-unavailable-test",
             Self::LoggingLifecycleTest => "logging-lifecycle-test",
         }
@@ -51,6 +56,10 @@ mod tests {
         assert_eq!(
             BootMode::parse(b"nullfs-restart-test\n"),
             Some(BootMode::NullfsRestartTest)
+        );
+        assert_eq!(
+            BootMode::parse(b"nullfs-out-of-space-test\n"),
+            Some(BootMode::NullfsOutOfSpaceTest)
         );
         assert_eq!(
             BootMode::parse(b"nullfs-unavailable-test\n"),

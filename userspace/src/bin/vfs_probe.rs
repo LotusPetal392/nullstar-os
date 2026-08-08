@@ -21,6 +21,7 @@ const READINESS_MODE: &[u8] = b"readiness";
 const FULL_MODE: &[u8] = b"full";
 const BOOTSTRAP_MODE: &[u8] = b"bootstrap";
 const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
+const NULLFS_OUT_OF_SPACE_MODE: &[u8] = b"out-of-space";
 const NULLFS_RESTART_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
 
@@ -32,6 +33,10 @@ const NULLFS_README: &[u8] = b"/Volumes/NullStar/docs/readme.txt";
 const NULLFS_MISSING: &[u8] = b"/Volumes/NullStar/missing";
 const NULLFS_PUBLIC_PROBE: &[u8] = b"/Applications/nullstar-vfs-probe-v1.bin";
 const NULLFS_PUBLIC_PROBE_RAW: &[u8] = b"/Volumes/NullStar/Applications/nullstar-vfs-probe-v1.bin";
+const NULLFS_OUT_OF_SPACE_FILL: &[u8] = b"/Applications/out-of-space-fill";
+const NULLFS_OUT_OF_SPACE_CREATE: &[u8] = b"/Applications/out-of-space-create";
+const NULLFS_OUT_OF_SPACE_CREATE_RAW: &[u8] = b"/Volumes/NullStar/Applications/out-of-space-create";
+const NULLFS_OUT_OF_SPACE_RECOVERY_BYTES: &[u8] = b"space reclaimed";
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
 const README: &[u8] = b"This volume is a deterministic NullFS integration fixture.\n";
 const INITIAL_BYTES: &[u8] = b"NullStar public VFS";
@@ -165,6 +170,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
     if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_RESTART_MODE) {
         probe_nullfs_restart();
+    }
+    if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_OUT_OF_SPACE_MODE) {
+        probe_nullfs_out_of_space();
     }
     let readiness = arguments.len() == 2 && arguments.get(1) == Some(READINESS_MODE);
     let full =
@@ -788,6 +796,76 @@ fn probe_user_namespace_mutation() {
     if syscall::close(raw).is_err() || syscall::close(canonical).is_err() {
         syscall::exit(125);
     }
+}
+
+fn probe_nullfs_out_of_space() -> ! {
+    if !matches!(
+        ipc::wait_for_handle(SERVICE_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
+    ) {
+        syscall::exit(130);
+    }
+
+    let filler = open_with_retry(
+        NULLFS_OUT_OF_SPACE_FILL,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::APPEND,
+    )
+    .unwrap_or_else(|| syscall::exit(131));
+    let original_size = match platform::fstat(filler) {
+        Ok(stat) if stat.kind == file::KIND_FILE && stat.size != 0 => stat.size,
+        _ => syscall::exit(132),
+    };
+    let mut filler_tail = [0_u8; 1];
+    if !write_fails_with_retry(filler, b"x", syscall::Errno::NO_SPACE)
+        || !descriptor_stat_matches(filler, original_size)
+        || syscall::seek(filler, syscall::SeekFrom::End(-1)).ok() != Some(original_size - 1)
+        || syscall::read(filler, &mut filler_tail).ok() != Some(1)
+        || filler_tail != [0xa5]
+    {
+        syscall::exit(133);
+    }
+    if !open_fails_with_retry(
+        NULLFS_OUT_OF_SPACE_CREATE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
+        syscall::Errno::NO_SPACE,
+    ) || !stat_failed_with_retry(NULLFS_OUT_OF_SPACE_CREATE, platform::Errno::NO_ENTRY)
+    {
+        syscall::exit(134);
+    }
+
+    let welcome = open_with_retry(NULLFS_WELCOME, syscall::OpenFlags::READ)
+        .unwrap_or_else(|| syscall::exit(135));
+    if !read_matches(welcome, WELCOME)
+        || syscall::close(welcome).is_err()
+        || syscall::close(filler).is_err()
+    {
+        syscall::exit(136);
+    }
+    if !unlink_with_retry(NULLFS_OUT_OF_SPACE_FILL) {
+        syscall::exit(137);
+    }
+
+    let recovered = open_with_retry(
+        NULLFS_OUT_OF_SPACE_CREATE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
+    )
+    .unwrap_or_else(|| syscall::exit(138));
+    if !write_all_with_retry(recovered, NULLFS_OUT_OF_SPACE_RECOVERY_BYTES)
+        || !descriptor_stat_matches(recovered, NULLFS_OUT_OF_SPACE_RECOVERY_BYTES.len() as u64)
+        || !stat_matches(
+            NULLFS_OUT_OF_SPACE_CREATE_RAW,
+            file::KIND_FILE,
+            NULLFS_OUT_OF_SPACE_RECOVERY_BYTES.len() as u64,
+        )
+        || syscall::seek(recovered, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(recovered, NULLFS_OUT_OF_SPACE_RECOVERY_BYTES)
+        || syscall::close(recovered).is_err()
+        || !unlink_with_retry(NULLFS_OUT_OF_SPACE_CREATE_RAW)
+        || !stat_failed_with_retry(NULLFS_OUT_OF_SPACE_CREATE, platform::Errno::NO_ENTRY)
+    {
+        syscall::exit(139);
+    }
+    syscall::exit(0);
 }
 
 fn probe_nullfs_restart() -> ! {
@@ -1455,6 +1533,43 @@ fn open_with_retry(path: &[u8], flags: syscall::OpenFlags) -> Option<syscall::Fi
         }
     }
     None
+}
+
+fn open_fails_with_retry(path: &[u8], flags: syscall::OpenFlags, expected: syscall::Errno) -> bool {
+    for _ in 0..8 {
+        match syscall::open(path, flags) {
+            Ok(descriptor) => {
+                let _ = syscall::close(descriptor);
+                return false;
+            }
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(error) => return error == expected,
+        }
+    }
+    false
+}
+
+fn write_fails_with_retry(
+    descriptor: syscall::FileDescriptor,
+    bytes: &[u8],
+    expected: syscall::Errno,
+) -> bool {
+    for _ in 0..64 {
+        match syscall::write(descriptor, bytes) {
+            Ok(_) => return false,
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(error) => return error == expected,
+        }
+    }
+    false
 }
 
 fn write_all_with_retry(descriptor: syscall::FileDescriptor, mut bytes: &[u8]) -> bool {
