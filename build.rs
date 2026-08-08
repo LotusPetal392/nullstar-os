@@ -24,6 +24,7 @@ const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
 const NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE: &[u8] = b"nullfs-out-of-space-test\n";
 const NULLFS_BLOCK_DEVICE_LOSS_TEST_BOOT_MODE: &[u8] = b"nullfs-block-device-loss-test\n";
+const NULLFS_CRASH_RECOVERY_TEST_BOOT_MODE: &[u8] = b"nullfs-crash-recovery-test\n";
 const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const MAX_EXECUTABLE_FILE_BYTES: usize = 1024 * 1024;
@@ -321,6 +322,13 @@ fn main() {
         .expect("failed to create NullFS block-device-loss-test BIOS disk image");
     append_nullfs_partition(&nullfs_block_device_loss_test_bios_image, &nullfs_fixture)
         .expect("failed to append NullFS partition to block-device-loss-test BIOS disk image");
+    let nullfs_crash_recovery_test_bios_image =
+        output_directory.join("nullstar-os-nullfs-crash-recovery-test-bios.img");
+    build_image(NULLFS_CRASH_RECOVERY_TEST_BOOT_MODE)
+        .create_bios_image(&nullfs_crash_recovery_test_bios_image)
+        .expect("failed to create NullFS crash-recovery-test BIOS disk image");
+    append_nullfs_partition(&nullfs_crash_recovery_test_bios_image, &nullfs_fixture)
+        .expect("failed to append NullFS partition to crash-recovery-test BIOS disk image");
     let nullfs_out_of_space_fixture = build_exhausted_nullfs_fixture(&nullfs_fixture);
     let nullfs_out_of_space_test_bios_image =
         output_directory.join("nullstar-os-nullfs-out-of-space-test-bios.img");
@@ -361,6 +369,10 @@ fn main() {
     println!(
         "cargo:rustc-env=NULLFS_OUT_OF_SPACE_TEST_BIOS_IMAGE={}",
         nullfs_out_of_space_test_bios_image.display()
+    );
+    println!(
+        "cargo:rustc-env=NULLFS_CRASH_RECOVERY_TEST_BIOS_IMAGE={}",
+        nullfs_crash_recovery_test_bios_image.display()
     );
     println!(
         "cargo:rustc-env=NULLFS_UNAVAILABLE_TEST_BIOS_IMAGE={}",

@@ -39,7 +39,7 @@ future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, deterministic out-of-space handling, unavailable-primary recovery proof, static `/System/bin` execution, the bounded service-definition parser, and one policy-pinned PID 1 activation pilot are implemented; general service management and remaining acceptance work are incomplete |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, deterministic out-of-space, block-device-loss, and service-crash recovery handling, unavailable-primary recovery proof, static `/System/bin` execution, the bounded service-definition parser, and one policy-pinned PID 1 activation pilot are implemented; boot-generation acceptance and general service management remain incomplete |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -325,8 +325,8 @@ Phase 5 moves from a read-only public test mount to the accepted persistent-volu
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
 operations, PR C's bounded public writable proxy, controlled quiesce/clean unmount with
 dirty-recovery fallback, stable primary-volume identity and layout, all three primary-tree
-namespace bindings, managed user-profile layout, deterministic out-of-space and block-device-loss
-handling, unavailable-primary recovery, static `/System/bin` execution, the bounded allocation-free
+namespace bindings, managed user-profile layout, deterministic out-of-space, block-device-loss, and
+service-crash recovery handling, unavailable-primary recovery, static `/System/bin` execution, the bounded allocation-free
 service-definition parser, and one policy-pinned definition-backed PID 1 activation pilot are
 implemented. Phase 5 remains in progress; general service management and the
 remaining integrated acceptance work are incomplete.
@@ -441,6 +441,29 @@ exact filesystem-provider generation. Old descriptors and path operations return
 an independent FAT/bootstrap read still succeeds. The host runner copies the source image before
 each run because the mutation may have reached durable storage before failure became observable.
 
+### Service-backed mutation crash and dirty remount — implemented
+
+The dedicated crash-recovery image starts NullFS with one private receive-only capability that is not
+part of public filesystem version 1, `NFLC`, or `NSVC`. PID 1 sends an exact 32-byte `NFCR` version 1
+`ARM` frame bound to the current service generation and a nonzero nonce. After the next successful
+nonempty `WRITE` has completed its core transaction but before the service queues the filesystem
+reply, the service emits an exact `MUTATION_REACHED` event containing the generation, nonce, and
+request ID, then exits with status 37.
+
+PID 1 requires that exact event and final status, rejects a wrong-generation offline attempt, and
+offlines the exact old filesystem generation. This wakes the one blocked public syscall with `EIO`;
+the probe submits it only once and never interprets uncertainty as permission to retry. PID 1 charges
+the ordinary failure restart budget, uses a fresh endpoint and strictly newer generation, and exposes
+the replacement only after writable mount has completed journal recovery, orphan reclamation,
+whole-volume validation, and dirty-state publication.
+
+The replacement probe requires every old descriptor operation to return `EIO`, opens the artifact
+through the raw alias, and requires the canonical path to expose exactly the baseline plus one suffix.
+It rejects missing, partial, or duplicated content, removes the artifact, and confirms independent FAT
+access. The runner always uses a disposable image. Exhaustive power-cut, failed-flush, reordered, and
+torn-write boundaries remain covered by the host `CrashBlockDevice` matrices; this native gate
+specifically proves the userspace service, kernel proxy, supervision, and remount path.
+
 ### Public writable proxy (PR C) — implemented and bounded
 
 For each service generation, the kernel proxy requests exactly `WRITE` and requires the
@@ -536,14 +559,14 @@ Direct NullFS loading by the bootloader is not required for Phase 5.
 ### Remaining Phase 5 acceptance
 
 PR C, controlled restart, all three primary-tree bindings, static system execution, and the
-policy-pinned definition-backed activation pilot, deterministic out-of-space and block-device-loss
-gates, and unavailable-primary recovery gate supply bounded writable public-ABI, clean/dirty
-replacement, canonical-path, cross-view identity, bootstrap-independence, normal-boot
-`/System/services` activation, exact data/inode exhaustion with reclamation, explicit provider-loss
-failure without hanging or uncertain retry, and missing-primary recovery coverage. They do not
-complete Phase 5. Completion still requires the remaining integrated work to demonstrate:
+policy-pinned definition-backed activation pilot, deterministic out-of-space, block-device-loss, and
+service-crash recovery gates, and unavailable-primary recovery gate supply bounded writable
+public-ABI, clean/dirty replacement, canonical-path, cross-view identity, bootstrap-independence,
+normal-boot `/System/services` activation, exact data/inode exhaustion with reclamation, explicit
+provider-loss failure without hanging or uncertain retry, a post-commit/pre-reply crash with exact
+old-generation `EIO` and single-copy durable remount recovery, and missing-primary recovery coverage.
+They do not complete Phase 5. Completion still requires the remaining integrated work to demonstrate:
 
-- crash injection and remount recovery for service-backed mutations;
 - boot-generation synchronization and rollback without corrupting the previously
   selected generation.
 
