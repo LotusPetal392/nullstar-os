@@ -5250,7 +5250,8 @@ fn vfs_route_begin_registration(
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
                 CapabilityObjectData::Notification(_)
                 | CapabilityObjectData::SharedMemory(_)
-                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
+                | CapabilityObjectData::KernelEarlyLogReader(_)
+                | CapabilityObjectData::Job(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -8155,7 +8156,8 @@ fn tmpfs_proxy_begin_connect(
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
                 CapabilityObjectData::Notification(_)
                 | CapabilityObjectData::SharedMemory(_)
-                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
+                | CapabilityObjectData::KernelEarlyLogReader(_)
+                | CapabilityObjectData::Job(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -8428,7 +8430,8 @@ fn tmpfs_proxy_begin_attach() -> Result<(), i64> {
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
                 CapabilityObjectData::Notification(_)
                 | CapabilityObjectData::SharedMemory(_)
-                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
+                | CapabilityObjectData::KernelEarlyLogReader(_)
+                | CapabilityObjectData::Job(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -9084,7 +9087,8 @@ fn tmpfs_proxy_begin_filesystem_request(
                 CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
                 CapabilityObjectData::Notification(_)
                 | CapabilityObjectData::SharedMemory(_)
-                | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
+                | CapabilityObjectData::KernelEarlyLogReader(_)
+                | CapabilityObjectData::Job(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -9754,7 +9758,8 @@ fn nullfs_proxy_push_request(
             CapabilityObjectData::Endpoint(_) => Err(ERR_TRY_AGAIN),
             CapabilityObjectData::Notification(_)
             | CapabilityObjectData::SharedMemory(_)
-            | CapabilityObjectData::KernelEarlyLogReader(_) => Err(ERR_IO),
+            | CapabilityObjectData::KernelEarlyLogReader(_)
+            | CapabilityObjectData::Job(_) => Err(ERR_IO),
         },
         None => Err(ERR_IO),
     }

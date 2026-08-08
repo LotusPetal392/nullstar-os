@@ -55,7 +55,7 @@ enum CapabilityObjectData {
     Notification(NotificationObject),
     SharedMemory(SharedMemoryObject),
     KernelEarlyLogReader(KernelEarlyLogReaderObject),
-    Job(crate::job::State),
+    Job(kernel::job::State),
 }
 
 #[derive(Debug)]
@@ -963,7 +963,7 @@ fn job_create(process_id: u64) -> u64 {
     let mut registry = CAPABILITY_REGISTRY.lock();
     let object = match registry.create_object(
         abi::capability::KIND_JOB,
-        CapabilityObjectData::Job(crate::job::State::new(MAX_PROCESS_SLOTS)),
+        CapabilityObjectData::Job(kernel::job::State::new(MAX_PROCESS_SLOTS)),
     ) {
         Ok(object) => object,
         Err(error) => return error_return(error),
@@ -1112,9 +1112,9 @@ fn capability_job_add_member(job: CapabilityObjectRef, process_id: u64) -> Resul
         return Err(abi::errno::INVALID_ARGUMENT);
     };
     state.assign(process_id).map_err(|error| match error {
-        crate::job::AssignError::InvalidProcess => abi::errno::INVALID_ARGUMENT,
-        crate::job::AssignError::AlreadyMember => abi::errno::PERMISSION,
-        crate::job::AssignError::Full => abi::errno::NO_SPACE,
+        kernel::job::AssignError::InvalidProcess => abi::errno::INVALID_ARGUMENT,
+        kernel::job::AssignError::AlreadyMember => abi::errno::PERMISSION,
+        kernel::job::AssignError::Full => abi::errno::NO_SPACE,
     })?;
     kernel_capability_root_add(job);
     Ok(())
@@ -1143,7 +1143,7 @@ fn capability_job_record_exit(job: CapabilityObjectRef, process_id: u64, status:
             .object_index(job)
             .and_then(|index| match &mut registry.objects[index].data {
                 CapabilityObjectData::Job(state) => {
-                    Some(state.complete(crate::job::ExitRecord { process_id, status }))
+                    Some(state.complete(kernel::job::ExitRecord { process_id, status }))
                 }
                 _ => None,
             })
