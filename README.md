@@ -184,9 +184,9 @@ images, and launches QEMU.
   recovery utilities remain independent bootstrap-image programs. The writable
   `/Users` binding contains a fixture home with the accepted managed `Profile`
   layout. Direct flags-zero sessions stay read-only, and raw block authority,
-  session authority, and public VFS policy remain separate. Public `mkdir`,
-  `rmdir`, rename, service-definition activation, and offline repair remain future
-  work.
+  session authority, and public VFS policy remain separate. The bounded version 1
+  service-definition parser is implemented; definition loading and activation, public
+  `mkdir`, `rmdir`, rename, and offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`

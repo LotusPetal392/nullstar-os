@@ -168,8 +168,9 @@ lifecycle traffic, a capability-bearing event, failure, or early/nonzero exit tr
 offlining, KILL/reap, and dirty recovery. Replacement uses a fresh endpoint and strictly newer
 generation before fence completion, and controlled restart does not charge failure policy. Filesystem
 `Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and the public filesystem version 1
-`Request`/`Reply` operations are unchanged. This adds no manager process, activation, definition
-loading, or cross-reboot persistence.
+`Request`/`Reply` operations are unchanged. The bounded allocation-free version 1 service-definition
+parser is implemented, but this adds no manager process, definition loading, activation, or
+cross-reboot persistence.
 
 ### Future service and session lifecycle
 
@@ -191,10 +192,10 @@ Successful login eventually creates a dedicated session job managed by a per-ses
 manager. The session manager, rather than PID 1, owns that user's compositor, desktop
 shell, session services, application jobs, logout, and lock lifecycle.
 
-See [Service, session, and application lifecycle](design/service-and-session-lifecycle.md)
-and [Service management and command-line direction](design/service-management-and-cli.md)
-for the accepted design rather than treating this current-system document as its full
-specification.
+See [Service, session, and application lifecycle](design/service-and-session-lifecycle.md),
+[Service management and command-line direction](design/service-management-and-cli.md), and
+the implemented [service-definition format](service-definition-format.md) for the accepted
+design rather than treating this current-system document as its full specification.
 
 ### Future identity and access control
 

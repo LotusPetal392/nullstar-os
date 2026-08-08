@@ -33,7 +33,7 @@ service-definition activation remain future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, and static `/System/bin` execution implemented; service-definition activation and remaining acceptance work are incomplete |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, static `/System/bin` execution, and the bounded service-definition parser implemented; definition loading, activation, and remaining acceptance work are incomplete |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -308,9 +308,9 @@ cargo run --locked --quiet -- --nullfs-restart-check
 The FAT bootstrap path remains independent while the UUID-selected primary volume is
 available at `/Volumes/NullStar`. Its bounded public mutation surface, initial backing
 layout, all three primary-tree bindings, static `/System/bin` execution, writable profile
-state, and controlled clean/dirty replacement paths are implemented. Activating service
-definitions from `/System`, broader namespace mutation, and offline repair policy remain
-future work.
+state, controlled clean/dirty replacement paths, and a bounded service-definition
+parser are implemented. Loading and activating definitions from `/System`, broader namespace
+mutation, and offline repair policy remain future work.
 
 ## Phase 5: writable service and namespace adoption — in progress
 
@@ -318,9 +318,10 @@ Phase 5 moves from a read-only public test mount to the accepted persistent-volu
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
 operations, PR C's bounded public writable proxy, controlled quiesce/clean unmount with
 dirty-recovery fallback, stable primary-volume identity and layout, all three primary-tree
-namespace bindings, managed user-profile layout, and one static `/System/bin` executable
-are implemented. Phase 5 remains in progress; service-definition activation and the
-remaining integrated acceptance work are incomplete.
+namespace bindings, managed user-profile layout, one static `/System/bin` executable, and
+the bounded allocation-free service-definition parser are implemented. Phase 5 remains in
+progress; definition loading, service activation, and the remaining integrated acceptance
+work are incomplete.
 
 ### Raw writable block authority — implemented
 
@@ -493,9 +494,9 @@ read-only.
 
 The staged transition has now bound all three primary trees. A statically linked fixture
 launches through `/System/bin`; canonical user-profile state is writable and survives
-controlled provider replacement. Activating ordinary service definitions from
-`/System/services` remains future work. The synthetic root and bootstrap facilities remain
-usable when the primary volume or service is unavailable.
+controlled provider replacement. The version 1 definition format and parser are implemented, but loading and activating
+ordinary definitions from `/System/services` remain future work. The synthetic root and
+bootstrap facilities remain usable when the primary volume or service is unavailable.
 
 ### Boot generations
 
