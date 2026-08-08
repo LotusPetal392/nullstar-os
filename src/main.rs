@@ -71,6 +71,16 @@ const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-tes
 const LOGGING_COLLECTOR_RESTART_PASSED_MARKER: &str = "userspace init: logging collector ring, backpressure, redaction, and route generation isolation verified";
 const NULLFS_RESTART_PASSED_MARKER: &str =
     "userspace init: NullFS restart persistent VFS mutation and stale descriptors verified";
+const NULLFS_UNAVAILABLE_MODE_MARKER: &str = "boot mode selected: nullfs-unavailable-test";
+const NULLFS_UNAVAILABLE_PARTITIONS_MARKER: &str =
+    "partition table initialized: kind=MBR, partitions=2,";
+const NULLFS_UNAVAILABLE_HANDOFF_MARKER: &str =
+    "userspace init: configured primary NullFS volume unavailable; entering recovery";
+const NULLFS_UNAVAILABLE_INIT_EXIT_MARKER: &str =
+    "userspace process exited: pid=1, path=/init, exit_code=78";
+const NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER: &str =
+    "userspace init terminated: pid=1; entering emergency kernel shell";
+const EMERGENCY_SHELL_READY_MARKER: &str = "Interactive shell ready. Type `help` for commands.";
 const LOGGING_LIFECYCLE_MODE_MARKER: &str = "boot mode selected: logging-lifecycle-test";
 const LOGGING_LIFECYCLE_STOPPING_MARKER: &str = "logging stopping desired=stopped generation=1";
 const LOGGING_LIFECYCLE_STOPPED_MARKER: &str = "logging stopped desired=running";
@@ -83,6 +93,7 @@ const LOGGING_LIFECYCLE_PASSED_MARKER: &str = "userspace init: logging live star
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
 const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(420);
+const NULLFS_UNAVAILABLE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGGING_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Default)]
@@ -176,6 +187,41 @@ impl NormalBootProgress {
 }
 
 #[derive(Debug, Default)]
+struct UnavailablePrimaryProgress {
+    partitions_absent: bool,
+    mode_selected: bool,
+    init_ready: bool,
+    recovery_handoff: bool,
+    init_exited: bool,
+    init_terminated: bool,
+    emergency_shell_ready: bool,
+}
+
+impl UnavailablePrimaryProgress {
+    fn observe(&mut self, line: &str) -> bool {
+        self.partitions_absent |= line.contains(NULLFS_UNAVAILABLE_PARTITIONS_MARKER);
+        self.mode_selected |=
+            self.partitions_absent && line.contains(NULLFS_UNAVAILABLE_MODE_MARKER);
+        self.init_ready |= self.mode_selected && line.contains(NORMAL_BOOT_INIT_MARKER);
+        self.recovery_handoff |=
+            self.init_ready && line.contains(NULLFS_UNAVAILABLE_HANDOFF_MARKER);
+        self.init_exited |= self.recovery_handoff && line == NULLFS_UNAVAILABLE_INIT_EXIT_MARKER;
+        self.init_terminated |=
+            self.init_exited && line.contains(NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER);
+        self.emergency_shell_ready |=
+            self.init_terminated && line.contains(EMERGENCY_SHELL_READY_MARKER);
+
+        self.partitions_absent
+            && self.mode_selected
+            && self.init_ready
+            && self.recovery_handoff
+            && self.init_exited
+            && self.init_terminated
+            && self.emergency_shell_ready
+    }
+}
+
+#[derive(Debug, Default)]
 struct LoggingLifecycleProgress {
     mode_selected: bool,
     stopping_observed: bool,
@@ -217,12 +263,17 @@ struct Options {
     boot_check: bool,
     test: bool,
     nullfs_restart_check: bool,
+    nullfs_unavailable_check: bool,
     logging_lifecycle_check: bool,
 }
 
 impl Options {
     fn boot_verification_selected(&self) -> bool {
-        self.boot_check || self.test || self.nullfs_restart_check || self.logging_lifecycle_check
+        self.boot_check
+            || self.test
+            || self.nullfs_restart_check
+            || self.nullfs_unavailable_check
+            || self.logging_lifecycle_check
     }
 }
 
@@ -236,6 +287,8 @@ fn main() -> ExitCode {
         run_kernel_smoke_test(&options)
     } else if options.nullfs_restart_check {
         run_nullfs_restart_check(&options)
+    } else if options.nullfs_unavailable_check {
+        run_nullfs_unavailable_check(&options)
     } else if options.logging_lifecycle_check {
         run_logging_lifecycle_check(&options)
     } else if options.boot_check {
@@ -282,6 +335,15 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
                 options.nullfs_restart_check = true;
                 options.headless = true;
             }
+            "--nullfs-unavailable-check" => {
+                if options.boot_verification_selected() {
+                    eprintln!("only one boot verification mode may be selected");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
+                options.nullfs_unavailable_check = true;
+                options.headless = true;
+            }
             "--logging-lifecycle-check" => {
                 if options.boot_verification_selected() {
                     eprintln!("only one boot verification mode may be selected");
@@ -308,12 +370,15 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --logging-lifecycle-check]"
+        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --nullfs-unavailable-check | --logging-lifecycle-check]"
     );
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!("  --boot-check  Verify that PID 1 launches the userspace shell");
     println!(
         "  --nullfs-restart-check  Verify NullFS replacement, persistent VFS mutation, and stale descriptors"
+    );
+    println!(
+        "  --nullfs-unavailable-check  Verify missing-primary recovery through the independent emergency shell"
     );
     println!(
         "  --logging-lifecycle-check  Verify logging live start, stop, route withdrawal, and generation replacement"
@@ -411,8 +476,9 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
     };
     let restart_result = smoke_result && run_nullfs_restart_test(options);
     let logging_result = restart_result && run_logging_lifecycle_test(options);
+    let recovery_result = logging_result && run_nullfs_unavailable_test(options);
     let _ = fs::remove_file(&test_image);
-    if logging_result {
+    if recovery_result {
         println!("QEMU kernel smoke test passed");
         ExitCode::SUCCESS
     } else {
@@ -427,6 +493,26 @@ fn run_nullfs_restart_check(options: &Options) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn run_nullfs_unavailable_check(options: &Options) -> ExitCode {
+    if run_nullfs_unavailable_test(options) {
+        println!("QEMU unavailable-primary recovery check passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_nullfs_unavailable_test(options: &Options) -> bool {
+    let image = Path::new(env!("NULLFS_UNAVAILABLE_TEST_BIOS_IMAGE"));
+    let mut progress = UnavailablePrimaryProgress::default();
+    run_qemu_until(
+        qemu_command_for_image(options, image),
+        "unavailable-primary recovery check",
+        NULLFS_UNAVAILABLE_TEST_TIMEOUT,
+        move |line| progress.observe(line),
+    )
 }
 
 fn run_logging_lifecycle_check(options: &Options) -> ExitCode {
@@ -705,12 +791,13 @@ mod tests {
     use super::{
         DEFINITION_SERVICE_FIRST_FAILURE_MARKER, DEFINITION_SERVICE_LOADING_MARKER,
         DEFINITION_SERVICE_READY_MARKER, DEFINITION_SERVICE_RESTARTING_MARKER,
-        DEFINITION_SERVICE_VERIFIED_MARKER, LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER,
-        LOGGING_LIFECYCLE_MODE_MARKER, LOGGING_LIFECYCLE_PASSED_MARKER,
-        LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER, LOGGING_LIFECYCLE_READY_MARKER,
-        LOGGING_LIFECYCLE_STOPPED_MARKER, LOGGING_LIFECYCLE_STOPPING_MARKER,
-        LoggingLifecycleProgress, NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER,
-        NORMAL_BOOT_INIT_MARKER, NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGCTL_MARKER,
+        DEFINITION_SERVICE_VERIFIED_MARKER, EMERGENCY_SHELL_READY_MARKER,
+        LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER, LOGGING_LIFECYCLE_MODE_MARKER,
+        LOGGING_LIFECYCLE_PASSED_MARKER, LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER,
+        LOGGING_LIFECYCLE_READY_MARKER, LOGGING_LIFECYCLE_STOPPED_MARKER,
+        LOGGING_LIFECYCLE_STOPPING_MARKER, LoggingLifecycleProgress,
+        NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER, NORMAL_BOOT_INIT_MARKER,
+        NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGCTL_MARKER,
         NORMAL_BOOT_LOGGING_IMPORT_MARKER, NORMAL_BOOT_LOGGING_PROBE_MARKER,
         NORMAL_BOOT_LOGGING_SERVICE_MARKER, NORMAL_BOOT_MODE_MARKER,
         NORMAL_BOOT_NULLFS_DISCOVERY_MARKER, NORMAL_BOOT_NULLFS_GENERATION_MARKER,
@@ -718,7 +805,10 @@ mod tests {
         NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SERVICE_CONTROL_MARKER, NORMAL_BOOT_SHELL_MARKER,
         NORMAL_BOOT_TMPFS_GENERATION_MARKER, NORMAL_BOOT_VFS_GENERATION_MARKER,
         NORMAL_BOOT_VFS_READINESS_MARKER, NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER,
-        NormalBootProgress, parse_options_from,
+        NULLFS_UNAVAILABLE_HANDOFF_MARKER, NULLFS_UNAVAILABLE_INIT_EXIT_MARKER,
+        NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER, NULLFS_UNAVAILABLE_MODE_MARKER,
+        NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, UnavailablePrimaryProgress,
+        parse_options_from,
     };
 
     #[test]
@@ -784,6 +874,31 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_primary_requires_ordered_recovery_handoff() {
+        let mut progress = UnavailablePrimaryProgress::default();
+
+        assert!(!progress.observe(EMERGENCY_SHELL_READY_MARKER));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_INIT_EXIT_MARKER));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_HANDOFF_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_INIT_MARKER));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_MODE_MARKER));
+        assert!(
+            !progress.observe(
+                "partition table initialized: kind=MBR, partitions=20, protective_mbr=false"
+            )
+        );
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_PARTITIONS_MARKER));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_MODE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_INIT_MARKER));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_HANDOFF_MARKER));
+        assert!(!progress.observe("userspace process exited: pid=1, path=/init, exit_code=780"));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_INIT_EXIT_MARKER));
+        assert!(!progress.observe(NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER));
+        assert!(progress.observe(EMERGENCY_SHELL_READY_MARKER));
+    }
+
+    #[test]
     fn logging_lifecycle_requires_mode_transitions_and_final_marker() {
         let mut progress = LoggingLifecycleProgress::default();
 
@@ -797,6 +912,15 @@ mod tests {
         assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER));
         assert!(progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+    }
+
+    #[test]
+    fn nullfs_unavailable_option_is_headless() {
+        let options = parse_options_from(["--nullfs-unavailable-check".to_owned()])
+            .expect("NullFS unavailable option should parse");
+
+        assert!(options.nullfs_unavailable_check);
+        assert!(options.headless);
     }
 
     #[test]
@@ -814,6 +938,7 @@ mod tests {
             "--boot-check",
             "--test",
             "--nullfs-restart-check",
+            "--nullfs-unavailable-check",
             "--logging-lifecycle-check",
         ];
 

@@ -59,13 +59,18 @@ Before publishing, run:
 ```
 
 The complete path additionally runs normal-boot readiness, the two-boot smoke suite,
-the targeted NullFS replacement phase, and logging lifecycle convergence. The targeted
-paths can be run directly:
+the targeted NullFS replacement phase, unavailable-primary recovery, and logging lifecycle
+convergence. The targeted paths can be run directly:
 
 ```sh
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-restart-check
+cargo +nightly-2026-02-01 run --release --locked -- --nullfs-unavailable-check
 cargo +nightly-2026-02-01 run --release --locked -- --logging-lifecycle-check
 ```
+
+The unavailable-primary image contains no NullFS partition. It requires exact `NO_ENTRY` for the
+configured filesystem UUID, a specific PID 1 recovery handoff, exact PID 1 exit code `78`, kernel
+handoff after final PID 1 termination, and the bootstrap-resident emergency-shell readiness marker.
 
 The logging lifecycle image validates live `start`, `stop`, and `restart`, immediate route
 withdrawal, fresh generation objects, duplicate-restart `Busy` fencing, exact filesystem

@@ -41,6 +41,8 @@ Generated images use `/BOOTMODE` to select among:
 - `smoke-test`, which runs deterministic subsystem probes and persistence checks;
 - `nullfs-restart-test`, which validates NullFS's clean quiesce/unmount replacement and a
   stopped-service timeout/KILL replacement through dirty recovery;
+- `nullfs-unavailable-test`, whose image omits the primary NullFS partition and validates exact
+  UUID lookup failure plus handoff to the independently available emergency kernel shell;
 - `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
   generation replacement, restart fencing, filesystem mutation policy, and forced termination.
 
@@ -344,8 +346,11 @@ paths. Public probes exercise canonical and raw view identity, canonical cwd beh
 system metadata flags, a static executable launched through `/System/bin`, writable user
 profile state, persistence and stale old descriptors across service restart,
 stopped-service timeout/KILL replacement through dirty recovery, and continued bootstrap
-availability. Remaining acceptance work is tracked in the
-[NullFS roadmap](filesystems/nullfs-roadmap.md).
+availability. A separate generated image contains no primary NullFS partition; PID 1 requires
+exact `NO_ENTRY` for the configured UUID, emits a specific recovery handoff, and exits with code
+`78`. The kernel then enters its bootstrap-resident emergency shell without trying a partition-index
+or label fallback. Remaining acceptance work is
+tracked in the [NullFS roadmap](filesystems/nullfs-roadmap.md).
 
 ## Shells
 

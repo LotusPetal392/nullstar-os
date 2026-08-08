@@ -161,8 +161,13 @@ const LOGGING_LIFECYCLE_TEST_PASSED: &[u8] = b"userspace init: logging live star
 const LOGGING_LIFECYCLE_TEST_FAILED: &[u8] = b"userspace init: logging lifecycle test failed\n";
 const BOOT_MODE_PATH: &[u8] = b"/BOOTMODE";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
+const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const BOOT_MODE_PROBE_FAILED: &[u8] = b"userspace init: unable to read boot mode\n";
+const NULLFS_UNAVAILABLE_RECOVERY_HANDOFF: &[u8] =
+    b"userspace init: configured primary NullFS volume unavailable; entering recovery\n";
+const NULLFS_UNAVAILABLE_TEST_FAILED: &[u8] =
+    b"userspace init: unavailable-primary recovery test failed\n";
 const SHELL_COMMAND: &[u8] = b"/ush";
 const SHELL_LAUNCHED: &[u8] = b"userspace init launched /ush\n";
 const SHELL_RESTARTING: &[u8] = b"userspace init: /ush exited; restarting\n";
@@ -2463,6 +2468,23 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let boot_mode = init_boot_mode();
     let nullfs_restart_test = boot_mode == InitBootMode::NullfsRestartTest;
     let logging_lifecycle_test = boot_mode == InitBootMode::LoggingLifecycleTest;
+    if boot_mode == InitBootMode::NullfsUnavailableTest {
+        match platform::open_writable_nullfs_block_device_endpoint(
+            &nullfs_primary_volume::FILESYSTEM_UUID,
+        ) {
+            Err(platform::Errno::NO_ENTRY) => {
+                if syscall::write_all(STDOUT, NULLFS_UNAVAILABLE_RECOVERY_HANDOFF).is_err() {
+                    syscall::exit(1);
+                }
+                syscall::exit(78);
+            }
+            Ok(endpoint) => {
+                let _ = ipc::close(endpoint);
+                fail(NULLFS_UNAVAILABLE_TEST_FAILED);
+            }
+            Err(_) => fail(NULLFS_UNAVAILABLE_TEST_FAILED),
+        }
+    }
 
     let mut route_broker = RouteBrokerState::new();
     let logging_early_log_reader =
@@ -3068,6 +3090,7 @@ enum InitBootMode {
     Normal,
     SmokeTest,
     NullfsRestartTest,
+    NullfsUnavailableTest,
     LoggingLifecycleTest,
 }
 
@@ -3082,6 +3105,9 @@ fn init_boot_mode() -> InitBootMode {
         b"normal" | b"normal\n" => InitBootMode::Normal,
         b"smoke-test" | b"smoke-test\n" => InitBootMode::SmokeTest,
         b"nullfs-restart-test" | NULLFS_RESTART_TEST_BOOT_MODE => InitBootMode::NullfsRestartTest,
+        b"nullfs-unavailable-test" | NULLFS_UNAVAILABLE_TEST_BOOT_MODE => {
+            InitBootMode::NullfsUnavailableTest
+        }
         b"logging-lifecycle-test" | LOGGING_LIFECYCLE_TEST_BOOT_MODE => {
             InitBootMode::LoggingLifecycleTest
         }
