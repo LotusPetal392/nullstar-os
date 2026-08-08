@@ -966,13 +966,18 @@ impl<D: BlockDevice> FilesystemServer<D> {
             .opens
             .find_one_record(request.session_id, request.generation, request.node_id)
             .map(|(_, record)| record);
+        let append = request.flags & protocol::request_flags::APPEND != 0;
         let (node, size) = if let Some(record) = record {
-            match self.attributes_for_open_record(record) {
-                Ok(attributes) => (record.handle.node, attributes.size),
-                Err(status) => {
-                    reply.status = status;
-                    return false;
+            if append {
+                match self.attributes_for_open_record(record) {
+                    Ok(attributes) => (record.handle.node, attributes.size),
+                    Err(status) => {
+                        reply.status = status;
+                        return false;
+                    }
                 }
+            } else {
+                (record.handle.node, 0)
             }
         } else {
             match self.resolve_current(request.node_id) {
@@ -991,11 +996,7 @@ impl<D: BlockDevice> FilesystemServer<D> {
                 return false;
             }
         }
-        let offset = if request.flags & protocol::request_flags::APPEND != 0 {
-            size
-        } else {
-            request.file_offset
-        };
+        let offset = if append { size } else { request.file_offset };
         if offset.checked_add(request.bulk.length).is_none() {
             reply.status = protocol::status::RANGE;
             return false;
@@ -1517,7 +1518,11 @@ impl<D: BlockDevice> FilesystemServer<D> {
         result: Result<T, CoreError>,
         reply: &mut protocol::Reply,
     ) -> Result<T, bool> {
-        if self.filesystem.is_poisoned() {
+        let provider_io = matches!(
+            result.as_ref(),
+            Err(CoreError::Device(BlockDeviceError::Io))
+        );
+        if self.filesystem.is_poisoned() || provider_io {
             reply.status = protocol::status::OUTCOME_UNKNOWN;
             return Err(true);
         }

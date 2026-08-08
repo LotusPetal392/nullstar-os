@@ -22,6 +22,15 @@ const FULL_MODE: &[u8] = b"full";
 const BOOTSTRAP_MODE: &[u8] = b"bootstrap";
 const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
 const NULLFS_OUT_OF_SPACE_MODE: &[u8] = b"out-of-space";
+const NULLFS_BLOCK_DEVICE_LOSS_MODE: &[u8] = b"block-device-loss";
+const NULLFS_BLOCK_DEVICE_LOSS_READY: &[u8] = b"block-device-loss: mutation prepared";
+const NULLFS_BLOCK_DEVICE_LOSS_OFFLINED: &[u8] = b"block-device-loss: provider offlined";
+const NULLFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED: &[u8] =
+    b"block-device-loss: uncertain mutation failed";
+const NULLFS_BLOCK_DEVICE_LOSS_FILESYSTEM_OFFLINED: &[u8] =
+    b"block-device-loss: filesystem generation offlined";
+const NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE: u64 = 2;
+const NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE: u64 = 3;
 const NULLFS_RESTART_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
 
@@ -37,6 +46,9 @@ const NULLFS_OUT_OF_SPACE_FILL: &[u8] = b"/Applications/out-of-space-fill";
 const NULLFS_OUT_OF_SPACE_CREATE: &[u8] = b"/Applications/out-of-space-create";
 const NULLFS_OUT_OF_SPACE_CREATE_RAW: &[u8] = b"/Volumes/NullStar/Applications/out-of-space-create";
 const NULLFS_OUT_OF_SPACE_RECOVERY_BYTES: &[u8] = b"space reclaimed";
+const NULLFS_BLOCK_DEVICE_LOSS_PATH: &[u8] = b"/Applications/block-device-loss.bin";
+const NULLFS_BLOCK_DEVICE_LOSS_BASELINE: &[u8] = b"before provider loss";
+const BOOTSTRAP_HELLO: &[u8] = b"Hello from a NullStar OS userspace file descriptor.\n";
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
 const README: &[u8] = b"This volume is a deterministic NullFS integration fixture.\n";
 const INITIAL_BYTES: &[u8] = b"NullStar public VFS";
@@ -173,6 +185,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
     if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_OUT_OF_SPACE_MODE) {
         probe_nullfs_out_of_space();
+    }
+    if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_BLOCK_DEVICE_LOSS_MODE) {
+        probe_nullfs_block_device_loss();
     }
     let readiness = arguments.len() == 2 && arguments.get(1) == Some(READINESS_MODE);
     let full =
@@ -796,6 +811,90 @@ fn probe_user_namespace_mutation() {
     if syscall::close(raw).is_err() || syscall::close(canonical).is_err() {
         syscall::exit(125);
     }
+}
+
+fn probe_nullfs_block_device_loss() -> ! {
+    if !matches!(
+        ipc::wait_for_handle(SERVICE_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
+    ) || !matches!(
+        ipc::wait_for_handle(NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
+    ) || !matches!(
+        ipc::wait_for_handle(NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
+    ) {
+        syscall::exit(140);
+    }
+    if platform::offline_writable_nullfs_block_device_endpoint(
+        &nullfs_primary_volume::FILESYSTEM_UUID,
+        1,
+    )
+    .err()
+        != Some(platform::Errno::PERMISSION)
+    {
+        syscall::exit(141);
+    }
+
+    let descriptor = open_with_retry(
+        NULLFS_BLOCK_DEVICE_LOSS_PATH,
+        syscall::OpenFlags::READ
+            | syscall::OpenFlags::WRITE
+            | syscall::OpenFlags::CREATE
+            | syscall::OpenFlags::TRUNCATE,
+    )
+    .unwrap_or_else(|| syscall::exit(142));
+    if !write_all_with_retry(descriptor, NULLFS_BLOCK_DEVICE_LOSS_BASELINE)
+        || !descriptor_stat_matches(descriptor, NULLFS_BLOCK_DEVICE_LOSS_BASELINE.len() as u64)
+        || ipc::send(
+            NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE,
+            NULLFS_BLOCK_DEVICE_LOSS_READY,
+            None,
+        )
+        .is_err()
+    {
+        syscall::exit(143);
+    }
+
+    let mut control = [0_u8; 64];
+    let message = ipc::receive(NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE, &mut control)
+        .unwrap_or_else(|_| syscall::exit(144));
+    if message.sender_process_id != 1
+        || message.capability.is_some()
+        || message.bytes != NULLFS_BLOCK_DEVICE_LOSS_OFFLINED.len()
+        || &control[..message.bytes] != NULLFS_BLOCK_DEVICE_LOSS_OFFLINED
+    {
+        syscall::exit(145);
+    }
+    if !write_fails_with_retry(descriptor, b" after", syscall::Errno::IO)
+        || ipc::send(
+            NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE,
+            NULLFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED,
+            None,
+        )
+        .is_err()
+    {
+        syscall::exit(146);
+    }
+
+    control.fill(0);
+    let message = ipc::receive(NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE, &mut control)
+        .unwrap_or_else(|_| syscall::exit(147));
+    if message.sender_process_id != 1
+        || message.capability.is_some()
+        || message.bytes != NULLFS_BLOCK_DEVICE_LOSS_FILESYSTEM_OFFLINED.len()
+        || &control[..message.bytes] != NULLFS_BLOCK_DEVICE_LOSS_FILESYSTEM_OFFLINED
+    {
+        syscall::exit(148);
+    }
+    if !fstat_fails_with_retry(descriptor, platform::Errno::IO)
+        || !stat_failed_with_retry(NULLFS_BLOCK_DEVICE_LOSS_PATH, platform::Errno::IO)
+        || !path_contents_match(b"/hello.txt", BOOTSTRAP_HELLO)
+    {
+        syscall::exit(149);
+    }
+    let _ = syscall::close(descriptor);
+    syscall::exit(0);
 }
 
 fn probe_nullfs_out_of_space() -> ! {
@@ -1490,6 +1589,21 @@ fn stat_with_retry(path: &[u8]) -> platform::Result<file::Stat> {
 
 fn stat_failed_with_retry(path: &[u8], expected: platform::Errno) -> bool {
     matches!(stat_with_retry(path), Err(error) if error == expected)
+}
+
+fn fstat_fails_with_retry(descriptor: syscall::FileDescriptor, expected: platform::Errno) -> bool {
+    for _ in 0..64 {
+        match platform::fstat(descriptor) {
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(error) => return error == expected,
+            Ok(_) => return false,
+        }
+    }
+    false
 }
 
 fn fstat_with_retry(descriptor: syscall::FileDescriptor) -> platform::Result<file::Stat> {
