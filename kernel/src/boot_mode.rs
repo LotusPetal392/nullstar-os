@@ -7,6 +7,7 @@ pub enum BootMode {
     NullfsRestartTest,
     NullfsOutOfSpaceTest,
     NullfsBlockDeviceLossTest,
+    NullfsCrashRecoveryTest,
     NullfsUnavailableTest,
     LoggingLifecycleTest,
 }
@@ -22,6 +23,9 @@ impl BootMode {
             }
             b"nullfs-block-device-loss-test" | b"nullfs-block-device-loss-test\n" => {
                 Some(Self::NullfsBlockDeviceLossTest)
+            }
+            b"nullfs-crash-recovery-test" | b"nullfs-crash-recovery-test\n" => {
+                Some(Self::NullfsCrashRecoveryTest)
             }
             b"nullfs-unavailable-test" | b"nullfs-unavailable-test\n" => {
                 Some(Self::NullfsUnavailableTest)
@@ -44,6 +48,7 @@ impl BootMode {
             Self::NullfsRestartTest => "nullfs-restart-test",
             Self::NullfsOutOfSpaceTest => "nullfs-out-of-space-test",
             Self::NullfsBlockDeviceLossTest => "nullfs-block-device-loss-test",
+            Self::NullfsCrashRecoveryTest => "nullfs-crash-recovery-test",
             Self::NullfsUnavailableTest => "nullfs-unavailable-test",
             Self::LoggingLifecycleTest => "logging-lifecycle-test",
         }
@@ -69,6 +74,10 @@ mod tests {
         assert_eq!(
             BootMode::parse(b"nullfs-block-device-loss-test\n"),
             Some(BootMode::NullfsBlockDeviceLossTest)
+        );
+        assert_eq!(
+            BootMode::parse(b"nullfs-crash-recovery-test\n"),
+            Some(BootMode::NullfsCrashRecoveryTest)
         );
         assert_eq!(
             BootMode::parse(b"nullfs-unavailable-test\n"),

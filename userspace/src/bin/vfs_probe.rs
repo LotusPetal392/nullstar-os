@@ -23,6 +23,11 @@ const BOOTSTRAP_MODE: &[u8] = b"bootstrap";
 const NULLFS_RESTART_MODE: &[u8] = b"nullfs-restart";
 const NULLFS_OUT_OF_SPACE_MODE: &[u8] = b"out-of-space";
 const NULLFS_BLOCK_DEVICE_LOSS_MODE: &[u8] = b"block-device-loss";
+const NULLFS_CRASH_RECOVERY_MODE: &[u8] = b"crash-recovery";
+const NULLFS_CRASH_RECOVERY_READY: &[u8] = b"crash-recovery: baseline ready";
+const NULLFS_CRASH_RECOVERY_GO: &[u8] = b"crash-recovery: mutation armed";
+const NULLFS_CRASH_RECOVERY_MUTATION_FAILED: &[u8] = b"crash-recovery: uncertain mutation failed";
+const NULLFS_CRASH_RECOVERY_REPLACEMENT: &[u8] = b"crash-recovery: replacement registered";
 const NULLFS_BLOCK_DEVICE_LOSS_READY: &[u8] = b"block-device-loss: mutation prepared";
 const NULLFS_BLOCK_DEVICE_LOSS_OFFLINED: &[u8] = b"block-device-loss: provider offlined";
 const NULLFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED: &[u8] =
@@ -48,6 +53,11 @@ const NULLFS_OUT_OF_SPACE_CREATE_RAW: &[u8] = b"/Volumes/NullStar/Applications/o
 const NULLFS_OUT_OF_SPACE_RECOVERY_BYTES: &[u8] = b"space reclaimed";
 const NULLFS_BLOCK_DEVICE_LOSS_PATH: &[u8] = b"/Applications/block-device-loss.bin";
 const NULLFS_BLOCK_DEVICE_LOSS_BASELINE: &[u8] = b"before provider loss";
+const NULLFS_CRASH_RECOVERY_PATH: &[u8] = b"/Applications/crash-recovery.bin";
+const NULLFS_CRASH_RECOVERY_PATH_RAW: &[u8] = b"/Volumes/NullStar/Applications/crash-recovery.bin";
+const NULLFS_CRASH_RECOVERY_BASELINE: &[u8] = b"before crash";
+const NULLFS_CRASH_RECOVERY_SUFFIX: &[u8] = b"|after crash";
+const NULLFS_CRASH_RECOVERY_DURABLE: &[u8] = b"before crash|after crash";
 const BOOTSTRAP_HELLO: &[u8] = b"Hello from a NullStar OS userspace file descriptor.\n";
 const WELCOME: &[u8] = b"NullStar persistent storage service fixture.\n";
 const README: &[u8] = b"This volume is a deterministic NullFS integration fixture.\n";
@@ -188,6 +198,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
     if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_BLOCK_DEVICE_LOSS_MODE) {
         probe_nullfs_block_device_loss();
+    }
+    if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_CRASH_RECOVERY_MODE) {
+        probe_nullfs_crash_recovery();
     }
     let readiness = arguments.len() == 2 && arguments.get(1) == Some(READINESS_MODE);
     let full =
@@ -811,6 +824,108 @@ fn probe_user_namespace_mutation() {
     if syscall::close(raw).is_err() || syscall::close(canonical).is_err() {
         syscall::exit(125);
     }
+}
+
+fn probe_nullfs_crash_recovery() -> ! {
+    if !matches!(
+        ipc::wait_for_handle(SERVICE_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
+    ) || !matches!(
+        ipc::wait_for_handle(RESTART_CONTROL_HANDLE),
+        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
+    ) {
+        syscall::exit(150);
+    }
+    match platform::stat(NULLFS_CRASH_RECOVERY_PATH) {
+        Err(error) if error == platform::Errno::NO_ENTRY => {}
+        Ok(stat) if stat.kind == file::KIND_FILE => {
+            if !unlink_with_retry(NULLFS_CRASH_RECOVERY_PATH)
+                || !stat_failed_with_retry(
+                    NULLFS_CRASH_RECOVERY_PATH_RAW,
+                    platform::Errno::NO_ENTRY,
+                )
+            {
+                syscall::exit(151);
+            }
+        }
+        _ => syscall::exit(151),
+    }
+
+    let stale = open_with_retry(
+        NULLFS_CRASH_RECOVERY_PATH,
+        syscall::OpenFlags::READ
+            | syscall::OpenFlags::WRITE
+            | syscall::OpenFlags::CREATE
+            | syscall::OpenFlags::TRUNCATE,
+    )
+    .unwrap_or_else(|| syscall::exit(152));
+    if !write_all_with_retry(stale, NULLFS_CRASH_RECOVERY_BASELINE)
+        || !descriptor_stat_matches(stale, NULLFS_CRASH_RECOVERY_BASELINE.len() as u64)
+        || ipc::send(SERVICE_HANDLE, NULLFS_CRASH_RECOVERY_READY, None).is_err()
+    {
+        syscall::exit(153);
+    }
+
+    let mut control = [0_u8; 64];
+    let message =
+        ipc::receive(RESTART_CONTROL_HANDLE, &mut control).unwrap_or_else(|_| syscall::exit(154));
+    if message.sender_process_id != 1
+        || message.capability.is_some()
+        || message.bytes != NULLFS_CRASH_RECOVERY_GO.len()
+        || &control[..message.bytes] != NULLFS_CRASH_RECOVERY_GO
+    {
+        syscall::exit(155);
+    }
+
+    if syscall::write(stale, NULLFS_CRASH_RECOVERY_SUFFIX) != Err(syscall::Errno::IO)
+        || ipc::send(SERVICE_HANDLE, NULLFS_CRASH_RECOVERY_MUTATION_FAILED, None).is_err()
+    {
+        syscall::exit(156);
+    }
+
+    control.fill(0);
+    let message =
+        ipc::receive(RESTART_CONTROL_HANDLE, &mut control).unwrap_or_else(|_| syscall::exit(157));
+    if message.sender_process_id != 1
+        || message.capability.is_some()
+        || message.bytes != NULLFS_CRASH_RECOVERY_REPLACEMENT.len()
+        || &control[..message.bytes] != NULLFS_CRASH_RECOVERY_REPLACEMENT
+    {
+        syscall::exit(158);
+    }
+
+    let mut stale_bytes = [0_u8; 1];
+    if syscall::read(stale, &mut stale_bytes) != Err(syscall::Errno::IO)
+        || syscall::write(stale, b"x") != Err(syscall::Errno::IO)
+        || !platform_failed_with(platform::fstat(stale), errno::IO)
+        || syscall::seek(stale, syscall::SeekFrom::Start(0)) != Err(syscall::Errno::IO)
+        || syscall::seek(stale, syscall::SeekFrom::Current(0)) != Err(syscall::Errno::IO)
+        || syscall::seek(stale, syscall::SeekFrom::End(0)) != Err(syscall::Errno::IO)
+    {
+        syscall::exit(159);
+    }
+
+    let recovered = open_with_retry(
+        NULLFS_CRASH_RECOVERY_PATH_RAW,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
+    )
+    .unwrap_or_else(|| syscall::exit(160));
+    if !descriptor_stat_matches(recovered, NULLFS_CRASH_RECOVERY_DURABLE.len() as u64)
+        || !read_matches(recovered, NULLFS_CRASH_RECOVERY_DURABLE)
+        || !stat_matches(
+            NULLFS_CRASH_RECOVERY_PATH,
+            file::KIND_FILE,
+            NULLFS_CRASH_RECOVERY_DURABLE.len() as u64,
+        )
+        || !path_contents_match(b"/hello.txt", BOOTSTRAP_HELLO)
+        || !unlink_with_retry(NULLFS_CRASH_RECOVERY_PATH)
+        || !stat_failed_with_retry(NULLFS_CRASH_RECOVERY_PATH_RAW, platform::Errno::NO_ENTRY)
+        || syscall::close(recovered).is_err()
+        || syscall::close(stale).is_err()
+    {
+        syscall::exit(161);
+    }
+    syscall::exit(0);
 }
 
 fn probe_nullfs_block_device_loss() -> ! {

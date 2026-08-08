@@ -14,6 +14,110 @@ pub mod protocol {
     ));
 }
 
+/// Private control messages used only by the NullFS crash-injection test.
+pub mod crash_test {
+    pub const MAGIC: [u8; 4] = *b"NFCR";
+    pub const VERSION: u16 = 1;
+    pub const MESSAGE_BYTES: usize = 32;
+
+    pub mod kind {
+        pub const ARM: u16 = 1;
+        pub const MUTATION_REACHED: u16 = 2;
+
+        pub const fn known(value: u16) -> bool {
+            matches!(value, ARM | MUTATION_REACHED)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Message {
+        pub kind: u16,
+        pub generation: u64,
+        pub nonce: u64,
+        pub request_id: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DecodeError {
+        Length,
+        Magic,
+        Version,
+        Kind,
+        Generation,
+        Nonce,
+        RequestId,
+    }
+
+    impl Message {
+        pub const fn new(kind: u16, generation: u64, nonce: u64, request_id: u64) -> Option<Self> {
+            if !kind::known(kind)
+                || generation == 0
+                || nonce == 0
+                || kind == kind::ARM && request_id != 0
+                || kind == kind::MUTATION_REACHED && request_id == 0
+            {
+                return None;
+            }
+            Some(Self {
+                kind,
+                generation,
+                nonce,
+                request_id,
+            })
+        }
+
+        pub fn encode(self) -> [u8; MESSAGE_BYTES] {
+            assert!(
+                Self::new(self.kind, self.generation, self.nonce, self.request_id).is_some(),
+                "cannot encode a noncanonical crash-test message"
+            );
+            let mut bytes = [0; MESSAGE_BYTES];
+            bytes[0..4].copy_from_slice(&MAGIC);
+            bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
+            bytes[6..8].copy_from_slice(&self.kind.to_le_bytes());
+            bytes[8..16].copy_from_slice(&self.generation.to_le_bytes());
+            bytes[16..24].copy_from_slice(&self.nonce.to_le_bytes());
+            bytes[24..32].copy_from_slice(&self.request_id.to_le_bytes());
+            bytes
+        }
+
+        pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+            if bytes.len() != MESSAGE_BYTES {
+                return Err(DecodeError::Length);
+            }
+            if bytes[0..4] != MAGIC {
+                return Err(DecodeError::Magic);
+            }
+            if u16::from_le_bytes([bytes[4], bytes[5]]) != VERSION {
+                return Err(DecodeError::Version);
+            }
+            let kind = u16::from_le_bytes([bytes[6], bytes[7]]);
+            if !kind::known(kind) {
+                return Err(DecodeError::Kind);
+            }
+            let generation = u64::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+            if generation == 0 {
+                return Err(DecodeError::Generation);
+            }
+            let nonce = u64::from_le_bytes([
+                bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22],
+                bytes[23],
+            ]);
+            if nonce == 0 {
+                return Err(DecodeError::Nonce);
+            }
+            let request_id = u64::from_le_bytes([
+                bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30],
+                bytes[31],
+            ]);
+            Self::new(kind, generation, nonce, request_id).ok_or(DecodeError::RequestId)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     InvalidName,
@@ -870,8 +974,9 @@ mod tests {
     use core::mem::size_of;
 
     use super::{
-        Error, Node, Session, connect, connect_with_flags, connect_writable, mutation_reply_result,
-        negotiated_session, node_from_reply_with_kind, protocol, valid_reply, write_count,
+        Error, Node, Session, connect, connect_with_flags, connect_writable, crash_test,
+        mutation_reply_result, negotiated_session, node_from_reply_with_kind, protocol,
+        valid_reply, write_count,
     };
 
     fn session() -> Session {
@@ -1526,5 +1631,96 @@ mod tests {
 
         reply.status = protocol::status::NOT_FOUND;
         assert!(!valid_reply(&request, &reply));
+    }
+
+    #[test]
+    fn crash_test_message_has_an_exact_golden_encoding() {
+        let message = crash_test::Message::new(
+            crash_test::kind::MUTATION_REACHED,
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+        )
+        .expect("canonical mutation-reached message");
+        let golden = [
+            0x4e, 0x46, 0x43, 0x52, 0x01, 0x00, 0x02, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+            0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x28, 0x27, 0x26, 0x25,
+            0x24, 0x23, 0x22, 0x21,
+        ];
+
+        assert_eq!(crash_test::MESSAGE_BYTES, 32);
+        assert_eq!(message.encode(), golden);
+        assert_eq!(crash_test::Message::decode(&golden), Ok(message));
+
+        let arm = crash_test::Message::new(crash_test::kind::ARM, 9, 10, 0)
+            .expect("canonical arm message");
+        assert_eq!(crash_test::Message::decode(&arm.encode()), Ok(arm));
+    }
+
+    #[test]
+    fn crash_test_decode_rejects_every_noncanonical_field() {
+        use crash_test::DecodeError;
+
+        let canonical = crash_test::Message::new(crash_test::kind::ARM, 9, 10, 0)
+            .expect("canonical arm message")
+            .encode();
+        assert_eq!(
+            crash_test::Message::decode(&canonical[..31]),
+            Err(DecodeError::Length)
+        );
+
+        let mut invalid = canonical;
+        invalid[0] = b'X';
+        assert_eq!(
+            crash_test::Message::decode(&invalid),
+            Err(DecodeError::Magic)
+        );
+
+        invalid = canonical;
+        invalid[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            crash_test::Message::decode(&invalid),
+            Err(DecodeError::Version)
+        );
+
+        invalid = canonical;
+        invalid[6..8].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(
+            crash_test::Message::decode(&invalid),
+            Err(DecodeError::Kind)
+        );
+
+        invalid = canonical;
+        invalid[8..16].fill(0);
+        assert_eq!(
+            crash_test::Message::decode(&invalid),
+            Err(DecodeError::Generation)
+        );
+
+        invalid = canonical;
+        invalid[16..24].fill(0);
+        assert_eq!(
+            crash_test::Message::decode(&invalid),
+            Err(DecodeError::Nonce)
+        );
+
+        invalid = canonical;
+        invalid[24..32].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(
+            crash_test::Message::decode(&invalid),
+            Err(DecodeError::RequestId)
+        );
+
+        invalid = canonical;
+        invalid[6..8].copy_from_slice(&crash_test::kind::MUTATION_REACHED.to_le_bytes());
+        assert_eq!(
+            crash_test::Message::decode(&invalid),
+            Err(DecodeError::RequestId)
+        );
+
+        assert!(crash_test::Message::new(crash_test::kind::ARM, 0, 1, 0).is_none());
+        assert!(crash_test::Message::new(crash_test::kind::ARM, 1, 0, 0).is_none());
+        assert!(crash_test::Message::new(crash_test::kind::ARM, 1, 1, 1).is_none());
+        assert!(crash_test::Message::new(crash_test::kind::MUTATION_REACHED, 1, 1, 0).is_none());
     }
 }

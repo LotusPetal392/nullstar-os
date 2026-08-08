@@ -84,17 +84,18 @@ prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 | `cargo run` | Boot the normal image with the QEMU display enabled. |
 | `cargo run -- --headless` | Boot normally without a display; serial output only. |
 | `cargo run -- --boot-check` | Boot headlessly and exit after PID 1 launches the userspace shell. |
-| `cargo run -- --test` | Run the full headless suite, including persistent FAT, NullFS replacement, out-of-space and block-device-loss handling, unavailable-primary recovery, and logging lifecycle verification. |
+| `cargo run -- --test` | Run the full headless suite, including persistent FAT, NullFS replacement, out-of-space, block-device-loss, crash/remount recovery, unavailable-primary recovery, and logging lifecycle verification. |
 | `cargo run -- --nullfs-restart-check` | Run only the targeted NullFS replacement and stale-descriptor check. |
 | `cargo run -- --nullfs-out-of-space-check` | Verify data-block and inode exhaustion, service continuity, reclamation, and subsequent mutation. |
 | `cargo run -- --nullfs-block-device-loss-check` | Verify exact-generation provider loss, uncertain-mutation fail-stop, stale VFS `EIO`, and bootstrap continuity. |
+| `cargo run -- --nullfs-crash-recovery-check` | Crash NullFS after a durable mutation but before its reply, then verify uncertain `EIO`, dirty remount, stale descriptors, and exactly-once recovered content. |
 | `cargo run -- --nullfs-unavailable-check` | Boot without a primary NullFS partition and verify recovery through the independent emergency shell. |
 | `cargo run -- --logging-lifecycle-check` | Run only logging start/stop/restart, route replacement, restart fencing, forced termination, and readiness-timeout recovery checks. |
 | `cargo run -- --help` | Show all runner options. |
 
-The smoke, out-of-space, and block-device-loss runners copy their dedicated source images to
-temporary files before testing, so persistence, reclamation, and uncertain-outcome checks remain
-repeatable and do not mutate generated source images.
+The smoke, out-of-space, block-device-loss, and crash-recovery runners copy their dedicated source
+images to temporary files before testing, so persistence, reclamation, and uncertain-outcome checks
+remain repeatable and do not mutate generated source images.
 
 ## Using the shells
 
@@ -144,8 +145,8 @@ the complete suite:
 ```
 
 The full suite adds a normal-boot readiness check, the two-boot QEMU smoke
-test, NullFS replacement, out-of-space and block-device-loss handling, unavailable-primary recovery,
-and logging lifecycle convergence. It can take several
+test, NullFS replacement, out-of-space, block-device-loss, and crash/remount recovery,
+unavailable-primary recovery, and logging lifecycle convergence. It can take several
 minutes. Individual Cargo commands should generally include `--locked` so local
 results use the committed dependency graph.
 

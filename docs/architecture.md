@@ -43,6 +43,10 @@ Generated images use `/BOOTMODE` to select among:
   stopped-service timeout/KILL replacement through dirty recovery;
 - `nullfs-out-of-space-test`, whose offline-built fixture has zero free inodes and data blocks and
   validates exact public-ABI exhaustion, service continuity, reclamation, and later mutation;
+- `nullfs-block-device-loss-test`, which validates exact raw-provider offlining, uncertain-mutation
+  fail-stop, stale filesystem generations, and bootstrap continuity;
+- `nullfs-crash-recovery-test`, which crashes the service after a durable public mutation but before
+  its reply and validates exact-generation offlining, dirty remount, and non-retried recovery;
 - `nullfs-unavailable-test`, whose image omits the primary NullFS partition and validates exact
   UUID lookup failure plus handoff to the independently available emergency kernel shell;
 - `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
@@ -334,6 +338,15 @@ public operation runs. `UNMOUNT` makes the service close all core open handles a
 invalid or capability-bearing event, lifecycle failure, or early/nonzero exit converges
 through exact-generation offlining, KILL/reap, and dirty mount recovery.
 
+The dedicated crash-recovery mode grants the service a private receive-only hook capability. PID 1
+arms one generation- and nonce-bound write; after the core reports successful durable completion but
+before the service sends its filesystem reply, the service emits an exact request event and exits 37.
+PID 1 offlines the old provider so the original syscall returns `EIO` without retry, then registers a
+fresh generation only after dirty mount recovery. The probe requires the mutation exactly once,
+rejects every stale old-descriptor operation with `EIO`, cleans the recovered artifact, and confirms
+bootstrap FAT remains available. The hook does not change public filesystem version 1, `NFLC`, or
+`NSVC`.
+
 The public proxy validates canonical replies. `OUTCOME_UNKNOWN`, a malformed reply, or
 post-send uncertainty about a mutation maps to `IO`, quarantines that service
 generation, and is never automatically retried. These rules do not add durability beyond
@@ -347,7 +360,8 @@ The generated 4 MiB primary volume is exposed at `/Volumes/NullStar` and contain
 paths. Public probes exercise canonical and raw view identity, canonical cwd behavior,
 system metadata flags, a static executable launched through `/System/bin`, writable user
 profile state, persistence and stale old descriptors across service restart,
-stopped-service timeout/KILL replacement through dirty recovery, and continued bootstrap
+stopped-service timeout/KILL replacement through dirty recovery, a post-commit/pre-reply service
+crash with non-retried uncertain `EIO` and exact durable recovery, and continued bootstrap
 availability. A dedicated fully allocated image verifies that writes to an existing file and
 creation of a new inode return exact `NO_SPACE` through the ordinary VFS ABI without poisoning the
 service; existing reads continue, unlink reclaims resources, and a later create/write/read/unlink

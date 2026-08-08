@@ -28,6 +28,7 @@ userspace::entry!(rust_main);
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const BLOCK_HANDLE: u64 = 3;
+const CRASH_TEST_HANDLE: u64 = 4;
 const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const SHARED_BUFFER_BYTES: usize = 4096;
@@ -37,12 +38,20 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     allocator::init();
 
     let arguments = unsafe { Args::from_stack(initial_stack) };
-    if arguments.len() != 2
-        || arguments.get(0) != Some(b"/nullfs-service")
-        || arguments.get(1) != Some(b"--writable")
+    let crash_test = if arguments.len() == 2
+        && arguments.get(0) == Some(b"/nullfs-service")
+        && arguments.get(1) == Some(b"--writable")
     {
-        fail(2, b"usage: /nullfs-service --writable\n");
-    }
+        false
+    } else if arguments.len() == 3
+        && arguments.get(0) == Some(b"/nullfs-service")
+        && arguments.get(1) == Some(b"--writable")
+        && arguments.get(2) == Some(b"--crash-test")
+    {
+        true
+    } else {
+        fail(2, b"usage: /nullfs-service --writable [--crash-test]\n");
+    };
 
     require_handle(
         READY_HANDLE,
@@ -62,6 +71,17 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         12,
         b"nullfs: handle 3 must be Endpoint SEND\n",
     );
+    let crash_test_hook = if crash_test {
+        require_handle(
+            CRASH_TEST_HANDLE,
+            Rights::RECEIVE,
+            14,
+            b"nullfs: handle 4 must be Endpoint RECEIVE in crash-test mode\n",
+        );
+        Some(server::CrashTestHook::new(CRASH_TEST_HANDLE))
+    } else {
+        None
+    };
     let service_generation =
         match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
             Ok(generation) => generation.get(),
@@ -121,7 +141,12 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if root_attributes.node != root || root_attributes.kind != NodeKind::Directory {
         fail(29, b"nullfs: root is not a directory\n");
     }
-    server::serve(filesystem, service_generation, root_attributes)
+    server::serve(
+        filesystem,
+        service_generation,
+        root_attributes,
+        crash_test_hook,
+    )
 }
 
 fn require_handle(handle: u64, rights: Rights, exit_code: u64, message: &[u8]) {

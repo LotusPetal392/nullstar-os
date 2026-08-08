@@ -84,6 +84,13 @@ const NULLFS_BLOCK_DEVICE_LOSS_FAIL_STOP_MARKER: &str =
     "nullfs: poisoned after filesystem mutation";
 const NULLFS_BLOCK_DEVICE_LOSS_SERVICE_EXIT_MARKER: &str = "path=/nullfs-service, exit_code=35";
 const NULLFS_BLOCK_DEVICE_LOSS_PASSED_MARKER: &str = "userspace init: NullFS block-device loss, uncertain mutation fail-stop, stale VFS errors, and bootstrap continuity verified";
+const NULLFS_CRASH_RECOVERY_MODE_MARKER: &str = "boot mode selected: nullfs-crash-recovery-test";
+const NULLFS_CRASH_RECOVERY_INJECTED_MARKER: &str =
+    "userspace init: NullFS service-backed mutation crash injected";
+const NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER: &str =
+    "nullfs: injected crash after durable mutation";
+const NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER: &str = "path=/nullfs-service, exit_code=37";
+const NULLFS_CRASH_RECOVERY_PASSED_MARKER: &str = "userspace init: NullFS service crash, uncertain VFS failure, dirty remount recovery, stale descriptors, and durable single mutation verified";
 const NULLFS_UNAVAILABLE_MODE_MARKER: &str = "boot mode selected: nullfs-unavailable-test";
 const NULLFS_UNAVAILABLE_PARTITIONS_MARKER: &str =
     "partition table initialized: kind=MBR, partitions=2,";
@@ -108,6 +115,7 @@ const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
 const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(420);
 const NULLFS_OUT_OF_SPACE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 const NULLFS_BLOCK_DEVICE_LOSS_TEST_TIMEOUT: Duration = Duration::from_secs(300);
+const NULLFS_CRASH_RECOVERY_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 const NULLFS_UNAVAILABLE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGGING_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -249,6 +257,31 @@ impl BlockDeviceLossProgress {
 }
 
 #[derive(Debug, Default)]
+struct CrashRecoveryProgress {
+    mode_selected: bool,
+    nullfs_ready: bool,
+    injection_reported: bool,
+    durable_mutation_reported: bool,
+    service_exited: bool,
+    verified: bool,
+}
+
+impl CrashRecoveryProgress {
+    fn observe(&mut self, line: &str) -> bool {
+        self.mode_selected |= line.contains(NULLFS_CRASH_RECOVERY_MODE_MARKER);
+        self.nullfs_ready |= self.mode_selected && line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
+        self.injection_reported |=
+            self.nullfs_ready && line.contains(NULLFS_CRASH_RECOVERY_INJECTED_MARKER);
+        self.durable_mutation_reported |=
+            self.injection_reported && line.contains(NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER);
+        self.service_exited |= self.durable_mutation_reported
+            && line.contains(NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER);
+        self.verified |= self.service_exited && line.contains(NULLFS_CRASH_RECOVERY_PASSED_MARKER);
+        self.verified
+    }
+}
+
+#[derive(Debug, Default)]
 struct UnavailablePrimaryProgress {
     partitions_absent: bool,
     mode_selected: bool,
@@ -327,6 +360,7 @@ struct Options {
     nullfs_restart_check: bool,
     nullfs_out_of_space_check: bool,
     nullfs_block_device_loss_check: bool,
+    nullfs_crash_recovery_check: bool,
     nullfs_unavailable_check: bool,
     logging_lifecycle_check: bool,
 }
@@ -338,6 +372,7 @@ impl Options {
             || self.nullfs_restart_check
             || self.nullfs_out_of_space_check
             || self.nullfs_block_device_loss_check
+            || self.nullfs_crash_recovery_check
             || self.nullfs_unavailable_check
             || self.logging_lifecycle_check
     }
@@ -357,6 +392,8 @@ fn main() -> ExitCode {
         run_nullfs_out_of_space_check(&options)
     } else if options.nullfs_block_device_loss_check {
         run_nullfs_block_device_loss_check(&options)
+    } else if options.nullfs_crash_recovery_check {
+        run_nullfs_crash_recovery_check(&options)
     } else if options.nullfs_unavailable_check {
         run_nullfs_unavailable_check(&options)
     } else if options.logging_lifecycle_check {
@@ -423,6 +460,15 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
                 options.nullfs_block_device_loss_check = true;
                 options.headless = true;
             }
+            "--nullfs-crash-recovery-check" => {
+                if options.boot_verification_selected() {
+                    eprintln!("only one boot verification mode may be selected");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
+                options.nullfs_crash_recovery_check = true;
+                options.headless = true;
+            }
             "--nullfs-unavailable-check" => {
                 if options.boot_verification_selected() {
                     eprintln!("only one boot verification mode may be selected");
@@ -458,7 +504,7 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --nullfs-out-of-space-check | --nullfs-block-device-loss-check | --nullfs-unavailable-check | --logging-lifecycle-check]"
+        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --nullfs-out-of-space-check | --nullfs-block-device-loss-check | --nullfs-crash-recovery-check | --nullfs-unavailable-check | --logging-lifecycle-check]"
     );
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!("  --boot-check  Verify that PID 1 launches the userspace shell");
@@ -470,6 +516,9 @@ fn print_usage() {
     );
     println!(
         "  --nullfs-block-device-loss-check  Verify exact storage offlining and NullFS fail-stop behavior"
+    );
+    println!(
+        "  --nullfs-crash-recovery-check  Verify durable NullFS mutation recovery after a service crash"
     );
     println!(
         "  --nullfs-unavailable-check  Verify missing-primary recovery through the independent emergency shell"
@@ -571,7 +620,8 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
     let restart_result = smoke_result && run_nullfs_restart_test(options);
     let out_of_space_result = restart_result && run_nullfs_out_of_space_test(options);
     let block_loss_result = out_of_space_result && run_nullfs_block_device_loss_test(options);
-    let logging_result = block_loss_result && run_logging_lifecycle_test(options);
+    let crash_recovery_result = block_loss_result && run_nullfs_crash_recovery_test(options);
+    let logging_result = crash_recovery_result && run_logging_lifecycle_test(options);
     let recovery_result = logging_result && run_nullfs_unavailable_test(options);
     if recovery_result {
         println!("QEMU kernel smoke test passed");
@@ -646,6 +696,36 @@ fn run_nullfs_block_device_loss_test(options: &Options) -> bool {
         qemu_command_for_image(options, test_image.path()),
         "NullFS block-device-loss check",
         NULLFS_BLOCK_DEVICE_LOSS_TEST_TIMEOUT,
+        move |line| progress.observe(line),
+    )
+}
+
+fn run_nullfs_crash_recovery_check(options: &Options) -> ExitCode {
+    if run_nullfs_crash_recovery_test(options) {
+        println!("QEMU NullFS crash-recovery check passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_nullfs_crash_recovery_test(options: &Options) -> bool {
+    let source_image = Path::new(env!("NULLFS_CRASH_RECOVERY_TEST_BIOS_IMAGE"));
+    let test_image = match DisposableImage::copy_from(source_image, "crash-recovery") {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!(
+                "Could not create disposable NullFS crash-recovery test image from {}: {error}",
+                source_image.display()
+            );
+            return false;
+        }
+    };
+    let mut progress = CrashRecoveryProgress::default();
+    run_qemu_until(
+        qemu_command_for_image(options, test_image.path()),
+        "NullFS crash-recovery check",
+        NULLFS_CRASH_RECOVERY_TEST_TIMEOUT,
         move |line| progress.observe(line),
     )
 }
@@ -981,7 +1061,7 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockDeviceLossProgress, DEFINITION_SERVICE_FIRST_FAILURE_MARKER,
+        BlockDeviceLossProgress, CrashRecoveryProgress, DEFINITION_SERVICE_FIRST_FAILURE_MARKER,
         DEFINITION_SERVICE_LOADING_MARKER, DEFINITION_SERVICE_READY_MARKER,
         DEFINITION_SERVICE_RESTARTING_MARKER, DEFINITION_SERVICE_VERIFIED_MARKER,
         EMERGENCY_SHELL_READY_MARKER, LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER,
@@ -1000,11 +1080,13 @@ mod tests {
         NULLFS_BLOCK_DEVICE_LOSS_FAIL_STOP_MARKER, NULLFS_BLOCK_DEVICE_LOSS_INJECTED_MARKER,
         NULLFS_BLOCK_DEVICE_LOSS_MODE_MARKER, NULLFS_BLOCK_DEVICE_LOSS_PASSED_MARKER,
         NULLFS_BLOCK_DEVICE_LOSS_SERVICE_EXIT_MARKER, NULLFS_BLOCK_ENDPOINT_OFFLINED_MARKER,
-        NULLFS_OUT_OF_SPACE_MODE_MARKER, NULLFS_OUT_OF_SPACE_PASSED_MARKER,
-        NULLFS_UNAVAILABLE_HANDOFF_MARKER, NULLFS_UNAVAILABLE_INIT_EXIT_MARKER,
-        NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER, NULLFS_UNAVAILABLE_MODE_MARKER,
-        NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, OutOfSpaceProgress,
-        UnavailablePrimaryProgress, parse_options_from,
+        NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER, NULLFS_CRASH_RECOVERY_INJECTED_MARKER,
+        NULLFS_CRASH_RECOVERY_MODE_MARKER, NULLFS_CRASH_RECOVERY_PASSED_MARKER,
+        NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER, NULLFS_OUT_OF_SPACE_MODE_MARKER,
+        NULLFS_OUT_OF_SPACE_PASSED_MARKER, NULLFS_UNAVAILABLE_HANDOFF_MARKER,
+        NULLFS_UNAVAILABLE_INIT_EXIT_MARKER, NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER,
+        NULLFS_UNAVAILABLE_MODE_MARKER, NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress,
+        OutOfSpaceProgress, UnavailablePrimaryProgress, parse_options_from,
     };
 
     #[test]
@@ -1102,6 +1184,23 @@ mod tests {
     }
 
     #[test]
+    fn crash_recovery_requires_ordered_crash_and_recovery_markers() {
+        let mut progress = CrashRecoveryProgress::default();
+
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_PASSED_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_INJECTED_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_MODE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_INJECTED_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER));
+        assert!(progress.observe(NULLFS_CRASH_RECOVERY_PASSED_MARKER));
+    }
+
+    #[test]
     fn unavailable_primary_requires_ordered_recovery_handoff() {
         let mut progress = UnavailablePrimaryProgress::default();
 
@@ -1161,6 +1260,15 @@ mod tests {
     }
 
     #[test]
+    fn nullfs_crash_recovery_option_is_headless() {
+        let options = parse_options_from(["--nullfs-crash-recovery-check".to_owned()])
+            .expect("NullFS crash-recovery option should parse");
+
+        assert!(options.nullfs_crash_recovery_check);
+        assert!(options.headless);
+    }
+
+    #[test]
     fn nullfs_unavailable_option_is_headless() {
         let options = parse_options_from(["--nullfs-unavailable-check".to_owned()])
             .expect("NullFS unavailable option should parse");
@@ -1186,6 +1294,7 @@ mod tests {
             "--nullfs-restart-check",
             "--nullfs-out-of-space-check",
             "--nullfs-block-device-loss-check",
+            "--nullfs-crash-recovery-check",
             "--nullfs-unavailable-check",
             "--logging-lifecycle-check",
         ];

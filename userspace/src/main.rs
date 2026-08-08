@@ -12,7 +12,7 @@ use service_route::{Authorizer, ProviderGeneration, ProviderGenerationSequence, 
 use userspace::{
     abi::{INIT_PROCESS_ID, file, signal},
     definition_service_probe, early_log,
-    filesystem::protocol as filesystem_protocol,
+    filesystem::{crash_test, protocol as filesystem_protocol},
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
     service_control::{
@@ -93,6 +93,7 @@ const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
 const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to acquire block-device endpoint\n";
 const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service --writable";
+const NULLFS_CRASH_TEST_SERVICE_COMMAND: &[u8] = b"/nullfs-service --writable --crash-test";
 const NULLFS_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const NULLFS_SERVICE_STARTING: &[u8] = b"userspace init: starting NullFS service\n";
 const NULLFS_SERVICE_RESTARTING: &[u8] = b"userspace init: NullFS service exited; restarting\n";
@@ -150,6 +151,16 @@ const VFS_BLOCK_DEVICE_LOSS_INJECTED: &[u8] =
 const VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED: &[u8] =
     b"userspace init: NullFS block-device-loss probe failed\n";
 const VFS_BLOCK_DEVICE_LOSS_PROBE_PASSED: &[u8] = b"userspace init: NullFS block-device loss, uncertain mutation fail-stop, stale VFS errors, and bootstrap continuity verified\n";
+const VFS_CRASH_RECOVERY_PROBE_COMMAND: &[u8] = b"/vfs-probe crash-recovery";
+const VFS_CRASH_RECOVERY_READY: &[u8] = b"crash-recovery: baseline ready";
+const VFS_CRASH_RECOVERY_GO: &[u8] = b"crash-recovery: mutation armed";
+const VFS_CRASH_RECOVERY_MUTATION_FAILED: &[u8] = b"crash-recovery: uncertain mutation failed";
+const VFS_CRASH_RECOVERY_REPLACEMENT: &[u8] = b"crash-recovery: replacement registered";
+const VFS_CRASH_RECOVERY_INJECTED: &[u8] =
+    b"userspace init: NullFS service-backed mutation crash injected\n";
+const VFS_CRASH_RECOVERY_PROBE_FAILED: &[u8] =
+    b"userspace init: NullFS crash-recovery probe failed\n";
+const VFS_CRASH_RECOVERY_PROBE_PASSED: &[u8] = b"userspace init: NullFS service crash, uncertain VFS failure, dirty remount recovery, stale descriptors, and durable single mutation verified\n";
 const DEFINITION_SERVICE_LOADING: &[u8] =
     b"userspace init: loading service definition from /System/services\n";
 const DEFINITION_SERVICE_STARTING: &[u8] = b"userspace init: starting definition-backed service\n";
@@ -178,6 +189,7 @@ const BOOT_MODE_PATH: &[u8] = b"/BOOTMODE";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
 const NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE: &[u8] = b"nullfs-out-of-space-test\n";
 const NULLFS_BLOCK_DEVICE_LOSS_TEST_BOOT_MODE: &[u8] = b"nullfs-block-device-loss-test\n";
+const NULLFS_CRASH_RECOVERY_TEST_BOOT_MODE: &[u8] = b"nullfs-crash-recovery-test\n";
 const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const BOOT_MODE_PROBE_FAILED: &[u8] = b"userspace init: unable to read boot mode\n";
@@ -199,6 +211,7 @@ const REQUEST_HANDLE: u64 = 2;
 const SV_OBSERVATION_HANDLE: u64 = 1;
 const SV_MUTATION_HANDLE: u64 = 2;
 const NULLFS_BLOCK_HANDLE: u64 = 3;
+const NULLFS_CRASH_TEST_HANDLE: u64 = 4;
 const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
 const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
 const GENERATION_HANDOFF_HANDLE: u64 = 5;
@@ -234,6 +247,10 @@ const NULLFS_SERVICE: ServiceSpec = ServiceSpec {
     restart_limit: 3,
     restart_backoff_yields: 32,
     fatal_startup_exit_status: None,
+};
+const NULLFS_CRASH_TEST_SERVICE: ServiceSpec = ServiceSpec {
+    command: NULLFS_CRASH_TEST_SERVICE_COMMAND,
+    ..NULLFS_SERVICE
 };
 const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"tmpfs",
@@ -2486,6 +2503,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let nullfs_restart_test = boot_mode == InitBootMode::NullfsRestartTest;
     let nullfs_out_of_space_test = boot_mode == InitBootMode::NullfsOutOfSpaceTest;
     let nullfs_block_device_loss_test = boot_mode == InitBootMode::NullfsBlockDeviceLossTest;
+    let nullfs_crash_recovery_test = boot_mode == InitBootMode::NullfsCrashRecoveryTest;
     let logging_lifecycle_test = boot_mode == InitBootMode::LoggingLifecycleTest;
     if boot_mode == InitBootMode::NullfsUnavailableTest {
         match platform::open_writable_nullfs_block_device_endpoint(
@@ -2607,19 +2625,40 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
     let mut nullfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
-    let mut nullfs_service = ServiceRuntime::new(NULLFS_SERVICE);
+    let nullfs_crash_hook_endpoint = if nullfs_crash_recovery_test {
+        Some(ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED)))
+    } else {
+        None
+    };
+    let nullfs_spec = if nullfs_crash_recovery_test {
+        NULLFS_CRASH_TEST_SERVICE
+    } else {
+        NULLFS_SERVICE
+    };
+    let mut nullfs_service = ServiceRuntime::new(nullfs_spec);
     let mut nullfs_generations = ProviderGenerationSequence::new();
     let nullfs_block_capability = BootstrapCapability {
         source_handle: nullfs_service_block_endpoint,
         rights: Rights::SEND,
         target_handle: NULLFS_BLOCK_HANDLE,
     };
+    let nullfs_crash_capability = BootstrapCapability {
+        source_handle: nullfs_crash_hook_endpoint.unwrap_or(0),
+        rights: Rights::RECEIVE,
+        target_handle: NULLFS_CRASH_TEST_HANDLE,
+    };
+    let nullfs_capabilities = [nullfs_block_capability, nullfs_crash_capability];
+    let nullfs_capabilities = if nullfs_crash_recovery_test {
+        &nullfs_capabilities[..]
+    } else {
+        &nullfs_capabilities[..1]
+    };
     let mut nullfs_generation = start_service(
         &mut nullfs_service,
         &mut nullfs_generations,
         &mut nullfs_readiness_endpoint,
         &mut nullfs_request_endpoint,
-        &[nullfs_block_capability],
+        nullfs_capabilities,
         &NULLFS_MESSAGES,
     );
     run_probe(
@@ -2715,6 +2754,16 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             nullfs_generation,
             vfs_request_endpoint,
             nullfs_service_block_endpoint,
+        );
+    } else if nullfs_crash_recovery_test {
+        nullfs_generation = run_nullfs_crash_recovery_probe(
+            &mut nullfs_service,
+            nullfs_generation,
+            &mut nullfs_generations,
+            &mut nullfs_readiness_endpoint,
+            &mut nullfs_request_endpoint,
+            nullfs_capabilities,
+            nullfs_crash_hook_endpoint.unwrap_or_else(|| fail(VFS_CRASH_RECOVERY_PROBE_FAILED)),
         );
     } else if nullfs_out_of_space_test {
         run_probe(
@@ -2881,7 +2930,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                         &mut nullfs_generations,
                         &mut nullfs_readiness_endpoint,
                         &mut nullfs_request_endpoint,
-                        &[nullfs_block_capability],
+                        nullfs_capabilities,
                         &NULLFS_MESSAGES,
                     );
                     register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
@@ -3125,6 +3174,7 @@ enum InitBootMode {
     NullfsRestartTest,
     NullfsOutOfSpaceTest,
     NullfsBlockDeviceLossTest,
+    NullfsCrashRecoveryTest,
     NullfsUnavailableTest,
     LoggingLifecycleTest,
 }
@@ -3146,6 +3196,9 @@ fn init_boot_mode() -> InitBootMode {
         b"nullfs-block-device-loss-test" | NULLFS_BLOCK_DEVICE_LOSS_TEST_BOOT_MODE => {
             InitBootMode::NullfsBlockDeviceLossTest
         }
+        b"nullfs-crash-recovery-test" | NULLFS_CRASH_RECOVERY_TEST_BOOT_MODE => {
+            InitBootMode::NullfsCrashRecoveryTest
+        }
         b"nullfs-unavailable-test" | NULLFS_UNAVAILABLE_TEST_BOOT_MODE => {
             InitBootMode::NullfsUnavailableTest
         }
@@ -3154,6 +3207,193 @@ fn init_boot_mode() -> InitBootMode {
         }
         _ => fail(BOOT_MODE_PROBE_FAILED),
     }
+}
+
+fn run_nullfs_crash_recovery_probe(
+    nullfs_service: &mut ServiceRuntime,
+    old_generation: ProviderGeneration,
+    generations: &mut ProviderGenerationSequence,
+    readiness_endpoint: &mut CapabilityHandle,
+    request_endpoint: &mut CapabilityHandle,
+    bootstrap_capabilities: &[BootstrapCapability],
+    crash_hook_endpoint: CapabilityHandle,
+) -> ProviderGeneration {
+    const NONCE: u64 = 0x4352_4153_4800_0001;
+
+    let old_process_id = nullfs_service
+        .process_id()
+        .unwrap_or_else(|| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let old_restart_count = nullfs_service.restart_count();
+    let old_endpoint_info =
+        ipc::info(*request_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+
+    let ready_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let control_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let barrier =
+        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let probe_process_id = syscall::spawn_command_with_barrier(
+        VFS_CRASH_RECOVERY_PROBE_COMMAND,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    if ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, READY_HANDLE).ok()
+        != Some(READY_HANDLE)
+        || ipc::grant_child(
+            probe_process_id,
+            control_endpoint,
+            Rights::RECEIVE,
+            REQUEST_HANDLE,
+        )
+        .ok()
+            != Some(REQUEST_HANDLE)
+    {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    wait_for_probe_message(
+        ready_endpoint,
+        probe_process_id,
+        VFS_CRASH_RECOVERY_READY,
+        VFS_CRASH_RECOVERY_PROBE_FAILED,
+    );
+
+    let arm = crash_test::Message::new(crash_test::kind::ARM, old_generation.get(), NONCE, 0)
+        .unwrap_or_else(|| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    ipc::send(crash_hook_endpoint, &arm.encode(), None)
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let _ = syscall::write_all(STDOUT, VFS_CRASH_RECOVERY_INJECTED);
+    ipc::send(control_endpoint, VFS_CRASH_RECOVERY_GO, None)
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+
+    let mut reached_bytes = [0_u8; crash_test::MESSAGE_BYTES];
+    let reached = loop {
+        match ipc::try_receive(*readiness_endpoint, &mut reached_bytes) {
+            Ok(message) => {
+                if message.sender_process_id != old_process_id
+                    || message.capability.is_some()
+                    || message.bytes != crash_test::MESSAGE_BYTES
+                {
+                    fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+                }
+                break crash_test::Message::decode(&reached_bytes)
+                    .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {}
+            Err(_) => fail(VFS_CRASH_RECOVERY_PROBE_FAILED),
+        }
+        if try_wait_final_status(probe_process_id).is_some() {
+            fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    };
+    if reached.kind != crash_test::kind::MUTATION_REACHED
+        || reached.generation != old_generation.get()
+        || reached.nonce != NONCE
+        || reached.request_id == 0
+    {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+
+    let service_status = loop {
+        if let Some(status) = try_wait_final_status(old_process_id) {
+            break status;
+        }
+        if try_wait_final_status(probe_process_id).is_some() {
+            fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    };
+    if service_status != 37 {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+    let backoff_yields = match nullfs_service.observe_status(service_status) {
+        ServiceStatusDisposition::Restart { backoff_yields } => backoff_yields,
+        _ => fail(VFS_CRASH_RECOVERY_PROBE_FAILED),
+    };
+    if nullfs_service.restart_count() != old_restart_count.saturating_add(1)
+        || nullfs_service.process_id().is_some()
+    {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+
+    let wrong_generation = u32::try_from(old_generation.get().saturating_add(1))
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    if platform::offline_filesystem_provider(platform::FilesystemProvider::Nullfs, wrong_generation)
+        .err()
+        != Some(platform::Errno::INVALID_ARGUMENT)
+    {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+    offline_filesystem_provider(
+        platform::FilesystemProvider::Nullfs,
+        old_generation,
+        VFS_CRASH_RECOVERY_PROBE_FAILED,
+    );
+    wait_for_probe_message(
+        ready_endpoint,
+        probe_process_id,
+        VFS_CRASH_RECOVERY_MUTATION_FAILED,
+        VFS_CRASH_RECOVERY_PROBE_FAILED,
+    );
+
+    ipc::close(*readiness_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    ipc::close(*request_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    *readiness_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let mut replacement_request_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    if ipc::info(replacement_request_endpoint)
+        .map(|info| info.object_id <= old_endpoint_info.object_id)
+        .unwrap_or(true)
+    {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+    backoff(backoff_yields);
+    let replacement_generation = start_service(
+        nullfs_service,
+        generations,
+        readiness_endpoint,
+        &mut replacement_request_endpoint,
+        bootstrap_capabilities,
+        &NULLFS_MESSAGES,
+    );
+    if replacement_generation.get() != old_generation.get().saturating_add(1) {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+    register_nullfs_proxy(replacement_generation, replacement_request_endpoint);
+    *request_endpoint = replacement_request_endpoint;
+    nullfs_service.complete_restart();
+    if nullfs_service.state() != ServiceState::Running
+        || nullfs_service.controlled_restart_pending()
+        || nullfs_service.restart_count() != old_restart_count.saturating_add(1)
+    {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+
+    ipc::send(control_endpoint, VFS_CRASH_RECOVERY_REPLACEMENT, None)
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let probe_status = loop {
+        if let Some(status) = try_wait_final_status(probe_process_id) {
+            break status;
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    };
+    if probe_status != 0 {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
+    ipc::close(ready_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    ipc::close(control_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let _ = syscall::write_all(STDOUT, VFS_CRASH_RECOVERY_PROBE_PASSED);
+    replacement_generation
 }
 
 fn run_nullfs_block_device_loss_probe(

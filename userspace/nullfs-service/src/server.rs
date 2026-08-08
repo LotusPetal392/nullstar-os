@@ -6,7 +6,7 @@ use nullfs_format::{BLOCK_SIZE, NodeKind, Timestamp};
 use nullfs_service::state::{NodeIdentity, NodeMap, NodeMapError, OpenRecord, OpenTable};
 use userspace::{
     abi::INIT_PROCESS_ID,
-    filesystem::protocol,
+    filesystem::{crash_test, protocol},
     filesystem_service::{BufferSlot, Error as SessionError, NodeReferenceError, SessionTable},
     ipc::{self, ObjectKind, ReceivedCapability, Rights},
     syscall,
@@ -14,10 +14,69 @@ use userspace::{
 
 use crate::REQUEST_HANDLE;
 
+const CRASH_TEST_FAILURE_EXIT: u64 = 38;
+
+pub struct CrashTestHook {
+    handle: u64,
+    armed_nonce: Option<u64>,
+}
+
+impl CrashTestHook {
+    pub const fn new(handle: u64) -> Self {
+        Self {
+            handle,
+            armed_nonce: None,
+        }
+    }
+
+    fn poll(&mut self, generation: u64) {
+        let mut bytes = [0_u8; crash_test::MESSAGE_BYTES];
+        loop {
+            let message = match ipc::try_receive(self.handle, &mut bytes) {
+                Ok(message) => message,
+                Err(error) if error == ipc::Error::TRY_AGAIN => return,
+                Err(_) => fail_crash_test_control(),
+            };
+            let has_capability = message.capability.is_some();
+            close_capability(message.capability);
+            if message.sender_process_id != INIT_PROCESS_ID || has_capability {
+                fail_crash_test_control();
+            }
+            let control = crash_test::Message::decode(&bytes[..message.bytes])
+                .unwrap_or_else(|_| fail_crash_test_control());
+            if control.kind != crash_test::kind::ARM
+                || control.generation != generation
+                || self.armed_nonce.is_some()
+            {
+                fail_crash_test_control();
+            }
+            self.armed_nonce = Some(control.nonce);
+        }
+    }
+
+    fn mutation_reached(&mut self, generation: u64, request_id: u64) {
+        let Some(nonce) = self.armed_nonce.take() else {
+            return;
+        };
+        let message = crash_test::Message::new(
+            crash_test::kind::MUTATION_REACHED,
+            generation,
+            nonce,
+            request_id,
+        )
+        .unwrap_or_else(|| fail_crash_test_control());
+        if ipc::send(crate::READY_HANDLE, &message.encode(), None).is_err() {
+            fail_crash_test_control();
+        }
+        fail(37, b"nullfs: injected crash after durable mutation\n")
+    }
+}
+
 pub fn serve<D: BlockDevice>(
     filesystem: Filesystem<D>,
     generation: u64,
     root_attributes: CoreNodeAttributes,
+    crash_test: Option<CrashTestHook>,
 ) -> ! {
     let root = root_attributes.node;
     let node_capacity = filesystem
@@ -39,6 +98,7 @@ pub fn serve<D: BlockDevice>(
         sessions: SessionTable::new(),
         nodes,
         opens: OpenTable::new(),
+        crash_test,
     };
     if ipc::send(crate::READY_HANDLE, crate::READY_MESSAGE, None).is_err() {
         fail(30, b"nullfs: readiness send failed\n");
@@ -58,6 +118,7 @@ struct FilesystemServer<D> {
     sessions: SessionTable,
     nodes: NodeMap,
     opens: OpenTable,
+    crash_test: Option<CrashTestHook>,
 }
 
 impl<D: BlockDevice> FilesystemServer<D> {
@@ -65,10 +126,25 @@ impl<D: BlockDevice> FilesystemServer<D> {
         let mut request_bytes = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
         let mut state = ServeState::Serving;
         loop {
-            let message = match ipc::receive(REQUEST_HANDLE, &mut request_bytes) {
-                Ok(message) => message,
-                Err(_) => fail(31, b"nullfs: request receive failed\n"),
+            self.poll_crash_test();
+            let message = if self.crash_test.is_some() {
+                match ipc::try_receive(REQUEST_HANDLE, &mut request_bytes) {
+                    Ok(message) => message,
+                    Err(error) if error == ipc::Error::TRY_AGAIN => {
+                        if syscall::yield_now().is_err() {
+                            fail(31, b"nullfs: request receive failed\n");
+                        }
+                        continue;
+                    }
+                    Err(_) => fail(31, b"nullfs: request receive failed\n"),
+                }
+            } else {
+                match ipc::receive(REQUEST_HANDLE, &mut request_bytes) {
+                    Ok(message) => message,
+                    Err(_) => fail(31, b"nullfs: request receive failed\n"),
+                }
             };
+            self.poll_crash_test();
             if message.bytes == protocol::lifecycle::MESSAGE_BYTES {
                 self.dispatch_lifecycle(
                     &request_bytes[..message.bytes],
@@ -87,6 +163,12 @@ impl<D: BlockDevice> FilesystemServer<D> {
                 continue;
             }
             self.dispatch(&request_bytes, message.capability);
+        }
+    }
+
+    fn poll_crash_test(&mut self) {
+        if let Some(crash_test) = self.crash_test.as_mut() {
+            crash_test.poll(self.generation);
         }
     }
 
@@ -343,6 +425,13 @@ impl<D: BlockDevice> FilesystemServer<D> {
                 false
             }
         };
+        if !fail_stop
+            && request.operation == protocol::operation::WRITE
+            && reply.status == protocol::status::OK
+            && let Some(crash_test) = self.crash_test.as_mut()
+        {
+            crash_test.mutation_reached(self.generation, request.request_id);
+        }
         send_value(reply_endpoint, &reply);
         if fail_stop {
             fail(35, b"nullfs: poisoned after filesystem mutation\n");
@@ -2047,6 +2136,13 @@ fn send_value<T>(endpoint: u64, value: &T) {
 
 fn value_bytes<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
+}
+
+fn fail_crash_test_control() -> ! {
+    fail(
+        CRASH_TEST_FAILURE_EXIT,
+        b"nullfs: invalid private crash-test control\n",
+    )
 }
 
 fn fail(code: u64, message: &[u8]) -> ! {

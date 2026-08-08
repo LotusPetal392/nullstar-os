@@ -177,10 +177,30 @@ unsafe replacement of open destinations.
 
 A mutation can fail after durable state changed or after the in-memory core
 became poisoned. When the service cannot prove the result, it replies
-`OUTCOME_UNKNOWN`, then fail-stops after sending that reply. Supervision starts
+`OUTCOME_UNKNOWN`, then fail-stops after sending that reply. A service may also
+die after committing a mutation but before sending any reply. Supervision starts
 a replacement that remounts and runs normal recovery. `OUTCOME_UNKNOWN`, a
 failed service generation, and a lost reply are never permission to retry a
 mutation automatically; only an explicitly retryable status may be retried.
+
+### Private NullFS crash-test frame
+
+The native crash-recovery acceptance mode uses a private capability-gated frame; it does not add a
+public filesystem operation or change version 1 `Request` or `Reply`, `NFLC`, or `NSVC`. Frames are
+exactly 32 bytes: ASCII `NFCR`, little-endian version `1`, kind, nonzero service generation, nonzero
+nonce, and request ID. `ARM` kind `1` requires request ID zero; `MUTATION_REACHED` kind `2` requires a
+nonzero request ID. Any wrong sender, attached capability, malformed frame, generation mismatch, or
+duplicate arm fails the test service closed.
+
+Only the dedicated test service receives handle 4 with exact endpoint `RECEIVE`; PID 1 retains send
+authority. After an exact `ARM`, the next successful nonempty `WRITE` completes its core transaction.
+Before queuing the filesystem reply, the service emits exact `MUTATION_REACHED` on its supervisor
+endpoint and exits 37. PID 1 then offlines the exact old provider, causing the one blocked syscall to
+return `EIO`, and starts a strictly newer generation. The client never retries the uncertain write.
+The replacement completes normal dirty mount recovery before fresh operations expose the mutation
+exactly once and stale descriptors remain `EIO`. This synchronization hook tests native supervision;
+host `CrashBlockDevice` matrices remain authoritative for individual torn/reordered power-cut
+boundaries.
 
 ## Provider offlining and replacement
 

@@ -121,8 +121,10 @@ unchanged.
   shutdown ordering, clean/dirty recovery, and bounded public mutation. A fully allocated service
   image proves exact data-block and inode exhaustion, continued reads, reclamation, and subsequent
   public mutation. Exact UUID- and generation-fenced block-endpoint offlining now proves explicit
-  `EIO`, uncertain-mutation fail-stop, stale filesystem-generation failure, and bootstrap continuity;
-  crash/remount injection, boot-generation rollback, and broader administrative tooling remain.
+  `EIO`, uncertain-mutation fail-stop, stale filesystem-generation failure, and bootstrap continuity.
+  A capability-gated post-commit/pre-reply service crash now proves non-retried public `EIO`, exact
+  old-generation offlining, dirty remount, stale descriptors, and single-copy durable recovery;
+  boot-generation rollback and broader administrative tooling remain.
 - **Partially implemented:** load non-bootstrap programs and service definitions through
   the bound `/System` tree; static executable loading, the bounded allocation-free
   definition parser, and one policy-pinned PID 1 activation pilot are implemented. General

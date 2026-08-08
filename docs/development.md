@@ -59,7 +59,7 @@ Before publishing, run:
 ```
 
 The complete path additionally runs normal-boot readiness, the two-boot smoke suite,
-the targeted NullFS replacement phase, out-of-space and block-device-loss handling,
+the targeted NullFS replacement phase, out-of-space, block-device-loss, and crash/remount recovery,
 unavailable-primary recovery, and logging lifecycle convergence. The targeted paths can be run
 directly:
 
@@ -67,6 +67,7 @@ directly:
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-restart-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-out-of-space-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-block-device-loss-check
+cargo +nightly-2026-02-01 run --release --locked -- --nullfs-crash-recovery-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-unavailable-check
 cargo +nightly-2026-02-01 run --release --locked -- --logging-lifecycle-check
 ```
@@ -81,6 +82,13 @@ NullFS endpoint UUID and generation after a public mutation is prepared. The gat
 `IO` rather than a hang, an `OUTCOME_UNKNOWN` service fail-stop with exit status 35, exact filesystem
 generation offlining, stale descriptor and path `EIO`, and continued bootstrap FAT access. It never
 automatically retries the uncertain mutation.
+
+The crash-recovery runner uses a private PID-1 capability to arm exactly one successful public
+`WRITE`. The service commits it, emits an exact generation/nonce/request event, and exits before
+sending the filesystem reply. PID 1 requires exit status 37, offlines the exact old provider,
+wakes the original non-retried syscall with `EIO`, and starts a fresh generation. The replacement
+completes dirty mount recovery before the probe verifies stale descriptors, exact single-copy durable
+content through canonical and raw views, cleanup, and independent FAT access.
 
 The unavailable-primary image contains no NullFS partition. It requires exact `NO_ENTRY` for the
 configured filesystem UUID, a specific PID 1 recovery handoff, exact PID 1 exit code `78`, kernel
