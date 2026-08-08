@@ -23,6 +23,8 @@ const CHILD_LAUNCH_FAILURE: &[u8] = b"userspace launch failed\n";
 #[derive(Debug)]
 pub struct LaunchBarrier {
     pair: PipePair,
+    reader_open: bool,
+    writer_open: bool,
 }
 
 impl LaunchBarrier {
@@ -35,13 +37,35 @@ impl LaunchBarrier {
             let _ = close(pair.reader);
             return Err(Errno::IO);
         }
-        Ok(Self { pair })
+        Ok(Self {
+            pair,
+            reader_open: true,
+            writer_open: true,
+        })
     }
 
-    pub fn release(self) -> Result<()> {
-        let writer_result = close(self.pair.writer);
-        let reader_result = close(self.pair.reader);
+    pub fn release_in_place(&mut self) -> Result<()> {
+        let writer_result = if self.writer_open {
+            close(self.pair.writer).inspect(|()| self.writer_open = false)
+        } else {
+            Ok(())
+        };
+        let reader_result = if self.reader_open {
+            close(self.pair.reader).inspect(|()| self.reader_open = false)
+        } else {
+            Ok(())
+        };
         writer_result.and(reader_result)
+    }
+
+    pub fn release(mut self) -> Result<()> {
+        self.release_in_place()
+    }
+}
+
+impl Drop for LaunchBarrier {
+    fn drop(&mut self) {
+        let _ = self.release_in_place();
     }
 }
 

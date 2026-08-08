@@ -7,10 +7,11 @@ use service_control::{
     ServiceControlRequest, ServiceControlResponse, ServiceId, ServiceRecord, TargetOutcome,
     TargetResponse,
 };
+use service_definition::{MAX_DEFINITION_BYTES, Readiness, RestartPolicy, ServiceDefinition};
 use service_route::{Authorizer, ProviderGeneration, ProviderGenerationSequence, RouteKey};
 use userspace::{
-    abi::{INIT_PROCESS_ID, signal},
-    early_log,
+    abi::{INIT_PROCESS_ID, file, signal},
+    definition_service_probe, early_log,
     filesystem::protocol as filesystem_protocol,
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
@@ -24,7 +25,7 @@ use userspace::{
         ServiceStatusDisposition, ShellStatusDisposition, StartRequestError, StopRequestError,
         shell_status_disposition,
     },
-    syscall::{self, ProcessId, STDERR, STDOUT, SpawnFlags},
+    syscall::{self, OpenFlags, ProcessId, STDERR, STDOUT, SpawnFlags},
     tmpfs::Mount,
 };
 
@@ -134,6 +135,20 @@ const VFS_FULL_PROBE_PASSED: &[u8] = b"userspace init: full vfs probe passed\n";
 const VFS_BOOTSTRAP_PROBE_COMMAND: &[u8] = b"/vfs-probe bootstrap";
 const VFS_BOOTSTRAP_PROBE_PASSED: &[u8] =
     b"userspace init: bootstrap VFS remained available while NullFS was offline\n";
+const DEFINITION_SERVICE_LOADING: &[u8] =
+    b"userspace init: loading service definition from /System/services\n";
+const DEFINITION_SERVICE_STARTING: &[u8] = b"userspace init: starting definition-backed service\n";
+const DEFINITION_SERVICE_RESTARTING: &[u8] =
+    b"userspace init: definition-backed service exited; restarting\n";
+const DEFINITION_SERVICE_READY: &[u8] = b"userspace init: definition-backed service ready\n";
+const DEFINITION_SERVICE_VERIFIED: &[u8] =
+    b"userspace init: definition-backed activation and restart verified\n";
+const DEFINITION_SERVICE_FAILED: &[u8] =
+    b"userspace init: definition-backed service activation failed\n";
+const DEFINITION_SERVICE_PROTOCOL_FAILED: &[u8] =
+    b"userspace init: invalid definition-backed service readiness\n";
+const DEFINITION_SERVICE_READINESS_GRACE_YIELDS: u32 = 2_048;
+const DEFINITION_SERVICE_FORCE_WAIT_YIELDS: u32 = 64;
 const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
 const NULLFS_RESTART_PROBE_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
@@ -231,6 +246,32 @@ struct BootstrapCapability {
     source_handle: CapabilityHandle,
     rights: Rights,
     target_handle: CapabilityHandle,
+}
+
+struct DefinitionServiceRuntime<'a> {
+    definition: ServiceDefinition<'a>,
+    process_id: Option<ProcessId>,
+    process_group_id: Option<ProcessId>,
+    generation: Option<ProviderGeneration>,
+    readiness_endpoint: Option<CapabilityHandle>,
+    restart_count: u32,
+    restart_deferred: bool,
+    cleanup_attempt: Option<DefinitionActivationAttempt>,
+}
+
+impl<'a> DefinitionServiceRuntime<'a> {
+    const fn new(definition: ServiceDefinition<'a>) -> Self {
+        Self {
+            definition,
+            process_id: None,
+            process_group_id: None,
+            generation: None,
+            readiness_endpoint: None,
+            restart_count: 0,
+            restart_deferred: false,
+            cleanup_attempt: None,
+        }
+    }
 }
 
 const LOGGING_PRODUCER_KEY: RouteKey = RouteKey::new(LOGGING_SERVICE_ID, LOGGING_PRODUCER_ROLE);
@@ -1830,6 +1871,588 @@ const VFS_MESSAGES: ServiceMessages = ServiceMessages {
     protocol_failed: VFS_SERVICE_PROTOCOL_FAILED,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefinitionServiceError {
+    Io,
+    InvalidDefinition,
+    Policy,
+    Activation,
+    Cleanup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefinitionStartOutcome {
+    Ready,
+    Exited { successful: bool },
+}
+
+fn load_definition_service<'a>(
+    buffer: &'a mut [u8; MAX_DEFINITION_BYTES],
+) -> Result<ServiceDefinition<'a>, DefinitionServiceError> {
+    let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_LOADING);
+    let descriptor = {
+        let mut attempts = 0_u32;
+        loop {
+            match syscall::open(definition_service_probe::DEFINITION_PATH, OpenFlags::READ) {
+                Ok(descriptor) => break descriptor,
+                Err(error) if error == syscall::Errno::TRY_AGAIN && attempts < 64 => {
+                    attempts += 1;
+                    syscall::yield_now().map_err(|_| DefinitionServiceError::Io)?;
+                }
+                Err(_) => return Err(DefinitionServiceError::Io),
+            }
+        }
+    };
+    let read_result = (|| {
+        let stat = {
+            let mut attempts = 0_u32;
+            loop {
+                match platform::fstat(descriptor) {
+                    Ok(stat) => break stat,
+                    Err(error) if error == platform::Errno::TRY_AGAIN && attempts < 64 => {
+                        attempts += 1;
+                        syscall::yield_now().map_err(|_| DefinitionServiceError::Io)?;
+                    }
+                    Err(_) => return Err(DefinitionServiceError::Io),
+                }
+            }
+        };
+        let length = usize::try_from(stat.size).map_err(|_| DefinitionServiceError::Io)?;
+        if stat.kind != file::KIND_FILE || length == 0 || length > buffer.len() {
+            return Err(DefinitionServiceError::InvalidDefinition);
+        }
+        let mut completed = 0;
+        let mut stalled = 0_u32;
+        while completed < length {
+            match syscall::read(descriptor, &mut buffer[completed..length]) {
+                Ok(0) => return Err(DefinitionServiceError::Io),
+                Ok(read) if read <= length - completed => {
+                    completed += read;
+                    stalled = 0;
+                }
+                Ok(_) => return Err(DefinitionServiceError::Io),
+                Err(error) if error == syscall::Errno::TRY_AGAIN && stalled < 64 => {
+                    stalled += 1;
+                    syscall::yield_now().map_err(|_| DefinitionServiceError::Io)?;
+                }
+                Err(_) => return Err(DefinitionServiceError::Io),
+            }
+        }
+        let mut extra = [0_u8; 1];
+        stalled = 0;
+        loop {
+            match syscall::read(descriptor, &mut extra) {
+                Ok(0) => break,
+                Ok(_) => return Err(DefinitionServiceError::InvalidDefinition),
+                Err(error) if error == syscall::Errno::TRY_AGAIN && stalled < 64 => {
+                    stalled += 1;
+                    syscall::yield_now().map_err(|_| DefinitionServiceError::Io)?;
+                }
+                Err(_) => return Err(DefinitionServiceError::Io),
+            }
+        }
+        Ok(length)
+    })();
+    let close_result = syscall::close(descriptor);
+    if close_result.is_err() {
+        return Err(DefinitionServiceError::Io);
+    }
+    let length = read_result?;
+    let definition = service_definition::parse(&buffer[..length])
+        .map_err(|_| DefinitionServiceError::InvalidDefinition)?;
+    if definition.service_id().as_bytes() != &definition_service_probe::SERVICE_ID_BYTES
+        || definition.name() != definition_service_probe::SERVICE_NAME
+        || definition.executable().as_bytes() != definition_service_probe::EXECUTABLE_PATH
+        || definition.arguments().len() != 0
+        || definition.readiness() != Readiness::Notify
+        || definition.ready_message().map(str::as_bytes)
+            != Some(definition_service_probe::READY_MESSAGE)
+        || definition.restart_policy() != RestartPolicy::OnFailure
+        || definition.restart_limit() != definition_service_probe::RESTART_LIMIT
+        || definition.restart_backoff_yields() != definition_service_probe::RESTART_BACKOFF_YIELDS
+    {
+        return Err(DefinitionServiceError::Policy);
+    }
+    Ok(definition)
+}
+
+fn definition_service_selects_restart(
+    runtime: &DefinitionServiceRuntime<'_>,
+    successful: bool,
+) -> bool {
+    match runtime.definition.restart_policy() {
+        RestartPolicy::Never => false,
+        RestartPolicy::OnFailure => !successful,
+        RestartPolicy::Always => true,
+    }
+}
+
+fn definition_service_consume_restart(runtime: &mut DefinitionServiceRuntime<'_>) -> bool {
+    if runtime.restart_count >= runtime.definition.restart_limit() {
+        return false;
+    }
+    runtime.restart_count += 1;
+    true
+}
+
+fn terminate_definition_process_group(
+    process_group_id: ProcessId,
+    leader_process_id: &mut Option<ProcessId>,
+) -> bool {
+    for _ in 0..DEFINITION_SERVICE_FORCE_WAIT_YIELDS {
+        let group_empty = match syscall::signal_process_group(process_group_id, signal::KILL) {
+            Ok(signaled) if signaled != 0 => false,
+            // The policy-pinned pilot executable does not create descendants. General
+            // service activation requires jobs before NO_CHILD can prove arbitrary
+            // descendant groups empty after their leader has been reaped.
+            Err(error) if error == syscall::Errno::NO_CHILD => true,
+            _ => return false,
+        };
+        if let Some(process_id) = *leader_process_id {
+            loop {
+                match syscall::try_wait_child(process_id) {
+                    Ok(status) if status.continued() || status.stopped_signal().is_some() => break,
+                    Ok(_) => {
+                        *leader_process_id = None;
+                        break;
+                    }
+                    Err(error) if error == syscall::Errno::TRY_AGAIN => break,
+                    Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                    Err(error) if error == syscall::Errno::NO_CHILD => {
+                        *leader_process_id = None;
+                        break;
+                    }
+                    Err(_) => return false,
+                }
+            }
+        }
+        if group_empty && leader_process_id.is_none() {
+            return true;
+        }
+        if syscall::yield_now().is_err() {
+            return false;
+        }
+    }
+    false
+}
+
+fn clear_definition_service_process(
+    runtime: &mut DefinitionServiceRuntime<'_>,
+    leader_reaped: bool,
+) -> bool {
+    if leader_reaped {
+        runtime.process_id = None;
+    }
+    let process_group_clean = match runtime.process_group_id {
+        Some(process_group_id) => {
+            if terminate_definition_process_group(process_group_id, &mut runtime.process_id) {
+                runtime.process_group_id = None;
+                true
+            } else {
+                false
+            }
+        }
+        None => runtime.process_id.is_none(),
+    };
+    let readiness_closed = match runtime.readiness_endpoint {
+        Some(endpoint) => {
+            if ipc::close(endpoint).is_ok() {
+                runtime.readiness_endpoint = None;
+                true
+            } else {
+                false
+            }
+        }
+        None => true,
+    };
+    if process_group_clean && readiness_closed {
+        runtime.generation = None;
+        true
+    } else {
+        false
+    }
+}
+
+struct DefinitionActivationAttempt {
+    generation_source: Option<CapabilityHandle>,
+    readiness_endpoint: Option<CapabilityHandle>,
+    barrier: Option<syscall::LaunchBarrier>,
+    process_id: Option<ProcessId>,
+    process_group_id: Option<ProcessId>,
+}
+
+impl DefinitionActivationAttempt {
+    const fn new() -> Self {
+        Self {
+            generation_source: None,
+            readiness_endpoint: None,
+            barrier: None,
+            process_id: None,
+            process_group_id: None,
+        }
+    }
+
+    fn close_generation_source(&mut self) -> bool {
+        match self.generation_source {
+            Some(source) => {
+                if ipc::close(source).is_ok() {
+                    self.generation_source = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn release_barrier(&mut self) -> bool {
+        match self.barrier.as_mut() {
+            Some(barrier) => {
+                if barrier.release_in_place().is_ok() {
+                    self.barrier = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn close_readiness(&mut self) -> bool {
+        match self.readiness_endpoint {
+            Some(endpoint) => {
+                if ipc::close(endpoint).is_ok() {
+                    self.readiness_endpoint = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn release_child(&mut self) -> bool {
+        let generation_closed = self.close_generation_source();
+        let barrier_released = self.release_barrier();
+        generation_closed && barrier_released
+    }
+
+    fn abort(&mut self) -> bool {
+        let generation_closed = self.close_generation_source();
+        let barrier_released = self.release_barrier();
+        let process_group_clean = match self.process_group_id {
+            Some(process_group_id) => {
+                if terminate_definition_process_group(process_group_id, &mut self.process_id) {
+                    self.process_group_id = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => self.process_id.is_none(),
+        };
+        let readiness_closed = self.close_readiness();
+        generation_closed && barrier_released && process_group_clean && readiness_closed
+    }
+
+    fn finish_reaped(&mut self) -> bool {
+        self.process_id = None;
+        self.abort()
+    }
+}
+
+fn cleanup_definition_attempt(
+    runtime: &mut DefinitionServiceRuntime<'_>,
+    mut attempt: DefinitionActivationAttempt,
+    leader_reaped: bool,
+) -> Result<(), DefinitionServiceError> {
+    let cleaned = if leader_reaped {
+        attempt.finish_reaped()
+    } else {
+        attempt.abort()
+    };
+    if cleaned {
+        Ok(())
+    } else {
+        runtime.cleanup_attempt = Some(attempt);
+        Err(DefinitionServiceError::Cleanup)
+    }
+}
+
+fn start_definition_service(
+    runtime: &mut DefinitionServiceRuntime<'_>,
+    generations: &mut ProviderGenerationSequence,
+) -> Result<DefinitionStartOutcome, DefinitionServiceError> {
+    let generation = generations
+        .next_generation()
+        .map_err(|_| DefinitionServiceError::Activation)?;
+    let mut attempt = DefinitionActivationAttempt::new();
+    let generation_source = match ipc::endpoint_create() {
+        Ok(source) => source,
+        Err(_) => return Err(DefinitionServiceError::Activation),
+    };
+    attempt.generation_source = Some(generation_source);
+    if queue_service_generation(generation_source, generation).is_err() {
+        cleanup_definition_attempt(runtime, attempt, false)?;
+        return Err(DefinitionServiceError::Activation);
+    }
+    if runtime.definition.readiness() == Readiness::Notify {
+        let readiness_endpoint = match ipc::endpoint_create() {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                cleanup_definition_attempt(runtime, attempt, false)?;
+                return Err(DefinitionServiceError::Activation);
+            }
+        };
+        attempt.readiness_endpoint = Some(readiness_endpoint);
+    }
+    let barrier = match syscall::LaunchBarrier::new() {
+        Ok(barrier) => barrier,
+        Err(_) => {
+            cleanup_definition_attempt(runtime, attempt, false)?;
+            return Err(DefinitionServiceError::Activation);
+        }
+    };
+    attempt.barrier = Some(barrier);
+    let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_STARTING);
+    let process_id = match syscall::spawn_command_with_barrier(
+        runtime.definition.executable().as_bytes(),
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        attempt
+            .barrier
+            .as_ref()
+            .expect("activation attempt owns its barrier"),
+    ) {
+        Ok(process_id) => process_id,
+        Err(_) => {
+            cleanup_definition_attempt(runtime, attempt, false)?;
+            return Err(DefinitionServiceError::Activation);
+        }
+    };
+    attempt.process_id = Some(process_id);
+    attempt.process_group_id = Some(process_id);
+    let readiness_granted = attempt.readiness_endpoint.is_none_or(|endpoint| {
+        ipc::grant_child(process_id, endpoint, Rights::SEND, READY_HANDLE).ok()
+            == Some(READY_HANDLE)
+    });
+    let generation_granted = ipc::grant_child(
+        process_id,
+        generation_source,
+        Rights::RECEIVE,
+        GENERATION_HANDOFF_HANDLE,
+    )
+    .ok()
+        == Some(GENERATION_HANDOFF_HANDLE);
+    if !readiness_granted || !generation_granted || !attempt.release_child() {
+        cleanup_definition_attempt(runtime, attempt, false)?;
+        return Err(DefinitionServiceError::Activation);
+    }
+
+    if runtime.definition.readiness() == Readiness::Immediate {
+        runtime.process_id = attempt.process_id.take();
+        runtime.process_group_id = attempt.process_group_id.take();
+        runtime.generation = Some(generation);
+        runtime.readiness_endpoint = None;
+        runtime.restart_deferred = false;
+        let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_READY);
+        return Ok(DefinitionStartOutcome::Ready);
+    }
+
+    let readiness_endpoint = attempt
+        .readiness_endpoint
+        .expect("notify readiness created an endpoint");
+    let ready_message = runtime
+        .definition
+        .ready_message()
+        .expect("notify readiness has a message")
+        .as_bytes();
+    let mut readiness_yields_remaining = DEFINITION_SERVICE_READINESS_GRACE_YIELDS;
+    let mut ready_buffer = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
+    loop {
+        match ipc::try_receive(readiness_endpoint, &mut ready_buffer) {
+            Ok(message) => {
+                let has_capability = message.capability.is_some();
+                if let Some(capability) = message.capability {
+                    let _ = ipc::close(capability.handle);
+                }
+                if message.sender_process_id != process_id
+                    || has_capability
+                    || message.bytes != ready_message.len()
+                    || &ready_buffer[..message.bytes] != ready_message
+                {
+                    let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_PROTOCOL_FAILED);
+                    cleanup_definition_attempt(runtime, attempt, false)?;
+                    return Ok(DefinitionStartOutcome::Exited { successful: false });
+                }
+                runtime.process_id = attempt.process_id.take();
+                runtime.process_group_id = attempt.process_group_id.take();
+                runtime.generation = Some(generation);
+                runtime.readiness_endpoint = attempt.readiness_endpoint.take();
+                runtime.restart_deferred = false;
+                let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_READY);
+                return Ok(DefinitionStartOutcome::Ready);
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {
+                if readiness_yields_remaining == 0 {
+                    cleanup_definition_attempt(runtime, attempt, false)?;
+                    return Ok(DefinitionStartOutcome::Exited { successful: false });
+                }
+                readiness_yields_remaining -= 1;
+            }
+            Err(_) => {
+                let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_PROTOCOL_FAILED);
+                cleanup_definition_attempt(runtime, attempt, false)?;
+                return Ok(DefinitionStartOutcome::Exited { successful: false });
+            }
+        }
+        match syscall::try_wait_child(process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(status) => {
+                cleanup_definition_attempt(runtime, attempt, true)?;
+                return Ok(DefinitionStartOutcome::Exited {
+                    successful: status.success(),
+                });
+            }
+            Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(_) => {
+                cleanup_definition_attempt(runtime, attempt, false)?;
+                return Err(DefinitionServiceError::Activation);
+            }
+        }
+        if syscall::yield_now().is_err() {
+            cleanup_definition_attempt(runtime, attempt, false)?;
+            return Err(DefinitionServiceError::Activation);
+        }
+    }
+}
+
+fn cleanup_definition_service_runtime(runtime: &mut DefinitionServiceRuntime<'_>) -> bool {
+    let attempt_clean = match runtime.cleanup_attempt.take() {
+        Some(mut attempt) => {
+            if attempt.abort() {
+                true
+            } else {
+                runtime.cleanup_attempt = Some(attempt);
+                false
+            }
+        }
+        None => true,
+    };
+    let process_clean = clear_definition_service_process(runtime, false);
+    attempt_clean && process_clean
+}
+
+fn converge_definition_service_start(
+    runtime: &mut DefinitionServiceRuntime<'_>,
+    generations: &mut ProviderGenerationSequence,
+) -> Result<bool, DefinitionServiceError> {
+    let DefinitionStartOutcome::Exited { successful } =
+        start_definition_service(runtime, generations)?
+    else {
+        return Ok(true);
+    };
+    if !definition_service_selects_restart(runtime, successful)
+        || !definition_service_consume_restart(runtime)
+    {
+        return Ok(false);
+    }
+    let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_RESTARTING);
+    backoff(runtime.definition.restart_backoff_yields());
+    match start_definition_service(runtime, generations) {
+        Ok(DefinitionStartOutcome::Ready) => Ok(true),
+        Ok(DefinitionStartOutcome::Exited { successful }) => {
+            runtime.restart_deferred = definition_service_selects_restart(runtime, successful)
+                && runtime.restart_count < runtime.definition.restart_limit();
+            Ok(false)
+        }
+        Err(_) => {
+            runtime.restart_deferred = runtime.restart_count < runtime.definition.restart_limit();
+            Ok(false)
+        }
+    }
+}
+
+fn poll_definition_service(
+    runtime: &mut DefinitionServiceRuntime<'_>,
+    generations: &mut ProviderGenerationSequence,
+    dependencies_ready: bool,
+) {
+    if let Some(mut attempt) = runtime.cleanup_attempt.take()
+        && !attempt.abort()
+    {
+        runtime.cleanup_attempt = Some(attempt);
+        return;
+    }
+
+    if let Some(process_id) = runtime.process_id {
+        match syscall::try_wait_child(process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {}
+            Ok(status) => {
+                runtime.restart_deferred =
+                    definition_service_selects_restart(runtime, status.success());
+                runtime.process_id = None;
+                if !clear_definition_service_process(runtime, true) {
+                    return;
+                }
+            }
+            Err(error) if error == syscall::Errno::TRY_AGAIN => return,
+            Err(error) if error == syscall::Errno::INTERRUPTED => return,
+            Err(error) if error == syscall::Errno::NO_CHILD => {
+                runtime.restart_deferred = definition_service_selects_restart(runtime, false);
+                runtime.process_id = None;
+                if !clear_definition_service_process(runtime, true) {
+                    return;
+                }
+            }
+            Err(_) => {
+                let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_FAILED);
+                return;
+            }
+        }
+    } else if (runtime.process_group_id.is_some()
+        || runtime.readiness_endpoint.is_some()
+        || runtime.generation.is_some())
+        && !clear_definition_service_process(runtime, true)
+    {
+        return;
+    }
+
+    if !runtime.restart_deferred || !dependencies_ready {
+        return;
+    }
+    if !definition_service_consume_restart(runtime) {
+        runtime.restart_deferred = false;
+        let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_FAILED);
+        return;
+    }
+    let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_RESTARTING);
+    backoff(runtime.definition.restart_backoff_yields());
+    match start_definition_service(runtime, generations) {
+        Ok(DefinitionStartOutcome::Ready) => runtime.restart_deferred = false,
+        Ok(DefinitionStartOutcome::Exited { successful }) => {
+            runtime.restart_deferred = definition_service_selects_restart(runtime, successful)
+                && runtime.restart_count < runtime.definition.restart_limit();
+            if !runtime.restart_deferred {
+                let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_FAILED);
+            }
+        }
+        Err(_) => {
+            runtime.restart_deferred = runtime.restart_count < runtime.definition.restart_limit();
+            if !runtime.restart_deferred {
+                let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_FAILED);
+            }
+        }
+    }
+}
+
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if syscall::getpid() != Ok(INIT_PROCESS_ID) {
         fail(WRONG_PROCESS_ID);
@@ -2029,6 +2652,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             vfs_request_endpoint,
             nullfs_block_capability,
         );
+        let _ = syscall::write_all(STDOUT, NULLFS_RESTART_PROBE_PASSED);
         run_service_control_probe(
             SV_STATUS_NULLFS_COMMAND,
             b"userspace init: sv status nullfs passed\n",
@@ -2044,7 +2668,6 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 vfs_generation,
             },
         );
-        let _ = syscall::write_all(STDOUT, NULLFS_RESTART_PROBE_PASSED);
     } else {
         run_probe(
             VFS_READINESS_PROBE_COMMAND,
@@ -2054,6 +2677,36 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         );
     }
 
+    let mut definition_bytes = [0_u8; MAX_DEFINITION_BYTES];
+    let mut definition_service_generations = ProviderGenerationSequence::new();
+    let mut definition_service = match load_definition_service(&mut definition_bytes) {
+        Ok(definition) => {
+            let mut runtime = DefinitionServiceRuntime::new(definition);
+            match converge_definition_service_start(
+                &mut runtime,
+                &mut definition_service_generations,
+            ) {
+                Ok(true)
+                    if runtime.restart_count == 1
+                        && runtime.generation.map(ProviderGeneration::get) == Some(2) =>
+                {
+                    let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_VERIFIED);
+                    Some(runtime)
+                }
+                Ok(false) if runtime.restart_deferred => Some(runtime),
+                Ok(_) | Err(_) => {
+                    runtime.restart_deferred = false;
+                    let cleaned = cleanup_definition_service_runtime(&mut runtime);
+                    let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_FAILED);
+                    if cleaned { None } else { Some(runtime) }
+                }
+            }
+        }
+        Err(_) => {
+            let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_FAILED);
+            None
+        }
+    };
     let registry = ServiceRegistryView {
         logging: &logging_service,
         logging_generation: logging_lifecycle.generation(),
@@ -2354,6 +3007,18 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
                 Err(_) => fail(VFS_SERVICE_FAILED),
             }
+        }
+
+        let definition_dependencies_ready = nullfs_service.state() == ServiceState::Running
+            && !nullfs_service.controlled_restart_pending()
+            && vfs_service.state() == ServiceState::Running
+            && !vfs_service.controlled_restart_pending();
+        if let Some(runtime) = definition_service.as_mut() {
+            poll_definition_service(
+                runtime,
+                &mut definition_service_generations,
+                definition_dependencies_ready,
+            );
         }
 
         match syscall::try_wait_child(shell_process_id) {

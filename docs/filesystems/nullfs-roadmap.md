@@ -22,8 +22,10 @@ selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `Sys
 selected provider's backend root, while matching `/Volumes/NullStar` paths remain raw
 administrative aliases. A static executable loads through `/System/bin`, and writable user
 profile state persists through controlled service replacement without making PID 1 or
-recovery depend on NullFS. Public `mkdir`/`rmdir`/rename, offline repair policy, and
-service-definition activation remain future work.
+recovery depend on NullFS. One policy-pinned PID 1 pilot loads a definition and executable through
+the canonical `/System` binding and verifies generation/readiness restart behavior. Public
+`mkdir`/`rmdir`/rename, offline repair policy, and general service-definition management remain
+future work.
 
 ## Status summary
 
@@ -33,7 +35,7 @@ service-definition activation remain future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, static `/System/bin` execution, and the bounded service-definition parser implemented; definition loading, activation, and remaining acceptance work are incomplete |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, static `/System/bin` execution, the bounded service-definition parser, and one policy-pinned PID 1 activation pilot are implemented; general service management and remaining acceptance work are incomplete |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -308,9 +310,10 @@ cargo run --locked --quiet -- --nullfs-restart-check
 The FAT bootstrap path remains independent while the UUID-selected primary volume is
 available at `/Volumes/NullStar`. Its bounded public mutation surface, initial backing
 layout, all three primary-tree bindings, static `/System/bin` execution, writable profile
-state, controlled clean/dirty replacement paths, and a bounded service-definition
-parser are implemented. Loading and activating definitions from `/System`, broader namespace
-mutation, and offline repair policy remain future work.
+state, controlled clean/dirty replacement paths, a bounded service-definition parser, and one
+policy-pinned activation path through canonical `/System/services` are implemented. General
+definition discovery and enablement, broader namespace mutation, and offline repair policy remain
+future work.
 
 ## Phase 5: writable service and namespace adoption — in progress
 
@@ -318,10 +321,10 @@ Phase 5 moves from a read-only public test mount to the accepted persistent-volu
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
 operations, PR C's bounded public writable proxy, controlled quiesce/clean unmount with
 dirty-recovery fallback, stable primary-volume identity and layout, all three primary-tree
-namespace bindings, managed user-profile layout, one static `/System/bin` executable, and
-the bounded allocation-free service-definition parser are implemented. Phase 5 remains in
-progress; definition loading, service activation, and the remaining integrated acceptance
-work are incomplete.
+namespace bindings, managed user-profile layout, static `/System/bin` execution, the bounded
+allocation-free service-definition parser, and one policy-pinned definition-backed PID 1
+activation pilot are implemented. Phase 5 remains in progress; general service management and the
+remaining integrated acceptance work are incomplete.
 
 ### Raw writable block authority — implemented
 
@@ -492,11 +495,14 @@ kernel also reapplies the system metadata flag in the canonical `/System` view w
 changing raw on-disk metadata, and it exposes both public views of the System subtree as
 read-only.
 
-The staged transition has now bound all three primary trees. A statically linked fixture
-launches through `/System/bin`; canonical user-profile state is writable and survives
-controlled provider replacement. The version 1 definition format and parser are implemented, but loading and activating
-ordinary definitions from `/System/services` remain future work. The synthetic root and
-bootstrap facilities remain usable when the primary volume or service is unavailable.
+The staged transition has now bound all three primary trees. Statically linked fixtures launch
+through `/System/bin`; canonical user-profile state is writable and survives controlled provider
+replacement. The version 1 definition format and parser are implemented, and one fixed PID 1
+migration pilot loads an exact definition through `/System/services`, applies generation/readiness
+lifecycle accounting and bounded `on-failure` restart, and works after controlled provider
+replacement. General discovery, enablement, dependencies, and a separate service manager remain
+future work. The synthetic root and bootstrap facilities remain usable when the primary volume or
+service is unavailable.
 
 ### Boot generations
 
@@ -508,16 +514,16 @@ Direct NullFS loading by the bootloader is not required for Phase 5.
 
 ### Remaining Phase 5 acceptance
 
-PR C, controlled restart, all three primary-tree bindings, and static system execution
-supply bounded writable public-ABI, clean/dirty replacement, canonical-path, cross-view
-identity, and bootstrap-independence coverage. They do not complete Phase 5.
-Completion still requires the remaining integrated work to demonstrate:
+PR C, controlled restart, all three primary-tree bindings, static system execution, and the
+policy-pinned definition-backed activation pilot supply bounded writable public-ABI, clean/dirty
+replacement, canonical-path, cross-view identity, bootstrap-independence, and normal-boot
+`/System/services` activation coverage. They do not complete Phase 5. Completion still requires
+the remaining integrated work to demonstrate:
 
 - crash injection and remount recovery for service-backed mutations;
 - deterministic out-of-space and block-device-loss behavior;
 - continued access to the bootstrap and recovery environment when the primary volume
   cannot mount;
-- normal boot loading and activating service definitions through `/System`;
 - boot-generation synchronization and rollback without corrupting the previously
   selected generation.
 

@@ -511,6 +511,7 @@ dependencies = [
  "nullfs-format",
  "nullfs-service",
  "nullfs-testkit",
+ "service-definition",
  "userspace",
 ]
 
@@ -918,6 +919,7 @@ dependencies = [
  "nswp-runtime",
  "nullfs-format",
  "service-control",
+ "service-definition",
  "service-route",
 ]
 

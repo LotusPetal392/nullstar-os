@@ -39,6 +39,13 @@ pub mod nullfs_primary_volume {
     ));
 }
 
+pub mod definition_service_probe {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../shared/definition_service_probe.rs"
+    ));
+}
+
 /// Defines the raw ELF entry point for a Rust userspace program.
 ///
 /// The supplied function receives the original kernel-built initial stack pointer.

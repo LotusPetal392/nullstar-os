@@ -17,7 +17,10 @@ model is specified in
 `sv`. Mutation is not restart-only: restart is generic, while logging is the first live
 `start`/`stop` target using bounded convergence and generation-isolated route replacement.
 Filesystem `Start` and `Stop` remain exactly `Unsupported`. The allocation-free version 1
-definition parser is implemented, but PID 1 does not load definitions and there is no
+definition parser and one policy-pinned PID 1 migration pilot are implemented. After VFS and
+NullFS readiness, PID 1 loads the exact definition through canonical `/System/services`, launches
+its NullFS-only executable with manager-owned generation and readiness capabilities, and applies
+bounded `on-failure` restart policy. This is not general discovery or enablement, and there is no
 separate manager.
 
 ## PID 1 and the system service manager
@@ -75,8 +78,10 @@ timer, path, device, and other activation classes should be added only after the
 failure, and authorization semantics are defined.
 
 The implemented version 1 format intentionally covers only identity, description,
-executable and structured arguments, readiness notification, and bounded restart fields.
-A later definition version should eventually include:
+executable and structured arguments, readiness notification, and bounded restart fields. The
+current migration pilot accepts no definition arguments because the launch ABI is still
+command-line based, grants no definition-selected capabilities, and treats its exact definition
+path as fixed enablement policy. A later definition version should eventually include:
 
 - stable canonical service identity and service class;
 - executable identity, argument vector, environment data, and working-directory

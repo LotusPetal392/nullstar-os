@@ -185,7 +185,8 @@ images, and launches QEMU.
   `/Users` binding contains a fixture home with the accepted managed `Profile`
   layout. Direct flags-zero sessions stay read-only, and raw block authority,
   session authority, and public VFS policy remain separate. The bounded version 1
-  service-definition parser is implemented; definition loading and activation, public
+  service-definition parser and one policy-pinned `/System/services` activation pilot are
+  implemented; general discovery, enablement, dependencies, a separate manager, public
   `mkdir`, `rmdir`, rename, and offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
