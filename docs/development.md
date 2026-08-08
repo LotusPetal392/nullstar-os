@@ -59,14 +59,20 @@ Before publishing, run:
 ```
 
 The complete path additionally runs normal-boot readiness, the two-boot smoke suite,
-the targeted NullFS replacement phase, unavailable-primary recovery, and logging lifecycle
-convergence. The targeted paths can be run directly:
+the targeted NullFS replacement phase, out-of-space handling, unavailable-primary recovery, and
+logging lifecycle convergence. The targeted paths can be run directly:
 
 ```sh
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-restart-check
+cargo +nightly-2026-02-01 run --release --locked -- --nullfs-out-of-space-check
 cargo +nightly-2026-02-01 run --release --locked -- --nullfs-unavailable-check
 cargo +nightly-2026-02-01 run --release --locked -- --logging-lifecycle-check
 ```
+
+The out-of-space image is built offline with zero free inodes and data blocks. Its public VFS probe
+requires exact `NO_SPACE` for append and create without changing the existing file or poisoning the
+service, verifies an unrelated persistent read, unlinks the filler, and then completes a fresh
+create/write/read/unlink cycle through canonical and raw paths.
 
 The unavailable-primary image contains no NullFS partition. It requires exact `NO_ENTRY` for the
 configured filesystem UUID, a specific PID 1 recovery handoff, exact PID 1 exit code `78`, kernel

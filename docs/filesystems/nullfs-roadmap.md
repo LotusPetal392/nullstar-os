@@ -22,8 +22,10 @@ selected by stable UUID, exposed at `/Volumes/NullStar`, and populated with `Sys
 selected provider's backend root, while matching `/Volumes/NullStar` paths remain raw
 administrative aliases. A static executable loads through `/System/bin`, and writable user
 profile state persists through controlled service replacement without making PID 1 or
-recovery depend on NullFS. A generated no-primary-volume image proves exact UUID lookup failure
-hands control to the independently available emergency kernel shell. One policy-pinned PID 1 pilot
+recovery depend on NullFS. A fully allocated service image proves deterministic data-block and inode
+exhaustion, continued reads, resource reclamation, and subsequent mutation through the public VFS
+ABI. A generated no-primary-volume image proves exact UUID lookup failure hands control to the
+independently available emergency kernel shell. One policy-pinned PID 1 pilot
 loads a definition and executable through
 the canonical `/System` binding and verifies generation/readiness restart behavior. Public
 `mkdir`/`rmdir`/rename, offline repair policy, and general service-definition management remain
@@ -37,7 +39,7 @@ future work.
 | 2 | Read-only core and host tooling | Implemented |
 | 3 | Writable core and recovery | Implemented; hardening continues |
 | 4 | Read-only NullStar filesystem service | Implemented |
-| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, unavailable-primary recovery proof, static `/System/bin` execution, the bounded service-definition parser, and one policy-pinned PID 1 activation pilot are implemented; general service management and remaining acceptance work are incomplete |
+| 5 | Writable service and namespace adoption | In progress; raw authority, writable service operation, controlled clean restart with dirty fallback, provider offlining, primary volume layout, all three primary-tree bindings, managed user-profile layout, deterministic out-of-space handling, unavailable-primary recovery proof, static `/System/bin` execution, the bounded service-definition parser, and one policy-pinned PID 1 activation pilot are implemented; general service management and remaining acceptance work are incomplete |
 | 6 | Hardening and native-volume features | Planned |
 
 ## Architectural position
@@ -323,9 +325,10 @@ Phase 5 moves from a read-only public test mount to the accepted persistent-volu
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
 operations, PR C's bounded public writable proxy, controlled quiesce/clean unmount with
 dirty-recovery fallback, stable primary-volume identity and layout, all three primary-tree
-namespace bindings, managed user-profile layout, static `/System/bin` execution, the bounded
-allocation-free service-definition parser, and one policy-pinned definition-backed PID 1
-activation pilot are implemented. Phase 5 remains in progress; general service management and the
+namespace bindings, managed user-profile layout, deterministic out-of-space handling,
+unavailable-primary recovery, static `/System/bin` execution, the bounded allocation-free
+service-definition parser, and one policy-pinned definition-backed PID 1 activation pilot are
+implemented. Phase 5 remains in progress; general service management and the
 remaining integrated acceptance work are incomplete.
 
 ### Raw writable block authority — implemented
@@ -517,14 +520,14 @@ Direct NullFS loading by the bootloader is not required for Phase 5.
 ### Remaining Phase 5 acceptance
 
 PR C, controlled restart, all three primary-tree bindings, static system execution, and the
-policy-pinned definition-backed activation pilot and unavailable-primary recovery gate supply
-bounded writable public-ABI, clean/dirty replacement, canonical-path, cross-view identity,
-bootstrap-independence, normal-boot `/System/services` activation, and missing-primary recovery
-coverage. They do not complete Phase 5. Completion still requires the remaining integrated work to
+policy-pinned definition-backed activation pilot, deterministic out-of-space gate, and
+unavailable-primary recovery gate supply bounded writable public-ABI, clean/dirty replacement,
+canonical-path, cross-view identity, bootstrap-independence, normal-boot `/System/services`
+activation, exact data/inode exhaustion with reclamation, and missing-primary recovery coverage. They do not complete Phase 5. Completion still requires the remaining integrated work to
 demonstrate:
 
 - crash injection and remount recovery for service-backed mutations;
-- deterministic out-of-space and block-device-loss behavior;
+- deterministic block-device-loss behavior;
 - boot-generation synchronization and rollback without corrupting the previously
   selected generation.
 

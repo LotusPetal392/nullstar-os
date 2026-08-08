@@ -71,6 +71,8 @@ const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-tes
 const LOGGING_COLLECTOR_RESTART_PASSED_MARKER: &str = "userspace init: logging collector ring, backpressure, redaction, and route generation isolation verified";
 const NULLFS_RESTART_PASSED_MARKER: &str =
     "userspace init: NullFS restart persistent VFS mutation and stale descriptors verified";
+const NULLFS_OUT_OF_SPACE_MODE_MARKER: &str = "boot mode selected: nullfs-out-of-space-test";
+const NULLFS_OUT_OF_SPACE_PASSED_MARKER: &str = "userspace init: NullFS data and inode exhaustion, service continuity, and resource reclamation verified";
 const NULLFS_UNAVAILABLE_MODE_MARKER: &str = "boot mode selected: nullfs-unavailable-test";
 const NULLFS_UNAVAILABLE_PARTITIONS_MARKER: &str =
     "partition table initialized: kind=MBR, partitions=2,";
@@ -93,6 +95,7 @@ const LOGGING_LIFECYCLE_PASSED_MARKER: &str = "userspace init: logging live star
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
 const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(420);
+const NULLFS_OUT_OF_SPACE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 const NULLFS_UNAVAILABLE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGGING_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -187,6 +190,24 @@ impl NormalBootProgress {
 }
 
 #[derive(Debug, Default)]
+struct OutOfSpaceProgress {
+    mode_selected: bool,
+    nullfs_ready: bool,
+    vfs_ready: bool,
+    verified: bool,
+}
+
+impl OutOfSpaceProgress {
+    fn observe(&mut self, line: &str) -> bool {
+        self.mode_selected |= line.contains(NULLFS_OUT_OF_SPACE_MODE_MARKER);
+        self.nullfs_ready |= self.mode_selected && line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
+        self.vfs_ready |= self.nullfs_ready && line.contains("userspace init: vfs service ready");
+        self.verified |= self.vfs_ready && line.contains(NULLFS_OUT_OF_SPACE_PASSED_MARKER);
+        self.verified
+    }
+}
+
+#[derive(Debug, Default)]
 struct UnavailablePrimaryProgress {
     partitions_absent: bool,
     mode_selected: bool,
@@ -263,6 +284,7 @@ struct Options {
     boot_check: bool,
     test: bool,
     nullfs_restart_check: bool,
+    nullfs_out_of_space_check: bool,
     nullfs_unavailable_check: bool,
     logging_lifecycle_check: bool,
 }
@@ -272,6 +294,7 @@ impl Options {
         self.boot_check
             || self.test
             || self.nullfs_restart_check
+            || self.nullfs_out_of_space_check
             || self.nullfs_unavailable_check
             || self.logging_lifecycle_check
     }
@@ -287,6 +310,8 @@ fn main() -> ExitCode {
         run_kernel_smoke_test(&options)
     } else if options.nullfs_restart_check {
         run_nullfs_restart_check(&options)
+    } else if options.nullfs_out_of_space_check {
+        run_nullfs_out_of_space_check(&options)
     } else if options.nullfs_unavailable_check {
         run_nullfs_unavailable_check(&options)
     } else if options.logging_lifecycle_check {
@@ -335,6 +360,15 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
                 options.nullfs_restart_check = true;
                 options.headless = true;
             }
+            "--nullfs-out-of-space-check" => {
+                if options.boot_verification_selected() {
+                    eprintln!("only one boot verification mode may be selected");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
+                options.nullfs_out_of_space_check = true;
+                options.headless = true;
+            }
             "--nullfs-unavailable-check" => {
                 if options.boot_verification_selected() {
                     eprintln!("only one boot verification mode may be selected");
@@ -370,12 +404,15 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --nullfs-unavailable-check | --logging-lifecycle-check]"
+        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --nullfs-out-of-space-check | --nullfs-unavailable-check | --logging-lifecycle-check]"
     );
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!("  --boot-check  Verify that PID 1 launches the userspace shell");
     println!(
         "  --nullfs-restart-check  Verify NullFS replacement, persistent VFS mutation, and stale descriptors"
+    );
+    println!(
+        "  --nullfs-out-of-space-check  Verify NullFS data/inode exhaustion and resource reclamation"
     );
     println!(
         "  --nullfs-unavailable-check  Verify missing-primary recovery through the independent emergency shell"
@@ -475,7 +512,8 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
         false
     };
     let restart_result = smoke_result && run_nullfs_restart_test(options);
-    let logging_result = restart_result && run_logging_lifecycle_test(options);
+    let out_of_space_result = restart_result && run_nullfs_out_of_space_test(options);
+    let logging_result = out_of_space_result && run_logging_lifecycle_test(options);
     let recovery_result = logging_result && run_nullfs_unavailable_test(options);
     let _ = fs::remove_file(&test_image);
     if recovery_result {
@@ -493,6 +531,38 @@ fn run_nullfs_restart_check(options: &Options) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn run_nullfs_out_of_space_check(options: &Options) -> ExitCode {
+    if run_nullfs_out_of_space_test(options) {
+        println!("QEMU NullFS out-of-space check passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_nullfs_out_of_space_test(options: &Options) -> bool {
+    let source_image = Path::new(env!("NULLFS_OUT_OF_SPACE_TEST_BIOS_IMAGE"));
+    let test_image = out_of_space_test_image_path();
+    let _ = fs::remove_file(&test_image);
+    if let Err(error) = fs::copy(source_image, &test_image) {
+        eprintln!(
+            "Could not create NullFS out-of-space test image {} from {}: {error}",
+            test_image.display(),
+            source_image.display()
+        );
+        return false;
+    }
+    let mut progress = OutOfSpaceProgress::default();
+    let result = run_qemu_until(
+        qemu_command_for_image(options, &test_image),
+        "NullFS out-of-space check",
+        NULLFS_OUT_OF_SPACE_TEST_TIMEOUT,
+        move |line| progress.observe(line),
+    );
+    let _ = fs::remove_file(&test_image);
+    result
 }
 
 fn run_nullfs_unavailable_check(options: &Options) -> ExitCode {
@@ -578,6 +648,13 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
                 && definition_verified
         },
     )
+}
+
+fn out_of_space_test_image_path() -> PathBuf {
+    env::temp_dir().join(format!(
+        "nullstar-os-out-of-space-{}.img",
+        std::process::id()
+    ))
 }
 
 fn persistent_test_image_path() -> PathBuf {
@@ -805,10 +882,11 @@ mod tests {
         NORMAL_BOOT_READY_MARKER, NORMAL_BOOT_SERVICE_CONTROL_MARKER, NORMAL_BOOT_SHELL_MARKER,
         NORMAL_BOOT_TMPFS_GENERATION_MARKER, NORMAL_BOOT_VFS_GENERATION_MARKER,
         NORMAL_BOOT_VFS_READINESS_MARKER, NORMAL_BOOT_WRITABLE_NULLFS_PARTITION_MARKER,
+        NULLFS_OUT_OF_SPACE_MODE_MARKER, NULLFS_OUT_OF_SPACE_PASSED_MARKER,
         NULLFS_UNAVAILABLE_HANDOFF_MARKER, NULLFS_UNAVAILABLE_INIT_EXIT_MARKER,
         NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER, NULLFS_UNAVAILABLE_MODE_MARKER,
-        NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, UnavailablePrimaryProgress,
-        parse_options_from,
+        NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, OutOfSpaceProgress,
+        UnavailablePrimaryProgress, parse_options_from,
     };
 
     #[test]
@@ -874,6 +952,19 @@ mod tests {
     }
 
     #[test]
+    fn out_of_space_requires_ready_services_before_verification() {
+        let mut progress = OutOfSpaceProgress::default();
+
+        assert!(!progress.observe(NULLFS_OUT_OF_SPACE_PASSED_MARKER));
+        assert!(!progress.observe("userspace init: vfs service ready"));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
+        assert!(!progress.observe(NULLFS_OUT_OF_SPACE_MODE_MARKER));
+        assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
+        assert!(!progress.observe("userspace init: vfs service ready"));
+        assert!(progress.observe(NULLFS_OUT_OF_SPACE_PASSED_MARKER));
+    }
+
+    #[test]
     fn unavailable_primary_requires_ordered_recovery_handoff() {
         let mut progress = UnavailablePrimaryProgress::default();
 
@@ -915,6 +1006,15 @@ mod tests {
     }
 
     #[test]
+    fn nullfs_out_of_space_option_is_headless() {
+        let options = parse_options_from(["--nullfs-out-of-space-check".to_owned()])
+            .expect("NullFS out-of-space option should parse");
+
+        assert!(options.nullfs_out_of_space_check);
+        assert!(options.headless);
+    }
+
+    #[test]
     fn nullfs_unavailable_option_is_headless() {
         let options = parse_options_from(["--nullfs-unavailable-check".to_owned()])
             .expect("NullFS unavailable option should parse");
@@ -938,6 +1038,7 @@ mod tests {
             "--boot-check",
             "--test",
             "--nullfs-restart-check",
+            "--nullfs-out-of-space-check",
             "--nullfs-unavailable-check",
             "--logging-lifecycle-check",
         ];
