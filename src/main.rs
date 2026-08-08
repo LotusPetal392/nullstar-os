@@ -91,6 +91,15 @@ const NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER: &str =
     "nullfs: injected crash after durable mutation";
 const NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER: &str = "path=/nullfs-service, exit_code=37";
 const NULLFS_CRASH_RECOVERY_PASSED_MARKER: &str = "userspace init: NullFS service crash, uncertain VFS failure, dirty remount recovery, stale descriptors, and durable single mutation verified";
+const NULLFS_BOOT_GENERATION_MODE_MARKER: &str = "boot mode selected: nullfs-boot-generation-test";
+const NULLFS_BOOT_GENERATION_STAGED_MARKER: &str =
+    "boot-generation-probe: generation 2 staged and selected";
+const NULLFS_BOOT_GENERATION_ROLLBACK_MARKER: &str =
+    "boot-generation-probe: generation 1 rollback selected";
+const NULLFS_BOOT_GENERATION_VERIFIED_MARKER: &str =
+    "boot-generation-probe: rollback persisted with both generations retained";
+const NULLFS_BOOT_GENERATION_PASSED_MARKER: &str =
+    "userspace init: NullFS boot-generation probe passed";
 const NULLFS_UNAVAILABLE_MODE_MARKER: &str = "boot mode selected: nullfs-unavailable-test";
 const NULLFS_UNAVAILABLE_PARTITIONS_MARKER: &str =
     "partition table initialized: kind=MBR, partitions=2,";
@@ -116,6 +125,7 @@ const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(420);
 const NULLFS_OUT_OF_SPACE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 const NULLFS_BLOCK_DEVICE_LOSS_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 const NULLFS_CRASH_RECOVERY_TEST_TIMEOUT: Duration = Duration::from_secs(300);
+const NULLFS_BOOT_GENERATION_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 const NULLFS_UNAVAILABLE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGGING_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -352,6 +362,41 @@ impl LoggingLifecycleProgress {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootGenerationPhase {
+    StageGeneration2,
+    RollbackGeneration1,
+    VerifyRollback,
+}
+
+#[derive(Debug)]
+struct BootGenerationProgress {
+    phase: BootGenerationPhase,
+    mode_selected: bool,
+    phase_completed: bool,
+}
+
+impl BootGenerationProgress {
+    const fn new(phase: BootGenerationPhase) -> Self {
+        Self {
+            phase,
+            mode_selected: false,
+            phase_completed: false,
+        }
+    }
+
+    fn observe(&mut self, line: &str) -> bool {
+        self.mode_selected |= line.contains(NULLFS_BOOT_GENERATION_MODE_MARKER);
+        let expected = match self.phase {
+            BootGenerationPhase::StageGeneration2 => NULLFS_BOOT_GENERATION_STAGED_MARKER,
+            BootGenerationPhase::RollbackGeneration1 => NULLFS_BOOT_GENERATION_ROLLBACK_MARKER,
+            BootGenerationPhase::VerifyRollback => NULLFS_BOOT_GENERATION_VERIFIED_MARKER,
+        };
+        self.phase_completed |= self.mode_selected && line.contains(expected);
+        self.phase_completed && line.contains(NULLFS_BOOT_GENERATION_PASSED_MARKER)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Options {
     headless: bool,
@@ -361,6 +406,7 @@ struct Options {
     nullfs_out_of_space_check: bool,
     nullfs_block_device_loss_check: bool,
     nullfs_crash_recovery_check: bool,
+    nullfs_boot_generation_check: bool,
     nullfs_unavailable_check: bool,
     logging_lifecycle_check: bool,
 }
@@ -373,6 +419,7 @@ impl Options {
             || self.nullfs_out_of_space_check
             || self.nullfs_block_device_loss_check
             || self.nullfs_crash_recovery_check
+            || self.nullfs_boot_generation_check
             || self.nullfs_unavailable_check
             || self.logging_lifecycle_check
     }
@@ -394,6 +441,8 @@ fn main() -> ExitCode {
         run_nullfs_block_device_loss_check(&options)
     } else if options.nullfs_crash_recovery_check {
         run_nullfs_crash_recovery_check(&options)
+    } else if options.nullfs_boot_generation_check {
+        run_nullfs_boot_generation_check(&options)
     } else if options.nullfs_unavailable_check {
         run_nullfs_unavailable_check(&options)
     } else if options.logging_lifecycle_check {
@@ -469,6 +518,15 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
                 options.nullfs_crash_recovery_check = true;
                 options.headless = true;
             }
+            "--nullfs-boot-generation-check" => {
+                if options.boot_verification_selected() {
+                    eprintln!("only one boot verification mode may be selected");
+                    print_usage();
+                    return Err(ExitCode::from(2));
+                }
+                options.nullfs_boot_generation_check = true;
+                options.headless = true;
+            }
             "--nullfs-unavailable-check" => {
                 if options.boot_verification_selected() {
                     eprintln!("only one boot verification mode may be selected");
@@ -504,7 +562,7 @@ fn parse_options_from(arguments: impl IntoIterator<Item = String>) -> Result<Opt
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --nullfs-out-of-space-check | --nullfs-block-device-loss-check | --nullfs-crash-recovery-check | --nullfs-unavailable-check | --logging-lifecycle-check]"
+        "Usage: cargo run -- [--headless] [--boot-check | --test | --nullfs-restart-check | --nullfs-out-of-space-check | --nullfs-block-device-loss-check | --nullfs-crash-recovery-check | --nullfs-boot-generation-check | --nullfs-unavailable-check | --logging-lifecycle-check]"
     );
     println!("  --headless  Disable the QEMU display and use serial output only");
     println!("  --boot-check  Verify that PID 1 launches the userspace shell");
@@ -519,6 +577,9 @@ fn print_usage() {
     );
     println!(
         "  --nullfs-crash-recovery-check  Verify durable NullFS mutation recovery after a service crash"
+    );
+    println!(
+        "  --nullfs-boot-generation-check  Verify three-boot staging, selection, and rollback without corrupting retained generations"
     );
     println!(
         "  --nullfs-unavailable-check  Verify missing-primary recovery through the independent emergency shell"
@@ -621,7 +682,8 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
     let out_of_space_result = restart_result && run_nullfs_out_of_space_test(options);
     let block_loss_result = out_of_space_result && run_nullfs_block_device_loss_test(options);
     let crash_recovery_result = block_loss_result && run_nullfs_crash_recovery_test(options);
-    let logging_result = crash_recovery_result && run_logging_lifecycle_test(options);
+    let boot_generation_result = crash_recovery_result && run_nullfs_boot_generation_test(options);
+    let logging_result = boot_generation_result && run_logging_lifecycle_test(options);
     let recovery_result = logging_result && run_nullfs_unavailable_test(options);
     if recovery_result {
         println!("QEMU kernel smoke test passed");
@@ -728,6 +790,51 @@ fn run_nullfs_crash_recovery_test(options: &Options) -> bool {
         NULLFS_CRASH_RECOVERY_TEST_TIMEOUT,
         move |line| progress.observe(line),
     )
+}
+
+fn run_nullfs_boot_generation_check(options: &Options) -> ExitCode {
+    if run_nullfs_boot_generation_test(options) {
+        println!("QEMU NullFS boot-generation check passed");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run_nullfs_boot_generation_test(options: &Options) -> bool {
+    let source_image = Path::new(env!("NULLFS_BOOT_GENERATION_TEST_BIOS_IMAGE"));
+    let test_image = match DisposableImage::copy_from(source_image, "boot-generation") {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!(
+                "Could not create disposable NullFS boot-generation test image from {}: {error}",
+                source_image.display()
+            );
+            return false;
+        }
+    };
+
+    for phase in [
+        BootGenerationPhase::StageGeneration2,
+        BootGenerationPhase::RollbackGeneration1,
+        BootGenerationPhase::VerifyRollback,
+    ] {
+        let mut progress = BootGenerationProgress::new(phase);
+        let label = match phase {
+            BootGenerationPhase::StageGeneration2 => "NullFS boot-generation staging check",
+            BootGenerationPhase::RollbackGeneration1 => "NullFS boot-generation rollback check",
+            BootGenerationPhase::VerifyRollback => "NullFS boot-generation persistence check",
+        };
+        if !run_qemu_until(
+            qemu_command_for_image(options, test_image.path()),
+            label,
+            NULLFS_BOOT_GENERATION_TEST_TIMEOUT,
+            move |line| progress.observe(line),
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 fn run_nullfs_unavailable_check(options: &Options) -> ExitCode {
@@ -1061,7 +1168,8 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockDeviceLossProgress, CrashRecoveryProgress, DEFINITION_SERVICE_FIRST_FAILURE_MARKER,
+        BlockDeviceLossProgress, BootGenerationPhase, BootGenerationProgress,
+        CrashRecoveryProgress, DEFINITION_SERVICE_FIRST_FAILURE_MARKER,
         DEFINITION_SERVICE_LOADING_MARKER, DEFINITION_SERVICE_READY_MARKER,
         DEFINITION_SERVICE_RESTARTING_MARKER, DEFINITION_SERVICE_VERIFIED_MARKER,
         EMERGENCY_SHELL_READY_MARKER, LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER,
@@ -1080,13 +1188,16 @@ mod tests {
         NULLFS_BLOCK_DEVICE_LOSS_FAIL_STOP_MARKER, NULLFS_BLOCK_DEVICE_LOSS_INJECTED_MARKER,
         NULLFS_BLOCK_DEVICE_LOSS_MODE_MARKER, NULLFS_BLOCK_DEVICE_LOSS_PASSED_MARKER,
         NULLFS_BLOCK_DEVICE_LOSS_SERVICE_EXIT_MARKER, NULLFS_BLOCK_ENDPOINT_OFFLINED_MARKER,
-        NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER, NULLFS_CRASH_RECOVERY_INJECTED_MARKER,
-        NULLFS_CRASH_RECOVERY_MODE_MARKER, NULLFS_CRASH_RECOVERY_PASSED_MARKER,
-        NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER, NULLFS_OUT_OF_SPACE_MODE_MARKER,
-        NULLFS_OUT_OF_SPACE_PASSED_MARKER, NULLFS_UNAVAILABLE_HANDOFF_MARKER,
-        NULLFS_UNAVAILABLE_INIT_EXIT_MARKER, NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER,
-        NULLFS_UNAVAILABLE_MODE_MARKER, NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress,
-        OutOfSpaceProgress, UnavailablePrimaryProgress, parse_options_from,
+        NULLFS_BOOT_GENERATION_MODE_MARKER, NULLFS_BOOT_GENERATION_PASSED_MARKER,
+        NULLFS_BOOT_GENERATION_ROLLBACK_MARKER, NULLFS_BOOT_GENERATION_STAGED_MARKER,
+        NULLFS_BOOT_GENERATION_VERIFIED_MARKER, NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER,
+        NULLFS_CRASH_RECOVERY_INJECTED_MARKER, NULLFS_CRASH_RECOVERY_MODE_MARKER,
+        NULLFS_CRASH_RECOVERY_PASSED_MARKER, NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER,
+        NULLFS_OUT_OF_SPACE_MODE_MARKER, NULLFS_OUT_OF_SPACE_PASSED_MARKER,
+        NULLFS_UNAVAILABLE_HANDOFF_MARKER, NULLFS_UNAVAILABLE_INIT_EXIT_MARKER,
+        NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER, NULLFS_UNAVAILABLE_MODE_MARKER,
+        NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, OutOfSpaceProgress,
+        UnavailablePrimaryProgress, parse_options_from,
     };
 
     #[test]
@@ -1201,6 +1312,43 @@ mod tests {
     }
 
     #[test]
+    fn boot_generation_phases_require_mode_expected_phase_and_init_completion() {
+        for (phase, marker) in [
+            (
+                BootGenerationPhase::StageGeneration2,
+                NULLFS_BOOT_GENERATION_STAGED_MARKER,
+            ),
+            (
+                BootGenerationPhase::RollbackGeneration1,
+                NULLFS_BOOT_GENERATION_ROLLBACK_MARKER,
+            ),
+            (
+                BootGenerationPhase::VerifyRollback,
+                NULLFS_BOOT_GENERATION_VERIFIED_MARKER,
+            ),
+        ] {
+            let mut progress = BootGenerationProgress::new(phase);
+            assert!(!progress.observe(NULLFS_BOOT_GENERATION_PASSED_MARKER));
+            assert!(!progress.observe(marker));
+            assert!(!progress.observe(NULLFS_BOOT_GENERATION_MODE_MARKER));
+            assert!(!progress.observe(NULLFS_BOOT_GENERATION_PASSED_MARKER));
+            assert!(!progress.observe(marker));
+            assert!(progress.observe(NULLFS_BOOT_GENERATION_PASSED_MARKER));
+        }
+    }
+
+    #[test]
+    fn boot_generation_phase_markers_are_not_interchangeable() {
+        let mut progress = BootGenerationProgress::new(BootGenerationPhase::RollbackGeneration1);
+        assert!(!progress.observe(NULLFS_BOOT_GENERATION_MODE_MARKER));
+        assert!(!progress.observe(NULLFS_BOOT_GENERATION_STAGED_MARKER));
+        assert!(!progress.observe(NULLFS_BOOT_GENERATION_VERIFIED_MARKER));
+        assert!(!progress.observe(NULLFS_BOOT_GENERATION_PASSED_MARKER));
+        assert!(!progress.observe(NULLFS_BOOT_GENERATION_ROLLBACK_MARKER));
+        assert!(progress.observe(NULLFS_BOOT_GENERATION_PASSED_MARKER));
+    }
+
+    #[test]
     fn unavailable_primary_requires_ordered_recovery_handoff() {
         let mut progress = UnavailablePrimaryProgress::default();
 
@@ -1269,6 +1417,15 @@ mod tests {
     }
 
     #[test]
+    fn nullfs_boot_generation_option_is_headless() {
+        let options = parse_options_from(["--nullfs-boot-generation-check".to_owned()])
+            .expect("NullFS boot-generation option should parse");
+
+        assert!(options.nullfs_boot_generation_check);
+        assert!(options.headless);
+    }
+
+    #[test]
     fn nullfs_unavailable_option_is_headless() {
         let options = parse_options_from(["--nullfs-unavailable-check".to_owned()])
             .expect("NullFS unavailable option should parse");
@@ -1295,6 +1452,7 @@ mod tests {
             "--nullfs-out-of-space-check",
             "--nullfs-block-device-loss-check",
             "--nullfs-crash-recovery-check",
+            "--nullfs-boot-generation-check",
             "--nullfs-unavailable-check",
             "--logging-lifecycle-check",
         ];
