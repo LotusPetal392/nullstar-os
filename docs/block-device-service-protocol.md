@@ -84,6 +84,17 @@ cooperatively yield and retry when the bounded request queue reports
   endpoint returns `NOT_SUPPORTED`.
 - `DISCONNECT` releases the session and all kernel roots owned by it.
 
+ABI 1.14 lets PID 1 offline one exact writable NullFS endpoint selected by its
+16-byte filesystem UUID and nonzero endpoint-object generation. The resulting
+offline tombstone rejects new acquisition and `CONNECT` with `IO`. Existing
+sessions remain serviced so requests cannot disappear into an unpolled endpoint:
+all operations admitted after the tombstone except `DISCONNECT` complete with
+`IO`, while `DISCONNECT` remains available to release session roots. A raw
+operation already admitted before the offline fence may complete, so the syscall
+is a provider-availability fence rather than cancellation of physical I/O already
+in progress. A stale generation cannot offline a newer endpoint, and closing PID
+1's handle is not treated as revocation of delegated handles.
+
 Unknown operations, flags, reserved fields, transferred capabilities, and
 noncanonical operation-specific fields are rejected. Request and reply records
 are fixed-size, `repr(C)`, and bounded below the 256-byte endpoint message limit.
@@ -202,3 +213,12 @@ blocks. At the filesystem layer, poisoned or otherwise uncertain mutation
 failures therefore return `OUTCOME_UNKNOWN`; the service sends the reply and
 fail-stops so supervision remounts through journal/orphan recovery. Callers must
 not automatically retry such operations.
+
+The targeted block-device-loss gate prepares a public VFS mutation, has PID 1
+offline the exact UUID and endpoint generation, then attempts a positional write.
+A raw provider `IO` encountered after a filesystem mutation is accepted is
+conservatively classified as uncertain even when an earlier safe boundary cannot
+be proven. The gate requires `nullfs-service` to exit with status 35, then offlines the exact
+filesystem-provider generation. Old descriptors and paths must return `EIO`,
+while bootstrap FAT remains readable. The runner uses a disposable image because
+the interrupted mutation's durable outcome is intentionally unknown.

@@ -325,8 +325,8 @@ Phase 5 moves from a read-only public test mount to the accepted persistent-volu
 synthetic-namespace architecture. Raw block authority, writable filesystem-service
 operations, PR C's bounded public writable proxy, controlled quiesce/clean unmount with
 dirty-recovery fallback, stable primary-volume identity and layout, all three primary-tree
-namespace bindings, managed user-profile layout, deterministic out-of-space handling,
-unavailable-primary recovery, static `/System/bin` execution, the bounded allocation-free
+namespace bindings, managed user-profile layout, deterministic out-of-space and block-device-loss
+handling, unavailable-primary recovery, static `/System/bin` execution, the bounded allocation-free
 service-definition parser, and one policy-pinned definition-backed PID 1 activation pilot are
 implemented. Phase 5 remains in progress; general service management and the
 remaining integrated acceptance work are incomplete.
@@ -425,6 +425,22 @@ needed, and replacement mount through dirty recovery. Controlled restart does no
 the failure budget. This is not live filesystem stop/start: filesystem `Start` and `Stop`
 remain exactly `Unsupported`, and `NSVC` v1 is unchanged.
 
+### Deterministic block-device loss — implemented
+
+ABI 1.14 lets PID 1 offline the writable NullFS block endpoint selected by the exact
+configured filesystem UUID and endpoint-object generation. A wrong, stale, or already-offline
+generation cannot affect another incarnation. The endpoint becomes a tombstone rather than
+being removed: new acquisition and connection return `IO`, existing sessions remain drainable,
+all operations except disconnect return explicit `IO`, and disconnect remains available for
+cleanup. This prevents delegated handles from queueing requests forever after provider loss.
+
+The targeted acceptance image prepares a mutation through the public VFS ABI before PID 1
+injects loss. The uncertain operation returns `IO`; the proxy does not retry it; the NullFS
+service reports `OUTCOME_UNKNOWN`, fail-stops with exit status 35, and PID 1 then offlines the
+exact filesystem-provider generation. Old descriptors and path operations return `EIO`, while
+an independent FAT/bootstrap read still succeeds. The host runner copies the source image before
+each run because the mutation may have reached durable storage before failure became observable.
+
 ### Public writable proxy (PR C) — implemented and bounded
 
 For each service generation, the kernel proxy requests exactly `WRITE` and requires the
@@ -520,14 +536,14 @@ Direct NullFS loading by the bootloader is not required for Phase 5.
 ### Remaining Phase 5 acceptance
 
 PR C, controlled restart, all three primary-tree bindings, static system execution, and the
-policy-pinned definition-backed activation pilot, deterministic out-of-space gate, and
-unavailable-primary recovery gate supply bounded writable public-ABI, clean/dirty replacement,
-canonical-path, cross-view identity, bootstrap-independence, normal-boot `/System/services`
-activation, exact data/inode exhaustion with reclamation, and missing-primary recovery coverage. They do not complete Phase 5. Completion still requires the remaining integrated work to
-demonstrate:
+policy-pinned definition-backed activation pilot, deterministic out-of-space and block-device-loss
+gates, and unavailable-primary recovery gate supply bounded writable public-ABI, clean/dirty
+replacement, canonical-path, cross-view identity, bootstrap-independence, normal-boot
+`/System/services` activation, exact data/inode exhaustion with reclamation, explicit provider-loss
+failure without hanging or uncertain retry, and missing-primary recovery coverage. They do not
+complete Phase 5. Completion still requires the remaining integrated work to demonstrate:
 
 - crash injection and remount recovery for service-backed mutations;
-- deterministic block-device-loss behavior;
 - boot-generation synchronization and rollback without corrupting the previously
   selected generation.
 

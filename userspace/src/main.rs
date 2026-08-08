@@ -138,6 +138,18 @@ const VFS_BOOTSTRAP_PROBE_PASSED: &[u8] =
 const VFS_OUT_OF_SPACE_PROBE_COMMAND: &[u8] = b"/vfs-probe out-of-space";
 const VFS_OUT_OF_SPACE_PROBE_FAILED: &[u8] = b"userspace init: NullFS out-of-space probe failed\n";
 const VFS_OUT_OF_SPACE_PROBE_PASSED: &[u8] = b"userspace init: NullFS data and inode exhaustion, service continuity, and resource reclamation verified\n";
+const VFS_BLOCK_DEVICE_LOSS_PROBE_COMMAND: &[u8] = b"/vfs-probe block-device-loss";
+const VFS_BLOCK_DEVICE_LOSS_PROBE_READY: &[u8] = b"block-device-loss: mutation prepared";
+const VFS_BLOCK_DEVICE_LOSS_PROVIDER_OFFLINED: &[u8] = b"block-device-loss: provider offlined";
+const VFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED: &[u8] =
+    b"block-device-loss: uncertain mutation failed";
+const VFS_BLOCK_DEVICE_LOSS_FILESYSTEM_OFFLINED: &[u8] =
+    b"block-device-loss: filesystem generation offlined";
+const VFS_BLOCK_DEVICE_LOSS_INJECTED: &[u8] =
+    b"userspace init: writable NullFS block endpoint loss injected\n";
+const VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED: &[u8] =
+    b"userspace init: NullFS block-device-loss probe failed\n";
+const VFS_BLOCK_DEVICE_LOSS_PROBE_PASSED: &[u8] = b"userspace init: NullFS block-device loss, uncertain mutation fail-stop, stale VFS errors, and bootstrap continuity verified\n";
 const DEFINITION_SERVICE_LOADING: &[u8] =
     b"userspace init: loading service definition from /System/services\n";
 const DEFINITION_SERVICE_STARTING: &[u8] = b"userspace init: starting definition-backed service\n";
@@ -165,6 +177,7 @@ const LOGGING_LIFECYCLE_TEST_FAILED: &[u8] = b"userspace init: logging lifecycle
 const BOOT_MODE_PATH: &[u8] = b"/BOOTMODE";
 const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
 const NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE: &[u8] = b"nullfs-out-of-space-test\n";
+const NULLFS_BLOCK_DEVICE_LOSS_TEST_BOOT_MODE: &[u8] = b"nullfs-block-device-loss-test\n";
 const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const BOOT_MODE_PROBE_FAILED: &[u8] = b"userspace init: unable to read boot mode\n";
@@ -2472,6 +2485,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let boot_mode = init_boot_mode();
     let nullfs_restart_test = boot_mode == InitBootMode::NullfsRestartTest;
     let nullfs_out_of_space_test = boot_mode == InitBootMode::NullfsOutOfSpaceTest;
+    let nullfs_block_device_loss_test = boot_mode == InitBootMode::NullfsBlockDeviceLossTest;
     let logging_lifecycle_test = boot_mode == InitBootMode::LoggingLifecycleTest;
     if boot_mode == InitBootMode::NullfsUnavailableTest {
         match platform::open_writable_nullfs_block_device_endpoint(
@@ -2694,6 +2708,13 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 vfs: &vfs_service,
                 vfs_generation,
             },
+        );
+    } else if nullfs_block_device_loss_test {
+        run_nullfs_block_device_loss_probe(
+            &nullfs_service,
+            nullfs_generation,
+            vfs_request_endpoint,
+            nullfs_service_block_endpoint,
         );
     } else if nullfs_out_of_space_test {
         run_probe(
@@ -3103,6 +3124,7 @@ enum InitBootMode {
     SmokeTest,
     NullfsRestartTest,
     NullfsOutOfSpaceTest,
+    NullfsBlockDeviceLossTest,
     NullfsUnavailableTest,
     LoggingLifecycleTest,
 }
@@ -3121,6 +3143,9 @@ fn init_boot_mode() -> InitBootMode {
         b"nullfs-out-of-space-test" | NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE => {
             InitBootMode::NullfsOutOfSpaceTest
         }
+        b"nullfs-block-device-loss-test" | NULLFS_BLOCK_DEVICE_LOSS_TEST_BOOT_MODE => {
+            InitBootMode::NullfsBlockDeviceLossTest
+        }
         b"nullfs-unavailable-test" | NULLFS_UNAVAILABLE_TEST_BOOT_MODE => {
             InitBootMode::NullfsUnavailableTest
         }
@@ -3129,6 +3154,172 @@ fn init_boot_mode() -> InitBootMode {
         }
         _ => fail(BOOT_MODE_PROBE_FAILED),
     }
+}
+
+fn run_nullfs_block_device_loss_probe(
+    nullfs_service: &ServiceRuntime,
+    nullfs_generation: ProviderGeneration,
+    vfs_request_endpoint: CapabilityHandle,
+    block_endpoint: CapabilityHandle,
+) {
+    let service_process_id = nullfs_service
+        .process_id()
+        .unwrap_or_else(|| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    let block_generation = ipc::info(block_endpoint)
+        .map(|info| info.object_id)
+        .unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    if block_generation == 0 {
+        fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
+    }
+
+    let ready_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    let control_endpoint =
+        ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    let barrier =
+        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    let probe_process_id = syscall::spawn_command_with_barrier(
+        VFS_BLOCK_DEVICE_LOSS_PROBE_COMMAND,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        &barrier,
+    )
+    .unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    if ipc::grant_child(probe_process_id, vfs_request_endpoint, Rights::SEND, 1).ok() != Some(1)
+        || ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, 2).ok() != Some(2)
+        || ipc::grant_child(probe_process_id, control_endpoint, Rights::RECEIVE, 3).ok() != Some(3)
+    {
+        fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
+    }
+    barrier
+        .release()
+        .unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    wait_for_probe_message(
+        ready_endpoint,
+        probe_process_id,
+        VFS_BLOCK_DEVICE_LOSS_PROBE_READY,
+        VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED,
+    );
+
+    let wrong_generation = block_generation
+        .checked_add(1)
+        .unwrap_or_else(|| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    if platform::offline_writable_nullfs_block_device_endpoint(
+        &nullfs_primary_volume::FILESYSTEM_UUID,
+        wrong_generation,
+    )
+    .err()
+        != Some(platform::Errno::INVALID_ARGUMENT)
+        || platform::offline_writable_nullfs_block_device_endpoint(
+            &nullfs_primary_volume::FILESYSTEM_UUID,
+            block_generation,
+        )
+        .is_err()
+        || platform::offline_writable_nullfs_block_device_endpoint(
+            &nullfs_primary_volume::FILESYSTEM_UUID,
+            block_generation,
+        )
+        .err()
+            != Some(platform::Errno::INVALID_ARGUMENT)
+        || platform::open_writable_nullfs_block_device_endpoint(
+            &nullfs_primary_volume::FILESYSTEM_UUID,
+        )
+        .err()
+            != Some(platform::Errno::IO)
+    {
+        fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
+    }
+    let _ = syscall::write_all(STDOUT, VFS_BLOCK_DEVICE_LOSS_INJECTED);
+    ipc::send(
+        control_endpoint,
+        VFS_BLOCK_DEVICE_LOSS_PROVIDER_OFFLINED,
+        None,
+    )
+    .unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    wait_for_probe_message(
+        ready_endpoint,
+        probe_process_id,
+        VFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED,
+        VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED,
+    );
+
+    let mut service_status = None;
+    for _ in 0..4_096 {
+        if service_status.is_none() {
+            service_status = try_wait_final_status(service_process_id);
+        }
+        if service_status.is_some() {
+            break;
+        }
+        if try_wait_final_status(probe_process_id).is_some() {
+            fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    }
+    if service_status != Some(35) {
+        fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
+    }
+    offline_filesystem_provider(
+        platform::FilesystemProvider::Nullfs,
+        nullfs_generation,
+        VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED,
+    );
+    ipc::send(
+        control_endpoint,
+        VFS_BLOCK_DEVICE_LOSS_FILESYSTEM_OFFLINED,
+        None,
+    )
+    .unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+
+    let mut probe_status = None;
+    for _ in 0..4_096 {
+        if probe_status.is_none() {
+            probe_status = try_wait_final_status(probe_process_id);
+        }
+        if probe_status.is_some() {
+            break;
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    }
+    if probe_status != Some(0) {
+        fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
+    }
+    ipc::close(ready_endpoint).unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    ipc::close(control_endpoint).unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
+    let _ = syscall::write_all(STDOUT, VFS_BLOCK_DEVICE_LOSS_PROBE_PASSED);
+}
+
+fn wait_for_probe_message(
+    endpoint: CapabilityHandle,
+    process_id: ProcessId,
+    expected: &[u8],
+    failure_message: &[u8],
+) {
+    let mut bytes = [0_u8; 64];
+    for _ in 0..4_096 {
+        match ipc::try_receive(endpoint, &mut bytes) {
+            Ok(message) => {
+                if message.sender_process_id != process_id
+                    || message.capability.is_some()
+                    || message.bytes != expected.len()
+                    || &bytes[..message.bytes] != expected
+                {
+                    fail(failure_message);
+                }
+                return;
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {}
+            Err(_) => fail(failure_message),
+        }
+        if try_wait_final_status(process_id).is_some() {
+            fail(failure_message);
+        }
+        syscall::yield_now().unwrap_or_else(|_| fail(failure_message));
+    }
+    fail(failure_message)
 }
 
 fn run_nullfs_restart_probe(

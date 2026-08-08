@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.13, and a
+The ABI is experimental, but callers can query the current version, 1.14, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -326,6 +326,33 @@ and only then completion of the restart fence. Writable NullFS is not withdrawn
 before final child status because a pre-exit quiesce-and-sync protocol remains
 future work.
 
+## Version 1.14 writable NullFS block-endpoint offlining
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 59 | `OFFLINE_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT` | `rdi`: 16-byte UUID address; `rsi`: exact length; `rdx`: expected endpoint generation | zero |
+
+This PID-1-only fault-containment operation offlines the exact writable NullFS
+block-endpoint object selected by a filesystem UUID and endpoint generation.
+Permission is checked before reading user memory. The UUID must be exactly 16
+readable, nonzero bytes, and the expected endpoint generation must be nonzero.
+No matching UUID returns `ENOENT`; an ambiguous UUID, stale or wrong generation,
+missing endpoint object, or already-offline generation returns `EINVAL`.
+
+A successful call changes the endpoint to an offline tombstone. New acquisition
+and connection attempts return `EIO`. Existing sessions and the endpoint object
+remain drainable so operations admitted after the tombstone complete deterministically
+rather than hanging: every operation except `DISCONNECT` returns protocol `IO`, while
+`DISCONNECT` remains available for bounded cleanup. A physical operation already admitted
+before the fence may complete; offlining is not cancellation of in-progress disk I/O.
+Closing PID 1's source handle alone is not revocation because delegated handles keep the
+endpoint object alive.
+
+A filesystem mutation may have committed before provider loss is observed. The
+filesystem service therefore reports `OUTCOME_UNKNOWN`, fail-stops, and requires
+supervision to offline the matching filesystem-provider generation. Neither the
+kernel proxy nor callers automatically retry an uncertain mutation.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -344,6 +371,9 @@ future work.
   and process-group signaling contracts.
 - ABI 1.13 adds PID-1-only exact-generation filesystem-provider offlining at
   syscall 58 without changing the filesystem or `NSVC` wire protocols.
+- ABI 1.14 adds PID-1-only exact-UUID and exact-generation writable NullFS
+  block-endpoint offlining at syscall 59 without changing the block-device,
+  filesystem, or `NSVC` wire protocols.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

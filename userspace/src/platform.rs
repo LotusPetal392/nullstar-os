@@ -18,6 +18,7 @@ pub struct Errno(i32);
 
 impl Errno {
     pub const NO_ENTRY: Self = Self((-abi::errno::NO_ENTRY) as i32);
+    pub const IO: Self = Self((-abi::errno::IO) as i32);
     pub const NO_PROCESS: Self = Self((-abi::errno::NO_PROCESS) as i32);
     pub const TRY_AGAIN: Self = Self((-abi::errno::TRY_AGAIN) as i32);
     pub const PERMISSION: Self = Self((-abi::errno::PERMISSION) as i32);
@@ -245,6 +246,23 @@ pub fn open_writable_nullfs_block_device_endpoint(
         );
     }
     decode(result)
+}
+
+pub fn offline_writable_nullfs_block_device_endpoint(
+    filesystem_uuid: &[u8; 16],
+    endpoint_generation: u64,
+) -> Result<()> {
+    let mut result = syscall::OFFLINE_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") filesystem_uuid.as_ptr() as u64,
+            in("rsi") filesystem_uuid.len() as u64,
+            in("rdx") endpoint_generation,
+        );
+    }
+    decode(result).map(|_| ())
 }
 
 fn open_partition_endpoint(number: u64, partition_index: u32) -> Result<FileDescriptor> {

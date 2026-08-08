@@ -62,6 +62,7 @@ struct BlockDeviceEndpoint {
     filesystem_uuid: Option<[u8; 16]>,
     endpoint: Option<CapabilityObjectRef>,
     generation: u64,
+    online: bool,
     next_session_id: u64,
     sessions: Vec<BlockDeviceSession>,
 }
@@ -130,6 +131,7 @@ pub fn configure_block_device_endpoints(inventory: &crate::partition::Inventory)
             filesystem_uuid: None,
             endpoint: None,
             generation: 0,
+            online: true,
             next_session_id: 1,
             sessions: Vec::new(),
         });
@@ -148,6 +150,7 @@ pub fn configure_block_device_endpoints(inventory: &crate::partition::Inventory)
                 filesystem_uuid: Some(filesystem_uuid),
                 endpoint: None,
                 generation: 0,
+                online: true,
                 next_session_id: 1,
                 sessions: Vec::new(),
             });
@@ -299,6 +302,55 @@ fn open_writable_nullfs_block_device_endpoint(
     )
 }
 
+fn offline_writable_nullfs_block_device_endpoint(
+    process_id: u64,
+    uuid_address: u64,
+    uuid_length: u64,
+    expected_generation: u64,
+) -> u64 {
+    if process_id != INIT_PROCESS_ID {
+        return error_return(abi::errno::PERMISSION);
+    }
+    if uuid_length != 16 || expected_generation == 0 {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    if !user_range_allows(process_id, uuid_address, 16, false) {
+        return error_return(ERR_BAD_ADDRESS);
+    }
+    let filesystem_uuid = unsafe { ptr::read_unaligned(uuid_address as *const [u8; 16]) };
+    if filesystem_uuid == [0; 16] {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+
+    let mut state = BLOCK_DEVICE_ENDPOINTS.lock();
+    let mut matched_index = None;
+    for (index, device) in state.devices.iter().enumerate() {
+        if device.access == BlockDeviceAccess::Writable
+            && device.filesystem_uuid == Some(filesystem_uuid)
+            && matched_index.replace(index).is_some()
+        {
+            return error_return(ERR_INVALID_ARGUMENT);
+        }
+    }
+    let Some(matched_index) = matched_index else {
+        return error_return(ERR_NO_ENTRY);
+    };
+    let device = &mut state.devices[matched_index];
+    if device.endpoint.is_none()
+        || device.generation != expected_generation
+        || !device.online
+    {
+        return error_return(ERR_INVALID_ARGUMENT);
+    }
+    device.online = false;
+    crate::serial_println!(
+        "writable NullFS block endpoint offlined: partition={}, generation={}",
+        device.partition.index,
+        device.generation
+    );
+    0
+}
+
 fn open_block_device_endpoint(
     process_id: u64,
     partition_index: u64,
@@ -330,6 +382,9 @@ fn open_block_device_endpoint(
                 };
                 return error_return(error);
             };
+            if !device.online {
+                return error_return(ERR_IO);
+            }
             device.endpoint
         };
     if let Some(endpoint) = existing {
@@ -457,6 +512,18 @@ fn service_block_device_endpoints() {
     }
     if !canonical_block_device_request(&request) {
         reply.status = block_device_protocol::status::INVALID;
+        block_device_release_transferred(message.capability);
+        block_device_queue_reply_or_remove_session(snapshot, reply);
+        return;
+    }
+    if request.operation != block_device_protocol::operation::DISCONNECT
+        && !block_device_endpoint_online(
+            snapshot.partition.index,
+            snapshot.access,
+            snapshot.session.generation,
+        )
+    {
+        reply.status = block_device_protocol::status::IO;
         block_device_release_transferred(message.capability);
         block_device_queue_reply_or_remove_session(snapshot, reply);
         return;
@@ -601,6 +668,7 @@ fn block_device_connect(
             .find(|device| device.partition.index == partition_index && device.access == access)
         {
             None => Err(block_device_protocol::status::IO),
+            Some(device) if !device.online => Err(block_device_protocol::status::IO),
             Some(device)
                 if device.sessions.len() >= MAX_BLOCK_DEVICE_SESSIONS
                     || device
@@ -648,6 +716,20 @@ fn block_device_connect(
     {
         block_device_release_session(released);
     }
+}
+
+fn block_device_endpoint_online(
+    partition_index: u32,
+    access: BlockDeviceAccess,
+    generation: u64,
+) -> bool {
+    let state = BLOCK_DEVICE_ENDPOINTS.lock();
+    state.devices.iter().any(|device| {
+        device.partition.index == partition_index
+            && device.access == access
+            && device.generation == generation
+            && device.online
+    })
 }
 
 fn block_device_attach_buffer(
