@@ -276,6 +276,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         b"/tmp",
         b"/System",
         b"/System/config",
+        b"/System/boot",
+        b"/System/boot/generations",
+        b"/System/boot/generations/1",
+        b"/System/boot/generations/2",
         b"/System/var",
         b"/System/var/log",
         b"/System/bin",
@@ -362,6 +366,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         b"/System",
         &[
             b"config",
+            b"boot",
             b"var",
             b"bin",
             b"services",
@@ -1607,6 +1612,7 @@ fn nullfs_docs_is_valid() -> bool {
 fn system_directory_is_valid() -> bool {
     const NAMES: &[&[u8]] = &[
         b"config",
+        b"boot",
         b"var",
         b"bin",
         b"services",
