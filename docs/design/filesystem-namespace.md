@@ -3,11 +3,11 @@
 ## Status
 
 A synthetic VFS root, canonical logical paths, and VFS namespace bindings are
-**accepted direction**. The first two staged bindings are now implemented: canonical
-`/System` and `/Applications` target matching nodes below the UUID-selected primary NullFS
-provider's backend root. One statically linked fixture executes through `/System/bin`,
-while bootstrap services remain independent. `/Users` remains synthetic and unbound, so
-complete namespace adoption is still future work. Magnetar-managed immutable
+**accepted direction**. All three primary-volume bindings are now implemented: canonical
+`/System`, `/Applications`, and `/Users` target matching nodes below the UUID-selected
+primary NullFS provider's backend root. One statically linked fixture executes through
+`/System/bin`, writable profile state persists through the `/Users` binding, and bootstrap
+services remain independent. Magnetar-managed immutable
 deployments and previous-generation boot selection are accepted direction. Exact
 deployment-store layout, boot-generation encoding, final raw-backing visibility, and
 the remainder of the transition from the FAT-rooted bootstrap image remain
@@ -46,13 +46,12 @@ The primary persistent NullFS volume initially contains:
 └── Users/
 ```
 
-The VFS projects those trees into their canonical locations. Two projections are
-implemented; the user tree remains planned:
+The VFS projects all three trees into their canonical locations:
 
 ```text
 /System         => NullStar volume, System node          (implemented)
 /Applications   => NullStar volume, Applications node    (implemented)
-/Users          => NullStar volume, Users node            (planned; currently synthetic)
+/Users          => NullStar volume, Users node            (implemented)
 ```
 
 `/dev` and `/tmp` remain service-backed mounts. Other local, removable, encrypted,
@@ -70,10 +69,10 @@ A namespace binding is a VFS routing record, not a symbolic link. It identifies:
 - mount and access policy;
 - whether a raw administrative view is exposed.
 
-Opening `/System/bin/example` or `/Applications/example` retains that canonical view path,
-and changing into either tree retains a logical working directory. Ordinary clients do not
-observe expansion to a matching path below `/Volumes/NullStar`. The same rule will apply to
-the future `/Users` binding.
+Opening `/System/bin/example`, `/Applications/example`, or `/Users/name/example` retains
+that canonical view path, and changing into any bound tree retains a logical working
+directory. Ordinary clients do not observe expansion to a matching path below
+`/Volumes/NullStar`.
 
 Bindings avoid the problems caused by path aliases:
 
@@ -89,10 +88,11 @@ compatibility layer may expose equivalent behavior as a bind mount where useful.
 The implemented routing contract is VFS namespace protocol version 2. Its bounded
 224-byte reply preserves the route ID, backend, and matched canonical-prefix length, and
 adds a binding flag plus a length-delimited, zero-padded backend-relative backing prefix.
-The VFS service owns the `/System` and `/Applications` binding records. The kernel validates
-each exact known NullFS target with the matching backing prefix, appends only the unmatched
-canonical suffix, and traverses that backend path internally. This first version
-deliberately does not let the service redirect the kernel to arbitrary backing targets.
+The VFS service owns the `/System`, `/Applications`, and `/Users` binding records. The
+kernel validates each exact known NullFS target with the matching backing prefix, appends
+only the unmatched canonical suffix, and traverses that backend path internally. This first
+version deliberately does not let the service redirect the kernel to arbitrary backing
+targets.
 
 ## Volume identity and naming
 
@@ -114,11 +114,11 @@ binding selected by UUID.
 
 ## Canonical and administrative views
 
-`/System`, `/Applications`, and `/Users` are the canonical paths for normal software.
-Today `/System` and `/Applications` have persistent backing; `/Users` remains synthetic and
-unbound. Matching paths below `/Volumes/NullStar` remain raw administrative aliases for the
-same NullFS nodes. The current public VFS rejects mutation anywhere in the System backing
-subtree through either view. The broader raw backing view is intended for recovery and
+`/System`, `/Applications`, and `/Users` are the canonical paths for normal software and
+all three have persistent backing. Matching paths below `/Volumes/NullStar` remain raw
+administrative aliases for the same NullFS nodes. The current public VFS rejects mutation
+anywhere in the System backing subtree through either view, while `/Applications` and
+`/Users` remain writable. The broader raw backing view is intended for recovery and
 administration.
 
 The final visibility policy is tentative. Acceptable implementations include:
@@ -247,19 +247,19 @@ The recommended progression is:
 4. Bind `/System`, preserve its system metadata in the canonical view, and load one
    ordinary static program through it while retaining the existing bootstrap path.
    (implemented; service-definition activation remains future)
-5. Bind `/Users`, complete policy for all three persistent trees, and treat the synthetic
-   VFS root as the normal namespace.
+5. Bind `/Users`, complete the initial policy for all three persistent trees, and treat the
+   synthetic VFS root as the normal namespace. (implemented)
 6. Complete administrative visibility, authorization, recovery, and namespace-mutation
    policy without weakening the implemented writable-service lifecycle.
 7. Add Magnetar-managed immutable system and boot generations, health states,
    previous-generation selection, and synchronization to the firmware-readable bootstrap
    partition.
 
-Current integration coverage exercises canonical `/System` and `/Applications` routing,
+Current integration coverage exercises canonical routing for all three primary trees,
 canonical and raw view identity, system metadata flags, a `/System/bin` executable,
-canonical `/Applications` mutation, stale descriptors across NullFS service restart, and
-continued bootstrap availability. Each later stage must retain that independent recovery
-path and integrated boot coverage.
+canonical `/Applications` and `/Users` mutation, stale descriptors and user-state
+persistence across NullFS service restart, and continued bootstrap availability. Each later
+stage must retain that independent recovery path and integrated boot coverage.
 
 ## Open questions
 

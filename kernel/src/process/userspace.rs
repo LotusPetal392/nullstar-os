@@ -5437,7 +5437,7 @@ fn vfs_route_is_offline() -> bool {
 }
 
 fn vfs_is_declared_namespace_directory(path: &str) -> bool {
-    matches!(path, "/dev" | "/Users" | "/Volumes")
+    matches!(path, "/dev" | "/Volumes")
 }
 
 fn vfs_routed_boot_directory(
@@ -5481,7 +5481,7 @@ fn vfs_routed_namespace_directory(
     capacity: usize,
 ) -> ControlOutcome {
     let names: &[&str] = match path {
-        "/dev" | "/Users" => &[],
+        "/dev" => &[],
         "/Volumes" => &[nullfs_primary_volume::DISPLAY_NAME],
         _ => return ControlOutcome::Ready(error_return(abi::errno::NO_ENTRY)),
     };
@@ -6078,8 +6078,8 @@ fn vfs_stat_route_is_valid(reply: &vfs_protocol::Reply, path: &str) -> bool {
         (
             "/Users",
             vfs_protocol::route::USERS,
-            vfs_protocol::backend::NAMESPACE,
-            None,
+            vfs_protocol::backend::NULLFS,
+            Some("/Users"),
         )
     } else if vfs_path_has_prefix(path, "/tmp") {
         (

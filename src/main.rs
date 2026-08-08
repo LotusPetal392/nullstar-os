@@ -73,7 +73,7 @@ const LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER: &str =
 const LOGGING_LIFECYCLE_PASSED_MARKER: &str = "userspace init: logging live start, stop, route withdrawal, restart fencing, and generation replacement verified";
 const NORMAL_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const SMOKE_PHASE_TIMEOUT: Duration = Duration::from_secs(420);
-const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(300);
+const NULLFS_RESTART_TEST_TIMEOUT: Duration = Duration::from_secs(420);
 const LOGGING_LIFECYCLE_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Default)]

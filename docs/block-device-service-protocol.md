@@ -169,7 +169,8 @@ backend at `/Volumes/NullStar`. The filesystem proxy's own kernel-registered
 proxy connects with exactly `WRITE`, requires `session_features::WRITE`, and
 permits ordinary stat/read/open plus writable, create, truncate, and append open,
 descriptor write, unlink, `fstat`, seek, `read_directory`, and `chdir`. Public
-`mkdir`, `rmdir`, rename, and broader namespace adoption remain future.
+`mkdir`, `rmdir`, rename, service-definition activation, and broader acceptance work remain
+future.
 
 ## Writable authority
 

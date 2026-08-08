@@ -177,15 +177,16 @@ images, and launches QEMU.
   and unlink through the UUID-selected 4 MiB primary volume at
   `/Volumes/NullStar`; stat, read, open, `fstat`, seek, directory reads, and
   `chdir` also remain available. The volume contains `System/`, `Applications/`,
-  and `Users/`; `/System` and `/Applications` are implemented namespace bindings
-  that retain canonical paths while using the volume's matching backing nodes.
+  and `Users/`; all three are implemented namespace bindings that retain
+  canonical paths while using the volume's matching backing nodes.
   The System subtree is read-only through both canonical and raw public views.
   A statically linked fixture now executes through `/System/bin`, while PID 1 and
-  recovery utilities remain independent bootstrap-image programs. `/Users` is
-  still synthetic and unbound. Direct flags-zero sessions stay read-only, and raw
-  block authority, session authority, and public VFS policy remain separate.
-  Public `mkdir`, `rmdir`, rename, user-tree adoption, and offline repair remain
-  future work.
+  recovery utilities remain independent bootstrap-image programs. The writable
+  `/Users` binding contains a fixture home with the accepted managed `Profile`
+  layout. Direct flags-zero sessions stay read-only, and raw block authority,
+  session authority, and public VFS policy remain separate. Public `mkdir`,
+  `rmdir`, rename, service-definition activation, and offline repair remain future
+  work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`

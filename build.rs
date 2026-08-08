@@ -374,9 +374,20 @@ fn build_nullfs_fixture(exec_target_path: &Path) -> Vec<u8> {
     let applications = image
         .create_directory(1, "Applications", 0o755)
         .expect("failed to create NullFS Applications directory");
-    image
+    let users = image
         .create_directory(1, "Users", 0o755)
         .expect("failed to create NullFS Users directory");
+    let natalie = image
+        .create_directory(users, "natalie", 0o700)
+        .expect("failed to create NullFS fixture user directory");
+    let profile = image
+        .create_directory(natalie, "Profile", 0o700)
+        .expect("failed to create NullFS fixture user profile");
+    for name in ["config", "cache", "state", "data", "logs", "runtime"] {
+        image
+            .create_directory(profile, name, 0o700)
+            .unwrap_or_else(|_| panic!("failed to create NullFS fixture user {name} directory"));
+    }
     let exec_probe = image
         .create_directory(applications, "ExecProbe", 0o755)
         .expect("failed to create NullFS ExecProbe directory");

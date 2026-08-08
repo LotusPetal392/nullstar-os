@@ -46,6 +46,13 @@ const NULLFS_EXEC_SPAWN_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/exec-targ
 const NULLFS_SYSTEM_EXEC_TARGET: &[u8] = b"/System/bin/exec-target";
 const NULLFS_SYSTEM_EXEC_TARGET_RAW: &[u8] = b"/Volumes/NullStar/System/bin/exec-target";
 const NULLFS_SYSTEM_EXEC_SPAWN_COMMAND: &[u8] = b"/System/bin/exec-target system-spawn";
+const NULLFS_USER_STATE: &[u8] = b"/Users/natalie/Profile/state";
+const NULLFS_USER_STATE_RAW: &[u8] = b"/Volumes/NullStar/Users/natalie/Profile/state";
+const NULLFS_USER_PROBE: &[u8] = b"/Users/natalie/Profile/state/nullstar-vfs-probe-v1.bin";
+const NULLFS_USER_PROBE_RAW: &[u8] =
+    b"/Volumes/NullStar/Users/natalie/Profile/state/nullstar-vfs-probe-v1.bin";
+const USER_PROBE_BYTES: &[u8] = b"NullStar user namespace";
+const USER_RESTART_BYTES: &[u8] = b"NullStar user namespace restart";
 const NULLFS_EXEC_MISSING_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/missing-target";
 const NULLFS_EXEC_NOT_DIRECTORY_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/exec-target/child";
 const NULLFS_EXEC_MALFORMED_COMMAND: &[u8] = b"/Applications/ExecProbe/bin/malformed-target";
@@ -125,7 +132,7 @@ const CASES: &[(&[u8], u32, u16, u16)] = &[
     (
         b"/Users/natalie",
         protocol::route::USERS,
-        protocol::backend::NAMESPACE,
+        protocol::backend::NULLFS,
         6,
     ),
     (
@@ -393,6 +400,12 @@ fn probe_readiness() {
             7,
         ),
         (
+            b"/Users",
+            protocol::route::USERS,
+            protocol::backend::NULLFS,
+            6,
+        ),
+        (
             b"/Volumes/NullStar",
             protocol::route::NULLSTAR_VOLUME,
             protocol::backend::NULLFS,
@@ -412,7 +425,13 @@ fn probe_readiness() {
             syscall::exit(101);
         }
     }
-    for path in [b"/".as_slice(), b"/tmp", b"/System", NULLFS_MOUNT] {
+    for path in [
+        b"/".as_slice(),
+        b"/tmp",
+        b"/System",
+        b"/Users",
+        NULLFS_MOUNT,
+    ] {
         if platform::stat(path).ok().map(|stat| stat.kind) != Some(file::KIND_DIRECTORY) {
             syscall::exit(102);
         }
@@ -436,6 +455,12 @@ fn probe_mounted_nullfs() {
 
     if !stat_matches(NULLFS_MOUNT, file::KIND_DIRECTORY, 0)
         || !stat_matches(b"/Applications", file::KIND_DIRECTORY, BLOCK_SIZE as u64)
+        || !stat_matches(b"/Users", file::KIND_DIRECTORY, BLOCK_SIZE as u64)
+        || !stat_matches(
+            b"/Volumes/NullStar/Users",
+            file::KIND_DIRECTORY,
+            BLOCK_SIZE as u64,
+        )
         || !stat_matches_flags(
             b"/System",
             file::KIND_DIRECTORY,
@@ -455,6 +480,7 @@ fn probe_mounted_nullfs() {
         syscall::exit(58);
     }
     if !system_directory_is_valid()
+        || !user_profile_is_valid()
         || !stat_matches(NULLFS_DOCS, file::KIND_DIRECTORY, BLOCK_SIZE as u64)
     {
         syscall::exit(21);
@@ -547,6 +573,10 @@ fn probe_mounted_nullfs() {
         || platform::getcwd(&mut cwd).ok() != Some(b"/System/var".as_slice())
         || platform::chdir(b"/Applications").is_err()
         || platform::getcwd(&mut cwd).ok() != Some(b"/Applications".as_slice())
+        || platform::chdir(NULLFS_USER_STATE).is_err()
+        || platform::getcwd(&mut cwd).ok() != Some(NULLFS_USER_STATE)
+        || platform::chdir(NULLFS_USER_STATE_RAW).is_err()
+        || platform::getcwd(&mut cwd).ok() != Some(NULLFS_USER_STATE_RAW)
         || platform::chdir(b"/").is_err()
         || platform::getcwd(&mut cwd).ok() != Some(b"/".as_slice())
     {
@@ -567,6 +597,7 @@ fn probe_mounted_nullfs() {
     }
 
     probe_public_nullfs_mutation();
+    probe_user_namespace_mutation();
     if !nullfs_root_is_valid() {
         syscall::exit(89);
     }
@@ -681,8 +712,8 @@ fn probe_public_nullfs_mutation() {
 
     let surviving = platform::dup(truncated).unwrap_or_else(|_| syscall::exit(83));
     if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         syscall::exit(84);
     }
@@ -719,6 +750,46 @@ fn probe_public_nullfs_mutation() {
     }
 }
 
+fn probe_user_namespace_mutation() {
+    if !recover_user_probe_artifact() {
+        syscall::exit(120);
+    }
+    let canonical = open_with_retry(
+        NULLFS_USER_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
+    )
+    .unwrap_or_else(|| syscall::exit(121));
+    if !descriptor_stat_matches(canonical, 0)
+        || !write_all_with_retry(canonical, USER_PROBE_BYTES)
+        || !descriptor_stat_matches(canonical, USER_PROBE_BYTES.len() as u64)
+        || !stat_matches(
+            NULLFS_USER_PROBE_RAW,
+            file::KIND_FILE,
+            USER_PROBE_BYTES.len() as u64,
+        )
+    {
+        syscall::exit(122);
+    }
+    let raw = open_with_retry(
+        NULLFS_USER_PROBE_RAW,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
+    )
+    .unwrap_or_else(|| syscall::exit(123));
+    if !descriptor_stat_matches(raw, USER_PROBE_BYTES.len() as u64)
+        || !read_matches(raw, USER_PROBE_BYTES)
+        || !unlink_with_retry(NULLFS_USER_PROBE_RAW)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
+        || syscall::seek(canonical, syscall::SeekFrom::Start(0)).ok() != Some(0)
+        || !read_matches(canonical, USER_PROBE_BYTES)
+    {
+        syscall::exit(124);
+    }
+    if syscall::close(raw).is_err() || syscall::close(canonical).is_err() {
+        syscall::exit(125);
+    }
+}
+
 fn probe_nullfs_restart() -> ! {
     if !matches!(
         ipc::wait_for_handle(SERVICE_HANDLE),
@@ -731,6 +802,9 @@ fn probe_nullfs_restart() -> ! {
     }
     if !recover_public_probe_artifact() {
         syscall::exit(91);
+    }
+    if !recover_user_probe_artifact() {
+        syscall::exit(108);
     }
 
     let stale = open_with_retry(
@@ -746,6 +820,21 @@ fn probe_nullfs_restart() -> ! {
         || syscall::seek(stale, syscall::SeekFrom::Start(0)).ok() != Some(0)
     {
         syscall::exit(94);
+    }
+    let stale_user = open_with_retry(
+        NULLFS_USER_PROBE,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE,
+    )
+    .unwrap_or_else(|| syscall::exit(109));
+    if !write_all_with_retry(stale_user, USER_RESTART_BYTES)
+        || !descriptor_stat_matches(stale_user, USER_RESTART_BYTES.len() as u64)
+        || !stat_matches(
+            NULLFS_USER_PROBE_RAW,
+            file::KIND_FILE,
+            USER_RESTART_BYTES.len() as u64,
+        )
+    {
+        syscall::exit(110);
     }
     if ipc::send(SERVICE_HANDLE, NULLFS_RESTART_READY, None).is_err() {
         syscall::exit(95);
@@ -776,6 +865,12 @@ fn probe_nullfs_restart() -> ! {
     {
         syscall::exit(98);
     }
+    let mut user_bytes = [0_u8; USER_RESTART_BYTES.len()];
+    if syscall::read(stale_user, &mut user_bytes) != Err(syscall::Errno::IO)
+        || !platform_failed_with(platform::fstat(stale_user), errno::IO)
+    {
+        syscall::exit(111);
+    }
     let replacement = open_with_retry(
         NULLFS_PUBLIC_PROBE_RAW,
         syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
@@ -787,8 +882,8 @@ fn probe_nullfs_restart() -> ! {
         syscall::exit(101);
     }
     if !unlink_with_retry(NULLFS_PUBLIC_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         syscall::exit(102);
     }
@@ -797,21 +892,52 @@ fn probe_nullfs_restart() -> ! {
     {
         syscall::exit(103);
     }
+    let replacement_user = open_with_retry(
+        NULLFS_USER_PROBE_RAW,
+        syscall::OpenFlags::READ | syscall::OpenFlags::WRITE,
+    )
+    .unwrap_or_else(|| syscall::exit(112));
+    if !descriptor_stat_matches(replacement_user, USER_RESTART_BYTES.len() as u64)
+        || !read_matches(replacement_user, USER_RESTART_BYTES)
+        || !unlink_with_retry(NULLFS_USER_PROBE)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
+    {
+        syscall::exit(113);
+    }
     if !nullfs_root_is_valid() {
         syscall::exit(104);
     }
-    if syscall::close(stale).is_err() || syscall::close(replacement).is_err() {
+    if syscall::close(stale).is_err()
+        || syscall::close(stale_user).is_err()
+        || syscall::close(replacement).is_err()
+        || syscall::close(replacement_user).is_err()
+    {
         syscall::exit(105);
     }
-    for _ in 0..8 {
+    for _ in 0..64 {
         syscall::yield_now().unwrap_or_else(|_| syscall::exit(106));
     }
-    if !fixture_files_are_exact()
-        || !nullfs_root_is_valid()
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE_RAW), errno::NO_ENTRY)
-    {
+    if !path_contents_match(NULLFS_WELCOME, WELCOME) {
         syscall::exit(107);
+    }
+    if !path_contents_match(NULLFS_README, README) {
+        syscall::exit(114);
+    }
+    if !nullfs_root_is_valid() {
+        syscall::exit(115);
+    }
+    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY) {
+        syscall::exit(116);
+    }
+    if !stat_failed_with_retry(NULLFS_PUBLIC_PROBE_RAW, platform::Errno::NO_ENTRY) {
+        syscall::exit(117);
+    }
+    if !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY) {
+        syscall::exit(118);
+    }
+    if !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY) {
+        syscall::exit(119);
     }
     syscall::exit(0)
 }
@@ -1063,7 +1189,39 @@ fn recover_public_probe_artifact() -> bool {
     };
     if !read_matches(descriptor, expected)
         || !unlink_with_retry(NULLFS_PUBLIC_PROBE)
-        || !platform_failed_with(platform::stat(NULLFS_PUBLIC_PROBE), errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_PUBLIC_PROBE, platform::Errno::NO_ENTRY)
+    {
+        let _ = syscall::close(descriptor);
+        return false;
+    }
+    syscall::close(descriptor).is_ok()
+}
+
+fn recover_user_probe_artifact() -> bool {
+    let stat = match stat_with_retry(NULLFS_USER_PROBE) {
+        Ok(stat) => stat,
+        Err(error) if error == platform::Errno::NO_ENTRY => return true,
+        Err(_) => return false,
+    };
+    if stat.kind != file::KIND_FILE || stat.flags != 0 {
+        return false;
+    }
+    let expected = if stat.size == 0 {
+        &[]
+    } else if stat.size == USER_PROBE_BYTES.len() as u64 {
+        USER_PROBE_BYTES
+    } else if stat.size == USER_RESTART_BYTES.len() as u64 {
+        USER_RESTART_BYTES
+    } else {
+        return false;
+    };
+    let Some(descriptor) = open_with_retry(NULLFS_USER_PROBE_RAW, syscall::OpenFlags::READ) else {
+        return false;
+    };
+    if !read_matches(descriptor, expected)
+        || !unlink_with_retry(NULLFS_USER_PROBE)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE, platform::Errno::NO_ENTRY)
+        || !stat_failed_with_retry(NULLFS_USER_PROBE_RAW, platform::Errno::NO_ENTRY)
     {
         let _ = syscall::close(descriptor);
         return false;
@@ -1196,6 +1354,15 @@ fn system_directory_is_valid() -> bool {
     }
 }
 
+fn user_profile_is_valid() -> bool {
+    directory_contains(b"/Users", &[b"natalie"])
+        && directory_contains(b"/Users/natalie", &[b"Profile"])
+        && directory_contains(
+            b"/Users/natalie/Profile",
+            &[b"config", b"cache", b"state", b"data", b"logs", b"runtime"],
+        )
+}
+
 fn system_mutation_is_denied(path: &[u8]) -> bool {
     syscall_failed_with(
         syscall::open(path, syscall::OpenFlags::READ | syscall::OpenFlags::WRITE),
@@ -1217,7 +1384,7 @@ fn path_contents_match(path: &[u8], expected: &[u8]) -> bool {
 }
 
 fn descriptor_stat_matches(descriptor: syscall::FileDescriptor, size: u64) -> bool {
-    platform::fstat(descriptor).ok()
+    fstat_with_retry(descriptor).ok()
         == Some(file::Stat {
             kind: file::KIND_FILE,
             size,
@@ -1227,6 +1394,38 @@ fn descriptor_stat_matches(descriptor: syscall::FileDescriptor, size: u64) -> bo
 
 fn stat_matches(path: &[u8], kind: u64, size: u64) -> bool {
     stat_matches_flags(path, kind, size, 0)
+}
+
+fn stat_with_retry(path: &[u8]) -> platform::Result<file::Stat> {
+    for _ in 0..64 {
+        match platform::stat(path) {
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
+    Err(platform::Errno::TRY_AGAIN)
+}
+
+fn stat_failed_with_retry(path: &[u8], expected: platform::Errno) -> bool {
+    matches!(stat_with_retry(path), Err(error) if error == expected)
+}
+
+fn fstat_with_retry(descriptor: syscall::FileDescriptor) -> platform::Result<file::Stat> {
+    for _ in 0..64 {
+        match platform::fstat(descriptor) {
+            Err(error) if error == platform::Errno::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
+    Err(platform::Errno::TRY_AGAIN)
 }
 
 fn stat_matches_flags(path: &[u8], kind: u64, size: u64, flags: u64) -> bool {
@@ -1392,6 +1591,7 @@ fn reply_binding_matches(reply: &protocol::Reply, route_id: u32) -> bool {
         protocol::route::SYSTEM_BIN => Some("/System/bin"),
         protocol::route::SYSTEM_LIB => Some("/System/lib"),
         protocol::route::SYSTEM => Some("/System"),
+        protocol::route::USERS => Some("/Users"),
         protocol::route::APPLICATIONS => Some("/Applications"),
         _ => None,
     };
