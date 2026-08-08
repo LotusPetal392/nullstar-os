@@ -93,7 +93,7 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.14. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.15. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
@@ -102,10 +102,12 @@ shell after final exit. Direct shell children are reaped by `ush`; abandoned des
 use the bounded internal kernel reaper.
 
 The process manager owns address spaces and copy-on-write state, arguments and
-environments, descriptor tables, parent/child relationships, process groups, terminal
-ownership, signals, and completion state. `exec` constructs and validates a replacement
-image before committing it, and `fork` initially shares read-only pages before copying
-on write.
+environments, descriptor tables, parent/child relationships, process groups, basic job
+membership, terminal ownership, signals, and completion state. `exec` constructs and
+validates a replacement image before committing it, and `fork` initially shares read-only
+pages before copying on write. Capability-backed jobs now provide flat descendant
+containment, independent FIFO exit observation, and whole-job forced termination;
+hierarchy and resource policy remain future work.
 
 ### Userspace service routes
 

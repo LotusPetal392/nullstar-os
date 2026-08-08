@@ -67,16 +67,19 @@ impl Rights {
     pub const WAIT: Self = Self(abi_capability::RIGHT_WAIT);
     pub const READ: Self = Self(abi_capability::RIGHT_READ);
     pub const WRITE: Self = Self(abi_capability::RIGHT_WRITE);
+    pub const MANAGE: Self = Self(abi_capability::RIGHT_MANAGE);
 
     pub const ENDPOINT: Self = Self(abi_capability::ENDPOINT_RIGHTS);
     pub const NOTIFICATION: Self = Self(abi_capability::NOTIFICATION_RIGHTS);
     pub const SHARED_MEMORY: Self = Self(abi_capability::SHARED_MEMORY_RIGHTS);
     pub const KERNEL_EARLY_LOG_READER: Self = Self(abi_capability::KERNEL_EARLY_LOG_READER_RIGHTS);
+    pub const JOB: Self = Self(abi_capability::JOB_RIGHTS);
 
     pub const fn from_bits(bits: u64) -> Option<Self> {
         let all = abi_capability::ENDPOINT_RIGHTS
             | abi_capability::NOTIFICATION_RIGHTS
-            | abi_capability::SHARED_MEMORY_RIGHTS;
+            | abi_capability::SHARED_MEMORY_RIGHTS
+            | abi_capability::JOB_RIGHTS;
         if bits & !all == 0 {
             Some(Self(bits))
         } else {
@@ -113,6 +116,7 @@ pub enum ObjectKind {
     Notification,
     SharedMemory,
     KernelEarlyLogReader,
+    Job,
 }
 
 impl ObjectKind {
@@ -122,6 +126,7 @@ impl ObjectKind {
             abi_capability::KIND_NOTIFICATION => Some(Self::Notification),
             abi_capability::KIND_SHARED_MEMORY => Some(Self::SharedMemory),
             abi_capability::KIND_KERNEL_EARLY_LOG_READER => Some(Self::KernelEarlyLogReader),
+            abi_capability::KIND_JOB => Some(Self::Job),
             _ => None,
         }
     }
@@ -152,6 +157,12 @@ pub struct ReceivedMessage {
     pub sender_process_id: u64,
     pub bytes: usize,
     pub capability: Option<ReceivedCapability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobExit {
+    pub process_id: u64,
+    pub status: crate::syscall::ChildStatus,
 }
 
 pub fn duplicate(handle: CapabilityHandle, rights: Rights) -> Result<CapabilityHandle> {
@@ -406,6 +417,75 @@ pub fn shared_memory_write(handle: CapabilityHandle, offset: usize, bytes: &[u8]
     decode(result).map(|count| count as usize)
 }
 
+pub fn job_create() -> Result<CapabilityHandle> {
+    let mut result = syscall::JOB_CREATE;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result)
+}
+
+pub fn job_assign(handle: CapabilityHandle, child_process_id: u64) -> Result<u64> {
+    let mut result = syscall::JOB_ASSIGN;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") handle,
+            in("rsi") child_process_id,
+        );
+    }
+    decode(result)
+}
+
+pub fn job_try_wait(handle: CapabilityHandle) -> Result<JobExit> {
+    let mut raw = crate::abi::job::Exit::EMPTY;
+    let mut result = syscall::JOB_TRY_WAIT;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") handle,
+            in("rsi") (&mut raw as *mut crate::abi::job::Exit) as u64,
+            in("rdx") size_of::<crate::abi::job::Exit>() as u64,
+        );
+    }
+    decode(result)?;
+    if raw.process_id == 0 {
+        return Err(Error::IO);
+    }
+    Ok(JobExit {
+        process_id: raw.process_id,
+        status: crate::syscall::ChildStatus::from_raw(raw.status),
+    })
+}
+
+pub fn job_wait(handle: CapabilityHandle) -> Result<JobExit> {
+    loop {
+        match job_try_wait(handle) {
+            Ok(exit) => return Ok(exit),
+            Err(error) if error == Error::TRY_AGAIN => {
+                if crate::syscall::yield_now().is_err() {
+                    return Err(Error::IO);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub fn job_terminate(handle: CapabilityHandle) -> Result<usize> {
+    let mut result = syscall::JOB_TERMINATE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") handle,
+        );
+    }
+    decode(result).map(|count| count as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ObjectKind, Rights, phase1_protection_abi};
@@ -434,7 +514,28 @@ mod tests {
             ObjectKind::from_raw(capability::KIND_KERNEL_EARLY_LOG_READER),
             Some(ObjectKind::KernelEarlyLogReader)
         );
+        assert_eq!(
+            ObjectKind::from_raw(capability::KIND_JOB),
+            Some(ObjectKind::Job)
+        );
         assert_eq!(ObjectKind::from_raw(99), None);
+    }
+
+    #[test]
+    fn job_exit_layout_and_syscall_numbers_are_stable() {
+        assert_eq!(core::mem::size_of::<crate::abi::job::Exit>(), 16);
+        assert_eq!(core::mem::align_of::<crate::abi::job::Exit>(), 8);
+        assert_eq!(syscall::JOB_CREATE, 60);
+        assert_eq!(syscall::JOB_ASSIGN, 61);
+        assert_eq!(syscall::JOB_TRY_WAIT, 62);
+        assert_eq!(syscall::JOB_TERMINATE, 63);
+        assert_eq!(
+            crate::syscall::ChildStatus::from_raw(
+                crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,
+            )
+            .signal(),
+            Some(crate::abi::signal::KILL)
+        );
     }
 
     #[test]

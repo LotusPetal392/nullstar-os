@@ -445,8 +445,10 @@ The name `ush` should not silently imply complete POSIX shell behavior.
 ## Recommended implementation stages
 
 1. Add job containment, process-exit observation, and a versioned control protocol to the
-   current supervisor. **Partly delivered:** the allocation-free, host-testable `NSVC` v1 codec and
-   PID 1 service registry fixes the observation contract, but job containment remains.
+   current supervisor. **Foundation delivered:** ABI 1.15 supplies capability-backed flat jobs,
+   inherited descendant containment, independent FIFO exit records, and bounded termination; the
+   allocation-free `NSVC` v1 codec and PID 1 registry supply service observation. Assigning service
+   generations to jobs and introducing job hierarchy remain.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
    delivered:** native `list`, `status`, and restart use separately authorized IPC, logging has live
    in-memory `start`/`stop`, and NullFS restart has exact-generation quiesce, clean unmount, forced

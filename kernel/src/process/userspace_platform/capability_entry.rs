@@ -55,6 +55,7 @@ enum CapabilityObjectData {
     Notification(NotificationObject),
     SharedMemory(SharedMemoryObject),
     KernelEarlyLogReader(KernelEarlyLogReaderObject),
+    Job(crate::job::State),
 }
 
 #[derive(Debug)]
@@ -187,7 +188,8 @@ impl CapabilityRegistry {
                 CapabilityObjectData::SharedMemory(memory) => Some(memory.bytes.len()),
                 CapabilityObjectData::Endpoint(_)
                 | CapabilityObjectData::Notification(_)
-                | CapabilityObjectData::KernelEarlyLogReader(_) => None,
+                | CapabilityObjectData::KernelEarlyLogReader(_)
+                | CapabilityObjectData::Job(_) => None,
             })
             .sum()
     }
@@ -203,6 +205,7 @@ impl CapabilityRegistry {
             abi::capability::KIND_NOTIFICATION => abi::limits::MAX_NOTIFICATION_OBJECTS,
             abi::capability::KIND_SHARED_MEMORY => abi::limits::MAX_SHARED_MEMORY_OBJECTS,
             abi::capability::KIND_KERNEL_EARLY_LOG_READER => 1,
+            abi::capability::KIND_JOB => abi::limits::MAX_JOB_OBJECTS,
             _ => return Err(abi::errno::INVALID_ARGUMENT),
         };
         if self.object_kind_count(kind) >= limit {
@@ -250,7 +253,8 @@ impl CapabilityRegistry {
                     ),
                     CapabilityObjectData::Notification(_)
                     | CapabilityObjectData::SharedMemory(_)
-                    | CapabilityObjectData::KernelEarlyLogReader(_) => None,
+                    | CapabilityObjectData::KernelEarlyLogReader(_)
+                    | CapabilityObjectData::Job(_) => None,
                 })
                 .unwrap_or_default();
             for object in transferred {
@@ -278,6 +282,7 @@ fn capability_allowed_rights(kind: u64) -> u64 {
         abi::capability::KIND_KERNEL_EARLY_LOG_READER => {
             abi::capability::KERNEL_EARLY_LOG_READER_RIGHTS
         }
+        abi::capability::KIND_JOB => abi::capability::JOB_RIGHTS,
         _ => 0,
     }
 }
@@ -339,6 +344,7 @@ fn capability_object_size(record: &CapabilityObjectRecord) -> u64 {
         CapabilityObjectData::KernelEarlyLogReader(_) => {
             crate::early_log::KERNEL_EARLY_LOG_CAPACITY as u64
         }
+        CapabilityObjectData::Job(job) => job.active_members() as u64,
     }
 }
 
@@ -418,6 +424,10 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::OPEN_WRITABLE_BLOCK_DEVICE_ENDPOINT
             | abi::syscall::OPEN_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT
             | abi::syscall::OFFLINE_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT
+            | abi::syscall::JOB_CREATE
+            | abi::syscall::JOB_ASSIGN
+            | abi::syscall::JOB_TRY_WAIT
+            | abi::syscall::JOB_TERMINATE
     )
 }
 
@@ -503,6 +513,12 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
                 registers.rdx,
             )
         }
+        abi::syscall::JOB_CREATE => job_create(process_id),
+        abi::syscall::JOB_ASSIGN => job_assign(process_id, registers.rdi, registers.rsi),
+        abi::syscall::JOB_TRY_WAIT => {
+            job_try_wait(process_id, registers.rdi, registers.rsi, registers.rdx)
+        }
+        abi::syscall::JOB_TERMINATE => job_terminate(process_id, registers.rdi),
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
@@ -702,7 +718,8 @@ fn endpoint_receive(
         },
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
-        | CapabilityObjectData::KernelEarlyLogReader(_) => {
+        | CapabilityObjectData::KernelEarlyLogReader(_)
+        | CapabilityObjectData::Job(_) => {
             return error_return(abi::errno::INVALID_ARGUMENT);
         }
     };
@@ -727,7 +744,8 @@ fn endpoint_receive(
             .expect("endpoint message disappeared during receive"),
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
-        | CapabilityObjectData::KernelEarlyLogReader(_) => {
+        | CapabilityObjectData::KernelEarlyLogReader(_)
+        | CapabilityObjectData::Job(_) => {
             return error_return(abi::errno::IO);
         }
     };
@@ -939,4 +957,200 @@ fn shared_memory_write(
         destination.copy_from_slice(source);
     }
     destination.len() as u64
+}
+
+fn job_create(process_id: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let object = match registry.create_object(
+        abi::capability::KIND_JOB,
+        CapabilityObjectData::Job(crate::job::State::new(MAX_PROCESS_SLOTS)),
+    ) {
+        Ok(object) => object,
+        Err(error) => return error_return(error),
+    };
+    match registry.insert_entry(process_id, object, abi::capability::JOB_RIGHTS) {
+        Ok(handle) => handle,
+        Err(error) => {
+            registry.collect_garbage();
+            error_return(error)
+        }
+    }
+}
+
+fn job_assign(process_id: u64, handle: u64, child_process_id: u64) -> u64 {
+    if child_process_id == 0 || child_process_id == process_id {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let job = {
+        let registry = CAPABILITY_REGISTRY.lock();
+        let Some(entry) = registry.entry(process_id, handle) else {
+            return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+        };
+        if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_MANAGE) {
+            return error_return(error);
+        }
+        if entry.object.kind != abi::capability::KIND_JOB {
+            return error_return(abi::errno::INVALID_ARGUMENT);
+        }
+        entry.object
+    };
+
+    let existing_job = {
+        let manager = PROCESS_MANAGER.lock();
+        let Some(child) = manager.processes.iter().find(|candidate| {
+            candidate.process_id == child_process_id
+                && candidate.parent_process_id == Some(process_id)
+                && candidate.is_live()
+        }) else {
+            return error_return(ERR_NO_CHILD);
+        };
+        child.job
+    };
+    if existing_job == Some(job) {
+        return child_process_id;
+    }
+    if existing_job.is_some() {
+        return error_return(abi::errno::PERMISSION);
+    }
+
+    if let Err(error) = capability_job_add_member(job, child_process_id) {
+        return error_return(error);
+    }
+    let installed = {
+        let mut manager = PROCESS_MANAGER.lock();
+        manager
+            .process_mut(child_process_id)
+            .filter(|child| {
+                child.parent_process_id == Some(process_id)
+                    && child.is_live()
+                    && child.job.is_none()
+            })
+            .map(|child| child.job = Some(job))
+            .is_some()
+    };
+    if !installed {
+        capability_job_remove_unstarted(job, child_process_id);
+        return error_return(ERR_NO_CHILD);
+    }
+    child_process_id
+}
+
+fn job_try_wait(process_id: u64, handle: u64, address: u64, length: u64) -> u64 {
+    if length != size_of::<abi::job::Exit>() as u64
+        || !user_range_allows(process_id, address, size_of::<abi::job::Exit>(), true)
+    {
+        return error_return(if length != size_of::<abi::job::Exit>() as u64 {
+            abi::errno::INVALID_ARGUMENT
+        } else {
+            abi::errno::BAD_ADDRESS
+        });
+    }
+    let record = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        let Some(entry) = registry.entry(process_id, handle) else {
+            return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+        };
+        if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
+            return error_return(error);
+        }
+        if entry.object.kind != abi::capability::KIND_JOB {
+            return error_return(abi::errno::INVALID_ARGUMENT);
+        }
+        let Some(index) = registry.object_index(entry.object) else {
+            return error_return(abi::errno::IO);
+        };
+        let CapabilityObjectData::Job(job) = &mut registry.objects[index].data else {
+            return error_return(abi::errno::INVALID_ARGUMENT);
+        };
+        match job.take_completion() {
+            Some(record) => record,
+            None if job.active_members() != 0 => return error_return(abi::errno::TRY_AGAIN),
+            None => return error_return(ERR_NO_CHILD),
+        }
+    };
+    let exit = abi::job::Exit {
+        process_id: record.process_id,
+        status: record.status,
+    };
+    unsafe { ptr::write_unaligned(address as *mut abi::job::Exit, exit) };
+    0
+}
+
+fn job_terminate(process_id: u64, handle: u64) -> u64 {
+    let members = {
+        let registry = CAPABILITY_REGISTRY.lock();
+        let Some(entry) = registry.entry(process_id, handle) else {
+            return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+        };
+        if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_SIGNAL) {
+            return error_return(error);
+        }
+        if entry.object.kind != abi::capability::KIND_JOB {
+            return error_return(abi::errno::INVALID_ARGUMENT);
+        }
+        let Some(index) = registry.object_index(entry.object) else {
+            return error_return(abi::errno::IO);
+        };
+        let CapabilityObjectData::Job(job) = &registry.objects[index].data else {
+            return error_return(abi::errno::INVALID_ARGUMENT);
+        };
+        job.members().collect::<Vec<_>>()
+    };
+
+    members
+        .into_iter()
+        .filter(|member| terminate_process_with_signal(*member, abi::signal::KILL, true))
+        .count() as u64
+}
+
+fn capability_job_add_member(job: CapabilityObjectRef, process_id: u64) -> Result<(), i64> {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(index) = registry.object_index(job) else {
+        return Err(abi::errno::IO);
+    };
+    let CapabilityObjectData::Job(state) = &mut registry.objects[index].data else {
+        return Err(abi::errno::INVALID_ARGUMENT);
+    };
+    state.assign(process_id).map_err(|error| match error {
+        crate::job::AssignError::InvalidProcess => abi::errno::INVALID_ARGUMENT,
+        crate::job::AssignError::AlreadyMember => abi::errno::PERMISSION,
+        crate::job::AssignError::Full => abi::errno::NO_SPACE,
+    })?;
+    kernel_capability_root_add(job);
+    Ok(())
+}
+
+fn capability_job_remove_unstarted(job: CapabilityObjectRef, process_id: u64) {
+    let removed = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        registry
+            .object_index(job)
+            .and_then(|index| match &mut registry.objects[index].data {
+                CapabilityObjectData::Job(state) => Some(state.remove_unstarted(process_id)),
+                _ => None,
+            })
+            .is_some_and(|result| result.is_ok())
+    };
+    if removed {
+        kernel_capability_root_remove(job);
+    }
+}
+
+fn capability_job_record_exit(job: CapabilityObjectRef, process_id: u64, status: u64) {
+    let recorded = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        registry
+            .object_index(job)
+            .and_then(|index| match &mut registry.objects[index].data {
+                CapabilityObjectData::Job(state) => {
+                    Some(state.complete(crate::job::ExitRecord { process_id, status }))
+                }
+                _ => None,
+            })
+            .is_some_and(|result| result.is_ok())
+    };
+    debug_assert!(recorded, "job member disappeared before process completion");
+    if recorded {
+        kernel_capability_root_remove(job);
+    }
 }

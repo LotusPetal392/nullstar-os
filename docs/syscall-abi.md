@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.14, and a
+The ABI is experimental, but callers can query the current version, 1.15, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -353,6 +353,39 @@ filesystem service therefore reports `OUTCOME_UNKNOWN`, fail-stops, and requires
 supervision to offline the matching filesystem-provider generation. Neither the
 kernel proxy nor callers automatically retry an uncertain mutation.
 
+## Version 1.15 basic job containment
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 60 | `JOB_CREATE` | none | new job handle |
+| 61 | `JOB_ASSIGN` | job handle, direct-child PID | assigned PID |
+| 62 | `JOB_TRY_WAIT` | job handle, `job::Exit` address, exact byte length | zero |
+| 63 | `JOB_TERMINATE` | job handle | number of members signaled |
+
+A job handle is capability kind `5`. Its full rights are `DUPLICATE | TRANSFER |
+SIGNAL | WAIT | MANAGE`; rights-reduced observer and cleanup handles are supported.
+`MANAGE` authorizes adding a live direct child that does not already belong to a job.
+Once assigned, that process cannot be moved to another job, and every later `fork`
+descendant inherits the same job before becoming visible to userspace.
+
+`JOB_TRY_WAIT` consumes one fixed 16-byte FIFO exit record containing the member PID and
+the same terminal status encoding used by child waiting. It returns `EAGAIN` while members
+remain but no record is ready, and `ECHILD` when both the member set and completion queue
+are empty. Job observation is independent of parent/child waiting: consuming either view
+does not consume the other. Fault and signal exits preserve the existing
+`child_status::SIGNAL_BASE + value` representation.
+
+Live members and undrained exit records share the existing 64-process bound. Assignment
+or inherited `fork` returns `ENOSPC` rather than accepting a member whose exit could not
+be retained. `JOB_TERMINATE` requires `SIGNAL` and delivers uncatchable signal 9 to every
+current member, including orphaned descendants. The job object remains reachable while
+it contains members even if userspace closes its last handle.
+
+This first slice is intentionally flat. It does not yet add child-job hierarchy,
+kill-on-last-handle-close, resource budgets, process suspension, blocking/multi-object
+wait, or automatic PID 1 service assignment. A launcher requiring strict containment
+must keep a new child behind its existing launch barrier until `JOB_ASSIGN` succeeds.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -374,6 +407,9 @@ kernel proxy nor callers automatically retry an uncertain mutation.
 - ABI 1.14 adds PID-1-only exact-UUID and exact-generation writable NullFS
   block-endpoint offlining at syscall 59 without changing the block-device,
   filesystem, or `NSVC` wire protocols.
+- ABI 1.15 adds capability-backed job creation, direct-child assignment, inherited
+  descendant containment, independent exit observation, and whole-job termination at
+  syscalls 60 through 63.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

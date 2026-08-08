@@ -15,6 +15,7 @@ userspace::panic_handler!();
 
 const SUCCESS: &[u8] = b"userspace Rust runtime probe passed\n";
 const DIRECTORY_PAGE: usize = 8;
+const JOB_WAIT_YIELDS: usize = 4096;
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
@@ -83,7 +84,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
     {
         return false;
     }
-    if !capability_probe(process_id) {
+    if !capability_probe(process_id) || !job_probe() {
         return false;
     }
     let Ok(process_group) = platform::get_process_group(0) else {
@@ -271,6 +272,167 @@ fn capability_probe(current_process: u64) -> bool {
         && ipc::close(notification).is_ok()
         && ipc::close(send_only).is_ok()
         && ipc::close(endpoint).is_ok()
+}
+
+fn job_probe() -> bool {
+    let Ok(job) = ipc::job_create() else {
+        return false;
+    };
+    let Ok(wait_only) = ipc::duplicate(job, Rights::WAIT) else {
+        let _ = ipc::close(job);
+        return false;
+    };
+    let Ok(info) = ipc::info(job) else {
+        let _ = ipc::close(wait_only);
+        let _ = ipc::close(job);
+        return false;
+    };
+    if info.kind != ObjectKind::Job
+        || info.rights != Rights::JOB
+        || info.size != 0
+        || ipc::job_try_wait(wait_only).err() != Some(ipc::Error::NO_CHILD)
+    {
+        let _ = ipc::close(wait_only);
+        let _ = ipc::close(job);
+        return false;
+    }
+
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return close_job_handles(job, wait_only, false);
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return close_job_handles(job, wait_only, false);
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.writer);
+        let mut byte = [0_u8; 1];
+        if syscall::read(barrier.reader, &mut byte).ok() != Some(0)
+            || syscall::close(barrier.reader).is_err()
+        {
+            syscall::exit(120);
+        }
+        match syscall::fork() {
+            Ok(0) => syscall::exit(42),
+            Ok(descendant) => {
+                if syscall::wait_child(descendant)
+                    .ok()
+                    .map(|status| status.raw())
+                    != Some(42)
+                {
+                    syscall::exit(121);
+                }
+            }
+            Err(_) => syscall::exit(122),
+        }
+        syscall::exit(23);
+    }
+
+    let reader_closed = syscall::close(barrier.reader).is_ok();
+    let attenuated_denied = ipc::job_assign(wait_only, child).err() == Some(ipc::Error::PERMISSION);
+    let assigned = ipc::job_assign(job, child).ok() == Some(child);
+    let member_visible = ipc::info(job).is_ok_and(|info| info.size == 1);
+    let barrier_released = syscall::close(barrier.writer).is_ok();
+    let setup_ok =
+        reader_closed && attenuated_denied && assigned && member_visible && barrier_released;
+    if !setup_ok {
+        let _ = ipc::job_terminate(job);
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+        return close_job_handles(job, wait_only, false);
+    }
+
+    let Some(first) = bounded_job_wait(wait_only) else {
+        let _ = ipc::job_terminate(job);
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+        return close_job_handles(job, wait_only, false);
+    };
+    let Some(second) = bounded_job_wait(wait_only) else {
+        let _ = ipc::job_terminate(job);
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+        return close_job_handles(job, wait_only, false);
+    };
+    let descendant_observed = [first, second]
+        .iter()
+        .any(|exit| exit.process_id != child && exit.status.raw() == 42);
+    let child_observed = [first, second]
+        .iter()
+        .any(|exit| exit.process_id == child && exit.status.raw() == 23);
+    if !descendant_observed
+        || !child_observed
+        || syscall::wait_child(child).ok().map(|status| status.raw()) != Some(23)
+        || ipc::job_try_wait(wait_only).err() != Some(ipc::Error::NO_CHILD)
+        || !ipc::info(job).is_ok_and(|info| info.size == 0)
+    {
+        return close_job_handles(job, wait_only, false);
+    }
+
+    let Ok(termination_barrier) = syscall::pipe_pair() else {
+        return close_job_handles(job, wait_only, false);
+    };
+    let Ok(terminated_child) = syscall::fork() else {
+        let _ = syscall::close(termination_barrier.reader);
+        let _ = syscall::close(termination_barrier.writer);
+        return close_job_handles(job, wait_only, false);
+    };
+    if terminated_child == 0 {
+        let _ = syscall::close(termination_barrier.writer);
+        let mut byte = [0_u8; 1];
+        let _ = syscall::read(termination_barrier.reader, &mut byte);
+        syscall::exit(123);
+    }
+    let termination_reader_closed = syscall::close(termination_barrier.reader).is_ok();
+    let termination_assigned =
+        ipc::job_assign(job, terminated_child).ok() == Some(terminated_child);
+    let attenuated_termination_denied =
+        ipc::job_terminate(wait_only).err() == Some(ipc::Error::PERMISSION);
+    let termination_count = ipc::job_terminate(job).ok();
+    if termination_count != Some(1) {
+        let _ = platform::kill(terminated_child, signal::KILL);
+    }
+    let terminated_exit = termination_assigned
+        .then(|| bounded_job_wait(wait_only))
+        .flatten();
+    let waited_status = syscall::wait_child(terminated_child).ok();
+    let _ = syscall::close(termination_barrier.writer);
+    let terminated = termination_reader_closed
+        && termination_assigned
+        && attenuated_termination_denied
+        && termination_count == Some(1)
+        && terminated_exit.is_some_and(|exit| {
+            exit.process_id == terminated_child && exit.status.signal() == Some(signal::KILL)
+        })
+        && waited_status.is_some_and(|status| status.signal() == Some(signal::KILL));
+
+    close_job_handles(job, wait_only, terminated)
+}
+
+fn bounded_job_wait(handle: ipc::CapabilityHandle) -> Option<ipc::JobExit> {
+    for _ in 0..JOB_WAIT_YIELDS {
+        match ipc::job_try_wait(handle) {
+            Ok(exit) => return Some(exit),
+            Err(error) if error == ipc::Error::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn close_job_handles(
+    job: ipc::CapabilityHandle,
+    wait_only: ipc::CapabilityHandle,
+    result: bool,
+) -> bool {
+    let wait_closed = ipc::close(wait_only).is_ok();
+    let job_closed = ipc::close(job).is_ok();
+    wait_closed && job_closed && result
 }
 
 fn relative_open_probe() -> bool {

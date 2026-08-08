@@ -660,6 +660,7 @@ pub enum Error {
     InvalidProcessGroup(u64),
     TerminalBusy,
     ProcessLimitReached,
+    JobLimitReached,
     Pipe(pipe::Error),
     ProcessNotFound(u64),
     Scheduler(scheduler::InitError),
@@ -705,6 +706,7 @@ impl Error {
             Self::InvalidProcessGroup(_) => "userspace process group is invalid",
             Self::TerminalBusy => "another userspace process owns the terminal",
             Self::ProcessLimitReached => "userspace process limit was reached",
+            Self::JobLimitReached => "userspace job membership limit was reached",
             Self::Pipe(_) => "kernel pipe operation failed",
             Self::ProcessNotFound(_) => "userspace process bookkeeping is missing",
             Self::Scheduler(_) => "scheduler rejected the userspace task",
@@ -1328,6 +1330,7 @@ struct Process {
     process_id: u64,
     parent_process_id: Option<u64>,
     process_group_id: u64,
+    job: Option<CapabilityObjectRef>,
     terminal_parent: Option<u64>,
     task_id: u64,
     path: String,
@@ -2210,6 +2213,14 @@ fn spawn_with_mode(
         return Err(Error::SchedulerNotOnBootstrapTask);
     }
     PROCESS_MANAGER.lock().ensure_process_slot()?;
+    let inherited_job = parent_process_id.and_then(|parent_process_id| {
+        PROCESS_MANAGER
+            .lock()
+            .processes
+            .iter()
+            .find(|process| process.process_id == parent_process_id)
+            .and_then(|process| process.job)
+    });
 
     let mut kernel_stack = vec![0_u128; KERNEL_TRANSITION_STACK_WORDS].into_boxed_slice();
     let kernel_stack_start = kernel_stack.as_mut_ptr() as usize;
@@ -2288,6 +2299,7 @@ fn spawn_with_mode(
         process_id,
         parent_process_id,
         process_group_id,
+        job: inherited_job,
         terminal_parent,
         task_id: 0,
         path: path.to_string(),
@@ -2375,6 +2387,17 @@ fn spawn_with_mode(
         file_descriptor_inherit_count: 0,
     });
 
+    if let Some(job) = inherited_job
+        && capability_job_add_member(job, process_id).is_err()
+    {
+        if let Some(mut process) = pending_process.take() {
+            for frame in process.owned_frames.drain(..) {
+                frame_allocator.deallocate_frame(frame);
+            }
+        }
+        return Err(Error::JobLimitReached);
+    }
+
     let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
         if foreground {
             let attached = match terminal_parent {
@@ -2406,6 +2429,9 @@ fn spawn_with_mode(
     let task_id = match task_result {
         Ok(task_id) => task_id,
         Err(error) => {
+            if let Some(job) = inherited_job {
+                capability_job_remove_unstarted(job, process_id);
+            }
             if foreground {
                 if let Some(parent_process) = terminal_parent {
                     let _ = terminal::transfer(process_id, parent_process);
@@ -2456,6 +2482,7 @@ struct ForkSnapshot {
     path: String,
     environment: Vec<String>,
     process_group_id: u64,
+    job: Option<CapabilityObjectRef>,
     entry_point: u64,
     mapped_pages: usize,
     load_segments: usize,
@@ -2969,6 +2996,7 @@ impl Runtime {
                 path: parent.path.clone(),
                 environment: parent.environment.clone(),
                 process_group_id: parent.process_group_id,
+                job: parent.job,
                 entry_point: parent.entry_point,
                 mapped_pages: parent.mapped_pages,
                 load_segments: parent.load_segments,
@@ -3026,6 +3054,15 @@ impl Runtime {
         unsafe { (child_stack_pointer as *mut SavedContext).write(child_context) };
 
         let child_process_id = PROCESS_MANAGER.lock().allocate_process_id();
+        if let Some(job) = snapshot.job
+            && capability_job_add_member(job, child_process_id).is_err()
+        {
+            release_fork_resources(&snapshot);
+            for frame in address_space.page_table_frames.drain(..) {
+                self.frame_allocator.deallocate_frame(frame);
+            }
+            return Err(Error::JobLimitReached);
+        }
         let page_table_address = address_space.page_table_frame.start_address().as_u64();
         let mut owned_frames = core::mem::take(&mut address_space.page_table_frames);
         owned_frames.extend(snapshot.pages.iter().map(|page| page.frame));
@@ -3048,6 +3085,7 @@ impl Runtime {
                 process_id: child_process_id,
                 parent_process_id: Some(parent_process_id),
                 process_group_id: snapshot.process_group_id,
+                job: snapshot.job,
                 terminal_parent: None,
                 task_id,
                 path: snapshot.path.clone(),
@@ -3151,6 +3189,9 @@ impl Runtime {
         });
 
         if let Err(error) = task_result {
+            if let Some(job) = snapshot.job {
+                capability_job_remove_unstarted(job, child_process_id);
+            }
             release_fork_resources(&snapshot);
             for frame in address_space.page_table_frames.drain(..) {
                 self.frame_allocator.deallocate_frame(frame);
@@ -6231,6 +6272,9 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
         let frames_reclaimed = release_owned_frames(&mut process.owned_frames, frame_allocator);
         debug_assert_eq!(process.task_id, task.task_id);
         let result = process.result(frames_reclaimed, task.scheduled_count, task.runtime_ticks)?;
+        if let Some(job) = process.job {
+            capability_job_record_exit(job, process_id, child_status(&result));
+        }
         cpu_interrupts::without_interrupts(|| {
             let mut manager = PROCESS_MANAGER.lock();
             manager.orphan_children_of(process_id);
@@ -7782,6 +7826,7 @@ fn process_error_number(error: &Error) -> i64 {
         Error::ProcessLimitReached | Error::Scheduler(scheduler::InitError::TaskLimitReached) => {
             ERR_TRY_AGAIN
         }
+        Error::JobLimitReached => ERR_NO_SPACE,
         Error::InvalidProcessGroup(_) => ERR_NO_PROCESS,
         Error::TerminalBusy => ERR_IO,
         _ => ERR_IO,
