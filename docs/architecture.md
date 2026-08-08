@@ -169,7 +169,11 @@ offlining, KILL/reap, and dirty recovery. Replacement uses a fresh endpoint and 
 generation before fence completion, and controlled restart does not charge failure policy. Filesystem
 `Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and the public filesystem version 1
 `Request`/`Reply` operations are unchanged. The bounded allocation-free version 1 service-definition
-parser is implemented, but this adds no manager process, definition loading, activation, or
+parser and one PID 1 migration pilot are implemented. After VFS and NullFS readiness, PID 1 reads one
+policy-pinned definition through `/System/services`, launches its NullFS-only `/System/bin`
+executable with only readiness and generation handles, and applies bounded restart policy. Failure is
+service-local, startup cleanup remains owned until complete, and dependent restart waits for VFS and
+NullFS recovery. This adds no manager process, general discovery, dependency graph, `NSVC` record, or
 cross-reboot persistence.
 
 ### Future service and session lifecycle

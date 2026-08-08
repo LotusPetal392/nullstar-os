@@ -12,6 +12,11 @@ mod nullfs_primary_volume {
     include!("shared/nullfs_primary_volume.rs");
 }
 
+#[allow(dead_code)]
+mod definition_service_probe {
+    include!("shared/definition_service_probe.rs");
+}
+
 const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n";
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
@@ -146,6 +151,10 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_nullfs_exec_target")
             .expect("userspace NullFS exec-target artifact path was not set"),
     );
+    let userspace_definition_service_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_definition_service_probe")
+            .expect("userspace definition-service probe artifact path was not set"),
+    );
     let userspace_fork_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_fork_probe")
             .expect("userspace fork-probe artifact path was not set"),
@@ -278,7 +287,10 @@ fn main() {
         image
     };
 
-    let nullfs_fixture = build_nullfs_fixture(&userspace_nullfs_exec_target);
+    let nullfs_fixture = build_nullfs_fixture(
+        &userspace_nullfs_exec_target,
+        &userspace_definition_service_probe,
+    );
     let bios_image = output_directory.join("nullstar-os-bios.img");
     build_image(NORMAL_BOOT_MODE)
         .create_bios_image(&bios_image)
@@ -321,7 +333,7 @@ fn main() {
     );
 }
 
-fn build_nullfs_fixture(exec_target_path: &Path) -> Vec<u8> {
+fn build_nullfs_fixture(exec_target_path: &Path, definition_service_path: &Path) -> Vec<u8> {
     let exec_target =
         fs::read(exec_target_path).expect("failed to read userspace NullFS exec-target artifact");
     assert!(
@@ -331,6 +343,63 @@ fn build_nullfs_fixture(exec_target_path: &Path) -> Vec<u8> {
     assert!(
         exec_target.len() <= MAX_EXECUTABLE_FILE_BYTES,
         "userspace NullFS exec-target artifact exceeded the 1 MiB executable limit"
+    );
+    let definition_service = fs::read(definition_service_path)
+        .expect("failed to read userspace definition-service probe artifact");
+    assert!(
+        !definition_service.is_empty(),
+        "userspace definition-service probe artifact was empty"
+    );
+    assert!(
+        definition_service.len() <= MAX_EXECUTABLE_FILE_BYTES,
+        "userspace definition-service probe artifact exceeded the 1 MiB executable limit"
+    );
+    let definition = service_definition::parse(definition_service_probe::DEFINITION_BYTES)
+        .expect("embedded service definition did not parse");
+    assert_eq!(
+        definition.service_id().as_bytes(),
+        &definition_service_probe::SERVICE_ID_BYTES,
+        "embedded service definition identity drifted"
+    );
+    assert_eq!(
+        definition.name(),
+        definition_service_probe::SERVICE_NAME,
+        "embedded service definition name drifted"
+    );
+    assert_eq!(
+        definition.executable().as_bytes(),
+        definition_service_probe::EXECUTABLE_PATH,
+        "embedded service definition executable drifted"
+    );
+    assert_eq!(
+        definition.arguments().len(),
+        0,
+        "activation pilot does not support definition arguments"
+    );
+    assert_eq!(
+        definition.readiness(),
+        service_definition::Readiness::Notify,
+        "embedded service definition must use notify readiness"
+    );
+    assert_eq!(
+        definition.ready_message().map(str::as_bytes),
+        Some(definition_service_probe::READY_MESSAGE),
+        "embedded service definition readiness message drifted"
+    );
+    assert_eq!(
+        definition.restart_policy(),
+        service_definition::RestartPolicy::OnFailure,
+        "embedded service definition restart policy drifted"
+    );
+    assert_eq!(
+        definition.restart_limit(),
+        definition_service_probe::RESTART_LIMIT,
+        "embedded service definition restart limit drifted"
+    );
+    assert_eq!(
+        definition.restart_backoff_yields(),
+        definition_service_probe::RESTART_BACKOFF_YIELDS,
+        "embedded service definition restart backoff drifted"
     );
 
     let device = MemoryBlockDevice::new(BLOCK_SIZE, nullfs_primary_volume::CAPACITY_BLOCKS)
@@ -356,7 +425,7 @@ fn build_nullfs_fixture(exec_target_path: &Path) -> Vec<u8> {
     let system_bin = image
         .create_directory(system, "bin", 0o755)
         .expect("failed to create NullFS System bin directory");
-    image
+    let system_services = image
         .create_directory(system, "services", 0o755)
         .expect("failed to create NullFS System services directory");
     image
@@ -371,6 +440,22 @@ fn build_nullfs_fixture(exec_target_path: &Path) -> Vec<u8> {
     image
         .create_file(system_bin, "exec-target", &exec_target, 0o755)
         .expect("failed to create NullFS system exec-target artifact");
+    image
+        .create_file(
+            system_bin,
+            "definition-service-probe",
+            &definition_service,
+            0o755,
+        )
+        .expect("failed to create NullFS definition-service probe artifact");
+    image
+        .create_file(
+            system_services,
+            "definition-probe.service",
+            definition_service_probe::DEFINITION_BYTES,
+            0o644,
+        )
+        .expect("failed to create NullFS service-definition fixture");
     let applications = image
         .create_directory(1, "Applications", 0o755)
         .expect("failed to create NullFS Applications directory");

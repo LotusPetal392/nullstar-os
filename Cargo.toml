@@ -36,6 +36,7 @@ bootloader = "0.11.15"
 nullfs-blockdev = { path = "crates/nullfs-blockdev", features = ["memory"] }
 nullfs-format = { path = "crates/nullfs-format" }
 nullfs-testkit = { path = "crates/nullfs-testkit" }
+service-definition = { path = "crates/service-definition" }
 
 kernel = {
     path = "kernel",

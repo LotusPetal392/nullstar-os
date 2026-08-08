@@ -337,8 +337,8 @@ overloading generic flags or inline data.
 6. Introduce NullFS, the native metadata-rich persistent filesystem, as another
    service. (read-write service mount, explicitly writable direct sessions, bounded public
    VFS create/write/truncate/append/unlink, all three primary-volume namespace bindings,
-   and static `/System/bin` execution complete; service-definition activation and broader
-   acceptance remain)
+   static `/System/bin` execution, and one policy-pinned definition-backed activation pilot
+   complete; general service management and broader acceptance remain)
 7. Remove the kernel-resident FAT and tmpfs data paths after equivalent smoke
    and recovery coverage exists.
 

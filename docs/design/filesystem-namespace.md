@@ -246,7 +246,7 @@ The recommended progression is:
    (implemented for `/Applications`)
 4. Bind `/System`, preserve its system metadata in the canonical view, and load one
    ordinary static program through it while retaining the existing bootstrap path.
-   (implemented; service-definition activation remains future)
+   (implemented, including one policy-pinned definition-backed activation pilot)
 5. Bind `/Users`, complete the initial policy for all three persistent trees, and treat the
    synthetic VFS root as the normal namespace. (implemented)
 6. Complete administrative visibility, authorization, recovery, and namespace-mutation

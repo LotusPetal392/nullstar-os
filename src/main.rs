@@ -56,6 +56,15 @@ const NORMAL_BOOT_SERVICE_CONTROL_MARKER: &str = "userspace init: sv status logg
 const NORMAL_BOOT_NULLFS_GENERATION_MARKER: &str = "nullfs ready desired=running generation=1";
 const NORMAL_BOOT_TMPFS_GENERATION_MARKER: &str = "tmpfs ready desired=running generation=1";
 const NORMAL_BOOT_VFS_GENERATION_MARKER: &str = "vfs ready desired=running generation=1";
+const DEFINITION_SERVICE_LOADING_MARKER: &str =
+    "userspace init: loading service definition from /System/services";
+const DEFINITION_SERVICE_FIRST_FAILURE_MARKER: &str =
+    "definition-service-probe: intentional first-generation failure";
+const DEFINITION_SERVICE_RESTARTING_MARKER: &str =
+    "userspace init: definition-backed service exited; restarting";
+const DEFINITION_SERVICE_READY_MARKER: &str = "userspace init: definition-backed service ready";
+const DEFINITION_SERVICE_VERIFIED_MARKER: &str =
+    "userspace init: definition-backed activation and restart verified";
 const NORMAL_BOOT_INIT_SHELL_MARKER: &str = "userspace init launched /ush";
 const NORMAL_BOOT_SHELL_MARKER: &str = "userspace shell ready";
 const NULLFS_RESTART_MODE_MARKER: &str = "boot mode selected: nullfs-restart-test";
@@ -96,6 +105,11 @@ struct NormalBootProgress {
     nullfs_generation_verified: bool,
     tmpfs_generation_verified: bool,
     vfs_generation_verified: bool,
+    definition_loading_observed: bool,
+    definition_first_failure_observed: bool,
+    definition_restart_observed: bool,
+    definition_ready_observed: bool,
+    definition_verified: bool,
     init_launched_shell: bool,
     shell_ready: bool,
 }
@@ -121,6 +135,15 @@ impl NormalBootProgress {
         self.nullfs_generation_verified |= line.contains(NORMAL_BOOT_NULLFS_GENERATION_MARKER);
         self.tmpfs_generation_verified |= line.contains(NORMAL_BOOT_TMPFS_GENERATION_MARKER);
         self.vfs_generation_verified |= line.contains(NORMAL_BOOT_VFS_GENERATION_MARKER);
+        self.definition_loading_observed |= line.contains(DEFINITION_SERVICE_LOADING_MARKER);
+        self.definition_first_failure_observed |= self.definition_loading_observed
+            && line.contains(DEFINITION_SERVICE_FIRST_FAILURE_MARKER);
+        self.definition_restart_observed |= self.definition_first_failure_observed
+            && line.contains(DEFINITION_SERVICE_RESTARTING_MARKER);
+        self.definition_ready_observed |=
+            self.definition_restart_observed && line.contains(DEFINITION_SERVICE_READY_MARKER);
+        self.definition_verified |=
+            self.definition_ready_observed && line.contains(DEFINITION_SERVICE_VERIFIED_MARKER);
         self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
         self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
 
@@ -142,6 +165,11 @@ impl NormalBootProgress {
             && self.nullfs_generation_verified
             && self.tmpfs_generation_verified
             && self.vfs_generation_verified
+            && self.definition_loading_observed
+            && self.definition_first_failure_observed
+            && self.definition_restart_observed
+            && self.definition_ready_observed
+            && self.definition_verified
             && self.init_launched_shell
             && self.shell_ready
     }
@@ -427,6 +455,11 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
     let mut logging_import_count = 0_u8;
     let mut logging_collector_verified = false;
     let mut restart_verified = false;
+    let mut definition_loading_observed = false;
+    let mut definition_first_failure_observed = false;
+    let mut definition_restart_observed = false;
+    let mut definition_ready_observed = false;
+    let mut definition_verified = false;
     run_qemu_until(
         qemu_command_for_image(options, image),
         "NullFS restart fault injection",
@@ -438,10 +471,25 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
             }
             logging_collector_verified |= line.contains(LOGGING_COLLECTOR_RESTART_PASSED_MARKER);
             restart_verified |= line.contains(NULLFS_RESTART_PASSED_MARKER);
+            definition_loading_observed |=
+                restart_verified && line.contains(DEFINITION_SERVICE_LOADING_MARKER);
+            definition_first_failure_observed |= definition_loading_observed
+                && line.contains(DEFINITION_SERVICE_FIRST_FAILURE_MARKER);
+            definition_restart_observed |= definition_first_failure_observed
+                && line.contains(DEFINITION_SERVICE_RESTARTING_MARKER);
+            definition_ready_observed |=
+                definition_restart_observed && line.contains(DEFINITION_SERVICE_READY_MARKER);
+            definition_verified |=
+                definition_ready_observed && line.contains(DEFINITION_SERVICE_VERIFIED_MARKER);
             mode_selected
                 && logging_import_count >= 2
                 && logging_collector_verified
                 && restart_verified
+                && definition_loading_observed
+                && definition_first_failure_observed
+                && definition_restart_observed
+                && definition_ready_observed
+                && definition_verified
         },
     )
 }
@@ -655,12 +703,14 @@ fn qemu_start_error(error: io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER, LOGGING_LIFECYCLE_MODE_MARKER,
-        LOGGING_LIFECYCLE_PASSED_MARKER, LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER,
-        LOGGING_LIFECYCLE_READY_MARKER, LOGGING_LIFECYCLE_STOPPED_MARKER,
-        LOGGING_LIFECYCLE_STOPPING_MARKER, LoggingLifecycleProgress,
-        NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER, NORMAL_BOOT_INIT_MARKER,
-        NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGCTL_MARKER,
+        DEFINITION_SERVICE_FIRST_FAILURE_MARKER, DEFINITION_SERVICE_LOADING_MARKER,
+        DEFINITION_SERVICE_READY_MARKER, DEFINITION_SERVICE_RESTARTING_MARKER,
+        DEFINITION_SERVICE_VERIFIED_MARKER, LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER,
+        LOGGING_LIFECYCLE_MODE_MARKER, LOGGING_LIFECYCLE_PASSED_MARKER,
+        LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER, LOGGING_LIFECYCLE_READY_MARKER,
+        LOGGING_LIFECYCLE_STOPPED_MARKER, LOGGING_LIFECYCLE_STOPPING_MARKER,
+        LoggingLifecycleProgress, NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER,
+        NORMAL_BOOT_INIT_MARKER, NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGCTL_MARKER,
         NORMAL_BOOT_LOGGING_IMPORT_MARKER, NORMAL_BOOT_LOGGING_PROBE_MARKER,
         NORMAL_BOOT_LOGGING_SERVICE_MARKER, NORMAL_BOOT_MODE_MARKER,
         NORMAL_BOOT_NULLFS_DISCOVERY_MARKER, NORMAL_BOOT_NULLFS_GENERATION_MARKER,
@@ -693,8 +743,34 @@ mod tests {
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_GENERATION_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_TMPFS_GENERATION_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_VFS_GENERATION_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_LOADING_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_FIRST_FAILURE_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_RESTARTING_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_READY_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_VERIFIED_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_INIT_SHELL_MARKER));
         assert!(progress.observe(NORMAL_BOOT_SHELL_MARKER));
+    }
+
+    #[test]
+    fn normal_boot_rejects_out_of_order_definition_activation_markers() {
+        let mut progress = NormalBootProgress::default();
+
+        assert!(!progress.observe(DEFINITION_SERVICE_VERIFIED_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_READY_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_RESTARTING_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_FIRST_FAILURE_MARKER));
+        assert!(!progress.definition_verified);
+        assert!(!progress.definition_ready_observed);
+        assert!(!progress.definition_restart_observed);
+        assert!(!progress.definition_first_failure_observed);
+
+        assert!(!progress.observe(DEFINITION_SERVICE_LOADING_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_FIRST_FAILURE_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_RESTARTING_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_READY_MARKER));
+        assert!(!progress.observe(DEFINITION_SERVICE_VERIFIED_MARKER));
+        assert!(progress.definition_verified);
     }
 
     #[test]

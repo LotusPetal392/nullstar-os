@@ -38,8 +38,11 @@ uses `try_unmount` to sync and publish a clean superblock, emits exact `CLEAN_UN
 replacement. Invalid lifecycle traffic, timeout, failure, or early/nonzero exit uses exact-generation
 offlining, KILL/reap, and dirty recovery. Controlled restart does not charge failure policy. Filesystem
 `Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and public filesystem version 1 operations
-are unchanged. A separate manager, activation, definition loading, and cross-reboot desired-state
-persistence remain future work.
+are unchanged. One policy-pinned migration pilot now loads
+`/System/services/definition-probe.service` through the canonical VFS/NullFS path, launches its
+NullFS-only executable, and applies generation-scoped readiness and bounded `on-failure` restart
+policy. General discovery, enablement, dependency resolution, a separate manager, and cross-reboot
+desired-state persistence remain future work.
 
 ## Design goals
 
@@ -210,8 +213,11 @@ across replacement. The current contract provides no durable cross-boot persiste
 
 The allocation-free version 1 parser currently covers stable identity, description,
 executable and structured arguments, readiness notification, and bounded restart fields.
-Definition loading and activation are not yet implemented. A later definition version
-should eventually include:
+One fixed PID 1 migration pilot loads and validates an exact definition from the canonical
+`/System/services` binding, grants only manager-owned generation and readiness capabilities,
+and applies its bounded restart policy. It deliberately does not implement discovery,
+enablement, dependency resolution, definition-selected capabilities, or a separate service
+manager. A later definition version should eventually include:
 
 - canonical service identity and description;
 - executable identity, argument array, environment, and working-directory authority;

@@ -12,6 +12,7 @@ nswp-core = { path = "../crates/nswp-core" }
 nswp-logging = { path = "../crates/nswp-logging" }
 nswp-runtime = { path = "../crates/nswp-runtime" }
 service-control = { path = "../crates/service-control" }
+service-definition = { path = "../crates/service-definition" }
 service-route = { path = "../crates/service-route" }
 
 [[bin]]
@@ -173,6 +174,12 @@ bench = false
 [[bin]]
 name = "nullfs_exec_target"
 path = "src/bin/nullfs_exec_target.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "definition_service_probe"
+path = "src/bin/definition_service_probe.rs"
 test = false
 bench = false
 
