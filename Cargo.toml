@@ -12,6 +12,7 @@ members = [
     "crates/nswp-runtime",
     "crates/nswp-testkit",
     "crates/service-control",
+    "crates/service-definition",
     "crates/service-route",
     "kernel",
     "tools/fsck-nullfs",

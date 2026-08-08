@@ -4,8 +4,10 @@
 
 A small PID 1 bootstrap supervisor, a separate declarative system service manager, a
 native `sv` management client, and a practical native utility set are **accepted
-direction**. Exact definition syntax, process names, the packaging of a multicall
-utility, and eventual GNU compatibility remain **tentative design**.
+direction**. The initial bounded service-definition syntax is implemented and documented
+in [NullStar service-definition format](../service-definition-format.md). Process names,
+the packaging of a multicall utility, later definition fields, and eventual GNU
+compatibility remain **tentative design**.
 
 The complete process, job, activation, restart, session, application, login, and recovery
 model is specified in
@@ -14,7 +16,9 @@ model is specified in
 64-byte control codec plus capability-separated native observation and mutation through PID 1 and
 `sv`. Mutation is not restart-only: restart is generic, while logging is the first live
 `start`/`stop` target using bounded convergence and generation-isolated route replacement.
-Filesystem `Start` and `Stop` remain exactly `Unsupported`. There is no separate manager.
+Filesystem `Start` and `Stop` remain exactly `Unsupported`. The allocation-free version 1
+definition parser is implemented, but PID 1 does not load definitions and there is no
+separate manager.
 
 ## PID 1 and the system service manager
 
@@ -66,11 +70,13 @@ Mutable system service state belongs under `/System/var`, while user service sta
 belongs under `Profile/state/services`. Packaged definitions are not modified to record
 whether a service is enabled.
 
-The first definition format needs ordinary service units and channel activation. Timer,
-path, device, and other activation classes should be added only after their queue,
+The first definition format describes ordinary immediate or notify-ready service units. Channel,
+timer, path, device, and other activation classes should be added only after their queue,
 failure, and authorization semantics are defined.
 
-A definition should eventually include:
+The implemented version 1 format intentionally covers only identity, description,
+executable and structured arguments, readiness notification, and bounded restart fields.
+A later definition version should eventually include:
 
 - stable canonical service identity and service class;
 - executable identity, argument vector, environment data, and working-directory
@@ -455,7 +461,7 @@ The name `ush` should not silently imply complete POSIX shell behavior.
 
 ## Open questions
 
-- The service-definition syntax and schema-evolution rules.
+- The schema-evolution rules and fields added after service-definition version 1.
 - The exact binary and process names for PID 1 and the system service manager.
 - Whether the service broker is part of the service manager or a separate early service.
 - The first channel-activation queue and failure limits.

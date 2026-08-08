@@ -121,8 +121,9 @@ unchanged.
   shutdown ordering, clean/dirty recovery, and bounded public mutation; broader
   administrative tooling remains.
 - **Partially implemented:** load non-bootstrap programs and service definitions through
-  the bound `/System` tree; static executable loading is proven, while definition loading
-  and activation remain future work.
+  the bound `/System` tree; static executable loading and the bounded allocation-free
+  definition parser are implemented, while definition loading and activation remain
+  future work.
 - **Future:** treat `/System/boot` as the canonical source of boot generations and
   initially mirror the selected generation to a firmware-readable bootstrap partition.
 - **Ongoing requirement:** retain an independent bootstrap and recovery environment

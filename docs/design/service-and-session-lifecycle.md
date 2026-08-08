@@ -6,9 +6,11 @@ A small root userspace bootstrap process, a separate declarative system service
 manager, hierarchical jobs, stable service identities, readiness-based supervision,
 per-login session managers, and per-application jobs are **accepted direction**.
 
-Exact service-definition syntax, process names, watchdog intervals, restart budgets,
-activation queue limits, and whether some bootstrap and service-manager code initially
-share one binary remain **tentative design**.
+The initial bounded service-definition syntax is implemented and documented in
+[NullStar service-definition format](../service-definition-format.md). Later definition
+fields, process names, watchdog intervals, production restart budgets, activation queue
+limits, and whether some bootstrap and service-manager code initially share one binary
+remain **tentative design**.
 
 This document defines the lifecycle architecture that uses the native
 [IPC and object model](ipc-and-object-model.md). Command-line administration and
@@ -206,7 +208,10 @@ across replacement. The current contract provides no durable cross-boot persiste
 
 ## Service definitions
 
-A declarative service definition should eventually include:
+The allocation-free version 1 parser currently covers stable identity, description,
+executable and structured arguments, readiness notification, and bounded restart fields.
+Definition loading and activation are not yet implemented. A later definition version
+should eventually include:
 
 - canonical service identity and description;
 - executable identity, argument array, environment, and working-directory authority;
