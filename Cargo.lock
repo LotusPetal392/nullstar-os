@@ -54,6 +54,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-generation"
+version = "0.1.0"
+dependencies = [
+ "nullfs-format",
+]
+
+[[package]]
 name = "bootloader"
 version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,6 +479,7 @@ dependencies = [
 name = "nullfs-service"
 version = "0.1.0"
 dependencies = [
+ "boot-generation",
  "nullfs-blockdev",
  "nullfs-core",
  "nullfs-format",
@@ -505,6 +513,7 @@ version = "0.1.0"
 name = "nullstar-os"
 version = "0.1.0"
 dependencies = [
+ "boot-generation",
  "bootloader",
  "kernel",
  "nullfs-blockdev",
@@ -915,6 +924,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 name = "userspace"
 version = "0.1.0"
 dependencies = [
+ "boot-generation",
  "nswp-core",
  "nswp-logging",
  "nswp-runtime",

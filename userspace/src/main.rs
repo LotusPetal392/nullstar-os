@@ -90,6 +90,11 @@ const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_FAILED: &[u8] =
     b"userspace init: writable NullFS partition probe failed\n";
 const WRITABLE_NULLFS_BLOCK_DEVICE_PROBE_PASSED: &[u8] =
     b"userspace init: writable NullFS partition probe passed\n";
+const NULLFS_BOOT_GENERATION_PROBE_COMMAND: &[u8] = b"/nullfs-boot-generation-probe";
+const NULLFS_BOOT_GENERATION_PROBE_FAILED: &[u8] =
+    b"userspace init: NullFS boot-generation probe failed\n";
+const NULLFS_BOOT_GENERATION_PROBE_PASSED: &[u8] =
+    b"userspace init: NullFS boot-generation probe passed\n";
 const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to acquire block-device endpoint\n";
 const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service --writable";
@@ -190,6 +195,7 @@ const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
 const NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE: &[u8] = b"nullfs-out-of-space-test\n";
 const NULLFS_BLOCK_DEVICE_LOSS_TEST_BOOT_MODE: &[u8] = b"nullfs-block-device-loss-test\n";
 const NULLFS_CRASH_RECOVERY_TEST_BOOT_MODE: &[u8] = b"nullfs-crash-recovery-test\n";
+const NULLFS_BOOT_GENERATION_TEST_BOOT_MODE: &[u8] = b"nullfs-boot-generation-test\n";
 const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const BOOT_MODE_PROBE_FAILED: &[u8] = b"userspace init: unable to read boot mode\n";
@@ -2504,6 +2510,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let nullfs_out_of_space_test = boot_mode == InitBootMode::NullfsOutOfSpaceTest;
     let nullfs_block_device_loss_test = boot_mode == InitBootMode::NullfsBlockDeviceLossTest;
     let nullfs_crash_recovery_test = boot_mode == InitBootMode::NullfsCrashRecoveryTest;
+    let nullfs_boot_generation_test = boot_mode == InitBootMode::NullfsBootGenerationTest;
     let logging_lifecycle_test = boot_mode == InitBootMode::LoggingLifecycleTest;
     if boot_mode == InitBootMode::NullfsUnavailableTest {
         match platform::open_writable_nullfs_block_device_endpoint(
@@ -2608,6 +2615,29 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     );
     ipc::close(writable_nullfs_block_device_endpoint)
         .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+
+    if nullfs_boot_generation_test {
+        let boot_generation_endpoint = platform::open_writable_nullfs_block_device_endpoint(
+            &nullfs_primary_volume::FILESYSTEM_UUID,
+        )
+        .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+        if !matches!(
+            ipc::info(boot_generation_endpoint),
+            Ok(info)
+                if info.kind == ipc::ObjectKind::Endpoint
+                    && info.rights == (Rights::SEND | Rights::TRANSFER)
+        ) {
+            fail(BLOCK_DEVICE_BOOTSTRAP_FAILED);
+        }
+        run_probe(
+            NULLFS_BOOT_GENERATION_PROBE_COMMAND,
+            boot_generation_endpoint,
+            NULLFS_BOOT_GENERATION_PROBE_FAILED,
+            NULLFS_BOOT_GENERATION_PROBE_PASSED,
+        );
+        ipc::close(boot_generation_endpoint)
+            .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
+    }
 
     let nullfs_service_block_endpoint = platform::open_writable_nullfs_block_device_endpoint(
         &nullfs_primary_volume::FILESYSTEM_UUID,
@@ -3175,6 +3205,7 @@ enum InitBootMode {
     NullfsOutOfSpaceTest,
     NullfsBlockDeviceLossTest,
     NullfsCrashRecoveryTest,
+    NullfsBootGenerationTest,
     NullfsUnavailableTest,
     LoggingLifecycleTest,
 }
@@ -3198,6 +3229,9 @@ fn init_boot_mode() -> InitBootMode {
         }
         b"nullfs-crash-recovery-test" | NULLFS_CRASH_RECOVERY_TEST_BOOT_MODE => {
             InitBootMode::NullfsCrashRecoveryTest
+        }
+        b"nullfs-boot-generation-test" | NULLFS_BOOT_GENERATION_TEST_BOOT_MODE => {
+            InitBootMode::NullfsBootGenerationTest
         }
         b"nullfs-unavailable-test" | NULLFS_UNAVAILABLE_TEST_BOOT_MODE => {
             InitBootMode::NullfsUnavailableTest

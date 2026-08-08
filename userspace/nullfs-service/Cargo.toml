@@ -11,6 +11,7 @@ default = []
 freestanding = []
 
 [dependencies]
+boot-generation = { path = "../../crates/boot-generation" }
 nullfs-blockdev = { path = "../../crates/nullfs-blockdev", default-features = false }
 nullfs-core = { path = "../../crates/nullfs-core" }
 nullfs-format = { path = "../../crates/nullfs-format" }
@@ -24,6 +25,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "nullfs_service"
 path = "src/main.rs"
+test = false
+bench = false
+required-features = ["freestanding"]
+
+[[bin]]
+name = "nullfs_boot_generation_probe"
+path = "src/bin/nullfs_boot_generation_probe.rs"
 test = false
 bench = false
 required-features = ["freestanding"]

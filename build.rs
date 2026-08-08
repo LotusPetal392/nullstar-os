@@ -18,6 +18,11 @@ mod definition_service_probe {
     include!("shared/definition_service_probe.rs");
 }
 
+#[allow(dead_code)]
+mod boot_generation_fixture {
+    include!("shared/boot_generation_fixture.rs");
+}
+
 const HELLO_TEXT: &str = "Hello from a NullStar OS userspace file descriptor.\n";
 const NORMAL_BOOT_MODE: &[u8] = b"normal\n";
 const SMOKE_TEST_BOOT_MODE: &[u8] = b"smoke-test\n";
@@ -25,6 +30,7 @@ const NULLFS_RESTART_TEST_BOOT_MODE: &[u8] = b"nullfs-restart-test\n";
 const NULLFS_OUT_OF_SPACE_TEST_BOOT_MODE: &[u8] = b"nullfs-out-of-space-test\n";
 const NULLFS_BLOCK_DEVICE_LOSS_TEST_BOOT_MODE: &[u8] = b"nullfs-block-device-loss-test\n";
 const NULLFS_CRASH_RECOVERY_TEST_BOOT_MODE: &[u8] = b"nullfs-crash-recovery-test\n";
+const NULLFS_BOOT_GENERATION_TEST_BOOT_MODE: &[u8] = b"nullfs-boot-generation-test\n";
 const NULLFS_UNAVAILABLE_TEST_BOOT_MODE: &[u8] = b"nullfs-unavailable-test\n";
 const LOGGING_LIFECYCLE_TEST_BOOT_MODE: &[u8] = b"logging-lifecycle-test\n";
 const MAX_EXECUTABLE_FILE_BYTES: usize = 1024 * 1024;
@@ -48,6 +54,10 @@ fn main() {
     let userspace_nullfs_service = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_NULLFS_SERVICE_nullfs_service")
             .expect("userspace NullFS service artifact path was not set"),
+    );
+    let userspace_nullfs_boot_generation_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_NULLFS_SERVICE_nullfs_boot_generation_probe")
+            .expect("userspace NullFS boot-generation probe artifact path was not set"),
     );
     let userspace_block_device_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_block_device_probe")
@@ -211,6 +221,10 @@ fn main() {
             userspace_nullfs_service.clone(),
         );
         image.set_file(
+            String::from("nullfs-boot-generation-probe"),
+            userspace_nullfs_boot_generation_probe.clone(),
+        );
+        image.set_file(
             String::from("block-device-probe"),
             userspace_block_device_probe.clone(),
         );
@@ -329,6 +343,25 @@ fn main() {
         .expect("failed to create NullFS crash-recovery-test BIOS disk image");
     append_nullfs_partition(&nullfs_crash_recovery_test_bios_image, &nullfs_fixture)
         .expect("failed to append NullFS partition to crash-recovery-test BIOS disk image");
+    let nullfs_boot_generation_test_bios_image =
+        output_directory.join("nullstar-os-nullfs-boot-generation-test-bios.img");
+    let mut nullfs_boot_generation_image = build_image(NULLFS_BOOT_GENERATION_TEST_BOOT_MODE);
+    nullfs_boot_generation_image.set_file_contents(
+        String::from("BOOT0.BIN"),
+        boot_generation_fixture::GENERATION_1_KERNEL.to_vec(),
+    );
+    nullfs_boot_generation_image.set_file_contents(String::from("BOOT1.BIN"), Vec::new());
+    nullfs_boot_generation_image.set_file_contents(
+        String::from("BOOTSEL.BIN"),
+        boot_generation_fixture::initial_selection()
+            .encode()
+            .to_vec(),
+    );
+    nullfs_boot_generation_image
+        .create_bios_image(&nullfs_boot_generation_test_bios_image)
+        .expect("failed to create NullFS boot-generation-test BIOS disk image");
+    append_nullfs_partition(&nullfs_boot_generation_test_bios_image, &nullfs_fixture)
+        .expect("failed to append NullFS partition to boot-generation-test BIOS disk image");
     let nullfs_out_of_space_fixture = build_exhausted_nullfs_fixture(&nullfs_fixture);
     let nullfs_out_of_space_test_bios_image =
         output_directory.join("nullstar-os-nullfs-out-of-space-test-bios.img");
@@ -373,6 +406,10 @@ fn main() {
     println!(
         "cargo:rustc-env=NULLFS_CRASH_RECOVERY_TEST_BIOS_IMAGE={}",
         nullfs_crash_recovery_test_bios_image.display()
+    );
+    println!(
+        "cargo:rustc-env=NULLFS_BOOT_GENERATION_TEST_BIOS_IMAGE={}",
+        nullfs_boot_generation_test_bios_image.display()
     );
     println!(
         "cargo:rustc-env=NULLFS_UNAVAILABLE_TEST_BIOS_IMAGE={}",
@@ -467,6 +504,54 @@ fn build_nullfs_fixture(exec_target_path: &Path, definition_service_path: &Path)
     image
         .create_directory(system, "config", 0o755)
         .expect("failed to create NullFS System config directory");
+    let system_boot = image
+        .create_directory(system, "boot", 0o755)
+        .expect("failed to create NullFS System boot directory");
+    let boot_generations = image
+        .create_directory(system_boot, "generations", 0o755)
+        .expect("failed to create NullFS boot generations directory");
+    let generation_1 = image
+        .create_directory(boot_generations, "1", 0o755)
+        .expect("failed to create NullFS boot generation 1 directory");
+    image
+        .create_file(
+            generation_1,
+            "kernel",
+            boot_generation_fixture::GENERATION_1_KERNEL,
+            0o644,
+        )
+        .expect("failed to create NullFS boot generation 1 kernel");
+    image
+        .create_file(
+            generation_1,
+            "manifest",
+            boot_generation_fixture::GENERATION_1_MANIFEST,
+            0o644,
+        )
+        .expect("failed to create NullFS boot generation 1 manifest");
+    let generation_2 = image
+        .create_directory(boot_generations, "2", 0o755)
+        .expect("failed to create NullFS boot generation 2 directory");
+    image
+        .create_file(
+            generation_2,
+            "kernel",
+            boot_generation_fixture::GENERATION_2_KERNEL,
+            0o644,
+        )
+        .expect("failed to create NullFS boot generation 2 kernel");
+    image
+        .create_file(
+            generation_2,
+            "manifest",
+            boot_generation_fixture::GENERATION_2_MANIFEST,
+            0o644,
+        )
+        .expect("failed to create NullFS boot generation 2 manifest");
+    let boot_selection = boot_generation_fixture::initial_selection().encode();
+    image
+        .create_file(system_boot, "selection", &boot_selection, 0o644)
+        .expect("failed to create NullFS boot selection record");
     let system_var = image
         .create_directory(system, "var", 0o755)
         .expect("failed to create NullFS System var directory");

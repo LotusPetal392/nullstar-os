@@ -7,6 +7,7 @@ repository = "https://github.com/LotusPetal392/nullstar-os"
 build = "build.rs"
 
 [dependencies]
+boot-generation = { path = "../crates/boot-generation" }
 nullfs-format = { path = "../crates/nullfs-format" }
 nswp-core = { path = "../crates/nswp-core" }
 nswp-logging = { path = "../crates/nswp-logging" }
