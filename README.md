@@ -96,7 +96,7 @@ prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 | `cargo run -- --nullfs-crash-recovery-check` | Crash NullFS after a durable mutation but before its reply, then verify uncertain `EIO`, dirty remount, stale descriptors, and exactly-once recovered content. |
 | `cargo run -- --nullfs-boot-generation-check` | Use one disposable image across three boots to stage generation 2, select it, roll back to generation 1, and verify that both canonical generations and firmware slots remain intact. |
 | `cargo run -- --nullfs-unavailable-check` | Boot without a primary NullFS partition and verify recovery through the independent emergency shell. |
-| `cargo run -- --logging-lifecycle-check` | Run only logging start/stop/restart, route replacement, restart fencing, forced termination, and readiness-timeout recovery checks. |
+| `cargo run -- --logging-lifecycle-check` | Run only logging start/stop/restart, route replacement, restart fencing, escaped-descendant job containment, forced termination, and readiness-timeout recovery checks. |
 | `cargo run -- --help` | Show all runner options. |
 
 The smoke, out-of-space, block-device-loss, crash-recovery, and boot-generation runners copy their

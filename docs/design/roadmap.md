@@ -35,8 +35,9 @@ The detailed contract is in
 1. **Implemented foundation and pilot integration:** add capability-backed flat job
    containment, inherited descendants, independent FIFO process-exit observation, and
    bounded whole-job termination. PID 1 assigns the policy-pinned definition-backed
-   activation pilot to a fresh job before launch-barrier release and drains the complete
-   generation before replacement. Core-service integration and child jobs remain follow-up.
+   activation pilot and every logging-service generation to fresh jobs before launch-barrier
+   release, retains only `SIGNAL | WAIT`, and drains each complete generation before
+   replacement. tmpfs, VFS, NullFS, and child jobs remain follow-up.
 2. replace broad ambient startup assumptions with one bootstrap channel carrying a
    versioned startup message and explicit handles;
 3. define stable service identity, service generation, lifecycle state, readiness,
@@ -73,10 +74,11 @@ Replacement still uses a fresh endpoint and strictly newer generation, and contr
 no failure budget. Filesystem `Start` and `Stop` stay exactly `Unsupported`; `NSVC` v1 and the public
 filesystem version 1 `Request`/`Reply` operations are unchanged. ABI 1.15 supplies flat jobs,
 non-relaxable descendant inheritance, independent exit records, and whole-job termination. PID 1 now
-assigns each policy-pinned definition-backed activation attempt before barrier release, retains only
-`SIGNAL | WAIT`, and drains the old generation to `ECHILD` before replacement. Logging, tmpfs, VFS,
-and NullFS job integration, a separate manager process, general activation, and cross-reboot
-desired-state persistence remain future work.
+assigns each policy-pinned definition-backed activation attempt and every logging generation before
+barrier release, retains only `SIGNAL | WAIT`, and drains the old job to `ECHILD` before replacement.
+Logging keeps cooperative process-group termination but uses whole-job KILL for escalation and escaped
+descendants. tmpfs, VFS, and NullFS job integration, a separate manager process, general activation,
+and cross-reboot desired-state persistence remain future work.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

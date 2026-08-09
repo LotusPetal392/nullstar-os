@@ -43,6 +43,8 @@ const LOGGING_SERVICE_READY: &[u8] = b"userspace init: logging service ready\n";
 const LOGGING_SERVICE_FAILED: &[u8] = b"userspace init: logging service exhausted restart budget\n";
 const LOGGING_SERVICE_FORCE_TERMINATING: &[u8] =
     b"userspace init: logging service termination grace expired; forcing exit\n";
+const LOGGING_SERVICE_JOB_DRAINED: &[u8] =
+    b"userspace init: logging service generation job drained\n";
 const LOGGING_SERVICE_READINESS_TIMEOUT: &[u8] =
     b"userspace init: logging service readiness deadline expired; forcing exit\n";
 const LOGGING_SERVICE_BOOTSTRAP_FAILED: &[u8] =
@@ -181,7 +183,6 @@ const DEFINITION_SERVICE_FAILED: &[u8] =
 const DEFINITION_SERVICE_PROTOCOL_FAILED: &[u8] =
     b"userspace init: invalid definition-backed service readiness\n";
 const DEFINITION_SERVICE_READINESS_GRACE_YIELDS: u32 = 2_048;
-const DEFINITION_SERVICE_FORCE_WAIT_YIELDS: u32 = 64;
 const NULLFS_RESTART_PROBE_COMMAND: &[u8] = b"/vfs-probe nullfs-restart";
 const NULLFS_RESTART_PROBE_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
@@ -232,6 +233,7 @@ const LOGGING_TERMINATION_GRACE_YIELDS: u32 = 64;
 const LOGGING_READINESS_GRACE_YIELDS: u32 = 2_048;
 const LOGGING_TEST_READINESS_GRACE_YIELDS: u32 = 64;
 const LOGGING_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
+const SERVICE_JOB_CLEANUP_YIELDS: u32 = 64;
 const NULLFS_QUIESCE_GRACE_YIELDS: u32 = 2_048;
 const NULLFS_TEST_QUIESCE_GRACE_YIELDS: u32 = 8;
 const NULLFS_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
@@ -1299,6 +1301,138 @@ fn pump_route_ingress(
     true
 }
 
+struct LoggingActivationAttempt {
+    generation_handoff_source: Option<CapabilityHandle>,
+    readiness_source: Option<CapabilityHandle>,
+    producer_source: Option<CapabilityHandle>,
+    observer_source: Option<CapabilityHandle>,
+    barrier: Option<syscall::LaunchBarrier>,
+    process_id: Option<ProcessId>,
+    process_group_id: Option<ProcessId>,
+    job_management: Option<CapabilityHandle>,
+    job: Option<CapabilityHandle>,
+    job_assigned: bool,
+}
+
+impl LoggingActivationAttempt {
+    const fn new() -> Self {
+        Self {
+            generation_handoff_source: None,
+            readiness_source: None,
+            producer_source: None,
+            observer_source: None,
+            barrier: None,
+            process_id: None,
+            process_group_id: None,
+            job_management: None,
+            job: None,
+            job_assigned: false,
+        }
+    }
+
+    fn close_capability(handle: &mut Option<CapabilityHandle>) -> bool {
+        match *handle {
+            Some(value) => {
+                if ipc::close(value).is_ok() {
+                    *handle = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn release_barrier(&mut self) -> bool {
+        match self.barrier.as_mut() {
+            Some(barrier) => {
+                if barrier.release_in_place().is_ok() {
+                    self.barrier = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn release_child(&mut self) -> bool {
+        let generation_closed = Self::close_capability(&mut self.generation_handoff_source);
+        let barrier_released = self.release_barrier();
+        generation_closed && barrier_released
+    }
+
+    fn abort(&mut self) -> bool {
+        let process_clean = if self.job_assigned {
+            let clean = terminate_and_drain_service_job(
+                &mut self.job,
+                &mut self.process_id,
+                &mut self.process_group_id,
+                LOGGING_SERVICE_JOB_DRAINED,
+            );
+            if clean {
+                self.job_assigned = false;
+            }
+            clean
+        } else {
+            let process_group_clean = match self.process_group_id {
+                Some(process_group_id) => {
+                    if terminate_unassigned_service_process_group(
+                        process_group_id,
+                        &mut self.process_id,
+                    ) {
+                        self.process_group_id = None;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => self.process_id.is_none(),
+            };
+            process_group_clean && close_empty_service_job(&mut self.job_management, &mut self.job)
+        };
+        let management_closed = if process_clean {
+            Self::close_capability(&mut self.job_management)
+        } else {
+            false
+        };
+        let generation_closed = if process_clean {
+            Self::close_capability(&mut self.generation_handoff_source)
+        } else {
+            false
+        };
+        let readiness_closed = if process_clean {
+            Self::close_capability(&mut self.readiness_source)
+        } else {
+            false
+        };
+        let producer_closed = if process_clean {
+            Self::close_capability(&mut self.producer_source)
+        } else {
+            false
+        };
+        let observer_closed = if process_clean {
+            Self::close_capability(&mut self.observer_source)
+        } else {
+            false
+        };
+        let barrier_released = if process_clean {
+            self.release_barrier()
+        } else {
+            false
+        };
+        process_clean
+            && management_closed
+            && generation_closed
+            && readiness_closed
+            && producer_closed
+            && observer_closed
+            && barrier_released
+    }
+}
+
 struct LoggingGeneration {
     generation: ProviderGeneration,
     readiness_source: CapabilityHandle,
@@ -1306,6 +1440,7 @@ struct LoggingGeneration {
     observer_source: CapabilityHandle,
     producer_object_id: u64,
     observer_object_id: u64,
+    job: Option<CapabilityHandle>,
     readiness_received: bool,
     child_stopped: bool,
     routes_published: bool,
@@ -1315,7 +1450,23 @@ struct LoggingGeneration {
 }
 
 impl LoggingGeneration {
+    fn drain_job(&mut self) {
+        let mut leader_process_id = None;
+        let mut process_group_id = None;
+        if !terminate_and_drain_service_job(
+            &mut self.job,
+            &mut leader_process_id,
+            &mut process_group_id,
+            LOGGING_SERVICE_JOB_DRAINED,
+        ) {
+            fail(LOGGING_SERVICE_FAILED);
+        }
+    }
+
     fn close(self) {
+        if self.job.is_some() {
+            fail(LOGGING_SERVICE_PROTOCOL_FAILED);
+        }
         ipc::close(self.readiness_source)
             .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
         ipc::close(self.producer_source).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
@@ -1362,7 +1513,8 @@ impl LoggingLifecycle {
     }
 
     fn close_current(&mut self) {
-        if let Some(generation) = self.current.take() {
+        if let Some(mut generation) = self.current.take() {
+            generation.drain_job();
             generation.close();
         }
         self.termination_grace_yields_remaining = None;
@@ -2044,7 +2196,7 @@ fn definition_service_consume_restart(runtime: &mut DefinitionServiceRuntime<'_>
     true
 }
 
-fn reap_definition_service_leader(leader_process_id: &mut Option<ProcessId>) -> bool {
+fn reap_service_leader(leader_process_id: &mut Option<ProcessId>) -> bool {
     let Some(process_id) = *leader_process_id else {
         return true;
     };
@@ -2066,17 +2218,17 @@ fn reap_definition_service_leader(leader_process_id: &mut Option<ProcessId>) -> 
     }
 }
 
-fn terminate_unassigned_definition_process_group(
+fn terminate_unassigned_service_process_group(
     process_group_id: ProcessId,
     leader_process_id: &mut Option<ProcessId>,
 ) -> bool {
-    for _ in 0..DEFINITION_SERVICE_FORCE_WAIT_YIELDS {
+    for _ in 0..SERVICE_JOB_CLEANUP_YIELDS {
         let group_empty = match syscall::signal_process_group(process_group_id, signal::KILL) {
             Ok(signaled) if signaled != 0 => false,
             Err(error) if error == syscall::Errno::NO_CHILD => true,
             _ => return false,
         };
-        let leader_reaped = reap_definition_service_leader(leader_process_id);
+        let leader_reaped = reap_service_leader(leader_process_id);
         if group_empty && leader_reaped {
             return true;
         }
@@ -2087,7 +2239,7 @@ fn terminate_unassigned_definition_process_group(
     false
 }
 
-fn close_empty_definition_job(
+fn close_empty_service_job(
     job_management: &mut Option<CapabilityHandle>,
     job: &mut Option<CapabilityHandle>,
 ) -> bool {
@@ -2122,15 +2274,16 @@ fn close_empty_definition_job(
     job_closed && management_closed
 }
 
-fn terminate_and_drain_definition_job(
+fn terminate_and_drain_service_job(
     job: &mut Option<CapabilityHandle>,
     leader_process_id: &mut Option<ProcessId>,
     process_group_id: &mut Option<ProcessId>,
+    drained_message: &[u8],
 ) -> bool {
     let Some(handle) = *job else {
         return false;
     };
-    for _ in 0..DEFINITION_SERVICE_FORCE_WAIT_YIELDS {
+    for _ in 0..SERVICE_JOB_CLEANUP_YIELDS {
         if ipc::job_terminate(handle).is_err() {
             return false;
         }
@@ -2142,14 +2295,14 @@ fn terminate_and_drain_definition_job(
                 Err(_) => return false,
             }
         };
-        let leader_reaped = reap_definition_service_leader(leader_process_id);
+        let leader_reaped = reap_service_leader(leader_process_id);
         if job_drained && leader_reaped {
             if ipc::close(handle).is_err() {
                 return false;
             }
             *job = None;
             *process_group_id = None;
-            let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_JOB_DRAINED);
+            let _ = syscall::write_all(STDOUT, drained_message);
             return true;
         }
         if syscall::yield_now().is_err() {
@@ -2167,10 +2320,11 @@ fn clear_definition_service_process(
         runtime.process_id = None;
     }
     let job_clean = match runtime.job {
-        Some(_) => terminate_and_drain_definition_job(
+        Some(_) => terminate_and_drain_service_job(
             &mut runtime.job,
             &mut runtime.process_id,
             &mut runtime.process_group_id,
+            DEFINITION_SERVICE_JOB_DRAINED,
         ),
         None => {
             runtime.process_group_id = None;
@@ -2287,10 +2441,11 @@ impl DefinitionActivationAttempt {
         let generation_closed = self.close_generation_source();
         let readiness_closed = self.close_readiness();
         let process_clean = if self.job_assigned {
-            let clean = terminate_and_drain_definition_job(
+            let clean = terminate_and_drain_service_job(
                 &mut self.job,
                 &mut self.process_id,
                 &mut self.process_group_id,
+                DEFINITION_SERVICE_JOB_DRAINED,
             );
             if clean {
                 self.job_assigned = false;
@@ -2299,7 +2454,7 @@ impl DefinitionActivationAttempt {
         } else {
             let process_group_clean = match self.process_group_id {
                 Some(process_group_id) => {
-                    if terminate_unassigned_definition_process_group(
+                    if terminate_unassigned_service_process_group(
                         process_group_id,
                         &mut self.process_id,
                     ) {
@@ -2311,8 +2466,7 @@ impl DefinitionActivationAttempt {
                 }
                 None => self.process_id.is_none(),
             };
-            process_group_clean
-                && close_empty_definition_job(&mut self.job_management, &mut self.job)
+            process_group_clean && close_empty_service_job(&mut self.job_management, &mut self.job)
         };
         let management_closed = if process_clean {
             self.close_job_management()
@@ -4215,6 +4369,199 @@ fn register_vfs_router(service_generation: ProviderGeneration, request_endpoint:
         .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
 }
 
+fn fail_logging_activation(mut attempt: LoggingActivationAttempt, message: &[u8]) -> ! {
+    if !attempt.abort() {
+        fail(LOGGING_SERVICE_FAILED);
+    }
+    fail(message)
+}
+
+fn launch_logging_generation(
+    service: &mut ServiceRuntime,
+    generations: &mut ProviderGenerationSequence,
+    early_log_reader: CapabilityHandle,
+    lifecycle_test: bool,
+) -> (ProcessId, LoggingGeneration) {
+    let generation = generations
+        .next_generation()
+        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+    let suppress_readiness = lifecycle_test && generation.get() >= 4;
+    let command = if suppress_readiness {
+        LOGGING_SERVICE_SUPPRESS_READINESS_COMMAND
+    } else if lifecycle_test {
+        LOGGING_SERVICE_IGNORE_TERMINATE_COMMAND
+    } else {
+        service.spec().command
+    };
+    let readiness_yields_remaining = if suppress_readiness {
+        LOGGING_TEST_READINESS_GRACE_YIELDS
+    } else {
+        LOGGING_READINESS_GRACE_YIELDS
+    };
+    let mut attempt = LoggingActivationAttempt::new();
+    let job_management = match ipc::job_create() {
+        Ok(handle) => handle,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    attempt.job_management = Some(job_management);
+    let job = match ipc::duplicate(job_management, Rights::SIGNAL | Rights::WAIT) {
+        Ok(handle) => handle,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    attempt.job = Some(job);
+    let job_handles_valid = matches!(
+        ipc::info(job_management),
+        Ok(info) if info.kind == ObjectKind::Job && info.rights == Rights::JOB && info.size == 0
+    ) && matches!(
+        ipc::info(job),
+        Ok(info)
+            if info.kind == ObjectKind::Job
+                && info.rights == Rights::SIGNAL | Rights::WAIT
+                && info.size == 0
+    ) && ipc::job_try_wait(job).err() == Some(ipc::Error::NO_CHILD);
+    if !job_handles_valid {
+        fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+
+    let generation_handoff_source = match ipc::endpoint_create() {
+        Ok(handle) => handle,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    attempt.generation_handoff_source = Some(generation_handoff_source);
+    if queue_service_generation(generation_handoff_source, generation).is_err() {
+        fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+    let readiness_source = match ipc::endpoint_create() {
+        Ok(handle) => handle,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    attempt.readiness_source = Some(readiness_source);
+    let producer_source = match ipc::endpoint_create() {
+        Ok(handle) => handle,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    attempt.producer_source = Some(producer_source);
+    let observer_source = match ipc::endpoint_create() {
+        Ok(handle) => handle,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    attempt.observer_source = Some(observer_source);
+    let producer_object_id = match ipc::info(producer_source) {
+        Ok(info) => info.object_id,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    let observer_object_id = match ipc::info(observer_source) {
+        Ok(info) => info.object_id,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    if producer_object_id == 0
+        || observer_object_id == 0
+        || producer_object_id == observer_object_id
+    {
+        fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+
+    let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.starting);
+    let barrier = match syscall::LaunchBarrier::new() {
+        Ok(barrier) => barrier,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_FAILED),
+    };
+    attempt.barrier = Some(barrier);
+    let process_id = match syscall::spawn_command_with_barrier(
+        command,
+        SpawnFlags::NEW_PROCESS_GROUP,
+        None,
+        None,
+        None,
+        None,
+        attempt
+            .barrier
+            .as_ref()
+            .expect("logging activation attempt owns its barrier"),
+    ) {
+        Ok(process_id) => process_id,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_FAILED),
+    };
+    attempt.process_id = Some(process_id);
+    attempt.process_group_id = Some(process_id);
+    if ipc::job_assign(job_management, process_id).ok() != Some(process_id) {
+        fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+    attempt.job_assigned = true;
+    if !matches!(
+        ipc::info(job),
+        Ok(info)
+            if info.kind == ObjectKind::Job
+                && info.rights == Rights::SIGNAL | Rights::WAIT
+                && info.size == 1
+    ) || !LoggingActivationAttempt::close_capability(&mut attempt.job_management)
+    {
+        fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+
+    if ipc::grant_child(process_id, readiness_source, Rights::SEND, READY_HANDLE).ok()
+        != Some(READY_HANDLE)
+        || ipc::grant_child(process_id, producer_source, Rights::RECEIVE, REQUEST_HANDLE).ok()
+            != Some(REQUEST_HANDLE)
+        || ipc::grant_child(
+            process_id,
+            observer_source,
+            Rights::RECEIVE,
+            LOGGING_OBSERVER_INGRESS_HANDLE,
+        )
+        .ok()
+            != Some(LOGGING_OBSERVER_INGRESS_HANDLE)
+        || ipc::grant_child(
+            process_id,
+            early_log_reader,
+            Rights::READ,
+            LOGGING_EARLY_LOG_HANDLE,
+        )
+        .ok()
+            != Some(LOGGING_EARLY_LOG_HANDLE)
+        || ipc::grant_child(
+            process_id,
+            generation_handoff_source,
+            Rights::RECEIVE,
+            GENERATION_HANDOFF_HANDLE,
+        )
+        .ok()
+            != Some(GENERATION_HANDOFF_HANDLE)
+        || !attempt.release_child()
+    {
+        fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+
+    service.note_spawned(process_id);
+    (
+        process_id,
+        LoggingGeneration {
+            generation,
+            readiness_source: attempt
+                .readiness_source
+                .take()
+                .expect("logging activation owns readiness source"),
+            producer_source: attempt
+                .producer_source
+                .take()
+                .expect("logging activation owns producer source"),
+            observer_source: attempt
+                .observer_source
+                .take()
+                .expect("logging activation owns observer source"),
+            producer_object_id,
+            observer_object_id,
+            job: attempt.job.take(),
+            readiness_received: false,
+            child_stopped: false,
+            routes_published: false,
+            readiness_yields_remaining,
+            readiness_force_termination_sent: false,
+            force_termination_attempts_remaining: LOGGING_FORCE_TERMINATION_ATTEMPTS,
+        },
+    )
+}
+
 fn start_logging_generation(
     service: &mut ServiceRuntime,
     route_broker: &mut RouteBrokerState,
@@ -4222,84 +4569,13 @@ fn start_logging_generation(
     early_log_reader: CapabilityHandle,
 ) -> LoggingGeneration {
     'attempt: loop {
-        let generation = generations
-            .next_generation()
-            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        let generation_handoff_source =
-            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        queue_service_generation(generation_handoff_source, generation)
-            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        let readiness_source =
-            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        let producer_source =
-            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        let observer_source =
-            ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        let producer_object_id = ipc::info(producer_source)
-            .map(|info| info.object_id)
-            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        let observer_object_id = ipc::info(observer_source)
-            .map(|info| info.object_id)
-            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        if producer_object_id == 0
-            || observer_object_id == 0
-            || producer_object_id == observer_object_id
-        {
-            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
-        }
-
         let spec = service.spec();
-        let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.starting);
-        let barrier =
-            syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
-        let process_id = syscall::spawn_command_with_barrier(
-            spec.command,
-            SpawnFlags::NEW_PROCESS_GROUP,
-            None,
-            None,
-            None,
-            None,
-            &barrier,
-        )
-        .unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
-        service.note_spawned(process_id);
-        if ipc::grant_child(process_id, readiness_source, Rights::SEND, READY_HANDLE).ok()
-            != Some(READY_HANDLE)
-            || ipc::grant_child(process_id, producer_source, Rights::RECEIVE, REQUEST_HANDLE).ok()
-                != Some(REQUEST_HANDLE)
-            || ipc::grant_child(
-                process_id,
-                observer_source,
-                Rights::RECEIVE,
-                LOGGING_OBSERVER_INGRESS_HANDLE,
-            )
-            .ok()
-                != Some(LOGGING_OBSERVER_INGRESS_HANDLE)
-            || ipc::grant_child(
-                process_id,
-                early_log_reader,
-                Rights::READ,
-                LOGGING_EARLY_LOG_HANDLE,
-            )
-            .ok()
-                != Some(LOGGING_EARLY_LOG_HANDLE)
-            || ipc::grant_child(
-                process_id,
-                generation_handoff_source,
-                Rights::RECEIVE,
-                GENERATION_HANDOFF_HANDLE,
-            )
-            .ok()
-                != Some(GENERATION_HANDOFF_HANDLE)
-        {
-            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
-        }
-        ipc::close(generation_handoff_source)
-            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        barrier
-            .release()
-            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-
+        let (process_id, mut logging_generation) =
+            launch_logging_generation(service, generations, early_log_reader, false);
+        let generation = logging_generation.generation;
+        let readiness_source = logging_generation.readiness_source;
+        let producer_source = logging_generation.producer_source;
+        let observer_source = logging_generation.observer_source;
         let mut ready_buffer = [0_u8; 64];
         let mut readiness_yields_remaining = LOGGING_READINESS_GRACE_YIELDS;
         let mut force_termination_attempts_remaining = LOGGING_FORCE_TERMINATION_ATTEMPTS;
@@ -4332,12 +4608,8 @@ fn start_logging_generation(
                             }
                             Ok(status) => match service.observe_status(status.raw()) {
                                 ServiceStatusDisposition::Restart { backoff_yields } => {
-                                    ipc::close(readiness_source)
-                                        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-                                    ipc::close(producer_source)
-                                        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-                                    ipc::close(observer_source)
-                                        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                                    logging_generation.drain_job();
+                                    logging_generation.close();
                                     let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.restarting);
                                     backoff(backoff_yields);
                                     continue 'attempt;
@@ -4353,27 +4625,20 @@ fn start_logging_generation(
                     }
                     route_broker.publish(generation, producer_source, observer_source);
                     let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.ready);
-                    return LoggingGeneration {
-                        generation,
-                        readiness_source,
-                        producer_source,
-                        observer_source,
-                        producer_object_id,
-                        observer_object_id,
-                        readiness_received: true,
-                        child_stopped: false,
-                        routes_published: true,
-                        readiness_yields_remaining: 0,
-                        readiness_force_termination_sent: false,
-                        force_termination_attempts_remaining: 0,
-                    };
+                    logging_generation.readiness_received = true;
+                    logging_generation.routes_published = true;
+                    logging_generation.readiness_yields_remaining = 0;
+                    logging_generation.force_termination_attempts_remaining = 0;
+                    return logging_generation;
                 }
                 Err(error) if error == ipc::Error::TRY_AGAIN => {
                     if readiness_yields_remaining != 0 {
                         readiness_yields_remaining -= 1;
                     } else if !force_termination_sent
                         && request_forced_termination(
-                            process_id,
+                            logging_generation
+                                .job
+                                .unwrap_or_else(|| fail(LOGGING_SERVICE_PROTOCOL_FAILED)),
                             &mut force_termination_attempts_remaining,
                         )
                     {
@@ -4388,12 +4653,8 @@ fn start_logging_generation(
                 Ok(status) => match service.observe_status(status.raw()) {
                     ServiceStatusDisposition::WaitForNextEvent => {}
                     ServiceStatusDisposition::Restart { backoff_yields } => {
-                        ipc::close(readiness_source)
-                            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-                        ipc::close(producer_source)
-                            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-                        ipc::close(observer_source)
-                            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+                        logging_generation.drain_job();
+                        logging_generation.close();
                         let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.restarting);
                         backoff(backoff_yields);
                         break;
@@ -4417,109 +4678,7 @@ fn begin_logging_generation(
     early_log_reader: CapabilityHandle,
     lifecycle_test: bool,
 ) -> LoggingGeneration {
-    let generation = generations
-        .next_generation()
-        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let generation_handoff_source =
-        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    queue_service_generation(generation_handoff_source, generation)
-        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let readiness_source =
-        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let producer_source =
-        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let observer_source =
-        ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let producer_object_id = ipc::info(producer_source)
-        .map(|info| info.object_id)
-        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    let observer_object_id = ipc::info(observer_source)
-        .map(|info| info.object_id)
-        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    if producer_object_id == 0
-        || observer_object_id == 0
-        || producer_object_id == observer_object_id
-    {
-        fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
-    }
-
-    let spec = service.spec();
-    let suppress_readiness = lifecycle_test && generation.get() >= 4;
-    let command = if suppress_readiness {
-        LOGGING_SERVICE_SUPPRESS_READINESS_COMMAND
-    } else if lifecycle_test {
-        LOGGING_SERVICE_IGNORE_TERMINATE_COMMAND
-    } else {
-        spec.command
-    };
-    let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.starting);
-    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
-    let process_id = syscall::spawn_command_with_barrier(
-        command,
-        SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &barrier,
-    )
-    .unwrap_or_else(|_| fail(LOGGING_SERVICE_FAILED));
-    service.note_spawned(process_id);
-    if ipc::grant_child(process_id, readiness_source, Rights::SEND, READY_HANDLE).ok()
-        != Some(READY_HANDLE)
-        || ipc::grant_child(process_id, producer_source, Rights::RECEIVE, REQUEST_HANDLE).ok()
-            != Some(REQUEST_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            observer_source,
-            Rights::RECEIVE,
-            LOGGING_OBSERVER_INGRESS_HANDLE,
-        )
-        .ok()
-            != Some(LOGGING_OBSERVER_INGRESS_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            early_log_reader,
-            Rights::READ,
-            LOGGING_EARLY_LOG_HANDLE,
-        )
-        .ok()
-            != Some(LOGGING_EARLY_LOG_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            generation_handoff_source,
-            Rights::RECEIVE,
-            GENERATION_HANDOFF_HANDLE,
-        )
-        .ok()
-            != Some(GENERATION_HANDOFF_HANDLE)
-    {
-        fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
-    }
-    ipc::close(generation_handoff_source)
-        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    barrier
-        .release()
-        .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-
-    LoggingGeneration {
-        generation,
-        readiness_source,
-        producer_source,
-        observer_source,
-        producer_object_id,
-        observer_object_id,
-        readiness_received: false,
-        child_stopped: false,
-        routes_published: false,
-        readiness_yields_remaining: if suppress_readiness {
-            LOGGING_TEST_READINESS_GRACE_YIELDS
-        } else {
-            LOGGING_READINESS_GRACE_YIELDS
-        },
-        readiness_force_termination_sent: false,
-        force_termination_attempts_remaining: LOGGING_FORCE_TERMINATION_ATTEMPTS,
-    }
+    launch_logging_generation(service, generations, early_log_reader, lifecycle_test).1
 }
 
 fn poll_logging_child(
@@ -4574,8 +4733,8 @@ fn poll_logging_child(
     }
 }
 
-fn request_forced_termination(process_id: ProcessId, attempts_remaining: &mut u32) -> bool {
-    if platform::kill(process_id, signal::KILL).is_ok() {
+fn request_forced_termination(job: CapabilityHandle, attempts_remaining: &mut u32) -> bool {
+    if ipc::job_terminate(job).is_ok() {
         return true;
     }
     if *attempts_remaining == 0 {
@@ -4601,12 +4760,17 @@ fn sync_logging_routes(
     }
 
     lifecycle.withdraw_routes(route_broker);
-    let Some(process_id) = service.process_id() else {
+    if service.process_id().is_none() {
         lifecycle.termination_grace_yields_remaining = None;
         lifecycle.force_termination_sent = false;
         lifecycle.force_termination_attempts_remaining = 0;
         return;
-    };
+    }
+    let job = lifecycle
+        .current
+        .as_ref()
+        .and_then(|generation| generation.job)
+        .unwrap_or_else(|| fail(LOGGING_SERVICE_PROTOCOL_FAILED));
     match lifecycle.termination_grace_yields_remaining {
         None => {
             lifecycle.termination_grace_yields_remaining = Some(LOGGING_TERMINATION_GRACE_YIELDS);
@@ -4616,10 +4780,8 @@ fn sync_logging_routes(
             lifecycle.termination_grace_yields_remaining = Some(remaining - 1);
         }
         Some(_) if !lifecycle.force_termination_sent => {
-            if request_forced_termination(
-                process_id,
-                &mut lifecycle.force_termination_attempts_remaining,
-            ) {
+            if request_forced_termination(job, &mut lifecycle.force_termination_attempts_remaining)
+            {
                 let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_FORCE_TERMINATING);
                 lifecycle.force_termination_sent = true;
             }
@@ -4679,7 +4841,9 @@ fn advance_logging_lifecycle(
                     generation.readiness_yields_remaining -= 1;
                 } else if !generation.readiness_force_termination_sent
                     && request_forced_termination(
-                        process_id,
+                        generation
+                            .job
+                            .unwrap_or_else(|| fail(LOGGING_SERVICE_PROTOCOL_FAILED)),
                         &mut generation.force_termination_attempts_remaining,
                     )
                 {
@@ -4897,7 +5061,7 @@ fn run_logging_collector_restart_test(
     route_broker: &mut RouteBrokerState,
     generations: &mut ProviderGenerationSequence,
     early_log_reader: CapabilityHandle,
-    generation: LoggingGeneration,
+    mut generation: LoggingGeneration,
 ) -> LoggingGeneration {
     let status_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
     let control_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
@@ -4995,6 +5159,7 @@ fn run_logging_collector_restart_test(
     let old_producer_object_id = generation.producer_object_id;
     let old_observer_object_id = generation.observer_object_id;
     route_broker.withdraw(old_generation);
+    generation.drain_job();
     generation.close();
     let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_RESTARTING);
     backoff(backoff_yields);
