@@ -109,7 +109,9 @@ validates a replacement image before committing it, and `fork` initially shares 
 pages before copying on write. Capability-backed jobs provide flat descendant
 containment, independent FIFO exit observation, and whole-job forced termination. PID 1
 uses them for the policy-pinned definition-backed activation pilot; core-service
-integration, hierarchy, and resource policy remain future work.
+integration, hierarchy, and resource policy remain future work. Shared PID 1 cleanup now
+uses allocation-free result classification and canonical bootstrap diagnostics for unexpected
+signal, wait, job, capability-close, launch-barrier, yield, and budget-exhaustion outcomes.
 
 ### Userspace service routes
 

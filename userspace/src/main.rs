@@ -15,6 +15,12 @@ use userspace::{
     filesystem::{crash_test, protocol as filesystem_protocol},
     ipc::{self, CapabilityHandle, ObjectKind, Rights},
     nullfs_primary_volume, platform,
+    service_cleanup::{
+        self, Action as CleanupAction, Diagnostic as CleanupDiagnostic,
+        JobWaitResult as CleanupJobWaitResult, LeaderResult as CleanupLeaderResult,
+        Observation as CleanupObservation, Operation as CleanupOperation, Phase as CleanupPhase,
+        Service as CleanupService,
+    },
     service_control::{
         ControlExchange, ControlIngress, LOGGING_SERVICE_ID as CONTROL_LOGGING_SERVICE_ID,
         NULLFS_SERVICE_ID, TMPFS_SERVICE_ID, VFS_SERVICE_ID,
@@ -307,6 +313,7 @@ struct DefinitionServiceRuntime<'a> {
     restart_count: u32,
     restart_deferred: bool,
     cleanup_attempt: Option<DefinitionActivationAttempt>,
+    cleanup_budget_reported: bool,
 }
 
 impl<'a> DefinitionServiceRuntime<'a> {
@@ -321,6 +328,7 @@ impl<'a> DefinitionServiceRuntime<'a> {
             restart_count: 0,
             restart_deferred: false,
             cleanup_attempt: None,
+            cleanup_budget_reported: false,
         }
     }
 }
@@ -1312,6 +1320,7 @@ struct LoggingActivationAttempt {
     job_management: Option<CapabilityHandle>,
     job: Option<CapabilityHandle>,
     job_assigned: bool,
+    cleanup_budget_reported: bool,
 }
 
 impl LoggingActivationAttempt {
@@ -1327,35 +1336,20 @@ impl LoggingActivationAttempt {
             job_management: None,
             job: None,
             job_assigned: false,
+            cleanup_budget_reported: false,
         }
     }
 
     fn close_capability(handle: &mut Option<CapabilityHandle>) -> bool {
-        match *handle {
-            Some(value) => {
-                if ipc::close(value).is_ok() {
-                    *handle = None;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => true,
-        }
+        close_cleanup_capability(
+            CleanupService::Logging,
+            CleanupPhase::ResourceRelease,
+            handle,
+        )
     }
 
     fn release_barrier(&mut self) -> bool {
-        match self.barrier.as_mut() {
-            Some(barrier) => {
-                if barrier.release_in_place().is_ok() {
-                    self.barrier = None;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => true,
-        }
+        release_cleanup_barrier(CleanupService::Logging, &mut self.barrier)
     }
 
     fn release_child(&mut self) -> bool {
@@ -1367,10 +1361,12 @@ impl LoggingActivationAttempt {
     fn abort(&mut self) -> bool {
         let process_clean = if self.job_assigned {
             let clean = terminate_and_drain_service_job(
+                CleanupService::Logging,
                 &mut self.job,
                 &mut self.process_id,
                 &mut self.process_group_id,
                 LOGGING_SERVICE_JOB_DRAINED,
+                &mut self.cleanup_budget_reported,
             );
             if clean {
                 self.job_assigned = false;
@@ -1380,8 +1376,10 @@ impl LoggingActivationAttempt {
             let process_group_clean = match self.process_group_id {
                 Some(process_group_id) => {
                     if terminate_unassigned_service_process_group(
+                        CleanupService::Logging,
                         process_group_id,
                         &mut self.process_id,
+                        &mut self.cleanup_budget_reported,
                     ) {
                         self.process_group_id = None;
                         true
@@ -1391,7 +1389,12 @@ impl LoggingActivationAttempt {
                 }
                 None => self.process_id.is_none(),
             };
-            process_group_clean && close_empty_service_job(&mut self.job_management, &mut self.job)
+            process_group_clean
+                && close_empty_service_job(
+                    CleanupService::Logging,
+                    &mut self.job_management,
+                    &mut self.job,
+                )
         };
         let management_closed = if process_clean {
             Self::close_capability(&mut self.job_management)
@@ -1441,6 +1444,7 @@ struct LoggingGeneration {
     producer_object_id: u64,
     observer_object_id: u64,
     job: Option<CapabilityHandle>,
+    cleanup_budget_reported: bool,
     readiness_received: bool,
     child_stopped: bool,
     routes_published: bool,
@@ -1454,10 +1458,12 @@ impl LoggingGeneration {
         let mut leader_process_id = None;
         let mut process_group_id = None;
         if !terminate_and_drain_service_job(
+            CleanupService::Logging,
             &mut self.job,
             &mut leader_process_id,
             &mut process_group_id,
             LOGGING_SERVICE_JOB_DRAINED,
+            &mut self.cleanup_budget_reported,
         ) {
             fail(LOGGING_SERVICE_FAILED);
         }
@@ -1467,10 +1473,30 @@ impl LoggingGeneration {
         if self.job.is_some() {
             fail(LOGGING_SERVICE_PROTOCOL_FAILED);
         }
-        ipc::close(self.readiness_source)
-            .unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        ipc::close(self.producer_source).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-        ipc::close(self.observer_source).unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
+        let mut readiness_source = Some(self.readiness_source);
+        if !close_cleanup_capability(
+            CleanupService::Logging,
+            CleanupPhase::ResourceRelease,
+            &mut readiness_source,
+        ) {
+            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+        }
+        let mut producer_source = Some(self.producer_source);
+        if !close_cleanup_capability(
+            CleanupService::Logging,
+            CleanupPhase::ResourceRelease,
+            &mut producer_source,
+        ) {
+            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+        }
+        let mut observer_source = Some(self.observer_source);
+        if !close_cleanup_capability(
+            CleanupService::Logging,
+            CleanupPhase::ResourceRelease,
+            &mut observer_source,
+        ) {
+            fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
+        }
     }
 }
 
@@ -2196,119 +2222,332 @@ fn definition_service_consume_restart(runtime: &mut DefinitionServiceRuntime<'_>
     true
 }
 
-fn reap_service_leader(leader_process_id: &mut Option<ProcessId>) -> bool {
+fn report_service_cleanup_diagnostic(
+    service: CleanupService,
+    phase: CleanupPhase,
+    operation: CleanupOperation,
+    observation: CleanupObservation,
+) {
+    let diagnostic = CleanupDiagnostic {
+        service,
+        phase,
+        operation,
+        observation,
+    };
+    let mut output = [0_u8; 192];
+    if let Some(length) = diagnostic.encode(&mut output) {
+        let _ = syscall::write_all(STDERR, &output[..length]);
+    } else {
+        let _ = syscall::write_all(STDERR, b"init: cleanup diagnostic encoding failed\n");
+    }
+}
+
+fn report_cleanup_budget_exhausted(
+    service: CleanupService,
+    phase: CleanupPhase,
+    operation: CleanupOperation,
+    reported: &mut bool,
+) {
+    if *reported {
+        return;
+    }
+    *reported = true;
+    report_service_cleanup_diagnostic(
+        service,
+        phase,
+        operation,
+        CleanupObservation::BudgetExhausted {
+            attempts: SERVICE_JOB_CLEANUP_YIELDS,
+        },
+    );
+}
+
+fn reap_service_leader(service: CleanupService, leader_process_id: &mut Option<ProcessId>) -> bool {
     let Some(process_id) = *leader_process_id else {
         return true;
     };
     loop {
-        match syscall::try_wait_child(process_id) {
-            Ok(status) if status.continued() || status.stopped_signal().is_some() => return false,
-            Ok(_) => {
+        let result = match syscall::try_wait_child(process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => {
+                CleanupLeaderResult::Transitional
+            }
+            Ok(_) => CleanupLeaderResult::Terminal,
+            Err(error) => CleanupLeaderResult::Error(error.code()),
+        };
+        match service_cleanup::classify_leader_wait(
+            result,
+            syscall::Errno::TRY_AGAIN.code(),
+            syscall::Errno::INTERRUPTED.code(),
+            syscall::Errno::NO_CHILD.code(),
+        ) {
+            CleanupAction::Complete => {
                 *leader_process_id = None;
                 return true;
             }
-            Err(error) if error == syscall::Errno::TRY_AGAIN => return false,
-            Err(error) if error == syscall::Errno::INTERRUPTED => {}
-            Err(error) if error == syscall::Errno::NO_CHILD => {
-                *leader_process_id = None;
-                return true;
+            CleanupAction::Pending => return false,
+            CleanupAction::Retry => {}
+            CleanupAction::Unexpected(observation) => {
+                report_service_cleanup_diagnostic(
+                    service,
+                    CleanupPhase::LeaderReap,
+                    CleanupOperation::TryWaitChild,
+                    observation,
+                );
+                return false;
             }
-            Err(_) => return false,
+            CleanupAction::Progress => return false,
         }
     }
 }
 
 fn terminate_unassigned_service_process_group(
+    service: CleanupService,
     process_group_id: ProcessId,
     leader_process_id: &mut Option<ProcessId>,
+    budget_reported: &mut bool,
 ) -> bool {
+    let mut group_empty = false;
+    let mut leader_reaped = leader_process_id.is_none();
     for _ in 0..SERVICE_JOB_CLEANUP_YIELDS {
-        let group_empty = match syscall::signal_process_group(process_group_id, signal::KILL) {
-            Ok(signaled) if signaled != 0 => false,
-            Err(error) if error == syscall::Errno::NO_CHILD => true,
-            _ => return false,
+        group_empty = match service_cleanup::classify_group_signal(
+            syscall::signal_process_group(process_group_id, signal::KILL)
+                .map_err(syscall::Errno::code),
+            syscall::Errno::NO_CHILD.code(),
+        ) {
+            CleanupAction::Progress => false,
+            CleanupAction::Complete => true,
+            CleanupAction::Unexpected(observation) => {
+                report_service_cleanup_diagnostic(
+                    service,
+                    CleanupPhase::UnassignedProcessGroup,
+                    CleanupOperation::SignalProcessGroup,
+                    observation,
+                );
+                return false;
+            }
+            CleanupAction::Pending | CleanupAction::Retry => return false,
         };
-        let leader_reaped = reap_service_leader(leader_process_id);
+        leader_reaped = reap_service_leader(service, leader_process_id);
         if group_empty && leader_reaped {
             return true;
         }
-        if syscall::yield_now().is_err() {
-            return false;
+        match service_cleanup::classify_unit(syscall::yield_now().map_err(syscall::Errno::code)) {
+            CleanupAction::Complete => {}
+            CleanupAction::Unexpected(observation) => {
+                report_service_cleanup_diagnostic(
+                    service,
+                    CleanupPhase::UnassignedProcessGroup,
+                    CleanupOperation::YieldNow,
+                    observation,
+                );
+                return false;
+            }
+            CleanupAction::Progress | CleanupAction::Pending | CleanupAction::Retry => {
+                return false;
+            }
         }
     }
+    let (phase, operation) = if group_empty && !leader_reaped {
+        (CleanupPhase::LeaderReap, CleanupOperation::TryWaitChild)
+    } else {
+        (
+            CleanupPhase::UnassignedProcessGroup,
+            CleanupOperation::SignalProcessGroup,
+        )
+    };
+    report_cleanup_budget_exhausted(service, phase, operation, budget_reported);
     false
 }
 
+fn close_cleanup_capability(
+    service: CleanupService,
+    phase: CleanupPhase,
+    handle: &mut Option<CapabilityHandle>,
+) -> bool {
+    let Some(value) = *handle else {
+        return true;
+    };
+    match service_cleanup::classify_unit(ipc::close(value).map_err(ipc::Error::code)) {
+        CleanupAction::Complete => {
+            *handle = None;
+            true
+        }
+        CleanupAction::Unexpected(observation) => {
+            report_service_cleanup_diagnostic(
+                service,
+                phase,
+                CleanupOperation::CapabilityClose,
+                observation,
+            );
+            false
+        }
+        CleanupAction::Progress | CleanupAction::Pending | CleanupAction::Retry => false,
+    }
+}
+
+fn release_cleanup_barrier(
+    service: CleanupService,
+    barrier: &mut Option<syscall::LaunchBarrier>,
+) -> bool {
+    let Some(value) = barrier.as_mut() else {
+        return true;
+    };
+    match service_cleanup::classify_unit(value.release_in_place().map_err(syscall::Errno::code)) {
+        CleanupAction::Complete => {
+            *barrier = None;
+            true
+        }
+        CleanupAction::Unexpected(observation) => {
+            report_service_cleanup_diagnostic(
+                service,
+                CleanupPhase::ResourceRelease,
+                CleanupOperation::LaunchBarrierRelease,
+                observation,
+            );
+            false
+        }
+        CleanupAction::Progress | CleanupAction::Pending | CleanupAction::Retry => false,
+    }
+}
+
 fn close_empty_service_job(
+    service: CleanupService,
     job_management: &mut Option<CapabilityHandle>,
     job: &mut Option<CapabilityHandle>,
 ) -> bool {
     let inspection_handle = (*job).or(*job_management);
-    if let Some(handle) = inspection_handle
-        && ipc::job_try_wait(handle).err() != Some(ipc::Error::NO_CHILD)
-    {
-        return false;
+    if let Some(handle) = inspection_handle {
+        let result = match ipc::job_try_wait(handle) {
+            Ok(exit) => CleanupJobWaitResult::Exit {
+                process_id: exit.process_id,
+                status: exit.status.raw(),
+            },
+            Err(error) => CleanupJobWaitResult::Error(error.code()),
+        };
+        match service_cleanup::classify_job_wait(
+            result,
+            ipc::Error::TRY_AGAIN.code(),
+            ipc::Error::NO_CHILD.code(),
+            true,
+        ) {
+            CleanupAction::Complete => {}
+            CleanupAction::Unexpected(observation) => {
+                report_service_cleanup_diagnostic(
+                    service,
+                    CleanupPhase::EmptyJobInspection,
+                    CleanupOperation::JobTryWait,
+                    observation,
+                );
+                return false;
+            }
+            CleanupAction::Progress | CleanupAction::Pending | CleanupAction::Retry => {
+                return false;
+            }
+        }
     }
-    let job_closed = match *job {
-        Some(handle) => {
-            if ipc::close(handle).is_ok() {
-                *job = None;
-                true
-            } else {
-                false
-            }
-        }
-        None => true,
-    };
-    let management_closed = match *job_management {
-        Some(handle) => {
-            if ipc::close(handle).is_ok() {
-                *job_management = None;
-                true
-            } else {
-                false
-            }
-        }
-        None => true,
-    };
+    let job_closed = close_cleanup_capability(service, CleanupPhase::ResourceRelease, job);
+    let management_closed =
+        close_cleanup_capability(service, CleanupPhase::ResourceRelease, job_management);
     job_closed && management_closed
 }
 
 fn terminate_and_drain_service_job(
+    service: CleanupService,
     job: &mut Option<CapabilityHandle>,
     leader_process_id: &mut Option<ProcessId>,
     process_group_id: &mut Option<ProcessId>,
     drained_message: &[u8],
+    budget_reported: &mut bool,
 ) -> bool {
     let Some(handle) = *job else {
+        report_service_cleanup_diagnostic(
+            service,
+            CleanupPhase::JobDrain,
+            CleanupOperation::JobTryWait,
+            CleanupObservation::MissingHandle,
+        );
         return false;
     };
+    let mut job_drained = false;
+    let mut leader_reaped = leader_process_id.is_none();
     for _ in 0..SERVICE_JOB_CLEANUP_YIELDS {
-        if ipc::job_terminate(handle).is_err() {
-            return false;
-        }
-        let job_drained = loop {
-            match ipc::job_try_wait(handle) {
-                Ok(_) => {}
-                Err(error) if error == ipc::Error::TRY_AGAIN => break false,
-                Err(error) if error == ipc::Error::NO_CHILD => break true,
-                Err(_) => return false,
-            }
-        };
-        let leader_reaped = reap_service_leader(leader_process_id);
-        if job_drained && leader_reaped {
-            if ipc::close(handle).is_err() {
+        match service_cleanup::classify_job_terminate(
+            ipc::job_terminate(handle).map_err(ipc::Error::code),
+        ) {
+            CleanupAction::Progress => {}
+            CleanupAction::Unexpected(observation) => {
+                report_service_cleanup_diagnostic(
+                    service,
+                    CleanupPhase::JobDrain,
+                    CleanupOperation::JobTerminate,
+                    observation,
+                );
                 return false;
             }
-            *job = None;
+            CleanupAction::Pending | CleanupAction::Complete | CleanupAction::Retry => {
+                return false;
+            }
+        }
+        job_drained = loop {
+            let result = match ipc::job_try_wait(handle) {
+                Ok(exit) => CleanupJobWaitResult::Exit {
+                    process_id: exit.process_id,
+                    status: exit.status.raw(),
+                },
+                Err(error) => CleanupJobWaitResult::Error(error.code()),
+            };
+            match service_cleanup::classify_job_wait(
+                result,
+                ipc::Error::TRY_AGAIN.code(),
+                ipc::Error::NO_CHILD.code(),
+                false,
+            ) {
+                CleanupAction::Progress => {}
+                CleanupAction::Pending => break false,
+                CleanupAction::Complete => break true,
+                CleanupAction::Unexpected(observation) => {
+                    report_service_cleanup_diagnostic(
+                        service,
+                        CleanupPhase::JobDrain,
+                        CleanupOperation::JobTryWait,
+                        observation,
+                    );
+                    return false;
+                }
+                CleanupAction::Retry => return false,
+            }
+        };
+        leader_reaped = reap_service_leader(service, leader_process_id);
+        if job_drained && leader_reaped {
+            if !close_cleanup_capability(service, CleanupPhase::ResourceRelease, job) {
+                return false;
+            }
             *process_group_id = None;
             let _ = syscall::write_all(STDOUT, drained_message);
             return true;
         }
-        if syscall::yield_now().is_err() {
-            return false;
+        match service_cleanup::classify_unit(syscall::yield_now().map_err(syscall::Errno::code)) {
+            CleanupAction::Complete => {}
+            CleanupAction::Unexpected(observation) => {
+                report_service_cleanup_diagnostic(
+                    service,
+                    CleanupPhase::JobDrain,
+                    CleanupOperation::YieldNow,
+                    observation,
+                );
+                return false;
+            }
+            CleanupAction::Progress | CleanupAction::Pending | CleanupAction::Retry => {
+                return false;
+            }
         }
     }
+    let (phase, operation) = if job_drained && !leader_reaped {
+        (CleanupPhase::LeaderReap, CleanupOperation::TryWaitChild)
+    } else {
+        (CleanupPhase::JobDrain, CleanupOperation::JobTryWait)
+    };
+    report_cleanup_budget_exhausted(service, phase, operation, budget_reported);
     false
 }
 
@@ -2321,27 +2560,23 @@ fn clear_definition_service_process(
     }
     let job_clean = match runtime.job {
         Some(_) => terminate_and_drain_service_job(
+            CleanupService::Definition,
             &mut runtime.job,
             &mut runtime.process_id,
             &mut runtime.process_group_id,
             DEFINITION_SERVICE_JOB_DRAINED,
+            &mut runtime.cleanup_budget_reported,
         ),
         None => {
             runtime.process_group_id = None;
             runtime.process_id.is_none()
         }
     };
-    let readiness_closed = match runtime.readiness_endpoint {
-        Some(endpoint) => {
-            if ipc::close(endpoint).is_ok() {
-                runtime.readiness_endpoint = None;
-                true
-            } else {
-                false
-            }
-        }
-        None => true,
-    };
+    let readiness_closed = close_cleanup_capability(
+        CleanupService::Definition,
+        CleanupPhase::ResourceRelease,
+        &mut runtime.readiness_endpoint,
+    );
     if job_clean && readiness_closed {
         runtime.generation = None;
         true
@@ -2359,6 +2594,7 @@ struct DefinitionActivationAttempt {
     job_management: Option<CapabilityHandle>,
     job: Option<CapabilityHandle>,
     job_assigned: bool,
+    cleanup_budget_reported: bool,
 }
 
 impl DefinitionActivationAttempt {
@@ -2372,63 +2608,36 @@ impl DefinitionActivationAttempt {
             job_management: None,
             job: None,
             job_assigned: false,
+            cleanup_budget_reported: false,
         }
     }
 
     fn close_generation_source(&mut self) -> bool {
-        match self.generation_source {
-            Some(source) => {
-                if ipc::close(source).is_ok() {
-                    self.generation_source = None;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => true,
-        }
+        close_cleanup_capability(
+            CleanupService::Definition,
+            CleanupPhase::ResourceRelease,
+            &mut self.generation_source,
+        )
     }
 
     fn close_job_management(&mut self) -> bool {
-        match self.job_management {
-            Some(handle) => {
-                if ipc::close(handle).is_ok() {
-                    self.job_management = None;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => true,
-        }
+        close_cleanup_capability(
+            CleanupService::Definition,
+            CleanupPhase::ResourceRelease,
+            &mut self.job_management,
+        )
     }
 
     fn release_barrier(&mut self) -> bool {
-        match self.barrier.as_mut() {
-            Some(barrier) => {
-                if barrier.release_in_place().is_ok() {
-                    self.barrier = None;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => true,
-        }
+        release_cleanup_barrier(CleanupService::Definition, &mut self.barrier)
     }
 
     fn close_readiness(&mut self) -> bool {
-        match self.readiness_endpoint {
-            Some(endpoint) => {
-                if ipc::close(endpoint).is_ok() {
-                    self.readiness_endpoint = None;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => true,
-        }
+        close_cleanup_capability(
+            CleanupService::Definition,
+            CleanupPhase::ResourceRelease,
+            &mut self.readiness_endpoint,
+        )
     }
 
     fn release_child(&mut self) -> bool {
@@ -2442,10 +2651,12 @@ impl DefinitionActivationAttempt {
         let readiness_closed = self.close_readiness();
         let process_clean = if self.job_assigned {
             let clean = terminate_and_drain_service_job(
+                CleanupService::Definition,
                 &mut self.job,
                 &mut self.process_id,
                 &mut self.process_group_id,
                 DEFINITION_SERVICE_JOB_DRAINED,
+                &mut self.cleanup_budget_reported,
             );
             if clean {
                 self.job_assigned = false;
@@ -2455,8 +2666,10 @@ impl DefinitionActivationAttempt {
             let process_group_clean = match self.process_group_id {
                 Some(process_group_id) => {
                     if terminate_unassigned_service_process_group(
+                        CleanupService::Definition,
                         process_group_id,
                         &mut self.process_id,
+                        &mut self.cleanup_budget_reported,
                     ) {
                         self.process_group_id = None;
                         true
@@ -2466,7 +2679,12 @@ impl DefinitionActivationAttempt {
                 }
                 None => self.process_id.is_none(),
             };
-            process_group_clean && close_empty_service_job(&mut self.job_management, &mut self.job)
+            process_group_clean
+                && close_empty_service_job(
+                    CleanupService::Definition,
+                    &mut self.job_management,
+                    &mut self.job,
+                )
         };
         let management_closed = if process_clean {
             self.close_job_management()
@@ -2632,6 +2850,7 @@ fn start_definition_service(
         runtime.process_id = attempt.process_id.take();
         runtime.process_group_id = attempt.process_group_id.take();
         runtime.job = attempt.job.take();
+        runtime.cleanup_budget_reported = false;
         runtime.generation = Some(generation);
         runtime.readiness_endpoint = None;
         runtime.restart_deferred = false;
@@ -2668,6 +2887,7 @@ fn start_definition_service(
                 runtime.process_id = attempt.process_id.take();
                 runtime.process_group_id = attempt.process_group_id.take();
                 runtime.job = attempt.job.take();
+                runtime.cleanup_budget_reported = false;
                 runtime.generation = Some(generation);
                 runtime.readiness_endpoint = attempt.readiness_endpoint.take();
                 runtime.restart_deferred = false;
@@ -4552,6 +4772,7 @@ fn launch_logging_generation(
             producer_object_id,
             observer_object_id,
             job: attempt.job.take(),
+            cleanup_budget_reported: false,
             readiness_received: false,
             child_stopped: false,
             routes_published: false,
