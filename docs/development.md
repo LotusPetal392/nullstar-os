@@ -105,7 +105,14 @@ The logging lifecycle image validates live `start`, `stop`, and `restart`, immed
 withdrawal, fresh generation objects, duplicate-restart `Busy` fencing, exact filesystem
 `Start`/`Stop` `Unsupported` responses, synchronized descendants that escape their leader's
 process group, whole-job escalation and `ECHILD` drainage after a bounded grace period, and
-repeated no-readiness failure through bounded restart/backoff into the terminal `Failed` state.
+repeated no-readiness failure through bounded restart/backoff into the terminal `Failed` state. Normal boot,
+logging lifecycle, and NullFS restart checks also reject any unexpected PID 1 cleanup
+diagnostic on their successful paths.
+
+The allocation-free `userspace::service_cleanup` classifier has host tests for process-group
+zero results, job-termination zero counts, job-drain versus empty-inspection semantics,
+direct-leader retry classes, exact error preservation, canonical diagnostic bytes, integer
+boundaries, and fixed-buffer exhaustion.
 
 QEMU must be available for integrated checks.
 

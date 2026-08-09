@@ -57,6 +57,7 @@ const NORMAL_BOOT_SERVICE_CONTROL_MARKER: &str = "userspace init: sv status logg
 const NORMAL_BOOT_NULLFS_GENERATION_MARKER: &str = "nullfs ready desired=running generation=1";
 const NORMAL_BOOT_TMPFS_GENERATION_MARKER: &str = "tmpfs ready desired=running generation=1";
 const NORMAL_BOOT_VFS_GENERATION_MARKER: &str = "vfs ready desired=running generation=1";
+const SERVICE_CLEANUP_DIAGNOSTIC_PREFIX: &str = "init: cleanup ";
 const DEFINITION_SERVICE_LOADING_MARKER: &str =
     "userspace init: loading service definition from /System/services";
 const DEFINITION_SERVICE_FIRST_FAILURE_MARKER: &str =
@@ -161,6 +162,7 @@ struct NormalBootProgress {
     definition_restart_observed: bool,
     definition_ready_observed: bool,
     definition_verified: bool,
+    cleanup_diagnostic_observed: bool,
     init_launched_shell: bool,
     shell_ready: bool,
 }
@@ -197,6 +199,7 @@ impl NormalBootProgress {
             self.definition_restart_observed && line.contains(DEFINITION_SERVICE_READY_MARKER);
         self.definition_verified |=
             self.definition_ready_observed && line.contains(DEFINITION_SERVICE_VERIFIED_MARKER);
+        self.cleanup_diagnostic_observed |= line.contains(SERVICE_CLEANUP_DIAGNOSTIC_PREFIX);
         self.init_launched_shell |= line.contains(NORMAL_BOOT_INIT_SHELL_MARKER);
         self.shell_ready |= line.contains(NORMAL_BOOT_SHELL_MARKER);
 
@@ -224,6 +227,7 @@ impl NormalBootProgress {
             && self.definition_restart_observed
             && self.definition_ready_observed
             && self.definition_verified
+            && !self.cleanup_diagnostic_observed
             && self.init_launched_shell
             && self.shell_ready
     }
@@ -347,6 +351,7 @@ struct LoggingLifecycleProgress {
     forced_job_drained: bool,
     readiness_timeout_observed: bool,
     timeout_job_drained: bool,
+    cleanup_diagnostic_observed: bool,
     lifecycle_verified: bool,
 }
 
@@ -367,6 +372,7 @@ impl LoggingLifecycleProgress {
             self.forced_job_drained && line.contains(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER);
         self.timeout_job_drained |=
             self.readiness_timeout_observed && line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER);
+        self.cleanup_diagnostic_observed |= line.contains(SERVICE_CLEANUP_DIAGNOSTIC_PREFIX);
         if self.mode_selected
             && self.stopping_observed
             && self.stopped_observed
@@ -376,6 +382,7 @@ impl LoggingLifecycleProgress {
             && self.forced_job_drained
             && self.readiness_timeout_observed
             && self.timeout_job_drained
+            && !self.cleanup_diagnostic_observed
             && line.contains(LOGGING_LIFECYCLE_PASSED_MARKER)
         {
             self.lifecycle_verified = true;
@@ -913,12 +920,14 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
     let mut definition_restart_observed = false;
     let mut definition_ready_observed = false;
     let mut definition_verified = false;
+    let mut cleanup_diagnostic_observed = false;
     run_qemu_until(
         qemu_command_for_image(options, image),
         "NullFS restart fault injection",
         NULLFS_RESTART_TEST_TIMEOUT,
         move |line| {
             mode_selected |= line.contains(NULLFS_RESTART_MODE_MARKER);
+            cleanup_diagnostic_observed |= line.contains(SERVICE_CLEANUP_DIAGNOSTIC_PREFIX);
             if line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER) {
                 logging_generation_job_drained = true;
             }
@@ -953,6 +962,7 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
                 && definition_restart_observed
                 && definition_ready_observed
                 && definition_verified
+                && !cleanup_diagnostic_observed
         },
     )
 }
@@ -1234,7 +1244,7 @@ mod tests {
         NULLFS_UNAVAILABLE_HANDOFF_MARKER, NULLFS_UNAVAILABLE_INIT_EXIT_MARKER,
         NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER, NULLFS_UNAVAILABLE_MODE_MARKER,
         NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, OutOfSpaceProgress,
-        UnavailablePrimaryProgress, parse_options_from,
+        SERVICE_CLEANUP_DIAGNOSTIC_PREFIX, UnavailablePrimaryProgress, parse_options_from,
     };
 
     #[test]
@@ -1436,6 +1446,30 @@ mod tests {
         assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
         assert!(!progress.observe(LOGGING_SERVICE_JOB_DRAINED_MARKER));
         assert!(progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+    }
+
+    #[test]
+    fn cleanup_diagnostics_prevent_expected_lifecycle_completion() {
+        let mut normal = NormalBootProgress::default();
+        assert!(!normal.observe(SERVICE_CLEANUP_DIAGNOSTIC_PREFIX));
+        assert!(normal.cleanup_diagnostic_observed);
+
+        let mut logging = LoggingLifecycleProgress {
+            mode_selected: true,
+            stopping_observed: true,
+            stopped_observed: true,
+            replacement_ready: true,
+            containment_descendant_observed: true,
+            force_termination_observed: true,
+            forced_job_drained: true,
+            readiness_timeout_observed: true,
+            timeout_job_drained: true,
+            ..LoggingLifecycleProgress::default()
+        };
+        assert!(!logging.observe(SERVICE_CLEANUP_DIAGNOSTIC_PREFIX));
+        assert!(!logging.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+        assert!(logging.cleanup_diagnostic_observed);
+        assert!(!logging.lifecycle_verified);
     }
 
     #[test]

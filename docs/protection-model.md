@@ -117,8 +117,15 @@ kill-on-close. PID 1 uses fresh jobs for the policy-pinned definition-backed ser
 and every logging generation, assigns leaders before launch-barrier release, retains only
 `SIGNAL | WAIT`, and drains all completion records before replacement. Logging retains
 cooperative process-group termination but escalates and removes escaped descendants through
-the job. Jobs are not yet hierarchical, do not carry CPU or memory limits, and are not yet
-the default container for tmpfs, VFS, or NullFS.
+the job. Shared PID 1 cleanup classifies process-group signaling, direct-leader waiting,
+job termination and drainage, capability closure, barrier release, and cooperative yields
+without allocation. Normal progress remains quiet; unexpected success values, exact errno
+codes, and missing handles emit canonical bootstrap diagnostics when observed. Final budget
+exhaustion emits at most once per cleanup episode. A representative record is
+`init: cleanup service=logging phase=job-drain operation=job-try-wait result=error code=9`.
+An `Ok(0)` process-group signal is an invariant violation, while `JOB_TERMINATE` returning
+zero is valid and still requires drainage to `ECHILD`. Jobs are not yet hierarchical, do
+not carry CPU or memory limits, and are not yet the default container for tmpfs, VFS, or NullFS.
 
 ## Userspace service-route use
 
