@@ -118,6 +118,10 @@ const LOGGING_LIFECYCLE_STOPPED_MARKER: &str = "logging stopped desired=running"
 const LOGGING_LIFECYCLE_READY_MARKER: &str = "logging ready desired=running generation=2";
 const LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER: &str =
     "userspace init: logging service termination grace expired; forcing exit";
+const LOGGING_CONTAINMENT_DESCENDANT_MARKER: &str =
+    "logging-service: containment descendant escaped process group";
+const LOGGING_SERVICE_JOB_DRAINED_MARKER: &str =
+    "userspace init: logging service generation job drained";
 const LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER: &str =
     "userspace init: logging service readiness deadline expired; forcing exit";
 const LOGGING_LIFECYCLE_PASSED_MARKER: &str = "userspace init: logging live start, stop, route withdrawal, restart fencing, and generation replacement verified";
@@ -338,8 +342,11 @@ struct LoggingLifecycleProgress {
     stopping_observed: bool,
     stopped_observed: bool,
     replacement_ready: bool,
+    containment_descendant_observed: bool,
     force_termination_observed: bool,
+    forced_job_drained: bool,
     readiness_timeout_observed: bool,
+    timeout_job_drained: bool,
     lifecycle_verified: bool,
 }
 
@@ -349,16 +356,26 @@ impl LoggingLifecycleProgress {
         self.stopping_observed |= line.contains(LOGGING_LIFECYCLE_STOPPING_MARKER);
         self.stopped_observed |= line.contains(LOGGING_LIFECYCLE_STOPPED_MARKER);
         self.replacement_ready |= line.contains(LOGGING_LIFECYCLE_READY_MARKER);
-        self.force_termination_observed |=
-            line.contains(LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER);
+        self.containment_descendant_observed |=
+            line.contains(LOGGING_CONTAINMENT_DESCENDANT_MARKER);
+        self.force_termination_observed |= self.containment_descendant_observed
+            && line.contains(LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER);
+        self.forced_job_drained |= self.containment_descendant_observed
+            && self.force_termination_observed
+            && line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER);
         self.readiness_timeout_observed |=
-            line.contains(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER);
+            self.forced_job_drained && line.contains(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER);
+        self.timeout_job_drained |=
+            self.readiness_timeout_observed && line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER);
         if self.mode_selected
             && self.stopping_observed
             && self.stopped_observed
             && self.replacement_ready
+            && self.containment_descendant_observed
             && self.force_termination_observed
+            && self.forced_job_drained
             && self.readiness_timeout_observed
+            && self.timeout_job_drained
             && line.contains(LOGGING_LIFECYCLE_PASSED_MARKER)
         {
             self.lifecycle_verified = true;
@@ -591,7 +608,7 @@ fn print_usage() {
         "  --nullfs-unavailable-check  Verify missing-primary recovery through the independent emergency shell"
     );
     println!(
-        "  --logging-lifecycle-check  Verify logging live start, stop, route withdrawal, and generation replacement"
+        "  --logging-lifecycle-check  Verify logging lifecycle, route replacement, job containment, and bounded failure recovery"
     );
     println!(
         "  --test      Verify hardware, persistent FAT writes across two boots, VFS, the Rust userspace runtime, transactional exec, copy-on-write fork, process environments, tmpfs, redirection, process control, pipelines, jobs, default signals, and handled signals"
@@ -887,6 +904,7 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
     let image = Path::new(env!("NULLFS_RESTART_TEST_BIOS_IMAGE"));
     let mut mode_selected = false;
     let mut logging_import_count = 0_u8;
+    let mut logging_generation_job_drained = false;
     let mut logging_collector_verified = false;
     let mut restart_verified = false;
     let mut definition_loading_observed = false;
@@ -901,10 +919,16 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
         NULLFS_RESTART_TEST_TIMEOUT,
         move |line| {
             mode_selected |= line.contains(NULLFS_RESTART_MODE_MARKER);
-            if line.contains(NORMAL_BOOT_LOGGING_IMPORT_MARKER) {
+            if line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER) {
+                logging_generation_job_drained = true;
+            }
+            if line.contains(NORMAL_BOOT_LOGGING_IMPORT_MARKER)
+                && (logging_import_count == 0 || logging_generation_job_drained)
+            {
                 logging_import_count = logging_import_count.saturating_add(1);
             }
-            logging_collector_verified |= line.contains(LOGGING_COLLECTOR_RESTART_PASSED_MARKER);
+            logging_collector_verified |= logging_generation_job_drained
+                && line.contains(LOGGING_COLLECTOR_RESTART_PASSED_MARKER);
             restart_verified |= line.contains(NULLFS_RESTART_PASSED_MARKER);
             definition_loading_observed |=
                 restart_verified && line.contains(DEFINITION_SERVICE_LOADING_MARKER);
@@ -920,6 +944,7 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
                 definition_ready_observed && line.contains(DEFINITION_SERVICE_VERIFIED_MARKER);
             mode_selected
                 && logging_import_count >= 2
+                && logging_generation_job_drained
                 && logging_collector_verified
                 && restart_verified
                 && definition_loading_observed
@@ -1183,10 +1208,11 @@ mod tests {
         DEFINITION_SERVICE_JOB_DRAINED_MARKER, DEFINITION_SERVICE_LOADING_MARKER,
         DEFINITION_SERVICE_READY_MARKER, DEFINITION_SERVICE_RESTARTING_MARKER,
         DEFINITION_SERVICE_VERIFIED_MARKER, EMERGENCY_SHELL_READY_MARKER,
-        LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER, LOGGING_LIFECYCLE_MODE_MARKER,
-        LOGGING_LIFECYCLE_PASSED_MARKER, LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER,
-        LOGGING_LIFECYCLE_READY_MARKER, LOGGING_LIFECYCLE_STOPPED_MARKER,
-        LOGGING_LIFECYCLE_STOPPING_MARKER, LoggingLifecycleProgress,
+        LOGGING_CONTAINMENT_DESCENDANT_MARKER, LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER,
+        LOGGING_LIFECYCLE_MODE_MARKER, LOGGING_LIFECYCLE_PASSED_MARKER,
+        LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER, LOGGING_LIFECYCLE_READY_MARKER,
+        LOGGING_LIFECYCLE_STOPPED_MARKER, LOGGING_LIFECYCLE_STOPPING_MARKER,
+        LOGGING_SERVICE_JOB_DRAINED_MARKER, LoggingLifecycleProgress,
         NORMAL_BOOT_BLOCK_DEVICE_MARKER, NORMAL_BOOT_EARLY_LOG_MARKER, NORMAL_BOOT_INIT_MARKER,
         NORMAL_BOOT_INIT_SHELL_MARKER, NORMAL_BOOT_LOGCTL_MARKER,
         NORMAL_BOOT_LOGGING_IMPORT_MARKER, NORMAL_BOOT_LOGGING_PROBE_MARKER,
@@ -1398,11 +1424,17 @@ mod tests {
         assert!(!progress.observe(LOGGING_LIFECYCLE_MODE_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_STOPPING_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_STOPPED_MARKER));
+        assert!(!progress.observe(LOGGING_CONTAINMENT_DESCENDANT_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_READY_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_FORCE_TERMINATION_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER));
+        assert!(!progress.readiness_timeout_observed);
+        assert!(!progress.observe(LOGGING_SERVICE_JOB_DRAINED_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER));
+        assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
+        assert!(!progress.observe(LOGGING_SERVICE_JOB_DRAINED_MARKER));
         assert!(progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
     }
 

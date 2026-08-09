@@ -113,10 +113,12 @@ information. Capability inspection reports the active member count.
 A `SIGNAL` handle may force signal 9 across the current member snapshot. The object is
 kept alive by kernel roots while it contains members, even if its controller exits or
 closes every userspace handle. This provides explicit bounded cleanup, not implicit
-kill-on-close. PID 1 now uses a fresh job for the policy-pinned definition-backed service
-pilot, assigns its leader before launch-barrier release, retains only `SIGNAL | WAIT`, and
-drains all completion records before replacement. Jobs are not yet hierarchical, do not
-carry CPU or memory limits, and are not yet the default container for core services.
+kill-on-close. PID 1 uses fresh jobs for the policy-pinned definition-backed service pilot
+and every logging generation, assigns leaders before launch-barrier release, retains only
+`SIGNAL | WAIT`, and drains all completion records before replacement. Logging retains
+cooperative process-group termination but escalates and removes escaped descendants through
+the job. Jobs are not yet hierarchical, do not carry CPU or memory limits, and are not yet
+the default container for tmpfs, VFS, or NullFS.
 
 ## Userspace service-route use
 

@@ -448,8 +448,9 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    current supervisor. **Foundation delivered:** ABI 1.15 supplies capability-backed flat jobs,
    inherited descendant containment, independent FIFO exit records, and bounded termination; the
    allocation-free `NSVC` v1 codec and PID 1 registry supply service observation. The policy-pinned
-   definition-backed activation pilot now receives a fresh job before barrier release and drains it
-   before replacement. Applying this lifecycle to core services and introducing job hierarchy remain.
+   definition-backed activation pilot and every logging generation now receive fresh jobs before
+   barrier release and drain before replacement. Applying this lifecycle to tmpfs, VFS, and NullFS
+   and introducing job hierarchy remain.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
    delivered:** native `list`, `status`, and restart use separately authorized IPC, logging has live
    in-memory `start`/`stop`, and NullFS restart has exact-generation quiesce, clean unmount, forced

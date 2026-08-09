@@ -103,9 +103,9 @@ handoff after final PID 1 termination, and the bootstrap-resident emergency-shel
 
 The logging lifecycle image validates live `start`, `stop`, and `restart`, immediate route
 withdrawal, fresh generation objects, duplicate-restart `Busy` fencing, exact filesystem
-`Start`/`Stop` `Unsupported` responses, escalation from cooperative termination to
-uncatchable forced termination after a bounded grace period, and repeated no-readiness
-failure through bounded restart/backoff into the terminal `Failed` state.
+`Start`/`Stop` `Unsupported` responses, synchronized descendants that escape their leader's
+process group, whole-job escalation and `ECHILD` drainage after a bounded grace period, and
+repeated no-readiness failure through bounded restart/backoff into the terminal `Failed` state.
 
 QEMU must be available for integrated checks.
 

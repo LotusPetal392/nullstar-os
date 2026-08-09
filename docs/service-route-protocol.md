@@ -159,7 +159,10 @@ handles were globally revoked.
 PID 1 is the temporary broker, publication owner, and generation authority for the logging producer
 and observer routes. It owns an allocation-free monotonic provider-generation sequence independent
 of process IDs. Every `/logging-service` startup attempt consumes a nonzero generation, including an
-attempt that fails before readiness. The current contract provides no durable cross-boot persistence.
+attempt that fails before readiness. Every attempt also receives a fresh flat job while its child is
+still behind the launch barrier. PID 1 retains exact `SIGNAL | WAIT`, uses the job for forced cleanup,
+and drains all exits to `ECHILD` before closing route sources or starting a replacement. The current
+contract provides no durable cross-boot persistence.
 
 PID 1 creates a private bootstrap endpoint, grants the logging-service child a handle with exactly
 `RECEIVE` rights, and sends exactly one 16-byte `NSGN` v1 record with no capability attachment:

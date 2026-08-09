@@ -17,6 +17,7 @@ use userspace::{
         AcceptError, InboundPacket, MAX_LOGGING_SESSIONS, PendingConnect, ServerIngress,
         ServerIngressEvent, ServerTransport, SessionRole, admission_rejection,
     },
+    platform,
     service_route::receive_service_generation,
     syscall::{self, SignalAction},
 };
@@ -32,6 +33,8 @@ const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: logging";
 const STARTED_MARKER: &[u8] = b"logging-service: bounded session collector ready\n";
 const KERNEL_IMPORT_MARKER: &[u8] = b"logging-service: kernel early log imported\n";
+const CONTAINMENT_DESCENDANT_MARKER: &[u8] =
+    b"logging-service: containment descendant escaped process group\n";
 const RECORD_PREFIX: &[u8] = b"logging-service: retained: ";
 const RECORD_SEPARATOR: &[u8] = b": ";
 const RECORD_SUFFIX: &[u8] = b"\n";
@@ -237,6 +240,52 @@ impl SessionManager {
     }
 }
 
+fn spawn_containment_descendant() {
+    let group_ready = match syscall::pipe_pair() {
+        Ok(pair) => pair,
+        Err(_) => syscall::exit(20),
+    };
+    match syscall::fork() {
+        Ok(0) => {
+            let _ = syscall::close(group_ready.reader);
+            if platform::set_process_group(0, 0).is_err()
+                || syscall::write_all(group_ready.writer, &[1]).is_err()
+                || syscall::close(group_ready.writer).is_err()
+            {
+                syscall::exit(21);
+            }
+            loop {
+                if syscall::yield_now().is_err() {
+                    syscall::exit(22);
+                }
+            }
+        }
+        Ok(_) => {
+            let _ = syscall::close(group_ready.writer);
+            let mut ready = [0_u8; 1];
+            let escaped = loop {
+                match syscall::read(group_ready.reader, &mut ready) {
+                    Ok(1) => break ready[0] == 1,
+                    Ok(_) => break false,
+                    Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                    Err(_) => break false,
+                }
+            };
+            if syscall::close(group_ready.reader).is_err()
+                || !escaped
+                || syscall::write_all(syscall::STDOUT, CONTAINMENT_DESCENDANT_MARKER).is_err()
+            {
+                syscall::exit(23);
+            }
+        }
+        Err(_) => {
+            let _ = syscall::close(group_ready.writer);
+            let _ = syscall::close(group_ready.reader);
+            syscall::exit(20);
+        }
+    }
+}
+
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
     let ignore_terminate = arguments.len() == 2 && arguments.get(1) == Some(b"--ignore-terminate");
@@ -286,6 +335,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
     if syscall::write_all(syscall::STDOUT, KERNEL_IMPORT_MARKER).is_err() {
         syscall::exit(6);
+    }
+    if ignore_terminate || suppress_readiness {
+        spawn_containment_descendant();
     }
     let mut sessions = SessionManager::new();
     if (!suppress_readiness && ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err())

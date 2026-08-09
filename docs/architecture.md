@@ -50,7 +50,8 @@ Generated images use `/BOOTMODE` to select among:
 - `nullfs-unavailable-test`, whose image omits the primary NullFS partition and validates exact
   UUID lookup failure plus handoff to the independently available emergency kernel shell;
 - `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
-  generation replacement, restart fencing, filesystem mutation policy, and forced termination.
+  generation replacement, restart fencing, escaped-descendant job containment, filesystem mutation
+  policy, forced termination, and readiness-timeout drainage.
 
 ## Boot sequence
 
@@ -165,12 +166,15 @@ neither.
 Logging is the first live desired-state convergence pilot. PID 1 processes logging child events,
 mutation requests, readiness, and backoff in bounded steps; stop withdraws producer and observer
 routes before later resolutions are serviced, and start publishes only a fresh ready generation.
-A bounded readiness deadline force-terminates a starting child that never declares readiness, after
-which ordinary restart/backoff limits apply. Controlled stop does not charge failure policy, and
-start/stop success commits desired state without
-waiting for exit or readiness. PID 1 first requests cooperative termination and escalates after a
-bounded grace period with uncatchable, unblockable signal 9; the dedicated lifecycle image verifies
-that escalation, duplicate-restart `Busy`, and exact filesystem `Start`/`Stop` `Unsupported` policy.
+A bounded readiness deadline force-terminates a starting generation that never declares readiness,
+after which ordinary restart/backoff limits apply. Each logging attempt is assigned to a fresh flat
+job before barrier release; PID 1 retains only `SIGNAL | WAIT`, consumes the direct leader status for
+policy, and drains the job to `ECHILD` before endpoint closure or replacement. Controlled stop does
+not charge failure policy, and start/stop success commits desired state without waiting for exit or
+readiness. PID 1 first requests cooperative process-group termination and escalates the whole job
+after a bounded grace period with uncatchable, unblockable signal 9; the dedicated lifecycle image
+verifies escaped-descendant cleanup, that escalation, duplicate-restart `Busy`, and exact filesystem
+`Start`/`Stop` `Unsupported` policy.
 Controlled NullFS restart queues private `NFLC` v1 `QUIESCE` behind earlier FIFO requests. Exact
 `QUIESCED` lets PID 1 offline that provider generation and wake tail work with `EIO`; `UNMOUNT` then
 closes core handles, syncs and publishes a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits

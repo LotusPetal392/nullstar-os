@@ -195,7 +195,12 @@ that fails before readiness. PID 1 sends it in one exact 16-byte `NSGN` v1 recor
 attachment, over a private bootstrap endpoint granted to the child with exact `RECEIVE` rights. The
 service requires that exact handle authority, kernel-stamped sender PID 1, `NSGN` magic, version 1,
 zero reserved bytes, a nonzero generation, and no trailing data. It closes the bootstrap handle after
-the one receive attempt.
+the one receive attempt. PID 1 also creates a fresh flat job for every startup attempt, assigns the
+blocked child before launch-barrier release, and drops the full management handle after retaining
+exactly `SIGNAL | WAIT`. Cooperative shutdown still begins with process-group `SIGTERM`; forced
+termination and readiness expiry target the whole job. PID 1 independently consumes the leader's
+parent status for restart policy, drains every job exit to `ECHILD`, and only then closes generation
+endpoints or starts a replacement.
 
 The accepted generation identifies the collector, binds `NSLS` sessions and the negotiated NSWP
 `service_generation`, and is published by PID 1 on both routes. Each generation receives fresh
@@ -237,8 +242,8 @@ is ordered after a preceding one-way producer send.
 The NullFS restart diagnostic stops the collector, fills the current eight-message producer ingress,
 verifies reliable backpressure and one best-effort producer drop, resumes the service, and submits 65
 records. It checks the 64-record ring wrap, oldest/newest IDs, redaction, and counters, then replaces
-the service after the clients disconnect. PID 1 delegates the same read-only early-log reader to the
-replacement, which reimports the kernel snapshot before readiness, and publishes fresh producer and
+the service after the clients disconnect. The old service job must drain completely before endpoint
+closure and replacement. PID 1 delegates the same read-only early-log reader to the replacement, which reimports the kernel snapshot before readiness, and publishes fresh producer and
 observer ingress objects. Freshly resolved sessions verify the same boot-scoped kernel sequences at
 collector record IDs 1 through 4 before accepting a new process record. Neither PID 1 nor the route
 layer replays an uncertain one-way `Emit` across this boundary.
