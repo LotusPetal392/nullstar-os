@@ -1,5 +1,10 @@
 # NullStar OS
 
+[![QEMU smoke test](https://img.shields.io/github/actions/workflow/status/LotusPetal392/nullstar-os/kernel-qemu.yml?branch=main&style=flat-square&label=QEMU%20smoke)](https://github.com/LotusPetal392/nullstar-os/actions/workflows/kernel-qemu.yml)
+[![Rust](https://img.shields.io/badge/language-Rust-dea584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square)](LICENSE)
+[![Status: experimental](https://img.shields.io/badge/status-experimental-orange?style=flat-square)](#nullstar-os)
+
 NullStar OS is an experimental x86-64 operating system written in Rust. It
 combines a freestanding `no_std` kernel with a small `no_std` ring-3 userspace
 and boots as a BIOS disk image in QEMU.
