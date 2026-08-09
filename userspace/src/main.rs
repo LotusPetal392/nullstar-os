@@ -76,6 +76,8 @@ const SV_START_LOGGING_COMMAND: &[u8] = b"/sv start logging";
 const SV_STOP_LOGGING_COMMAND: &[u8] = b"/sv stop logging";
 const SV_RESTART_LOGGING_COMMAND: &[u8] = b"/sv restart logging";
 const SV_RESTART_NULLFS_COMMAND: &[u8] = b"/sv restart nullfs";
+const SV_RESTART_TMPFS_COMMAND: &[u8] = b"/sv restart tmpfs";
+const SV_RESTART_VFS_COMMAND: &[u8] = b"/sv restart vfs";
 const SV_LIST_PASSED: &[u8] = b"userspace init: sv list passed\n";
 const SV_STATUS_LOGGING_PASSED: &[u8] = b"userspace init: sv status logging passed\n";
 const SERVICE_CONTROL_BOOTSTRAP_FAILED: &[u8] =
@@ -122,6 +124,7 @@ const NULLFS_FULL_PROBE_COMMAND: &[u8] = b"/nullfs-probe full";
 const NULLFS_FULL_PROBE_FAILED: &[u8] = b"userspace init: full NullFS probe failed\n";
 const NULLFS_FULL_PROBE_PASSED: &[u8] = b"userspace init: full NullFS probe passed\n";
 const SERVICE_COMMAND: &[u8] = b"/tmpfs-service";
+const TMPFS_CONTAINMENT_TEST_COMMAND: &[u8] = b"/tmpfs-service --containment-test";
 const SERVICE_READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
 const SERVICE_STARTING: &[u8] = b"userspace init: starting tmpfs service\n";
 const SERVICE_RESTARTING: &[u8] = b"userspace init: tmpfs service exited; restarting\n";
@@ -129,10 +132,12 @@ const SERVICE_READY: &[u8] = b"userspace init: tmpfs service ready\n";
 const SERVICE_FAILED: &[u8] = b"userspace init: tmpfs service exhausted restart budget\n";
 const SERVICE_BOOTSTRAP_FAILED: &[u8] = b"userspace init: failed to grant tmpfs capabilities\n";
 const SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid tmpfs readiness message\n";
+const TMPFS_SERVICE_JOB_DRAINED: &[u8] = b"userspace init: tmpfs service generation job drained\n";
 const TMPFS_PROBE_COMMAND: &[u8] = b"/tmpfs-probe";
 const TMPFS_PROBE_FAILED: &[u8] = b"userspace init: userspace tmpfs probe failed\n";
 const TMPFS_PROBE_PASSED: &[u8] = b"userspace init: userspace tmpfs probe passed\n";
 const VFS_SERVICE_COMMAND: &[u8] = b"/vfs-service";
+const VFS_CONTAINMENT_TEST_COMMAND: &[u8] = b"/vfs-service --containment-test";
 const VFS_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: vfs";
 const VFS_SERVICE_STARTING: &[u8] = b"userspace init: starting vfs service\n";
 const VFS_SERVICE_RESTARTING: &[u8] = b"userspace init: vfs service exited; restarting\n";
@@ -140,6 +145,7 @@ const VFS_SERVICE_READY: &[u8] = b"userspace init: vfs service ready\n";
 const VFS_SERVICE_FAILED: &[u8] = b"userspace init: vfs service exhausted restart budget\n";
 const VFS_SERVICE_BOOTSTRAP_FAILED: &[u8] = b"userspace init: failed to grant vfs capabilities\n";
 const VFS_SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid vfs readiness message\n";
+const VFS_SERVICE_JOB_DRAINED: &[u8] = b"userspace init: vfs service generation job drained\n";
 const VFS_READINESS_PROBE_COMMAND: &[u8] = b"/vfs-probe readiness";
 const VFS_READINESS_PROBE_FAILED: &[u8] = b"userspace init: vfs readiness failed\n";
 const VFS_READINESS_PROBE_PASSED: &[u8] = b"userspace init: vfs readiness passed\n";
@@ -277,6 +283,10 @@ const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
     restart_backoff_yields: 32,
     fatal_startup_exit_status: None,
 };
+const TMPFS_CONTAINMENT_TEST_SERVICE: ServiceSpec = ServiceSpec {
+    command: TMPFS_CONTAINMENT_TEST_COMMAND,
+    ..TMPFS_SERVICE
+};
 const VFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"vfs",
     command: VFS_SERVICE_COMMAND,
@@ -285,6 +295,10 @@ const VFS_SERVICE: ServiceSpec = ServiceSpec {
     restart_limit: 3,
     restart_backoff_yields: 32,
     fatal_startup_exit_status: None,
+};
+const VFS_CONTAINMENT_TEST_SERVICE: ServiceSpec = ServiceSpec {
+    command: VFS_CONTAINMENT_TEST_COMMAND,
+    ..VFS_SERVICE
 };
 
 struct ServiceMessages {
@@ -301,6 +315,171 @@ struct BootstrapCapability {
     source_handle: CapabilityHandle,
     rights: Rights,
     target_handle: CapabilityHandle,
+}
+
+#[derive(Clone, Copy)]
+struct ServiceContainment {
+    service: CleanupService,
+    drained_message: &'static [u8],
+}
+
+const TMPFS_CONTAINMENT: ServiceContainment = ServiceContainment {
+    service: CleanupService::Tmpfs,
+    drained_message: TMPFS_SERVICE_JOB_DRAINED,
+};
+const VFS_CONTAINMENT: ServiceContainment = ServiceContainment {
+    service: CleanupService::Vfs,
+    drained_message: VFS_SERVICE_JOB_DRAINED,
+};
+
+struct ContainedServiceActivationAttempt {
+    containment: ServiceContainment,
+    generation_handoff_source: Option<CapabilityHandle>,
+    barrier: Option<syscall::LaunchBarrier>,
+    process_id: Option<ProcessId>,
+    process_group_id: Option<ProcessId>,
+    job_management: Option<CapabilityHandle>,
+    job: Option<CapabilityHandle>,
+    job_assigned: bool,
+    cleanup_budget_reported: bool,
+}
+
+impl ContainedServiceActivationAttempt {
+    const fn new(containment: ServiceContainment) -> Self {
+        Self {
+            containment,
+            generation_handoff_source: None,
+            barrier: None,
+            process_id: None,
+            process_group_id: None,
+            job_management: None,
+            job: None,
+            job_assigned: false,
+            cleanup_budget_reported: false,
+        }
+    }
+
+    fn close_capability(&self, handle: &mut Option<CapabilityHandle>) -> bool {
+        close_cleanup_capability(
+            self.containment.service,
+            CleanupPhase::ResourceRelease,
+            handle,
+        )
+    }
+
+    fn release_child(&mut self) -> bool {
+        let mut generation_handoff_source = self.generation_handoff_source.take();
+        let generation_closed = self.close_capability(&mut generation_handoff_source);
+        self.generation_handoff_source = generation_handoff_source;
+        let barrier_released = release_cleanup_barrier(self.containment.service, &mut self.barrier);
+        generation_closed && barrier_released
+    }
+
+    fn abort(&mut self) -> bool {
+        let process_clean = if self.job_assigned {
+            let clean = terminate_and_drain_service_job(
+                self.containment.service,
+                &mut self.job,
+                &mut self.process_id,
+                &mut self.process_group_id,
+                self.containment.drained_message,
+                &mut self.cleanup_budget_reported,
+            );
+            if clean {
+                self.job_assigned = false;
+            }
+            clean
+        } else {
+            let process_group_clean = match self.process_group_id {
+                Some(process_group_id) => {
+                    if terminate_unassigned_service_process_group(
+                        self.containment.service,
+                        process_group_id,
+                        &mut self.process_id,
+                        &mut self.cleanup_budget_reported,
+                    ) {
+                        self.process_group_id = None;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => self.process_id.is_none(),
+            };
+            process_group_clean
+                && close_empty_service_job(
+                    self.containment.service,
+                    &mut self.job_management,
+                    &mut self.job,
+                )
+        };
+        let management_closed = if process_clean {
+            let mut handle = self.job_management.take();
+            let closed = self.close_capability(&mut handle);
+            self.job_management = handle;
+            closed
+        } else {
+            false
+        };
+        let generation_closed = if process_clean {
+            let mut handle = self.generation_handoff_source.take();
+            let closed = self.close_capability(&mut handle);
+            self.generation_handoff_source = handle;
+            closed
+        } else {
+            false
+        };
+        let barrier_released = if process_clean {
+            release_cleanup_barrier(self.containment.service, &mut self.barrier)
+        } else {
+            false
+        };
+        process_clean && management_closed && generation_closed && barrier_released
+    }
+
+    fn finish_reaped(&mut self) -> bool {
+        self.process_id = None;
+        self.abort()
+    }
+
+    fn into_job(mut self, messages: &ServiceMessages) -> ContainedServiceJob {
+        if !self.job_assigned
+            || self.process_id.is_none()
+            || self.process_group_id.is_none()
+            || self.job.is_none()
+            || self.job_management.is_some()
+            || self.generation_handoff_source.is_some()
+            || self.barrier.is_some()
+        {
+            fail(messages.protocol_failed);
+        }
+        ContainedServiceJob {
+            containment: self.containment,
+            job: self.job.take(),
+            cleanup_budget_reported: false,
+        }
+    }
+}
+
+struct ContainedServiceJob {
+    containment: ServiceContainment,
+    job: Option<CapabilityHandle>,
+    cleanup_budget_reported: bool,
+}
+
+impl ContainedServiceJob {
+    fn drain(&mut self) -> bool {
+        let mut leader_process_id = None;
+        let mut process_group_id = None;
+        terminate_and_drain_service_job(
+            self.containment.service,
+            &mut self.job,
+            &mut leader_process_id,
+            &mut process_group_id,
+            self.containment.drained_message,
+            &mut self.cleanup_budget_reported,
+        )
+    }
 }
 
 struct DefinitionServiceRuntime<'a> {
@@ -1572,6 +1751,11 @@ enum LoggingLifecycleCheckPhase {
     WaitRestartFence,
     BeginUnsupported(usize),
     WaitUnsupported(usize),
+    SpawnTmpfsRestart,
+    WaitTmpfsRestartClient(ProcessId),
+    WaitTmpfsReady,
+    WaitVfsRestartClient(ProcessId),
+    WaitVfsReady,
     SpawnReadinessTimeout,
     WaitReadinessRestartClient(ProcessId),
     WaitReadinessFailure,
@@ -1904,10 +2088,82 @@ impl LoggingLifecycleCheck {
                     fail(LOGGING_LIFECYCLE_TEST_FAILED);
                 }
                 if index == 5 {
-                    self.phase = LoggingLifecycleCheckPhase::SpawnReadinessTimeout;
+                    self.phase = LoggingLifecycleCheckPhase::SpawnTmpfsRestart;
                 } else {
                     self.phase = LoggingLifecycleCheckPhase::BeginUnsupported(index + 1);
                 }
+            }
+            LoggingLifecycleCheckPhase::SpawnTmpfsRestart => {
+                let process_id = spawn_sv_command(
+                    SV_RESTART_TMPFS_COMMAND,
+                    control.mutation_source,
+                    SV_MUTATION_HANDLE,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitTmpfsRestartClient(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitTmpfsRestartClient(process_id) => {
+                let Some(success) = try_wait_probe(process_id) else {
+                    return;
+                };
+                if !success {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.phase = LoggingLifecycleCheckPhase::WaitTmpfsReady;
+            }
+            LoggingLifecycleCheckPhase::WaitTmpfsReady => {
+                let previous = self.filesystem_records[1];
+                let current = filesystem_records[1];
+                if current.observed_state() != ObservedState::Ready {
+                    return;
+                }
+                let previous_generation = previous
+                    .generation()
+                    .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+                if filesystem_records[0] != self.filesystem_records[0]
+                    || current.service() != TMPFS_SERVICE_ID
+                    || current.desired_state() != DesiredState::Running
+                    || current.generation().map(ProviderGeneration::get)
+                        != Some(previous_generation.get().saturating_add(1))
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.filesystem_records[1] = current;
+                let process_id = spawn_sv_command(
+                    SV_RESTART_VFS_COMMAND,
+                    control.mutation_source,
+                    SV_MUTATION_HANDLE,
+                );
+                self.phase = LoggingLifecycleCheckPhase::WaitVfsRestartClient(process_id);
+            }
+            LoggingLifecycleCheckPhase::WaitVfsRestartClient(process_id) => {
+                let Some(success) = try_wait_probe(process_id) else {
+                    return;
+                };
+                if !success {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.phase = LoggingLifecycleCheckPhase::WaitVfsReady;
+            }
+            LoggingLifecycleCheckPhase::WaitVfsReady => {
+                let previous = self.filesystem_records[2];
+                let current = filesystem_records[2];
+                if current.observed_state() != ObservedState::Ready {
+                    return;
+                }
+                let previous_generation = previous
+                    .generation()
+                    .unwrap_or_else(|| fail(LOGGING_LIFECYCLE_TEST_FAILED));
+                if filesystem_records[0] != self.filesystem_records[0]
+                    || filesystem_records[1] != self.filesystem_records[1]
+                    || current.service() != VFS_SERVICE_ID
+                    || current.desired_state() != DesiredState::Running
+                    || current.generation().map(ProviderGeneration::get)
+                        != Some(previous_generation.get().saturating_add(1))
+                {
+                    fail(LOGGING_LIFECYCLE_TEST_FAILED);
+                }
+                self.filesystem_records[2] = current;
+                self.phase = LoggingLifecycleCheckPhase::SpawnReadinessTimeout;
             }
             LoggingLifecycleCheckPhase::SpawnReadinessTimeout => {
                 let process_id = spawn_sv_command(
@@ -3254,15 +3510,21 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
     let mut request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
-    let mut service = ServiceRuntime::new(TMPFS_SERVICE);
+    let tmpfs_spec = if logging_lifecycle_test {
+        TMPFS_CONTAINMENT_TEST_SERVICE
+    } else {
+        TMPFS_SERVICE
+    };
+    let mut service = ServiceRuntime::new(tmpfs_spec);
     let mut tmpfs_generations = ProviderGenerationSequence::new();
-    let mut tmpfs_generation = start_service(
+    let (mut tmpfs_generation, mut tmpfs_job) = start_contained_service(
         &mut service,
         &mut tmpfs_generations,
         &mut readiness_endpoint,
         &mut request_endpoint,
         &[],
         &TMPFS_MESSAGES,
+        TMPFS_CONTAINMENT,
     );
     register_tmpfs_proxy(tmpfs_generation, request_endpoint);
     run_tmpfs_probe(request_endpoint);
@@ -3270,15 +3532,21 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
     let mut vfs_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
-    let mut vfs_service = ServiceRuntime::new(VFS_SERVICE);
+    let vfs_spec = if logging_lifecycle_test {
+        VFS_CONTAINMENT_TEST_SERVICE
+    } else {
+        VFS_SERVICE
+    };
+    let mut vfs_service = ServiceRuntime::new(vfs_spec);
     let mut vfs_generations = ProviderGenerationSequence::new();
-    let mut vfs_generation = start_service(
+    let (mut vfs_generation, mut vfs_job) = start_contained_service(
         &mut vfs_service,
         &mut vfs_generations,
         &mut vfs_readiness_endpoint,
         &mut vfs_request_endpoint,
         &[],
         &VFS_MESSAGES,
+        VFS_CONTAINMENT,
     );
     register_vfs_router(vfs_generation, vfs_request_endpoint);
     let mut service_control = ServiceControlState::new();
@@ -3565,20 +3833,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             tmpfs_generation,
                             SERVICE_FAILED,
                         );
-                        ipc::close(readiness_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
-                        ipc::close(request_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
+                        if !tmpfs_job.drain() {
+                            fail(SERVICE_FAILED);
+                        }
+                        close_contained_endpoint(
+                            TMPFS_CONTAINMENT,
+                            readiness_endpoint,
+                            SERVICE_FAILED,
+                        );
+                        close_contained_endpoint(
+                            TMPFS_CONTAINMENT,
+                            request_endpoint,
+                            SERVICE_FAILED,
+                        );
                         readiness_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
                         request_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(SERVICE_BOOTSTRAP_FAILED));
                         backoff(backoff_yields);
-                        tmpfs_generation = start_service(
+                        (tmpfs_generation, tmpfs_job) = start_contained_service(
                             &mut service,
                             &mut tmpfs_generations,
                             &mut readiness_endpoint,
                             &mut request_endpoint,
                             &[],
                             &TMPFS_MESSAGES,
+                            TMPFS_CONTAINMENT,
                         );
                         register_tmpfs_proxy(tmpfs_generation, request_endpoint);
                         service_control.drain_mutation(
@@ -3602,8 +3882,19 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             tmpfs_generation,
                             SERVICE_FAILED,
                         );
-                        ipc::close(readiness_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
-                        ipc::close(request_endpoint).unwrap_or_else(|_| fail(SERVICE_FAILED));
+                        if !tmpfs_job.drain() {
+                            fail(SERVICE_FAILED);
+                        }
+                        close_contained_endpoint(
+                            TMPFS_CONTAINMENT,
+                            readiness_endpoint,
+                            SERVICE_FAILED,
+                        );
+                        close_contained_endpoint(
+                            TMPFS_CONTAINMENT,
+                            request_endpoint,
+                            SERVICE_FAILED,
+                        );
                     }
                     ServiceStatusDisposition::Failed => {
                         offline_filesystem_provider(
@@ -3611,8 +3902,19 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             tmpfs_generation,
                             SERVICE_FAILED,
                         );
-                        let _ = ipc::close(readiness_endpoint);
-                        let _ = ipc::close(request_endpoint);
+                        if !tmpfs_job.drain() {
+                            fail(SERVICE_FAILED);
+                        }
+                        close_contained_endpoint(
+                            TMPFS_CONTAINMENT,
+                            readiness_endpoint,
+                            SERVICE_FAILED,
+                        );
+                        close_contained_endpoint(
+                            TMPFS_CONTAINMENT,
+                            request_endpoint,
+                            SERVICE_FAILED,
+                        );
                         fail(SERVICE_FAILED)
                     }
                 },
@@ -3633,22 +3935,32 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             vfs_generation,
                             VFS_SERVICE_FAILED,
                         );
-                        ipc::close(vfs_readiness_endpoint)
-                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
-                        ipc::close(vfs_request_endpoint)
-                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
+                        if !vfs_job.drain() {
+                            fail(VFS_SERVICE_FAILED);
+                        }
+                        close_contained_endpoint(
+                            VFS_CONTAINMENT,
+                            vfs_readiness_endpoint,
+                            VFS_SERVICE_FAILED,
+                        );
+                        close_contained_endpoint(
+                            VFS_CONTAINMENT,
+                            vfs_request_endpoint,
+                            VFS_SERVICE_FAILED,
+                        );
                         vfs_readiness_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
                         vfs_request_endpoint = ipc::endpoint_create()
                             .unwrap_or_else(|_| fail(VFS_SERVICE_BOOTSTRAP_FAILED));
                         backoff(backoff_yields);
-                        vfs_generation = start_service(
+                        (vfs_generation, vfs_job) = start_contained_service(
                             &mut vfs_service,
                             &mut vfs_generations,
                             &mut vfs_readiness_endpoint,
                             &mut vfs_request_endpoint,
                             &[],
                             &VFS_MESSAGES,
+                            VFS_CONTAINMENT,
                         );
                         register_vfs_router(vfs_generation, vfs_request_endpoint);
                         service_control.drain_mutation(
@@ -3672,10 +3984,19 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             vfs_generation,
                             VFS_SERVICE_FAILED,
                         );
-                        ipc::close(vfs_readiness_endpoint)
-                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
-                        ipc::close(vfs_request_endpoint)
-                            .unwrap_or_else(|_| fail(VFS_SERVICE_FAILED));
+                        if !vfs_job.drain() {
+                            fail(VFS_SERVICE_FAILED);
+                        }
+                        close_contained_endpoint(
+                            VFS_CONTAINMENT,
+                            vfs_readiness_endpoint,
+                            VFS_SERVICE_FAILED,
+                        );
+                        close_contained_endpoint(
+                            VFS_CONTAINMENT,
+                            vfs_request_endpoint,
+                            VFS_SERVICE_FAILED,
+                        );
                     }
                     ServiceStatusDisposition::Failed => {
                         offline_filesystem_provider(
@@ -3683,8 +4004,19 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                             vfs_generation,
                             VFS_SERVICE_FAILED,
                         );
-                        let _ = ipc::close(vfs_readiness_endpoint);
-                        let _ = ipc::close(vfs_request_endpoint);
+                        if !vfs_job.drain() {
+                            fail(VFS_SERVICE_FAILED);
+                        }
+                        close_contained_endpoint(
+                            VFS_CONTAINMENT,
+                            vfs_readiness_endpoint,
+                            VFS_SERVICE_FAILED,
+                        );
+                        close_contained_endpoint(
+                            VFS_CONTAINMENT,
+                            vfs_request_endpoint,
+                            VFS_SERVICE_FAILED,
+                        );
                         fail(VFS_SERVICE_FAILED)
                     }
                 },
@@ -5089,6 +5421,222 @@ fn advance_logging_lifecycle(
     );
     generation.routes_published = true;
     let _ = syscall::write_all(STDOUT, LOGGING_MESSAGES.ready);
+}
+
+fn fail_contained_activation(
+    mut attempt: ContainedServiceActivationAttempt,
+    messages: &ServiceMessages,
+    message: &[u8],
+) -> ! {
+    if !attempt.abort() {
+        fail(messages.failed);
+    }
+    fail(message)
+}
+
+fn close_contained_endpoint(
+    containment: ServiceContainment,
+    handle: CapabilityHandle,
+    failure_message: &[u8],
+) {
+    let mut handle = Some(handle);
+    if !close_cleanup_capability(
+        containment.service,
+        CleanupPhase::ResourceRelease,
+        &mut handle,
+    ) {
+        fail(failure_message);
+    }
+}
+
+fn start_contained_service(
+    service: &mut ServiceRuntime,
+    generations: &mut ProviderGenerationSequence,
+    readiness_endpoint: &mut CapabilityHandle,
+    request_endpoint: &mut CapabilityHandle,
+    additional_capabilities: &[BootstrapCapability],
+    messages: &ServiceMessages,
+    containment: ServiceContainment,
+) -> (ProviderGeneration, ContainedServiceJob) {
+    'attempt: loop {
+        let spec = service.spec();
+        let generation = generations
+            .next_generation()
+            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
+        let mut attempt = ContainedServiceActivationAttempt::new(containment);
+        let job_management = match ipc::job_create() {
+            Ok(handle) => handle,
+            Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
+        };
+        attempt.job_management = Some(job_management);
+        let job = match ipc::duplicate(job_management, Rights::SIGNAL | Rights::WAIT) {
+            Ok(handle) => handle,
+            Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
+        };
+        attempt.job = Some(job);
+        let job_handles_valid = matches!(
+            ipc::info(job_management),
+            Ok(info) if info.kind == ObjectKind::Job && info.rights == Rights::JOB && info.size == 0
+        ) && matches!(
+            ipc::info(job),
+            Ok(info)
+                if info.kind == ObjectKind::Job
+                    && info.rights == Rights::SIGNAL | Rights::WAIT
+                    && info.size == 0
+        ) && ipc::job_try_wait(job).err() == Some(ipc::Error::NO_CHILD);
+        if !job_handles_valid {
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+
+        let generation_handoff_source = match ipc::endpoint_create() {
+            Ok(handle) => handle,
+            Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
+        };
+        attempt.generation_handoff_source = Some(generation_handoff_source);
+        if queue_service_generation(generation_handoff_source, generation).is_err() {
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+        let _ = syscall::write_all(STDOUT, messages.starting);
+        let barrier = match syscall::LaunchBarrier::new() {
+            Ok(barrier) => barrier,
+            Err(_) => fail_contained_activation(attempt, messages, messages.failed),
+        };
+        attempt.barrier = Some(barrier);
+        let process_id = match syscall::spawn_command_with_barrier(
+            spec.command,
+            SpawnFlags::NEW_PROCESS_GROUP,
+            None,
+            None,
+            None,
+            None,
+            attempt
+                .barrier
+                .as_ref()
+                .expect("contained activation owns its barrier"),
+        ) {
+            Ok(process_id) => process_id,
+            Err(_) => fail_contained_activation(attempt, messages, messages.failed),
+        };
+        attempt.process_id = Some(process_id);
+        attempt.process_group_id = Some(process_id);
+        if ipc::job_assign(job_management, process_id).ok() != Some(process_id) {
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+        attempt.job_assigned = true;
+        if !matches!(
+            ipc::info(job),
+            Ok(info)
+                if info.kind == ObjectKind::Job
+                    && info.rights == Rights::SIGNAL | Rights::WAIT
+                    && info.size == 1
+        ) {
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+        let mut management = attempt.job_management.take();
+        if !close_cleanup_capability(
+            containment.service,
+            CleanupPhase::ResourceRelease,
+            &mut management,
+        ) {
+            attempt.job_management = management;
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+        attempt.job_management = management;
+
+        if ipc::grant_child(process_id, *readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
+            != Some(READY_HANDLE)
+            || ipc::grant_child(
+                process_id,
+                *request_endpoint,
+                Rights::RECEIVE,
+                REQUEST_HANDLE,
+            )
+            .ok()
+                != Some(REQUEST_HANDLE)
+            || ipc::grant_child(
+                process_id,
+                generation_handoff_source,
+                Rights::RECEIVE,
+                GENERATION_HANDOFF_HANDLE,
+            )
+            .ok()
+                != Some(GENERATION_HANDOFF_HANDLE)
+            || additional_capabilities.iter().copied().any(|capability| {
+                ipc::grant_child(
+                    process_id,
+                    capability.source_handle,
+                    capability.rights,
+                    capability.target_handle,
+                )
+                .ok()
+                    != Some(capability.target_handle)
+            })
+            || !attempt.release_child()
+        {
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+        service.note_spawned(process_id);
+
+        let mut ready_buffer = [0_u8; 64];
+        loop {
+            match ipc::try_receive(*readiness_endpoint, &mut ready_buffer) {
+                Ok(message) => {
+                    if message.sender_process_id != process_id
+                        || message.capability.is_some()
+                        || message.bytes != spec.ready_message.len()
+                        || &ready_buffer[..message.bytes] != spec.ready_message
+                    {
+                        fail_contained_activation(attempt, messages, messages.protocol_failed);
+                    }
+                    if service.note_ready() != ReadyDisposition::Accepted {
+                        fail_contained_activation(attempt, messages, messages.protocol_failed);
+                    }
+                    let _ = syscall::write_all(STDOUT, messages.ready);
+                    return (generation, attempt.into_job(messages));
+                }
+                Err(error) if error == ipc::Error::TRY_AGAIN => {}
+                Err(_) => fail_contained_activation(attempt, messages, messages.protocol_failed),
+            }
+
+            match syscall::try_wait_child(process_id) {
+                Ok(status) => match service.observe_status(status.raw()) {
+                    ServiceStatusDisposition::WaitForNextEvent => {}
+                    ServiceStatusDisposition::Restart { backoff_yields } => {
+                        if !attempt.finish_reaped() {
+                            fail(messages.failed);
+                        }
+                        let _ = syscall::write_all(STDOUT, messages.restarting);
+                        backoff(backoff_yields);
+                        close_contained_endpoint(
+                            containment,
+                            *readiness_endpoint,
+                            messages.bootstrap_failed,
+                        );
+                        close_contained_endpoint(
+                            containment,
+                            *request_endpoint,
+                            messages.bootstrap_failed,
+                        );
+                        *readiness_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
+                        *request_endpoint = ipc::endpoint_create()
+                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
+                        continue 'attempt;
+                    }
+                    ServiceStatusDisposition::Stopped | ServiceStatusDisposition::Failed => {
+                        if !attempt.finish_reaped() {
+                            fail(messages.failed);
+                        }
+                        fail(messages.failed)
+                    }
+                },
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
+                Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                Err(_) => fail_contained_activation(attempt, messages, messages.failed),
+            }
+            let _ = syscall::yield_now();
+        }
+    }
 }
 
 fn start_service(

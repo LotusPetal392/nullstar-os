@@ -27,11 +27,15 @@ Controlled restart is implemented without charging failure policy. Logging now a
 `start` and `stop` through bounded PID 1 convergence: stop withdraws routes and converges without
 charging failure policy, while start creates and publishes only a fresh ready generation. Restart
 intent remains fenced through replacement startup, queued duplicates receive `Busy`, and PID 1
-escalates an uncooperative generation to uncatchable signal 9 after a bounded grace period. Every
-logging attempt is assigned to a fresh flat job before launch-barrier release; PID 1 retains only
-`SIGNAL | WAIT` and drains all generation exits to `ECHILD` before closing endpoints or replacing it.
-Starting logging generations also have a bounded readiness deadline whose expiry enters normal
-restart and backoff policy rather than leaving the runtime in `Starting` indefinitely. Controlled NullFS restart
+escalates an uncooperative generation to uncatchable signal 9 after a bounded grace period.
+Policy-pinned definition-backed service attempts and every logging, tmpfs, and VFS generation are
+assigned to fresh flat jobs before launch-barrier release; PID 1 retains only `SIGNAL | WAIT` and
+drains all generation exits to `ECHILD` before closing endpoints or starting a replacement. The
+logging-lifecycle QEMU gate injects tmpfs/VFS descendants that escape their leaders' process groups
+and requires descendant termination, whole-job drainage to `ECHILD`, and generation replacement.
+Starting logging generations also have a bounded
+readiness deadline whose expiry enters normal restart and backoff policy rather than leaving the
+runtime in `Starting` indefinitely. Controlled NullFS restart
 now queues a private `NFLC` v1 `QUIESCE` marker behind earlier FIFO requests. The service finishes
 those requests and processes no later public operations after exact `QUIESCED`; PID 1 then offlines the
 exact generation, waking tail work with `EIO`, and sends `UNMOUNT`. The service closes core handles,
@@ -614,10 +618,11 @@ The accepted model can be introduced incrementally:
 
 1. **Implemented foundation and bounded pilot:** provide flat capability-backed job
    containment, non-relaxable descendant inheritance, independent process-exit records,
-   and bounded whole-job termination. PID 1 assigns each policy-pinned definition-backed
-   activation attempt and every logging generation while its leader remains behind the
-   launch barrier, then terminates and drains the complete generation before replacement.
-   tmpfs, VFS, NullFS, and hierarchy remain follow-up.
+   and bounded whole-job termination. PID 1 assigns policy-pinned definition-backed
+   service attempts and every logging, tmpfs, and VFS generation while its leader remains
+   behind the launch barrier, retains only `SIGNAL | WAIT`, and drains the complete generation to `ECHILD`
+   before replacement. NullFS containment remains separate future work because its
+   durability and quiesce lifecycle must be preserved; hierarchy also remains future work.
 2. introduce the one-bootstrap-channel startup contract and explicit startup handles;
 3. define stable service identity, generation, lifecycle state, readiness, and control
    protocols;

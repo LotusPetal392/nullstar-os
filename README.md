@@ -34,14 +34,19 @@ experimentation, not production use or untrusted workloads.
   unblockable forced termination
 - bounded per-process capability tables with rights-reduced duplication and
   delegation, message endpoints, counted notifications, shared byte-memory
-  objects, and explicit direct-child bootstrap grants
+  objects, explicit direct-child bootstrap grants, and flat descendant jobs with
+  FIFO exit observation and whole-job termination
 - a documented userspace platform ABI with system discovery, file metadata,
   paged directory reads, per-process working directories, descriptor
   duplication, parent-process lookup, direct child signaling, and controlled
   process-group reassignment
-- a PID 1 userspace supervisor, a userspace shell (`ush`) with pipelines,
-  redirection, variables, background jobs and basic job control, and an
-  emergency kernel diagnostic shell
+- a PID 1 userspace supervisor that gives policy-pinned definition-backed service
+  attempts and every logging, tmpfs, and VFS generation a fresh flat job before
+  launch-barrier release, retains only `SIGNAL | WAIT`, and drains the generation
+  to `ECHILD` before replacement. NullFS containment remains future work because
+  its durability and quiesce lifecycle must be preserved. A userspace shell (`ush`)
+  provides pipelines, redirection, variables, background jobs and basic job control;
+  an emergency kernel diagnostic shell
 - separate normal-boot and destructive smoke-test images, including non-destructive
   NullFS raw-endpoint identity, bounds, and flush checks during normal boot, plus
   host-side unit tests and a local pre-push check script
@@ -96,7 +101,7 @@ prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 | `cargo run -- --nullfs-crash-recovery-check` | Crash NullFS after a durable mutation but before its reply, then verify uncertain `EIO`, dirty remount, stale descriptors, and exactly-once recovered content. |
 | `cargo run -- --nullfs-boot-generation-check` | Use one disposable image across three boots to stage generation 2, select it, roll back to generation 1, and verify that both canonical generations and firmware slots remain intact. |
 | `cargo run -- --nullfs-unavailable-check` | Boot without a primary NullFS partition and verify recovery through the independent emergency shell. |
-| `cargo run -- --logging-lifecycle-check` | Run only logging start/stop/restart, route replacement, restart fencing, escaped-descendant job containment, forced termination, and readiness-timeout recovery checks. |
+| `cargo run -- --logging-lifecycle-check` | Run logging start/stop/restart, route replacement, restart fencing, forced termination, readiness-timeout recovery, and tmpfs/VFS escaped-process-group descendant termination, whole-job drainage, and generation replacement. |
 | `cargo run -- --help` | Show all runner options. |
 
 The smoke, out-of-space, block-device-loss, crash-recovery, and boot-generation runners copy their

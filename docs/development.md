@@ -103,11 +103,13 @@ handoff after final PID 1 termination, and the bootstrap-resident emergency-shel
 
 The logging lifecycle image validates live `start`, `stop`, and `restart`, immediate route
 withdrawal, fresh generation objects, duplicate-restart `Busy` fencing, exact filesystem
-`Start`/`Stop` `Unsupported` responses, synchronized descendants that escape their leader's
-process group, whole-job escalation and `ECHILD` drainage after a bounded grace period, and
-repeated no-readiness failure through bounded restart/backoff into the terminal `Failed` state. Normal boot,
-logging lifecycle, and NullFS restart checks also reject any unexpected PID 1 cleanup
-diagnostic on their successful paths.
+`Start`/`Stop` `Unsupported` responses, synchronized logging descendants that escape their leader's
+process group, whole-job escalation and `ECHILD` drainage after a bounded grace period, and repeated
+no-readiness failure through bounded restart/backoff into the terminal `Failed` state. The same QEMU
+gate injects escaped-process-group descendants into tmpfs and VFS generations and requires their
+termination, whole-job drainage to `ECHILD`, and generation replacement. Normal boot, logging
+lifecycle, and NullFS restart checks also reject any unexpected PID 1 cleanup diagnostic on their
+successful paths.
 
 The allocation-free `userspace::service_cleanup` classifier has host tests for process-group
 zero results, job-termination zero counts, job-drain versus empty-inspection semantics,

@@ -123,6 +123,15 @@ const LOGGING_CONTAINMENT_DESCENDANT_MARKER: &str =
     "logging-service: containment descendant escaped process group";
 const LOGGING_SERVICE_JOB_DRAINED_MARKER: &str =
     "userspace init: logging service generation job drained";
+const TMPFS_CONTAINMENT_DESCENDANT_MARKER: &str =
+    "tmpfs-service: containment descendant escaped process group";
+const TMPFS_SERVICE_JOB_DRAINED_MARKER: &str =
+    "userspace init: tmpfs service generation job drained";
+const TMPFS_REPLACEMENT_READY_MARKER: &str = "userspace init: tmpfs service ready";
+const VFS_CONTAINMENT_DESCENDANT_MARKER: &str =
+    "vfs-service: containment descendant escaped process group";
+const VFS_SERVICE_JOB_DRAINED_MARKER: &str = "userspace init: vfs service generation job drained";
+const VFS_REPLACEMENT_READY_MARKER: &str = "userspace init: vfs service ready";
 const LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER: &str =
     "userspace init: logging service readiness deadline expired; forcing exit";
 const LOGGING_LIFECYCLE_PASSED_MARKER: &str = "userspace init: logging live start, stop, route withdrawal, restart fencing, and generation replacement verified";
@@ -349,6 +358,12 @@ struct LoggingLifecycleProgress {
     containment_descendant_observed: bool,
     force_termination_observed: bool,
     forced_job_drained: bool,
+    tmpfs_descendant_observed: bool,
+    tmpfs_job_drained: bool,
+    tmpfs_replacement_ready: bool,
+    vfs_descendant_observed: bool,
+    vfs_job_drained: bool,
+    vfs_replacement_ready: bool,
     readiness_timeout_observed: bool,
     timeout_job_drained: bool,
     cleanup_diagnostic_observed: bool,
@@ -368,8 +383,20 @@ impl LoggingLifecycleProgress {
         self.forced_job_drained |= self.containment_descendant_observed
             && self.force_termination_observed
             && line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER);
+        self.tmpfs_descendant_observed |= line.contains(TMPFS_CONTAINMENT_DESCENDANT_MARKER);
+        self.tmpfs_job_drained |= self.tmpfs_descendant_observed
+            && self.forced_job_drained
+            && line.contains(TMPFS_SERVICE_JOB_DRAINED_MARKER);
+        self.tmpfs_replacement_ready |=
+            self.tmpfs_job_drained && line.contains(TMPFS_REPLACEMENT_READY_MARKER);
+        self.vfs_descendant_observed |= line.contains(VFS_CONTAINMENT_DESCENDANT_MARKER);
+        self.vfs_job_drained |= self.vfs_descendant_observed
+            && self.tmpfs_replacement_ready
+            && line.contains(VFS_SERVICE_JOB_DRAINED_MARKER);
+        self.vfs_replacement_ready |=
+            self.vfs_job_drained && line.contains(VFS_REPLACEMENT_READY_MARKER);
         self.readiness_timeout_observed |=
-            self.forced_job_drained && line.contains(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER);
+            self.vfs_replacement_ready && line.contains(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER);
         self.timeout_job_drained |=
             self.readiness_timeout_observed && line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER);
         self.cleanup_diagnostic_observed |= line.contains(SERVICE_CLEANUP_DIAGNOSTIC_PREFIX);
@@ -380,6 +407,12 @@ impl LoggingLifecycleProgress {
             && self.containment_descendant_observed
             && self.force_termination_observed
             && self.forced_job_drained
+            && self.tmpfs_descendant_observed
+            && self.tmpfs_job_drained
+            && self.tmpfs_replacement_ready
+            && self.vfs_descendant_observed
+            && self.vfs_job_drained
+            && self.vfs_replacement_ready
             && self.readiness_timeout_observed
             && self.timeout_job_drained
             && !self.cleanup_diagnostic_observed
@@ -1244,7 +1277,10 @@ mod tests {
         NULLFS_UNAVAILABLE_HANDOFF_MARKER, NULLFS_UNAVAILABLE_INIT_EXIT_MARKER,
         NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER, NULLFS_UNAVAILABLE_MODE_MARKER,
         NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, OutOfSpaceProgress,
-        SERVICE_CLEANUP_DIAGNOSTIC_PREFIX, UnavailablePrimaryProgress, parse_options_from,
+        SERVICE_CLEANUP_DIAGNOSTIC_PREFIX, TMPFS_CONTAINMENT_DESCENDANT_MARKER,
+        TMPFS_REPLACEMENT_READY_MARKER, TMPFS_SERVICE_JOB_DRAINED_MARKER,
+        UnavailablePrimaryProgress, VFS_CONTAINMENT_DESCENDANT_MARKER,
+        VFS_REPLACEMENT_READY_MARKER, VFS_SERVICE_JOB_DRAINED_MARKER, parse_options_from,
     };
 
     #[test]
@@ -1442,6 +1478,16 @@ mod tests {
         assert!(!progress.observe(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER));
         assert!(!progress.readiness_timeout_observed);
         assert!(!progress.observe(LOGGING_SERVICE_JOB_DRAINED_MARKER));
+        assert!(!progress.observe(TMPFS_REPLACEMENT_READY_MARKER));
+        assert!(!progress.tmpfs_replacement_ready);
+        assert!(!progress.observe(TMPFS_CONTAINMENT_DESCENDANT_MARKER));
+        assert!(!progress.observe(TMPFS_SERVICE_JOB_DRAINED_MARKER));
+        assert!(!progress.observe(TMPFS_REPLACEMENT_READY_MARKER));
+        assert!(!progress.observe(VFS_REPLACEMENT_READY_MARKER));
+        assert!(!progress.vfs_replacement_ready);
+        assert!(!progress.observe(VFS_CONTAINMENT_DESCENDANT_MARKER));
+        assert!(!progress.observe(VFS_SERVICE_JOB_DRAINED_MARKER));
+        assert!(!progress.observe(VFS_REPLACEMENT_READY_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_READINESS_TIMEOUT_MARKER));
         assert!(!progress.observe(LOGGING_LIFECYCLE_PASSED_MARKER));
         assert!(!progress.observe(LOGGING_SERVICE_JOB_DRAINED_MARKER));
@@ -1462,6 +1508,12 @@ mod tests {
             containment_descendant_observed: true,
             force_termination_observed: true,
             forced_job_drained: true,
+            tmpfs_descendant_observed: true,
+            tmpfs_job_drained: true,
+            tmpfs_replacement_ready: true,
+            vfs_descendant_observed: true,
+            vfs_job_drained: true,
+            vfs_replacement_ready: true,
             readiness_timeout_observed: true,
             timeout_job_drained: true,
             ..LoggingLifecycleProgress::default()
