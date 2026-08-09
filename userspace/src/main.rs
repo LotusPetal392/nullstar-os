@@ -171,6 +171,8 @@ const DEFINITION_SERVICE_LOADING: &[u8] =
 const DEFINITION_SERVICE_STARTING: &[u8] = b"userspace init: starting definition-backed service\n";
 const DEFINITION_SERVICE_RESTARTING: &[u8] =
     b"userspace init: definition-backed service exited; restarting\n";
+const DEFINITION_SERVICE_JOB_DRAINED: &[u8] =
+    b"userspace init: definition-backed service generation job drained\n";
 const DEFINITION_SERVICE_READY: &[u8] = b"userspace init: definition-backed service ready\n";
 const DEFINITION_SERVICE_VERIFIED: &[u8] =
     b"userspace init: definition-backed activation and restart verified\n";
@@ -297,6 +299,7 @@ struct DefinitionServiceRuntime<'a> {
     definition: ServiceDefinition<'a>,
     process_id: Option<ProcessId>,
     process_group_id: Option<ProcessId>,
+    job: Option<CapabilityHandle>,
     generation: Option<ProviderGeneration>,
     readiness_endpoint: Option<CapabilityHandle>,
     restart_count: u32,
@@ -310,6 +313,7 @@ impl<'a> DefinitionServiceRuntime<'a> {
             definition,
             process_id: None,
             process_group_id: None,
+            job: None,
             generation: None,
             readiness_endpoint: None,
             restart_count: 0,
@@ -2040,38 +2044,112 @@ fn definition_service_consume_restart(runtime: &mut DefinitionServiceRuntime<'_>
     true
 }
 
-fn terminate_definition_process_group(
+fn reap_definition_service_leader(leader_process_id: &mut Option<ProcessId>) -> bool {
+    let Some(process_id) = *leader_process_id else {
+        return true;
+    };
+    loop {
+        match syscall::try_wait_child(process_id) {
+            Ok(status) if status.continued() || status.stopped_signal().is_some() => return false,
+            Ok(_) => {
+                *leader_process_id = None;
+                return true;
+            }
+            Err(error) if error == syscall::Errno::TRY_AGAIN => return false,
+            Err(error) if error == syscall::Errno::INTERRUPTED => {}
+            Err(error) if error == syscall::Errno::NO_CHILD => {
+                *leader_process_id = None;
+                return true;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn terminate_unassigned_definition_process_group(
     process_group_id: ProcessId,
     leader_process_id: &mut Option<ProcessId>,
 ) -> bool {
     for _ in 0..DEFINITION_SERVICE_FORCE_WAIT_YIELDS {
         let group_empty = match syscall::signal_process_group(process_group_id, signal::KILL) {
             Ok(signaled) if signaled != 0 => false,
-            // The policy-pinned pilot executable does not create descendants. General
-            // service activation requires jobs before NO_CHILD can prove arbitrary
-            // descendant groups empty after their leader has been reaped.
             Err(error) if error == syscall::Errno::NO_CHILD => true,
             _ => return false,
         };
-        if let Some(process_id) = *leader_process_id {
-            loop {
-                match syscall::try_wait_child(process_id) {
-                    Ok(status) if status.continued() || status.stopped_signal().is_some() => break,
-                    Ok(_) => {
-                        *leader_process_id = None;
-                        break;
-                    }
-                    Err(error) if error == syscall::Errno::TRY_AGAIN => break,
-                    Err(error) if error == syscall::Errno::INTERRUPTED => {}
-                    Err(error) if error == syscall::Errno::NO_CHILD => {
-                        *leader_process_id = None;
-                        break;
-                    }
-                    Err(_) => return false,
-                }
+        let leader_reaped = reap_definition_service_leader(leader_process_id);
+        if group_empty && leader_reaped {
+            return true;
+        }
+        if syscall::yield_now().is_err() {
+            return false;
+        }
+    }
+    false
+}
+
+fn close_empty_definition_job(
+    job_management: &mut Option<CapabilityHandle>,
+    job: &mut Option<CapabilityHandle>,
+) -> bool {
+    let inspection_handle = (*job).or(*job_management);
+    if let Some(handle) = inspection_handle
+        && ipc::job_try_wait(handle).err() != Some(ipc::Error::NO_CHILD)
+    {
+        return false;
+    }
+    let job_closed = match *job {
+        Some(handle) => {
+            if ipc::close(handle).is_ok() {
+                *job = None;
+                true
+            } else {
+                false
             }
         }
-        if group_empty && leader_process_id.is_none() {
+        None => true,
+    };
+    let management_closed = match *job_management {
+        Some(handle) => {
+            if ipc::close(handle).is_ok() {
+                *job_management = None;
+                true
+            } else {
+                false
+            }
+        }
+        None => true,
+    };
+    job_closed && management_closed
+}
+
+fn terminate_and_drain_definition_job(
+    job: &mut Option<CapabilityHandle>,
+    leader_process_id: &mut Option<ProcessId>,
+    process_group_id: &mut Option<ProcessId>,
+) -> bool {
+    let Some(handle) = *job else {
+        return false;
+    };
+    for _ in 0..DEFINITION_SERVICE_FORCE_WAIT_YIELDS {
+        if ipc::job_terminate(handle).is_err() {
+            return false;
+        }
+        let job_drained = loop {
+            match ipc::job_try_wait(handle) {
+                Ok(_) => {}
+                Err(error) if error == ipc::Error::TRY_AGAIN => break false,
+                Err(error) if error == ipc::Error::NO_CHILD => break true,
+                Err(_) => return false,
+            }
+        };
+        let leader_reaped = reap_definition_service_leader(leader_process_id);
+        if job_drained && leader_reaped {
+            if ipc::close(handle).is_err() {
+                return false;
+            }
+            *job = None;
+            *process_group_id = None;
+            let _ = syscall::write_all(STDOUT, DEFINITION_SERVICE_JOB_DRAINED);
             return true;
         }
         if syscall::yield_now().is_err() {
@@ -2088,16 +2166,16 @@ fn clear_definition_service_process(
     if leader_reaped {
         runtime.process_id = None;
     }
-    let process_group_clean = match runtime.process_group_id {
-        Some(process_group_id) => {
-            if terminate_definition_process_group(process_group_id, &mut runtime.process_id) {
-                runtime.process_group_id = None;
-                true
-            } else {
-                false
-            }
+    let job_clean = match runtime.job {
+        Some(_) => terminate_and_drain_definition_job(
+            &mut runtime.job,
+            &mut runtime.process_id,
+            &mut runtime.process_group_id,
+        ),
+        None => {
+            runtime.process_group_id = None;
+            runtime.process_id.is_none()
         }
-        None => runtime.process_id.is_none(),
     };
     let readiness_closed = match runtime.readiness_endpoint {
         Some(endpoint) => {
@@ -2110,7 +2188,7 @@ fn clear_definition_service_process(
         }
         None => true,
     };
-    if process_group_clean && readiness_closed {
+    if job_clean && readiness_closed {
         runtime.generation = None;
         true
     } else {
@@ -2124,6 +2202,9 @@ struct DefinitionActivationAttempt {
     barrier: Option<syscall::LaunchBarrier>,
     process_id: Option<ProcessId>,
     process_group_id: Option<ProcessId>,
+    job_management: Option<CapabilityHandle>,
+    job: Option<CapabilityHandle>,
+    job_assigned: bool,
 }
 
 impl DefinitionActivationAttempt {
@@ -2134,6 +2215,9 @@ impl DefinitionActivationAttempt {
             barrier: None,
             process_id: None,
             process_group_id: None,
+            job_management: None,
+            job: None,
+            job_assigned: false,
         }
     }
 
@@ -2142,6 +2226,20 @@ impl DefinitionActivationAttempt {
             Some(source) => {
                 if ipc::close(source).is_ok() {
                     self.generation_source = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn close_job_management(&mut self) -> bool {
+        match self.job_management {
+            Some(handle) => {
+                if ipc::close(handle).is_ok() {
+                    self.job_management = None;
                     true
                 } else {
                     false
@@ -2187,20 +2285,50 @@ impl DefinitionActivationAttempt {
 
     fn abort(&mut self) -> bool {
         let generation_closed = self.close_generation_source();
-        let barrier_released = self.release_barrier();
-        let process_group_clean = match self.process_group_id {
-            Some(process_group_id) => {
-                if terminate_definition_process_group(process_group_id, &mut self.process_id) {
-                    self.process_group_id = None;
-                    true
-                } else {
-                    false
-                }
-            }
-            None => self.process_id.is_none(),
-        };
         let readiness_closed = self.close_readiness();
-        generation_closed && barrier_released && process_group_clean && readiness_closed
+        let process_clean = if self.job_assigned {
+            let clean = terminate_and_drain_definition_job(
+                &mut self.job,
+                &mut self.process_id,
+                &mut self.process_group_id,
+            );
+            if clean {
+                self.job_assigned = false;
+            }
+            clean
+        } else {
+            let process_group_clean = match self.process_group_id {
+                Some(process_group_id) => {
+                    if terminate_unassigned_definition_process_group(
+                        process_group_id,
+                        &mut self.process_id,
+                    ) {
+                        self.process_group_id = None;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => self.process_id.is_none(),
+            };
+            process_group_clean
+                && close_empty_definition_job(&mut self.job_management, &mut self.job)
+        };
+        let management_closed = if process_clean {
+            self.close_job_management()
+        } else {
+            false
+        };
+        let barrier_released = if process_clean {
+            self.release_barrier()
+        } else {
+            false
+        };
+        generation_closed
+            && readiness_closed
+            && process_clean
+            && management_closed
+            && barrier_released
     }
 
     fn finish_reaped(&mut self) -> bool {
@@ -2235,9 +2363,39 @@ fn start_definition_service(
         .next_generation()
         .map_err(|_| DefinitionServiceError::Activation)?;
     let mut attempt = DefinitionActivationAttempt::new();
+    let job_management = match ipc::job_create() {
+        Ok(handle) => handle,
+        Err(_) => return Err(DefinitionServiceError::Activation),
+    };
+    attempt.job_management = Some(job_management);
+    let job = match ipc::duplicate(job_management, Rights::SIGNAL | Rights::WAIT) {
+        Ok(handle) => handle,
+        Err(_) => {
+            cleanup_definition_attempt(runtime, attempt, false)?;
+            return Err(DefinitionServiceError::Activation);
+        }
+    };
+    attempt.job = Some(job);
+    let job_handles_valid = matches!(
+        ipc::info(job_management),
+        Ok(info) if info.kind == ObjectKind::Job && info.rights == Rights::JOB && info.size == 0
+    ) && matches!(
+        ipc::info(job),
+        Ok(info)
+            if info.kind == ObjectKind::Job
+                && info.rights == Rights::SIGNAL | Rights::WAIT
+                && info.size == 0
+    ) && ipc::job_try_wait(job).err() == Some(ipc::Error::NO_CHILD);
+    if !job_handles_valid {
+        cleanup_definition_attempt(runtime, attempt, false)?;
+        return Err(DefinitionServiceError::Activation);
+    }
     let generation_source = match ipc::endpoint_create() {
         Ok(source) => source,
-        Err(_) => return Err(DefinitionServiceError::Activation),
+        Err(_) => {
+            cleanup_definition_attempt(runtime, attempt, false)?;
+            return Err(DefinitionServiceError::Activation);
+        }
     };
     attempt.generation_source = Some(generation_source);
     if queue_service_generation(generation_source, generation).is_err() {
@@ -2283,6 +2441,22 @@ fn start_definition_service(
     };
     attempt.process_id = Some(process_id);
     attempt.process_group_id = Some(process_id);
+    if ipc::job_assign(job_management, process_id).ok() != Some(process_id) {
+        cleanup_definition_attempt(runtime, attempt, false)?;
+        return Err(DefinitionServiceError::Activation);
+    }
+    attempt.job_assigned = true;
+    if !matches!(
+        ipc::info(job),
+        Ok(info)
+            if info.kind == ObjectKind::Job
+                && info.rights == Rights::SIGNAL | Rights::WAIT
+                && info.size == 1
+    ) || !attempt.close_job_management()
+    {
+        cleanup_definition_attempt(runtime, attempt, false)?;
+        return Err(DefinitionServiceError::Activation);
+    }
     let readiness_granted = attempt.readiness_endpoint.is_none_or(|endpoint| {
         ipc::grant_child(process_id, endpoint, Rights::SEND, READY_HANDLE).ok()
             == Some(READY_HANDLE)
@@ -2303,6 +2477,7 @@ fn start_definition_service(
     if runtime.definition.readiness() == Readiness::Immediate {
         runtime.process_id = attempt.process_id.take();
         runtime.process_group_id = attempt.process_group_id.take();
+        runtime.job = attempt.job.take();
         runtime.generation = Some(generation);
         runtime.readiness_endpoint = None;
         runtime.restart_deferred = false;
@@ -2338,6 +2513,7 @@ fn start_definition_service(
                 }
                 runtime.process_id = attempt.process_id.take();
                 runtime.process_group_id = attempt.process_group_id.take();
+                runtime.job = attempt.job.take();
                 runtime.generation = Some(generation);
                 runtime.readiness_endpoint = attempt.readiness_endpoint.take();
                 runtime.restart_deferred = false;
@@ -2463,6 +2639,7 @@ fn poll_definition_service(
             }
         }
     } else if (runtime.process_group_id.is_some()
+        || runtime.job.is_some()
         || runtime.readiness_endpoint.is_some()
         || runtime.generation.is_some())
         && !clear_definition_service_process(runtime, true)

@@ -105,9 +105,10 @@ The process manager owns address spaces and copy-on-write state, arguments and
 environments, descriptor tables, parent/child relationships, process groups, basic job
 membership, terminal ownership, signals, and completion state. `exec` constructs and
 validates a replacement image before committing it, and `fork` initially shares read-only
-pages before copying on write. Capability-backed jobs now provide flat descendant
-containment, independent FIFO exit observation, and whole-job forced termination;
-hierarchy and resource policy remain future work.
+pages before copying on write. Capability-backed jobs provide flat descendant
+containment, independent FIFO exit observation, and whole-job forced termination. PID 1
+uses them for the policy-pinned definition-backed activation pilot; core-service
+integration, hierarchy, and resource policy remain future work.
 
 ### Userspace service routes
 

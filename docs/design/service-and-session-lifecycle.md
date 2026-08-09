@@ -610,9 +610,12 @@ ticket, not an ambient “become root” state.
 
 The accepted model can be introduced incrementally:
 
-1. **Implemented foundation:** provide flat capability-backed job containment,
-   non-relaxable descendant inheritance, independent process-exit records, and bounded
-   whole-job termination. PID 1 service assignment and hierarchy remain follow-up.
+1. **Implemented foundation and bounded pilot:** provide flat capability-backed job
+   containment, non-relaxable descendant inheritance, independent process-exit records,
+   and bounded whole-job termination. PID 1 assigns each policy-pinned definition-backed
+   activation attempt while its leader remains behind the launch barrier, then terminates
+   and drains the complete generation before replacement. Core-service assignment and
+   hierarchy remain follow-up.
 2. introduce the one-bootstrap-channel startup contract and explicit startup handles;
 3. define stable service identity, generation, lifecycle state, readiness, and control
    protocols;
