@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 14;
+pub const ABI_VERSION_MINOR: u64 = 15;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -79,6 +79,10 @@ pub mod syscall {
     pub const KERNEL_EARLY_LOG_READ: u64 = 57;
     pub const OFFLINE_FILESYSTEM_PROVIDER: u64 = 58;
     pub const OFFLINE_WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINT: u64 = 59;
+    pub const JOB_CREATE: u64 = 60;
+    pub const JOB_ASSIGN: u64 = 61;
+    pub const JOB_TRY_WAIT: u64 = 62;
+    pub const JOB_TERMINATE: u64 = 63;
 }
 
 pub mod filesystem_provider {
@@ -106,6 +110,7 @@ pub mod capability {
     pub const KERNEL_EARLY_LOG_READER: u64 = 1 << 15;
     pub const FILESYSTEM_PROVIDER_OFFLINE: u64 = 1 << 16;
     pub const WRITABLE_NULLFS_BLOCK_DEVICE_OFFLINE: u64 = 1 << 17;
+    pub const JOB_OBJECTS: u64 = 1 << 18;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -125,7 +130,8 @@ pub mod capability {
         | WRITABLE_NULLFS_BLOCK_DEVICE_ENDPOINTS
         | KERNEL_EARLY_LOG_READER
         | FILESYSTEM_PROVIDER_OFFLINE
-        | WRITABLE_NULLFS_BLOCK_DEVICE_OFFLINE;
+        | WRITABLE_NULLFS_BLOCK_DEVICE_OFFLINE
+        | JOB_OBJECTS;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -133,6 +139,7 @@ pub mod capability {
     pub const KIND_NOTIFICATION: u64 = 2;
     pub const KIND_SHARED_MEMORY: u64 = 3;
     pub const KIND_KERNEL_EARLY_LOG_READER: u64 = 4;
+    pub const KIND_JOB: u64 = 5;
 
     pub const RIGHT_DUPLICATE: u64 = 1 << 0;
     pub const RIGHT_TRANSFER: u64 = 1 << 1;
@@ -142,6 +149,7 @@ pub mod capability {
     pub const RIGHT_WAIT: u64 = 1 << 5;
     pub const RIGHT_READ: u64 = 1 << 6;
     pub const RIGHT_WRITE: u64 = 1 << 7;
+    pub const RIGHT_MANAGE: u64 = 1 << 8;
 
     pub const ENDPOINT_RIGHTS: u64 = RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SEND | RIGHT_RECEIVE;
     pub const NOTIFICATION_RIGHTS: u64 =
@@ -149,6 +157,8 @@ pub mod capability {
     pub const SHARED_MEMORY_RIGHTS: u64 =
         RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_READ | RIGHT_WRITE;
     pub const KERNEL_EARLY_LOG_READER_RIGHTS: u64 = RIGHT_TRANSFER | RIGHT_READ;
+    pub const JOB_RIGHTS: u64 =
+        RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SIGNAL | RIGHT_WAIT | RIGHT_MANAGE;
 
     #[repr(C)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +167,8 @@ pub mod capability {
         pub kind: u64,
         pub rights: u64,
         /// Object-specific bounded state: queued endpoint messages, pending
-        /// notification count, shared-memory byte length, or early-log record capacity.
+        /// notification count, shared-memory byte length, early-log record capacity,
+        /// or active job-member count.
         pub size: u64,
     }
 
@@ -185,6 +196,22 @@ pub mod capability {
             byte_count: 0,
             transferred_handle: INVALID_HANDLE,
             transferred_rights: 0,
+        };
+    }
+}
+
+pub mod job {
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Exit {
+        pub process_id: u64,
+        pub status: u64,
+    }
+
+    impl Exit {
+        pub const EMPTY: Self = Self {
+            process_id: 0,
+            status: 0,
         };
     }
 }
@@ -421,6 +448,7 @@ pub mod limits {
     pub const MAX_ENDPOINT_OBJECTS: usize = 32;
     pub const MAX_NOTIFICATION_OBJECTS: usize = 32;
     pub const MAX_SHARED_MEMORY_OBJECTS: usize = 16;
+    pub const MAX_JOB_OBJECTS: usize = 32;
     pub const MAX_ENDPOINT_MESSAGES: usize = 8;
     pub const MAX_IPC_MESSAGE_BYTES: usize = 256;
     pub const MAX_SHARED_MEMORY_BYTES: usize = 16 * 1024;

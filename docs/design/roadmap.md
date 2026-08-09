@@ -12,7 +12,8 @@ direct-child bootstrap grants. The next architecture stages are:
 
 1. formalize common kernel-object ownership, typed handles, immutable rights, object
    signals, close, duplicate, replace, inspection, and diagnostic object identity;
-2. separate process, thread, address-space, and hierarchical job abstractions;
+2. evolve the implemented flat job-containment object into distinct process, thread,
+   address-space, and hierarchical job abstractions;
 3. introduce channel pairs with peer closure, bounded queues, atomic move-transfer of
    multiple rights-reduced handles, and explicit backpressure accounting;
 4. add general one- and many-object waiting with absolute monotonic deadlines;
@@ -31,10 +32,11 @@ The detailed contract is in
 
 ## Process startup and service lifecycle
 
-1. replace broad ambient startup assumptions with one bootstrap channel carrying a
+1. **Implemented foundation:** add capability-backed flat job containment, inherited
+   descendants, independent FIFO process-exit observation, and bounded whole-job
+   termination. Integrating service launches and adding child jobs remain follow-up.
+2. replace broad ambient startup assumptions with one bootstrap channel carrying a
    versioned startup message and explicit handles;
-2. add process-exit observation and basic hierarchical job containment around the
-   current supervisor;
 3. define stable service identity, service generation, lifecycle state, readiness,
    control, and failure protocols;
 4. keep PID 1 as a minimal bootstrap and recovery supervisor while moving ordinary
@@ -67,9 +69,10 @@ Only that exact event plus final exit `0` proves a clean path. Timeout, invalid 
 failure, or early/nonzero exit triggers exact-generation offlining, KILL/reap, and dirty recovery.
 Replacement still uses a fresh endpoint and strictly newer generation, and controlled restart charges
 no failure budget. Filesystem `Start` and `Stop` stay exactly `Unsupported`; `NSVC` v1 and the public
-filesystem version 1 `Request`/`Reply` operations are unchanged. Jobs, a separate manager process,
-activation, definitions, and cross-reboot desired-state persistence remain future work. ABI 1.13 adds
-the narrow PID-1 provider-offlining syscall; the existing signal ABI supplies forced termination.
+filesystem version 1 `Request`/`Reply` operations are unchanged. ABI 1.15 now supplies flat jobs,
+non-relaxable descendant inheritance, independent exit records, and whole-job termination, but PID 1
+does not yet assign service generations to them. A separate manager process, general activation,
+and cross-reboot desired-state persistence remain future work.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

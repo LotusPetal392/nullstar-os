@@ -183,7 +183,8 @@ fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
         CapabilityObjectData::Endpoint(endpoint) => Ok(!endpoint.queue.is_empty()),
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
-        | CapabilityObjectData::KernelEarlyLogReader(_) => Err(abi::errno::INVALID_ARGUMENT),
+        | CapabilityObjectData::KernelEarlyLogReader(_)
+        | CapabilityObjectData::Job(_) => Err(abi::errno::INVALID_ARGUMENT),
     }
 }
 

@@ -10,7 +10,8 @@ ready for hostile workloads.
 The original protection phase introduced bounded process-local capability tables,
 rights-reduced duplication and delegation, endpoints, counted notifications, shared
 byte-memory objects, scheduler-integrated endpoint waiting, and direct-child bootstrap
-grants.
+grants. ABI 1.15 adds the first capability-backed job object with non-relaxable `fork`
+inheritance, independent process-exit records, and bounded whole-job termination.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
@@ -46,6 +47,8 @@ The implemented model establishes these properties:
 3. Processes exchange bounded messages and restricted capabilities through endpoints.
 4. Resource use is bounded so exhaustion returns a defined error.
 5. Supervised service replacement does not silently rebind old sessions or handles.
+6. A process assigned to a job cannot escape by forking or being moved into a different
+   job.
 
 The capability namespace is separate from the file-descriptor namespace. Both use small
 integers today, but handles are valid only for capability operations and descriptors are
@@ -58,6 +61,7 @@ valid only for descriptor and filesystem I/O.
 | Endpoint | Bounded FIFO messages and optional capability delegation | `SEND`, `RECEIVE`, `DUPLICATE`, `TRANSFER` |
 | Notification | Counted asynchronous event delivery | `SIGNAL`, `WAIT`, `DUPLICATE`, `TRANSFER` |
 | Shared memory | Bounded byte storage shared by capability holders | `READ`, `WRITE`, `DUPLICATE`, `TRANSFER` |
+| Job | Flat descendant containment and FIFO process-exit observation | `MANAGE`, `WAIT`, `SIGNAL`, `DUPLICATE`, `TRANSFER` |
 
 `DUPLICATE` creates another handle in the same process. `TRANSFER` permits placing a
 rights-reduced copy in an endpoint message or granting it to a live direct child. Neither
@@ -92,6 +96,26 @@ initial handle across `fork` and `exec`.
 
 This is intentionally not a general operation for opening another process. It cannot
 grant directly to siblings, unrelated processes, or arbitrary process identifiers.
+
+## Basic job containment and exit observation
+
+`JOB_CREATE` returns a new empty job. A handle with `MANAGE` may assign only one live
+direct child that has no prior job. Membership is non-relaxable: a later attempt to move
+that process is denied, and all of its `fork` descendants inherit the same job. Parent
+exit and reparenting to the kernel reaper do not change membership.
+
+Every member contributes one immutable terminal record to the job in addition to the
+ordinary parent completion. A `WAIT` handle consumes those records FIFO without racing or
+stealing the parent's `wait_child` result. The combined live-member and unconsumed-record
+count is bounded at 64, so the kernel rejects new membership rather than dropping exit
+information. Capability inspection reports the active member count.
+
+A `SIGNAL` handle may force signal 9 across the current member snapshot. The object is
+kept alive by kernel roots while it contains members, even if its controller exits or
+closes every userspace handle. This provides explicit bounded cleanup, not implicit
+kill-on-close. Jobs are not yet hierarchical, do not carry CPU or memory limits, and are
+not yet the supervisor's default launch container. Strict launchers must retain the child
+behind a barrier until assignment commits.
 
 ## Userspace service-route use
 
@@ -280,7 +304,7 @@ Future work should preserve the current rules while adding:
 - cancellation, multi-object waiting, and endpoint peer-liveness notification;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
   restartable service-manager broker that owns the sequence and receives its current state;
-- job-level resource accounting and limits;
+- hierarchical child jobs plus job-level resource accounting and limits;
 - capability-aware identity, sandbox, portal, driver, network, media, and graphics
   services.
 

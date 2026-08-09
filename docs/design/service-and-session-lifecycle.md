@@ -610,8 +610,9 @@ ticket, not an ambient “become root” state.
 
 The accepted model can be introduced incrementally:
 
-1. formalize process termination observation and basic job containment around the
-   current PID 1 supervisor;
+1. **Implemented foundation:** provide flat capability-backed job containment,
+   non-relaxable descendant inheritance, independent process-exit records, and bounded
+   whole-job termination. PID 1 service assignment and hierarchy remain follow-up.
 2. introduce the one-bootstrap-channel startup contract and explicit startup handles;
 3. define stable service identity, generation, lifecycle state, readiness, and control
    protocols;

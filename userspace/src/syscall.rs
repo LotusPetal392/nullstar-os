@@ -284,6 +284,10 @@ pub struct PipePair {
 pub struct ChildStatus(u64);
 
 impl ChildStatus {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -299,6 +303,7 @@ impl ChildStatus {
             && matches!(
                 number,
                 signal::INTERRUPT
+                    | signal::KILL
                     | signal::TERMINATE
                     | signal::CONTINUE
                     | signal::STOP
