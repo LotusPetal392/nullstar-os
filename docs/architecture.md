@@ -50,8 +50,9 @@ Generated images use `/BOOTMODE` to select among:
 - `nullfs-unavailable-test`, whose image omits the primary NullFS partition and validates exact
   UUID lookup failure plus handoff to the independently available emergency kernel shell;
 - `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
-  generation replacement, restart fencing, escaped-descendant job containment, filesystem mutation
-  policy, forced termination, and readiness-timeout drainage.
+  generation replacement, restart fencing, filesystem mutation policy, forced termination,
+  readiness-timeout drainage, and tmpfs/VFS escaped-process-group descendant termination,
+  whole-job drainage, and generation replacement.
 
 ## Boot sequence
 
@@ -108,8 +109,11 @@ membership, terminal ownership, signals, and completion state. `exec` constructs
 validates a replacement image before committing it, and `fork` initially shares read-only
 pages before copying on write. Capability-backed jobs provide flat descendant
 containment, independent FIFO exit observation, and whole-job forced termination. PID 1
-uses them for the policy-pinned definition-backed activation pilot; core-service
-integration, hierarchy, and resource policy remain future work. Shared PID 1 cleanup now
+uses fresh jobs for policy-pinned definition-backed service attempts and every logging,
+tmpfs, and VFS generation before launch-barrier release, retains only `SIGNAL | WAIT`, and drains each
+generation to `ECHILD` before replacement. Job hierarchy and resource policy remain future
+work. NullFS containment is a separate future milestone because replacement must preserve
+its durability and quiesce lifecycle. Shared PID 1 cleanup now
 uses allocation-free result classification and canonical bootstrap diagnostics for unexpected
 signal, wait, job, capability-close, launch-barrier, yield, and budget-exhaustion outcomes.
 
@@ -176,7 +180,11 @@ not charge failure policy, and start/stop success commits desired state without 
 readiness. PID 1 first requests cooperative process-group termination and escalates the whole job
 after a bounded grace period with uncatchable, unblockable signal 9; the dedicated lifecycle image
 verifies escaped-descendant cleanup, that escalation, duplicate-restart `Busy`, and exact filesystem
-`Start`/`Stop` `Unsupported` policy.
+`Start`/`Stop` `Unsupported` policy. Policy-pinned definition-backed service attempts and every tmpfs and VFS
+generation also receive a fresh flat job before launch-barrier release; PID 1 retains only
+`SIGNAL | WAIT` and drains the complete generation to `ECHILD` before replacement. The lifecycle
+gate injects tmpfs/VFS descendants that escape their leaders' process groups and requires descendant
+termination, whole-job drainage to `ECHILD`, and generation replacement.
 Controlled NullFS restart queues private `NFLC` v1 `QUIESCE` behind earlier FIFO requests. Exact
 `QUIESCED` lets PID 1 offline that provider generation and wake tail work with `EIO`; `UNMOUNT` then
 closes core handles, syncs and publishes a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits

@@ -4,6 +4,8 @@
 pub enum Service {
     Definition,
     Logging,
+    Tmpfs,
+    Vfs,
 }
 
 impl Service {
@@ -11,6 +13,8 @@ impl Service {
         match self {
             Self::Definition => b"definition",
             Self::Logging => b"logging",
+            Self::Tmpfs => b"tmpfs",
+            Self::Vfs => b"vfs",
         }
     }
 }
@@ -387,6 +391,30 @@ mod tests {
         assert_eq!(
             &output[..length],
             b"init: cleanup service=definition phase=resource-release operation=capability-close result=error code=-2147483648\n"
+        );
+
+        let tmpfs = Diagnostic {
+            service: Service::Tmpfs,
+            phase: Phase::JobDrain,
+            operation: Operation::JobTryWait,
+            observation: Observation::MissingHandle,
+        };
+        let length = tmpfs.encode(&mut output).expect("diagnostic fits");
+        assert_eq!(
+            &output[..length],
+            b"init: cleanup service=tmpfs phase=job-drain operation=job-try-wait result=missing-handle\n"
+        );
+
+        let vfs = Diagnostic {
+            service: Service::Vfs,
+            phase: Phase::JobDrain,
+            operation: Operation::JobTryWait,
+            observation: Observation::MissingHandle,
+        };
+        let length = vfs.encode(&mut output).expect("diagnostic fits");
+        assert_eq!(
+            &output[..length],
+            b"init: cleanup service=vfs phase=job-drain operation=job-try-wait result=missing-handle\n"
         );
     }
 

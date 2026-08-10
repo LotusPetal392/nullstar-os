@@ -5,8 +5,9 @@ use core::{mem::size_of, slice};
 
 use userspace::{
     abi::INIT_PROCESS_ID,
+    args::Args,
     ipc::{self, ObjectKind, Rights},
-    nullfs_primary_volume,
+    nullfs_primary_volume, platform,
     service_route::receive_service_generation,
     syscall,
     vfs::protocol,
@@ -19,6 +20,9 @@ const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: vfs";
+const CONTAINMENT_TEST_ARGUMENT: &[u8] = b"--containment-test";
+const CONTAINMENT_DESCENDANT_MARKER: &[u8] =
+    b"vfs-service: containment descendant escaped process group\n";
 
 struct Route {
     path: &'static [u8],
@@ -114,16 +118,72 @@ const ROUTES: &[Route] = &[
     },
 ];
 
-extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
+fn spawn_containment_descendant() {
+    let group_ready = match syscall::pipe_pair() {
+        Ok(pair) => pair,
+        Err(_) => syscall::exit(20),
+    };
+    match syscall::fork() {
+        Ok(0) => {
+            let _ = syscall::close(group_ready.reader);
+            if platform::set_process_group(0, 0).is_err()
+                || syscall::write_all(group_ready.writer, &[1]).is_err()
+                || syscall::close(group_ready.writer).is_err()
+            {
+                syscall::exit(21);
+            }
+            loop {
+                if syscall::yield_now().is_err() {
+                    syscall::exit(22);
+                }
+            }
+        }
+        Ok(_) => {
+            let _ = syscall::close(group_ready.writer);
+            let mut ready = [0_u8; 1];
+            let escaped = loop {
+                match syscall::read(group_ready.reader, &mut ready) {
+                    Ok(1) => break ready[0] == 1,
+                    Ok(_) => break false,
+                    Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                    Err(_) => break false,
+                }
+            };
+            if syscall::close(group_ready.reader).is_err()
+                || !escaped
+                || syscall::write_all(syscall::STDOUT, CONTAINMENT_DESCENDANT_MARKER).is_err()
+            {
+                syscall::exit(23);
+            }
+        }
+        Err(_) => {
+            let _ = syscall::close(group_ready.writer);
+            let _ = syscall::close(group_ready.reader);
+            syscall::exit(20);
+        }
+    }
+}
+
+extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+    let arguments = unsafe { Args::from_stack(initial_stack) };
+    let containment_test =
+        arguments.len() == 2 && arguments.get(1) == Some(CONTAINMENT_TEST_ARGUMENT);
+    if !(arguments.len() == 1 || containment_test) {
+        syscall::exit(1);
+    }
+
     if !valid_bootstrap(READY_HANDLE, ObjectKind::Endpoint, Rights::SEND)
         || !valid_bootstrap(REQUEST_HANDLE, ObjectKind::Endpoint, Rights::RECEIVE)
     {
         syscall::exit(2);
     }
-    let _generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
-        Ok(generation) => generation,
+    let generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
+        Ok(generation) => generation.get(),
         Err(_) => syscall::exit(3),
     };
+    if containment_test && generation == 1 {
+        spawn_containment_descendant();
+    }
     if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err() {
         syscall::exit(4);
     }
