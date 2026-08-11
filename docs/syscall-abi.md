@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.15, and a
+The ABI is experimental, but callers can query the current version, 1.16, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -381,10 +381,33 @@ be retained. `JOB_TERMINATE` requires `SIGNAL` and delivers uncatchable signal 9
 current member, including orphaned descendants. The job object remains reachable while
 it contains members even if userspace closes its last handle.
 
-This first slice is intentionally flat. It does not yet add child-job hierarchy,
-kill-on-last-handle-close, resource budgets, process suspension, blocking/multi-object
-wait, or automatic PID 1 service assignment. A launcher requiring strict containment
-must keep a new child behind its existing launch barrier until `JOB_ASSIGN` succeeds.
+The ABI 1.15 slice is intentionally flat. It does not add kill-on-last-handle-close,
+resource budgets, process suspension, or blocking/multi-object wait. A launcher requiring
+strict containment must keep a new child behind its existing launch barrier until `JOB_ASSIGN`
+succeeds.
+
+## Version 1.16 child-job hierarchy
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 64 | `JOB_CREATE_CHILD` | parent job handle | new child-job handle |
+
+`JOB_CREATE_CHILD` requires `MANAGE` on the parent. A child job is attached exactly once at
+creation, cannot be reparented, and retains a reverse parent edge so any live handle or process in
+the connected tree preserves the immutable hierarchy. Each job may own at most 32 direct children,
+and the existing global 32-job bound still applies.
+
+Process assignment remains leaf-local and non-relaxable: `JOB_ASSIGN` adds a direct child process to
+the selected job, and later `fork` descendants inherit that exact job. Capability `Info.size`,
+`JOB_TRY_WAIT`, and `JOB_TERMINATE` on a job cover its complete subtree. Waiting uses deterministic
+parent-before-child breadth-first traversal, preserves FIFO order within each job, and consumes an
+exit exactly once across handles to that job or its ancestors. It returns `EAGAIN` while any subtree
+member remains without a completion and `ECHILD` only when the entire subtree has no live members or
+pending completions. Termination snapshots and signals all current subtree members.
+
+This slice does not add hierarchy enumeration or removal, per-job resource budgets, suspension,
+kill-on-close, or blocking/multi-object wait. Empty child jobs remain attached and reusable until the
+connected hierarchy becomes unreachable.
 
 ## Compatibility rules
 
@@ -410,6 +433,8 @@ must keep a new child behind its existing launch barrier until `JOB_ASSIGN` succ
 - ABI 1.15 adds capability-backed job creation, direct-child assignment, inherited
   descendant containment, independent exit observation, and whole-job termination at
   syscalls 60 through 63.
+- ABI 1.16 adds immutable child-job creation and subtree inspection, exit drainage, and
+  termination at syscall 64.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

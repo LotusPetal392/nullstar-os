@@ -97,7 +97,7 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.15. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.16. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
@@ -109,12 +109,14 @@ The process manager owns address spaces and copy-on-write state, arguments and
 environments, descriptor tables, parent/child relationships, process groups, basic job
 membership, terminal ownership, signals, and completion state. `exec` constructs and
 validates a replacement image before committing it, and `fork` initially shares read-only
-pages before copying on write. Capability-backed jobs provide flat descendant
-containment, independent FIFO exit observation, and whole-job forced termination. PID 1
+pages before copying on write. Capability-backed jobs provide immutable child hierarchy,
+leaf-local descendant containment, deterministic subtree exit observation, and whole-subtree
+forced termination. PID 1
 uses fresh jobs for policy-pinned definition-backed service attempts and every logging,
 NullFS, tmpfs, and VFS generation before launch-barrier release, retains only `SIGNAL | WAIT`, and drains each
-generation to `ECHILD` before replacement. Job hierarchy and resource policy remain future
-work. NullFS preserves its exact quiesce and clean-unmount durability proof before job drainage;
+generation to `ECHILD` before replacement. PID 1 still uses one flat job per service
+generation; session, application, and resource-policy integration remain future work. NullFS
+preserves its exact quiesce and clean-unmount durability proof before job drainage;
 failure paths terminate and drain the job before dirty recovery. Shared PID 1 cleanup now
 uses allocation-free result classification and canonical bootstrap diagnostics for unexpected
 signal, wait, job, capability-close, launch-barrier, yield, and budget-exhaustion outcomes.

@@ -1,8 +1,8 @@
-//! Bounded process membership and exit observation for one job object.
+//! Bounded process membership, child hierarchy, and exit observation for one job object.
 //!
 //! The live capability registry owns these states. Keeping the state machine independent
-//! makes its containment and lossless-completion rules host-testable before job hierarchy,
-//! resource limits, or asynchronous wait sets are added.
+//! makes its containment and lossless-completion rules host-testable before resource limits
+//! or asynchronous wait sets are added.
 
 use alloc::{collections::VecDeque, vec::Vec};
 
@@ -21,6 +21,13 @@ pub enum AssignError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildError {
+    InvalidJob,
+    AlreadyChild,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnknownMember;
 
 /// Fixed-policy state behind one job capability object.
@@ -30,18 +37,63 @@ pub struct UnknownMember;
 /// degrades into a lossy notification under pressure.
 #[derive(Debug)]
 pub struct State {
-    capacity: usize,
+    member_capacity: usize,
+    child_capacity: usize,
+    parent: Option<u64>,
     members: Vec<u64>,
     completions: VecDeque<ExitRecord>,
+    children: Vec<u64>,
 }
 
 impl State {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(member_capacity: usize, child_capacity: usize) -> Self {
         Self {
-            capacity,
+            member_capacity,
+            child_capacity,
+            parent: None,
             members: Vec::new(),
             completions: VecDeque::new(),
+            children: Vec::new(),
         }
+    }
+
+    pub fn set_parent(&mut self, job_id: u64) -> Result<(), ChildError> {
+        if job_id == 0 {
+            return Err(ChildError::InvalidJob);
+        }
+        if self.parent.is_some() {
+            return Err(ChildError::AlreadyChild);
+        }
+        self.parent = Some(job_id);
+        Ok(())
+    }
+
+    pub fn parent(&self) -> Option<u64> {
+        self.parent
+    }
+
+    pub fn attach_child(&mut self, job_id: u64) -> Result<(), ChildError> {
+        if job_id == 0 {
+            return Err(ChildError::InvalidJob);
+        }
+        if self.children.contains(&job_id) {
+            return Err(ChildError::AlreadyChild);
+        }
+        if self.children.len() >= self.child_capacity {
+            return Err(ChildError::Full);
+        }
+        self.children.push(job_id);
+        Ok(())
+    }
+
+    pub fn remove_child(&mut self, job_id: u64) -> Result<(), UnknownMember> {
+        let index = self
+            .children
+            .iter()
+            .position(|child| *child == job_id)
+            .ok_or(UnknownMember)?;
+        self.children.remove(index);
+        Ok(())
     }
 
     pub fn assign(&mut self, process_id: u64) -> Result<(), AssignError> {
@@ -51,7 +103,7 @@ impl State {
         if self.members.contains(&process_id) {
             return Err(AssignError::AlreadyMember);
         }
-        if self.members.len().saturating_add(self.completions.len()) >= self.capacity {
+        if self.members.len().saturating_add(self.completions.len()) >= self.member_capacity {
             return Err(AssignError::Full);
         }
         self.members.push(process_id);
@@ -75,7 +127,9 @@ impl State {
             .position(|member| *member == record.process_id)
             .ok_or(UnknownMember)?;
         self.members.remove(index);
-        debug_assert!(self.members.len().saturating_add(self.completions.len()) < self.capacity);
+        debug_assert!(
+            self.members.len().saturating_add(self.completions.len()) < self.member_capacity
+        );
         self.completions.push_back(record);
         Ok(())
     }
@@ -95,15 +149,20 @@ impl State {
     pub fn members(&self) -> impl Iterator<Item = u64> + '_ {
         self.members.iter().copied()
     }
+
+    pub fn children(&self) -> impl Iterator<Item = u64> + '_ {
+        self.children.iter().copied()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn completions_are_fifo_and_independent_per_process() {
-        let mut state = State::new(4);
+        let mut state = State::new(4, 4);
         state.assign(11).unwrap();
         state.assign(12).unwrap();
 
@@ -129,7 +188,7 @@ mod tests {
 
     #[test]
     fn undrained_completions_reserve_their_bounded_storage() {
-        let mut state = State::new(2);
+        let mut state = State::new(2, 2);
         state.assign(1).unwrap();
         state
             .complete(ExitRecord {
@@ -146,12 +205,32 @@ mod tests {
 
     #[test]
     fn membership_is_unique_and_unstarted_members_can_roll_back() {
-        let mut state = State::new(2);
+        let mut state = State::new(2, 2);
         state.assign(41).unwrap();
 
         assert_eq!(state.assign(41), Err(AssignError::AlreadyMember));
         assert_eq!(state.remove_unstarted(41), Ok(()));
         assert_eq!(state.remove_unstarted(41), Err(UnknownMember));
         assert_eq!(state.active_members(), 0);
+    }
+
+    #[test]
+    fn child_jobs_are_bounded_ordered_and_removable_for_rollback() {
+        let mut state = State::new(2, 2);
+
+        assert_eq!(state.set_parent(0), Err(ChildError::InvalidJob));
+        assert_eq!(state.set_parent(70), Ok(()));
+        assert_eq!(state.set_parent(71), Err(ChildError::AlreadyChild));
+        assert_eq!(state.parent(), Some(70));
+        assert_eq!(state.attach_child(0), Err(ChildError::InvalidJob));
+        assert_eq!(state.attach_child(71), Ok(()));
+        assert_eq!(state.attach_child(71), Err(ChildError::AlreadyChild));
+        assert_eq!(state.attach_child(72), Ok(()));
+        assert_eq!(state.attach_child(73), Err(ChildError::Full));
+        assert_eq!(state.children().collect::<Vec<_>>(), vec![71, 72]);
+        assert_eq!(state.remove_child(71), Ok(()));
+        assert_eq!(state.remove_child(71), Err(UnknownMember));
+        assert_eq!(state.attach_child(73), Ok(()));
+        assert_eq!(state.children().collect::<Vec<_>>(), vec![72, 73]);
     }
 }

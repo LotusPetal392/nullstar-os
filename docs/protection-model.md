@@ -11,7 +11,9 @@ The original protection phase introduced bounded process-local capability tables
 rights-reduced duplication and delegation, endpoints, counted notifications, shared
 byte-memory objects, scheduler-integrated endpoint waiting, and direct-child bootstrap
 grants. ABI 1.15 adds the first capability-backed job object with non-relaxable `fork`
-inheritance, independent process-exit records, and bounded whole-job termination.
+inheritance, independent process-exit records, and bounded whole-job termination. ABI 1.16 adds
+immutable child-job creation plus subtree inspection, exit drainage, and termination while reverse
+parent reachability prevents hierarchy relaxation through handle closure.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
@@ -131,8 +133,8 @@ An `Ok(0)` process-group signal is an invariant violation, while `JOB_TERMINATE`
 zero is valid and still requires drainage to `ECHILD`. NullFS completes exact quiesce and
 clean-unmount durability proof before its clean generation job is terminated and drained;
 timeout, invalid lifecycle traffic, crash, and provider-loss paths terminate and drain the
-whole job before dirty recovery. Jobs are not yet hierarchical and do not carry CPU or memory
-limits.
+whole job before dirty recovery. Jobs support immutable hierarchy but do not yet carry CPU or
+memory limits; current PID 1 service generations remain flat roots.
 
 ## Userspace service-route use
 
@@ -321,7 +323,8 @@ Future work should preserve the current rules while adding:
 - cancellation, multi-object waiting, and endpoint peer-liveness notification;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
   restartable service-manager broker that owns the sequence and receives its current state;
-- hierarchical child jobs plus job-level resource accounting and limits;
+- job-level resource accounting and limits plus service, session, and application hierarchy
+  integration;
 - capability-aware identity, sandbox, portal, driver, network, media, and graphics
   services.
 

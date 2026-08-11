@@ -239,7 +239,7 @@ impl CapabilityRegistry {
         let mut cursor = 0usize;
         while cursor < reachable.len() {
             let reference = reachable[cursor];
-            let transferred = self
+            let linked = self
                 .object_index(reference)
                 .and_then(|index| match &self.objects[index].data {
                     CapabilityObjectData::Endpoint(endpoint) => Some(
@@ -251,13 +251,22 @@ impl CapabilityRegistry {
                             })
                             .collect::<Vec<_>>(),
                     ),
+                    CapabilityObjectData::Job(job) => Some(
+                        job.parent()
+                            .into_iter()
+                            .chain(job.children())
+                            .map(|id| CapabilityObjectRef {
+                                id,
+                                kind: abi::capability::KIND_JOB,
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
                     CapabilityObjectData::Notification(_)
                     | CapabilityObjectData::SharedMemory(_)
-                    | CapabilityObjectData::KernelEarlyLogReader(_)
-                    | CapabilityObjectData::Job(_) => None,
+                    | CapabilityObjectData::KernelEarlyLogReader(_) => None,
                 })
                 .unwrap_or_default();
-            for object in transferred {
+            for object in linked {
                 push_unique_object(&mut reachable, object);
             }
             cursor = cursor.saturating_add(1);
@@ -265,6 +274,52 @@ impl CapabilityRegistry {
 
         self.objects
             .retain(|record| reachable.contains(&record.reference));
+    }
+
+    fn job_subtree(&self, root: CapabilityObjectRef) -> Result<Vec<CapabilityObjectRef>, i64> {
+        if root.kind != abi::capability::KIND_JOB {
+            return Err(abi::errno::INVALID_ARGUMENT);
+        }
+        let mut jobs = Vec::new();
+        jobs.push(root);
+        let mut cursor = 0usize;
+        while cursor < jobs.len() {
+            let current = jobs[cursor];
+            let Some(index) = self.object_index(current) else {
+                return Err(abi::errno::IO);
+            };
+            let CapabilityObjectData::Job(job) = &self.objects[index].data else {
+                return Err(abi::errno::INVALID_ARGUMENT);
+            };
+            for id in job.children() {
+                let child = CapabilityObjectRef {
+                    id,
+                    kind: abi::capability::KIND_JOB,
+                };
+                if jobs.contains(&child) {
+                    return Err(abi::errno::IO);
+                }
+                jobs.push(child);
+            }
+            cursor = cursor.saturating_add(1);
+        }
+        Ok(jobs)
+    }
+
+    fn job_subtree_active_members(&self, root: CapabilityObjectRef) -> Result<usize, i64> {
+        let mut active = 0usize;
+        for job in self.job_subtree(root)? {
+            let Some(index) = self.object_index(job) else {
+                return Err(abi::errno::IO);
+            };
+            let CapabilityObjectData::Job(state) = &self.objects[index].data else {
+                return Err(abi::errno::INVALID_ARGUMENT);
+            };
+            active = active
+                .checked_add(state.active_members())
+                .ok_or(abi::errno::RANGE)?;
+        }
+        Ok(active)
     }
 }
 
@@ -336,15 +391,20 @@ fn capability_read_message(process_id: u64, address: u64, length: u64) -> Result
     Ok(unsafe { slice::from_raw_parts(address as *const u8, length) }.to_vec())
 }
 
-fn capability_object_size(record: &CapabilityObjectRecord) -> u64 {
+fn capability_object_size(
+    registry: &CapabilityRegistry,
+    record: &CapabilityObjectRecord,
+) -> Result<u64, i64> {
     match &record.data {
-        CapabilityObjectData::Endpoint(endpoint) => endpoint.queue.len() as u64,
-        CapabilityObjectData::Notification(notification) => notification.pending,
-        CapabilityObjectData::SharedMemory(memory) => memory.bytes.len() as u64,
+        CapabilityObjectData::Endpoint(endpoint) => Ok(endpoint.queue.len() as u64),
+        CapabilityObjectData::Notification(notification) => Ok(notification.pending),
+        CapabilityObjectData::SharedMemory(memory) => Ok(memory.bytes.len() as u64),
         CapabilityObjectData::KernelEarlyLogReader(_) => {
-            crate::early_log::KERNEL_EARLY_LOG_CAPACITY as u64
+            Ok(crate::early_log::KERNEL_EARLY_LOG_CAPACITY as u64)
         }
-        CapabilityObjectData::Job(job) => job.active_members() as u64,
+        CapabilityObjectData::Job(_) => registry
+            .job_subtree_active_members(record.reference)
+            .and_then(|members| u64::try_from(members).map_err(|_| abi::errno::RANGE)),
     }
 }
 
@@ -428,6 +488,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::JOB_ASSIGN
             | abi::syscall::JOB_TRY_WAIT
             | abi::syscall::JOB_TERMINATE
+            | abi::syscall::JOB_CREATE_CHILD
     )
 }
 
@@ -519,6 +580,7 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
             job_try_wait(process_id, registers.rdi, registers.rsi, registers.rdx)
         }
         abi::syscall::JOB_TERMINATE => job_terminate(process_id, registers.rdi),
+        abi::syscall::JOB_CREATE_CHILD => job_create_child(process_id, registers.rdi),
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
@@ -580,11 +642,15 @@ fn capability_info(process_id: u64, handle: u64, address: u64, length: u64) -> u
             return error_return(abi::errno::IO);
         };
         let record = &registry.objects[index];
+        let size = match capability_object_size(&registry, record) {
+            Ok(size) => size,
+            Err(error) => return error_return(error),
+        };
         abi::capability::Info {
             object_id: entry.object.id,
             kind: entry.object.kind,
             rights: entry.rights,
-            size: capability_object_size(record),
+            size,
         }
     };
     platform_write_value(process_id, address, length, info)
@@ -963,7 +1029,10 @@ fn job_create(process_id: u64) -> u64 {
     let mut registry = CAPABILITY_REGISTRY.lock();
     let object = match registry.create_object(
         abi::capability::KIND_JOB,
-        CapabilityObjectData::Job(kernel::job::State::new(MAX_PROCESS_SLOTS)),
+        CapabilityObjectData::Job(kernel::job::State::new(
+            MAX_PROCESS_SLOTS,
+            abi::limits::MAX_JOB_OBJECTS,
+        )),
     ) {
         Ok(object) => object,
         Err(error) => return error_return(error),
@@ -971,6 +1040,62 @@ fn job_create(process_id: u64) -> u64 {
     match registry.insert_entry(process_id, object, abi::capability::JOB_RIGHTS) {
         Ok(handle) => handle,
         Err(error) => {
+            registry.collect_garbage();
+            error_return(error)
+        }
+    }
+}
+
+fn job_create_child(process_id: u64, parent_handle: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(parent_entry) = registry.entry(process_id, parent_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(parent_entry, abi::capability::RIGHT_MANAGE) {
+        return error_return(error);
+    }
+    if parent_entry.object.kind != abi::capability::KIND_JOB {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let parent = parent_entry.object;
+    let mut child_state =
+        kernel::job::State::new(MAX_PROCESS_SLOTS, abi::limits::MAX_JOB_OBJECTS);
+    if child_state.set_parent(parent.id).is_err() {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let child = match registry.create_object(
+        abi::capability::KIND_JOB,
+        CapabilityObjectData::Job(child_state),
+    ) {
+        Ok(object) => object,
+        Err(error) => return error_return(error),
+    };
+    let attached = registry
+        .object_index(parent)
+        .and_then(|index| match &mut registry.objects[index].data {
+            CapabilityObjectData::Job(state) => Some(state.attach_child(child.id)),
+            _ => None,
+        });
+    let attach_error = match attached {
+        Some(Ok(())) => None,
+        Some(Err(kernel::job::ChildError::InvalidJob)) | None => {
+            Some(abi::errno::INVALID_ARGUMENT)
+        }
+        Some(Err(kernel::job::ChildError::AlreadyChild)) => Some(abi::errno::PERMISSION),
+        Some(Err(kernel::job::ChildError::Full)) => Some(abi::errno::NO_SPACE),
+    };
+    if let Some(error) = attach_error {
+        registry.collect_garbage();
+        return error_return(error);
+    }
+    match registry.insert_entry(process_id, child, abi::capability::JOB_RIGHTS) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Some(index) = registry.object_index(parent)
+                && let CapabilityObjectData::Job(state) = &mut registry.objects[index].data
+            {
+                let _ = state.remove_child(child.id);
+            }
             registry.collect_garbage();
             error_return(error)
         }
@@ -1056,16 +1181,30 @@ fn job_try_wait(process_id: u64, handle: u64, address: u64, length: u64) -> u64 
         if entry.object.kind != abi::capability::KIND_JOB {
             return error_return(abi::errno::INVALID_ARGUMENT);
         }
-        let Some(index) = registry.object_index(entry.object) else {
-            return error_return(abi::errno::IO);
+        let jobs = match registry.job_subtree(entry.object) {
+            Ok(jobs) => jobs,
+            Err(error) => return error_return(error),
         };
-        let CapabilityObjectData::Job(job) = &mut registry.objects[index].data else {
-            return error_return(abi::errno::INVALID_ARGUMENT);
-        };
-        match job.take_completion() {
+        let mut completion = None;
+        for job in &jobs {
+            let Some(index) = registry.object_index(*job) else {
+                return error_return(abi::errno::IO);
+            };
+            let CapabilityObjectData::Job(state) = &mut registry.objects[index].data else {
+                return error_return(abi::errno::INVALID_ARGUMENT);
+            };
+            if let Some(record) = state.take_completion() {
+                completion = Some(record);
+                break;
+            }
+        }
+        match completion {
             Some(record) => record,
-            None if job.active_members() != 0 => return error_return(abi::errno::TRY_AGAIN),
-            None => return error_return(ERR_NO_CHILD),
+            None => match registry.job_subtree_active_members(entry.object) {
+                Ok(0) => return error_return(ERR_NO_CHILD),
+                Ok(_) => return error_return(abi::errno::TRY_AGAIN),
+                Err(error) => return error_return(error),
+            },
         }
     };
     let exit = abi::job::Exit {
@@ -1088,13 +1227,21 @@ fn job_terminate(process_id: u64, handle: u64) -> u64 {
         if entry.object.kind != abi::capability::KIND_JOB {
             return error_return(abi::errno::INVALID_ARGUMENT);
         }
-        let Some(index) = registry.object_index(entry.object) else {
-            return error_return(abi::errno::IO);
+        let jobs = match registry.job_subtree(entry.object) {
+            Ok(jobs) => jobs,
+            Err(error) => return error_return(error),
         };
-        let CapabilityObjectData::Job(job) = &registry.objects[index].data else {
-            return error_return(abi::errno::INVALID_ARGUMENT);
-        };
-        job.members().collect::<Vec<_>>()
+        let mut members = Vec::new();
+        for job in jobs {
+            let Some(index) = registry.object_index(job) else {
+                return error_return(abi::errno::IO);
+            };
+            let CapabilityObjectData::Job(state) = &registry.objects[index].data else {
+                return error_return(abi::errno::INVALID_ARGUMENT);
+            };
+            members.extend(state.members());
+        }
+        members
     };
 
     members
