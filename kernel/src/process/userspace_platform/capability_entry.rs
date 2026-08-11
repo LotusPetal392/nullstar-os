@@ -321,6 +321,50 @@ impl CapabilityRegistry {
         }
         Ok(active)
     }
+
+    fn job_ancestors_inclusive(
+        &self,
+        leaf: CapabilityObjectRef,
+    ) -> Result<Vec<CapabilityObjectRef>, i64> {
+        if leaf.kind != abi::capability::KIND_JOB {
+            return Err(abi::errno::INVALID_ARGUMENT);
+        }
+        let mut jobs = Vec::new();
+        let mut current = Some(leaf);
+        while let Some(job) = current {
+            if jobs.contains(&job) {
+                return Err(abi::errno::IO);
+            }
+            jobs.push(job);
+            let Some(index) = self.object_index(job) else {
+                return Err(abi::errno::IO);
+            };
+            let CapabilityObjectData::Job(state) = &self.objects[index].data else {
+                return Err(abi::errno::INVALID_ARGUMENT);
+            };
+            current = state.parent().map(|id| CapabilityObjectRef {
+                id,
+                kind: abi::capability::KIND_JOB,
+            });
+        }
+        Ok(jobs)
+    }
+
+    fn job_admits_process(&self, leaf: CapabilityObjectRef) -> Result<bool, i64> {
+        for job in self.job_ancestors_inclusive(leaf)? {
+            let Some(index) = self.object_index(job) else {
+                return Err(abi::errno::IO);
+            };
+            let CapabilityObjectData::Job(state) = &self.objects[index].data else {
+                return Err(abi::errno::INVALID_ARGUMENT);
+            };
+            let limit = state.process_limit();
+            if self.job_subtree_active_members(job)? >= limit {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn push_unique_object(objects: &mut Vec<CapabilityObjectRef>, object: CapabilityObjectRef) {
@@ -489,6 +533,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::JOB_TRY_WAIT
             | abi::syscall::JOB_TERMINATE
             | abi::syscall::JOB_CREATE_CHILD
+            | abi::syscall::JOB_SET_PROCESS_LIMIT
     )
 }
 
@@ -581,6 +626,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         }
         abi::syscall::JOB_TERMINATE => job_terminate(process_id, registers.rdi),
         abi::syscall::JOB_CREATE_CHILD => job_create_child(process_id, registers.rdi),
+        abi::syscall::JOB_SET_PROCESS_LIMIT => {
+            job_set_process_limit(process_id, registers.rdi, registers.rsi)
+        }
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
@@ -1058,10 +1106,23 @@ fn job_create_child(process_id: u64, parent_handle: u64) -> u64 {
         return error_return(abi::errno::INVALID_ARGUMENT);
     }
     let parent = parent_entry.object;
+    let Some(parent_index) = registry.object_index(parent) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Job(parent_state) = &registry.objects[parent_index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    let parent_process_limit = parent_state.process_limit();
     let mut child_state =
         kernel::job::State::new(MAX_PROCESS_SLOTS, abi::limits::MAX_JOB_OBJECTS);
     if child_state.set_parent(parent.id).is_err() {
         return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    if child_state
+        .set_process_limit(parent_process_limit)
+        .is_err()
+    {
+        return error_return(abi::errno::IO);
     }
     let child = match registry.create_object(
         abi::capability::KIND_JOB,
@@ -1099,6 +1160,33 @@ fn job_create_child(process_id: u64, parent_handle: u64) -> u64 {
             registry.collect_garbage();
             error_return(error)
         }
+    }
+}
+
+fn job_set_process_limit(process_id: u64, handle: u64, limit: u64) -> u64 {
+    let Ok(limit) = usize::try_from(limit) else {
+        return error_return(abi::errno::RANGE);
+    };
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_MANAGE) {
+        return error_return(error);
+    }
+    if entry.object.kind != abi::capability::KIND_JOB {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(index) = registry.object_index(entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Job(state) = &mut registry.objects[index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    match state.set_process_limit(limit) {
+        Ok(()) => limit as u64,
+        Err(kernel::job::LimitError::OutOfRange) => error_return(abi::errno::RANGE),
+        Err(kernel::job::LimitError::Relaxation) => error_return(abi::errno::PERMISSION),
     }
 }
 
@@ -1252,6 +1340,9 @@ fn job_terminate(process_id: u64, handle: u64) -> u64 {
 
 fn capability_job_add_member(job: CapabilityObjectRef, process_id: u64) -> Result<(), i64> {
     let mut registry = CAPABILITY_REGISTRY.lock();
+    if !registry.job_admits_process(job)? {
+        return Err(abi::errno::NO_SPACE);
+    }
     let Some(index) = registry.object_index(job) else {
         return Err(abi::errno::IO);
     };

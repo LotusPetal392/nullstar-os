@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.16, and a
+The ABI is experimental, but callers can query the current version, 1.17, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -409,6 +409,26 @@ This slice does not add hierarchy enumeration or removal, per-job resource budge
 kill-on-close, or blocking/multi-object wait. Empty child jobs remain attached and reusable until the
 connected hierarchy becomes unreachable.
 
+## Version 1.17 job process limits
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 65 | `JOB_SET_PROCESS_LIMIT` | job handle, maximum live processes | accepted limit |
+
+`JOB_SET_PROCESS_LIMIT` requires `MANAGE`. The configured limit is in the inclusive range `0..=64`,
+may stay unchanged or decrease, and cannot increase: relaxation returns `EPERM`, while a value above
+the global process bound returns `ERANGE`. A new child job inherits its parent's configured limit.
+
+Before `JOB_ASSIGN` or inherited child creation admits a process, the kernel checks the target job
+and every ancestor. Admission returns `ENOSPC` if any checked job already has at least its configured
+number of live processes across its complete subtree. Pending completion records do not count toward
+this policy ceiling and retain their existing lossless bounded storage.
+
+Tightening below current usage is valid and does not terminate existing processes. It prevents new
+admission until usage falls below every applicable ceiling; setting zero therefore freezes process
+creation in the subtree without being a termination operation. This slice does not add a limit query,
+CPU or memory accounting, reservations, or policy relaxation.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -435,6 +455,7 @@ connected hierarchy becomes unreachable.
   syscalls 60 through 63.
 - ABI 1.16 adds immutable child-job creation and subtree inspection, exit drainage, and
   termination at syscall 64.
+- ABI 1.17 adds a tightening-only hierarchy-scoped process ceiling at syscall 65.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

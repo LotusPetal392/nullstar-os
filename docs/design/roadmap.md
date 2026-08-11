@@ -13,7 +13,8 @@ direct-child bootstrap grants. The next architecture stages are:
 1. formalize common kernel-object ownership, typed handles, immutable rights, object
    signals, close, duplicate, replace, inspection, and diagnostic object identity;
 2. evolve the implemented process and immutable hierarchical-job containment into distinct thread
-   and address-space abstractions plus hierarchy-scoped resource policy;
+   and address-space abstractions plus broader hierarchy-scoped resource policy beyond the
+   implemented process-count ceiling;
 3. introduce channel pairs with peer closure, bounded queues, atomic move-transfer of
    multiple rights-reduced handles, and explicit backpressure accounting;
 4. add general one- and many-object waiting with absolute monotonic deadlines;
@@ -35,7 +36,8 @@ The detailed contract is in
 1. **Implemented foundation and service integration:** add capability-backed job
    containment, inherited descendants, independent FIFO process-exit observation, and
    bounded whole-job termination. ABI 1.16 also adds immutable child-job creation with recursive
-   inspection, drainage, and termination. PID 1 assigns policy-pinned definition-backed
+   inspection, drainage, and termination; ABI 1.17 adds a tightening-only subtree process ceiling.
+   PID 1 assigns policy-pinned definition-backed
    service attempts and every logging, NullFS, tmpfs, and VFS generation to fresh jobs before
    launch-barrier release, retains only `SIGNAL | WAIT`, and drains each complete generation to `ECHILD` before
    replacement. NullFS preserves exact quiesce, clean-unmount, and final-exit evidence before clean
@@ -78,7 +80,8 @@ Replacement still uses a fresh endpoint and strictly newer generation, and contr
 no failure budget. Filesystem `Start` and `Stop` stay exactly `Unsupported`; `NSVC` v1 and the public
 filesystem version 1 `Request`/`Reply` operations are unchanged. ABI 1.15 supplies flat jobs,
 non-relaxable descendant inheritance, independent exit records, and whole-job termination; ABI 1.16
-adds immutable child creation with recursive inspection, drainage, and termination. PID 1 now
+adds immutable child creation with recursive inspection, drainage, and termination; ABI 1.17 adds
+hierarchy-scoped process ceilings. PID 1 now
 assigns each policy-pinned definition-backed service attempt and every logging, NullFS, tmpfs, and VFS
 generation before barrier release, retains only `SIGNAL | WAIT`, and drains the old job to `ECHILD`
 before replacement.
