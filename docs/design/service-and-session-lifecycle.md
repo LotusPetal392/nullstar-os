@@ -31,6 +31,8 @@ escalates an uncooperative generation to uncatchable signal 9 after a bounded gr
 Policy-pinned definition-backed service attempts and every logging, NullFS, tmpfs, and VFS generation are
 assigned to fresh flat jobs before launch-barrier release; PID 1 retains only `SIGNAL | WAIT` and
 drains all generation exits to `ECHILD` before closing endpoints or starting a replacement. The
+ABI also supports immutable child jobs with recursive subtree inspection, drainage, and termination;
+service generations remain flat roots until a separate manager introduces policy subtrees. The
 logging-lifecycle QEMU gate injects tmpfs/VFS descendants that escape their leaders' process groups
 and requires descendant termination, whole-job drainage to `ECHILD`, and generation replacement.
 The NullFS restart, crash-recovery, and block-device-loss gates inject the same escaped descendant;

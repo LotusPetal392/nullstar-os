@@ -425,6 +425,18 @@ pub fn job_create() -> Result<CapabilityHandle> {
     decode(result)
 }
 
+pub fn job_create_child(parent: CapabilityHandle) -> Result<CapabilityHandle> {
+    let mut result = syscall::JOB_CREATE_CHILD;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") parent,
+        );
+    }
+    decode(result)
+}
+
 pub fn job_assign(handle: CapabilityHandle, child_process_id: u64) -> Result<u64> {
     let mut result = syscall::JOB_ASSIGN;
     unsafe {
@@ -529,6 +541,7 @@ mod tests {
         assert_eq!(syscall::JOB_ASSIGN, 61);
         assert_eq!(syscall::JOB_TRY_WAIT, 62);
         assert_eq!(syscall::JOB_TERMINATE, 63);
+        assert_eq!(syscall::JOB_CREATE_CHILD, 64);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

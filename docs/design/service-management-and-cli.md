@@ -447,11 +447,14 @@ The name `ush` should not silently imply complete POSIX shell behavior.
 1. Add job containment, process-exit observation, and a versioned control protocol to the
    current supervisor. **Foundation delivered:** ABI 1.15 supplies capability-backed flat jobs,
    inherited descendant containment, independent FIFO exit records, and bounded termination; the
+   ABI 1.16 child-creation extension adds immutable hierarchy plus recursive subtree observation and
+   termination. The
    allocation-free `NSVC` v1 codec and PID 1 registry supply service observation. Policy-pinned
    definition-backed service attempts and every logging, NullFS, tmpfs, and VFS generation now receive
    fresh jobs before barrier release; PID 1 retains only `SIGNAL | WAIT` and drains each complete generation to
    `ECHILD` before replacement. NullFS preserves exact quiesce and clean-unmount evidence before
-   clean drainage and uses whole-job termination before dirty recovery; job hierarchy remains future work.
+   clean drainage and uses whole-job termination before dirty recovery. Current service generations
+   remain flat jobs until a separate manager introduces service subtrees.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
    delivered:** native `list`, `status`, and restart use separately authorized IPC, logging has live
    in-memory `start`/`stop`, and NullFS restart has exact-generation quiesce, clean unmount, forced

@@ -407,7 +407,159 @@ fn job_probe() -> bool {
         })
         && waited_status.is_some_and(|status| status.signal() == Some(signal::KILL));
 
-    close_job_handles(job, wait_only, terminated)
+    let hierarchy_verified = terminated && hierarchical_job_probe(job, wait_only);
+    close_job_handles(job, wait_only, hierarchy_verified)
+}
+
+fn hierarchical_job_probe(
+    parent: ipc::CapabilityHandle,
+    parent_wait: ipc::CapabilityHandle,
+) -> bool {
+    if ipc::job_create_child(parent_wait).err() != Some(ipc::Error::PERMISSION) {
+        return false;
+    }
+    let Ok(child_job) = ipc::job_create_child(parent) else {
+        return false;
+    };
+    let Ok(grandchild_job) = ipc::job_create_child(child_job) else {
+        let _ = ipc::close(child_job);
+        return false;
+    };
+    let hierarchy_shape = ipc::info(child_job).is_ok_and(|child| {
+        ipc::info(grandchild_job).is_ok_and(|grandchild| {
+            child.kind == ObjectKind::Job
+                && child.rights == Rights::JOB
+                && child.size == 0
+                && grandchild.kind == ObjectKind::Job
+                && grandchild.rights == Rights::JOB
+                && grandchild.size == 0
+                && child.object_id != grandchild.object_id
+        })
+    });
+    if !hierarchy_shape || ipc::job_try_wait(parent_wait).err() != Some(ipc::Error::NO_CHILD) {
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    }
+
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.writer);
+        let mut byte = [0_u8; 1];
+        if syscall::read(barrier.reader, &mut byte).ok() != Some(0)
+            || syscall::close(barrier.reader).is_err()
+        {
+            syscall::exit(124);
+        }
+        match syscall::fork() {
+            Ok(0) => syscall::exit(44),
+            Ok(descendant) => {
+                if syscall::wait_child(descendant)
+                    .ok()
+                    .map(|status| status.raw())
+                    != Some(44)
+                {
+                    syscall::exit(125);
+                }
+            }
+            Err(_) => syscall::exit(126),
+        }
+        syscall::exit(24);
+    }
+
+    let reader_closed = syscall::close(barrier.reader).is_ok();
+    let assigned = ipc::job_assign(grandchild_job, child).ok() == Some(child);
+    let subtree_visible = [parent, child_job, grandchild_job]
+        .iter()
+        .all(|job| ipc::info(*job).is_ok_and(|info| info.size == 1));
+    let barrier_released = syscall::close(barrier.writer).is_ok();
+    if !reader_closed || !assigned || !subtree_visible || !barrier_released {
+        let _ = ipc::job_terminate(parent);
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    }
+
+    let Some(first) = bounded_job_wait(parent_wait) else {
+        let _ = ipc::job_terminate(parent);
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    };
+    let Some(second) = bounded_job_wait(parent_wait) else {
+        let _ = ipc::job_terminate(parent);
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    };
+    let descendant_observed = [first, second]
+        .iter()
+        .any(|exit| exit.process_id != child && exit.status.raw() == 44);
+    let child_observed = [first, second]
+        .iter()
+        .any(|exit| exit.process_id == child && exit.status.raw() == 24);
+    if !descendant_observed
+        || !child_observed
+        || syscall::wait_child(child).ok().map(|status| status.raw()) != Some(24)
+        || ipc::job_try_wait(grandchild_job).err() != Some(ipc::Error::NO_CHILD)
+        || ![parent, child_job, grandchild_job]
+            .iter()
+            .all(|job| ipc::info(*job).is_ok_and(|info| info.size == 0))
+    {
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    }
+
+    let Ok(termination_barrier) = syscall::pipe_pair() else {
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    };
+    let Ok(terminated_child) = syscall::fork() else {
+        let _ = syscall::close(termination_barrier.reader);
+        let _ = syscall::close(termination_barrier.writer);
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    };
+    if terminated_child == 0 {
+        let _ = syscall::close(termination_barrier.writer);
+        let mut byte = [0_u8; 1];
+        let _ = syscall::read(termination_barrier.reader, &mut byte);
+        syscall::exit(127);
+    }
+    let termination_reader_closed = syscall::close(termination_barrier.reader).is_ok();
+    let termination_assigned =
+        ipc::job_assign(child_job, terminated_child).ok() == Some(terminated_child);
+    let termination_count = ipc::job_terminate(parent).ok();
+    if termination_count != Some(1) {
+        let _ = platform::kill(terminated_child, signal::KILL);
+    }
+    let terminated_exit = termination_assigned
+        .then(|| bounded_job_wait(parent_wait))
+        .flatten();
+    let waited_status = syscall::wait_child(terminated_child).ok();
+    let _ = syscall::close(termination_barrier.writer);
+    let terminated = termination_reader_closed
+        && termination_assigned
+        && termination_count == Some(1)
+        && terminated_exit.is_some_and(|exit| {
+            exit.process_id == terminated_child && exit.status.signal() == Some(signal::KILL)
+        })
+        && waited_status.is_some_and(|status| status.signal() == Some(signal::KILL))
+        && ipc::job_try_wait(parent_wait).err() == Some(ipc::Error::NO_CHILD);
+
+    close_hierarchy_handles(child_job, grandchild_job, terminated)
+}
+
+fn close_hierarchy_handles(
+    child: ipc::CapabilityHandle,
+    grandchild: ipc::CapabilityHandle,
+    result: bool,
+) -> bool {
+    let grandchild_closed = ipc::close(grandchild).is_ok();
+    let child_closed = ipc::close(child).is_ok();
+    grandchild_closed && child_closed && result
 }
 
 fn bounded_job_wait(handle: ipc::CapabilityHandle) -> Option<ipc::JobExit> {
