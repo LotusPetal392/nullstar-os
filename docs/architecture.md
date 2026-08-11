@@ -40,13 +40,15 @@ Generated images use `/BOOTMODE` to select among:
 - `normal`, which starts services, PID 1, and the foreground userspace shell;
 - `smoke-test`, which runs deterministic subsystem probes and persistence checks;
 - `nullfs-restart-test`, which validates NullFS's clean quiesce/unmount replacement and a
-  stopped-service timeout/KILL replacement through dirty recovery;
+  stopped-service timeout/whole-job KILL replacement through dirty recovery, including escaped
+  descendants and complete job drainage;
 - `nullfs-out-of-space-test`, whose offline-built fixture has zero free inodes and data blocks and
   validates exact public-ABI exhaustion, service continuity, reclamation, and later mutation;
 - `nullfs-block-device-loss-test`, which validates exact raw-provider offlining, uncertain-mutation
-  fail-stop, stale filesystem generations, and bootstrap continuity;
+  fail-stop, escaped-descendant job drainage, stale filesystem generations, and bootstrap continuity;
 - `nullfs-crash-recovery-test`, which crashes the service after a durable public mutation but before
-  its reply and validates exact-generation offlining, dirty remount, and non-retried recovery;
+  its reply and validates exact-generation offlining, escaped-descendant job drainage, dirty remount,
+  and non-retried recovery;
 - `nullfs-unavailable-test`, whose image omits the primary NullFS partition and validates exact
   UUID lookup failure plus handoff to the independently available emergency kernel shell;
 - `logging-lifecycle-test`, which validates live logging start/stop/restart, route and
@@ -110,10 +112,10 @@ validates a replacement image before committing it, and `fork` initially shares 
 pages before copying on write. Capability-backed jobs provide flat descendant
 containment, independent FIFO exit observation, and whole-job forced termination. PID 1
 uses fresh jobs for policy-pinned definition-backed service attempts and every logging,
-tmpfs, and VFS generation before launch-barrier release, retains only `SIGNAL | WAIT`, and drains each
+NullFS, tmpfs, and VFS generation before launch-barrier release, retains only `SIGNAL | WAIT`, and drains each
 generation to `ECHILD` before replacement. Job hierarchy and resource policy remain future
-work. NullFS containment is a separate future milestone because replacement must preserve
-its durability and quiesce lifecycle. Shared PID 1 cleanup now
+work. NullFS preserves its exact quiesce and clean-unmount durability proof before job drainage;
+failure paths terminate and drain the job before dirty recovery. Shared PID 1 cleanup now
 uses allocation-free result classification and canonical bootstrap diagnostics for unexpected
 signal, wait, job, capability-close, launch-barrier, yield, and budget-exhaustion outcomes.
 
@@ -190,7 +192,9 @@ Controlled NullFS restart queues private `NFLC` v1 `QUIESCE` behind earlier FIFO
 closes core handles, syncs and publishes a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits
 `0`. Only that exact event plus final exit `0` proves the clean path. Timeout, malformed or wrong
 lifecycle traffic, a capability-bearing event, failure, or early/nonzero exit triggers exact-generation
-offlining, KILL/reap, and dirty recovery. Replacement uses a fresh endpoint and strictly newer
+offlining, whole-job KILL/drain, and dirty recovery. Every NullFS generation is assigned to its fresh
+job before barrier release; after clean proof PID 1 drains escaped descendants, while crash and
+provider-loss paths also drain to `ECHILD` before endpoint closure or replacement. Replacement uses a fresh endpoint and strictly newer
 generation before fence completion, and controlled restart does not charge failure policy. Filesystem
 `Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and the public filesystem version 1
 `Request`/`Reply` operations are unchanged. The bounded allocation-free version 1 service-definition
@@ -353,7 +357,8 @@ public operation runs. `UNMOUNT` makes the service close all core open handles a
 `try_unmount`, including sync and clean-superblock publication, before exact
 `CLEAN_UNMOUNTED` and exit `0`. Both are required for clean-path proof. Any timeout,
 invalid or capability-bearing event, lifecycle failure, or early/nonzero exit converges
-through exact-generation offlining, KILL/reap, and dirty mount recovery.
+through exact-generation offlining, whole-generation-job termination and drainage, and dirty mount
+recovery.
 
 The dedicated crash-recovery mode grants the service a private receive-only hook capability. PID 1
 arms one generation- and nonce-bound write; after the core reports successful durable completion but

@@ -109,7 +109,8 @@ no-readiness failure through bounded restart/backoff into the terminal `Failed` 
 gate injects escaped-process-group descendants into tmpfs and VFS generations and requires their
 termination, whole-job drainage to `ECHILD`, and generation replacement. Normal boot, logging
 lifecycle, and NullFS restart checks also reject any unexpected PID 1 cleanup diagnostic on their
-successful paths.
+successful paths. NullFS restart, crash-recovery, and block-device-loss images inject an escaped
+NullFS descendant and require whole-job drainage after clean proof, crash, or provider fail-stop.
 
 The allocation-free `userspace::service_cleanup` classifier has host tests for process-group
 zero results, job-termination zero counts, job-drain versus empty-inspection semantics,

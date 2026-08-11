@@ -108,7 +108,10 @@ const NULLFS_BOOT_GENERATION_PROBE_PASSED: &[u8] =
 const BLOCK_DEVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to acquire block-device endpoint\n";
 const NULLFS_SERVICE_COMMAND: &[u8] = b"/nullfs-service --writable";
-const NULLFS_CRASH_TEST_SERVICE_COMMAND: &[u8] = b"/nullfs-service --writable --crash-test";
+const NULLFS_CONTAINMENT_TEST_SERVICE_COMMAND: &[u8] =
+    b"/nullfs-service --writable --containment-test";
+const NULLFS_CRASH_CONTAINMENT_TEST_SERVICE_COMMAND: &[u8] =
+    b"/nullfs-service --writable --crash-test --containment-test";
 const NULLFS_SERVICE_READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const NULLFS_SERVICE_STARTING: &[u8] = b"userspace init: starting NullFS service\n";
 const NULLFS_SERVICE_RESTARTING: &[u8] = b"userspace init: NullFS service exited; restarting\n";
@@ -117,6 +120,8 @@ const NULLFS_SERVICE_FAILED: &[u8] = b"userspace init: NullFS service exhausted 
 const NULLFS_SERVICE_BOOTSTRAP_FAILED: &[u8] =
     b"userspace init: failed to grant NullFS capabilities\n";
 const NULLFS_SERVICE_PROTOCOL_FAILED: &[u8] = b"userspace init: invalid NullFS readiness message\n";
+const NULLFS_SERVICE_JOB_DRAINED: &[u8] =
+    b"userspace init: NullFS service generation job drained\n";
 const NULLFS_READINESS_PROBE_COMMAND: &[u8] = b"/nullfs-probe readiness";
 const NULLFS_READINESS_PROBE_FAILED: &[u8] = b"userspace init: NullFS readiness failed\n";
 const NULLFS_READINESS_PROBE_PASSED: &[u8] = b"userspace init: NullFS readiness passed\n";
@@ -270,8 +275,12 @@ const NULLFS_SERVICE: ServiceSpec = ServiceSpec {
     restart_backoff_yields: 32,
     fatal_startup_exit_status: None,
 };
-const NULLFS_CRASH_TEST_SERVICE: ServiceSpec = ServiceSpec {
-    command: NULLFS_CRASH_TEST_SERVICE_COMMAND,
+const NULLFS_CONTAINMENT_TEST_SERVICE: ServiceSpec = ServiceSpec {
+    command: NULLFS_CONTAINMENT_TEST_SERVICE_COMMAND,
+    ..NULLFS_SERVICE
+};
+const NULLFS_CRASH_CONTAINMENT_TEST_SERVICE: ServiceSpec = ServiceSpec {
+    command: NULLFS_CRASH_CONTAINMENT_TEST_SERVICE_COMMAND,
     ..NULLFS_SERVICE
 };
 const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
@@ -326,6 +335,10 @@ struct ServiceContainment {
 const TMPFS_CONTAINMENT: ServiceContainment = ServiceContainment {
     service: CleanupService::Tmpfs,
     drained_message: TMPFS_SERVICE_JOB_DRAINED,
+};
+const NULLFS_CONTAINMENT: ServiceContainment = ServiceContainment {
+    service: CleanupService::Nullfs,
+    drained_message: NULLFS_SERVICE_JOB_DRAINED,
 };
 const VFS_CONTAINMENT: ServiceContainment = ServiceContainment {
     service: CleanupService::Vfs,
@@ -467,7 +480,40 @@ struct ContainedServiceJob {
     cleanup_budget_reported: bool,
 }
 
+struct NullfsGenerationResources<'a> {
+    readiness_endpoint: &'a mut CapabilityHandle,
+    request_endpoint: &'a mut CapabilityHandle,
+    job: &'a mut ContainedServiceJob,
+}
+
 impl ContainedServiceJob {
+    fn request_termination(&mut self) -> bool {
+        let Some(handle) = self.job else {
+            report_service_cleanup_diagnostic(
+                self.containment.service,
+                CleanupPhase::JobDrain,
+                CleanupOperation::JobTerminate,
+                CleanupObservation::MissingHandle,
+            );
+            return false;
+        };
+        match service_cleanup::classify_job_terminate(
+            ipc::job_terminate(handle).map_err(ipc::Error::code),
+        ) {
+            CleanupAction::Progress => true,
+            CleanupAction::Unexpected(observation) => {
+                report_service_cleanup_diagnostic(
+                    self.containment.service,
+                    CleanupPhase::JobDrain,
+                    CleanupOperation::JobTerminate,
+                    observation,
+                );
+                false
+            }
+            CleanupAction::Pending | CleanupAction::Complete | CleanupAction::Retry => false,
+        }
+    }
+
     fn drain(&mut self) -> bool {
         let mut leader_process_id = None;
         let mut process_group_id = None;
@@ -727,6 +773,7 @@ impl NullfsLifecycle {
         current_generation: ProviderGeneration,
         readiness_endpoint: CapabilityHandle,
         request_endpoint: CapabilityHandle,
+        job: &mut ContainedServiceJob,
     ) -> Option<u64> {
         if self.phase == NullfsLifecyclePhase::Idle {
             let status = current_process_id.and_then(try_wait_final_status);
@@ -763,7 +810,7 @@ impl NullfsLifecycle {
             fail(NULLFS_SERVICE_PROTOCOL_FAILED);
         }
 
-        self.receive_event(readiness_endpoint);
+        self.receive_event(readiness_endpoint, job);
         if let NullfsLifecyclePhase::WaitCleanExit {
             clean_seen: true,
             final_status: Some(0),
@@ -807,7 +854,7 @@ impl NullfsLifecycle {
                         yields_remaining: yields_remaining - 1,
                     };
                 }
-                Err(_) => self.begin_force(process_id, generation),
+                Err(_) => self.begin_force(process_id, generation, job),
             }
         }
 
@@ -868,7 +915,7 @@ impl NullfsLifecycle {
                 generation,
                 transition_id: _,
                 yields_remaining: 0,
-            } => self.begin_force(process_id, generation),
+            } => self.begin_force(process_id, generation, job),
             NullfsLifecyclePhase::WaitQuiesced {
                 process_id,
                 generation,
@@ -900,7 +947,7 @@ impl NullfsLifecycle {
                 transition_id: _,
                 yields_remaining: 0,
                 ..
-            } => self.begin_force(process_id, generation),
+            } => self.begin_force(process_id, generation, job),
             NullfsLifecyclePhase::WaitCleanExit {
                 process_id,
                 generation,
@@ -928,7 +975,9 @@ impl NullfsLifecycle {
                 generation,
                 attempts_remaining,
             } => {
-                let _ = syscall::signal_process_group(process_id, signal::KILL);
+                if !job.request_termination() && attempts_remaining == 1 {
+                    fail(NULLFS_SERVICE_FAILED);
+                }
                 self.phase = NullfsLifecyclePhase::ForceWait {
                     process_id,
                     generation,
@@ -940,7 +989,11 @@ impl NullfsLifecycle {
         None
     }
 
-    fn receive_event(&mut self, readiness_endpoint: CapabilityHandle) {
+    fn receive_event(
+        &mut self,
+        readiness_endpoint: CapabilityHandle,
+        job: &mut ContainedServiceJob,
+    ) {
         let mut bytes = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
         let received = match ipc::try_receive(readiness_endpoint, &mut bytes) {
             Ok(received) => received,
@@ -962,11 +1015,11 @@ impl NullfsLifecycle {
         };
         let message = filesystem_protocol::lifecycle::Message::decode(&bytes[..received.bytes]);
         if received.sender_process_id != expected_process || !capability_valid {
-            self.force_current();
+            self.force_current(job);
             return;
         }
         let Ok(message) = message else {
-            self.force_current();
+            self.force_current(job);
             return;
         };
         match self.phase {
@@ -1011,11 +1064,11 @@ impl NullfsLifecycle {
                     final_status,
                 };
             }
-            _ => self.force_current(),
+            _ => self.force_current(job),
         }
     }
 
-    fn force_current(&mut self) {
+    fn force_current(&mut self, job: &mut ContainedServiceJob) {
         let (process_id, generation) = match self.phase {
             NullfsLifecyclePhase::Idle => return,
             NullfsLifecyclePhase::WaitQuiesced {
@@ -1039,10 +1092,15 @@ impl NullfsLifecycle {
                 ..
             } => (process_id, generation),
         };
-        self.begin_force(process_id, generation);
+        self.begin_force(process_id, generation, job);
     }
 
-    fn begin_force(&mut self, process_id: ProcessId, generation: ProviderGeneration) {
+    fn begin_force(
+        &mut self,
+        process_id: ProcessId,
+        generation: ProviderGeneration,
+        job: &mut ContainedServiceJob,
+    ) {
         offline_filesystem_provider(
             platform::FilesystemProvider::Nullfs,
             generation,
@@ -1052,7 +1110,9 @@ impl NullfsLifecycle {
             STDOUT,
             b"userspace init: NullFS quiesce failed; forcing dirty recovery\n",
         );
-        let _ = syscall::signal_process_group(process_id, signal::KILL);
+        if !job.request_termination() {
+            fail(NULLFS_SERVICE_FAILED);
+        }
         self.phase = NullfsLifecyclePhase::ForceWait {
             process_id,
             generation,
@@ -3468,7 +3528,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         None
     };
     let nullfs_spec = if nullfs_crash_recovery_test {
-        NULLFS_CRASH_TEST_SERVICE
+        NULLFS_CRASH_CONTAINMENT_TEST_SERVICE
+    } else if nullfs_restart_test || nullfs_block_device_loss_test {
+        NULLFS_CONTAINMENT_TEST_SERVICE
     } else {
         NULLFS_SERVICE
     };
@@ -3490,13 +3552,14 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     } else {
         &nullfs_capabilities[..1]
     };
-    let mut nullfs_generation = start_service(
+    let (mut nullfs_generation, mut nullfs_job) = start_contained_service(
         &mut nullfs_service,
         &mut nullfs_generations,
         &mut nullfs_readiness_endpoint,
         &mut nullfs_request_endpoint,
         nullfs_capabilities,
         &NULLFS_MESSAGES,
+        NULLFS_CONTAINMENT,
     );
     run_probe(
         NULLFS_READINESS_PROBE_COMMAND,
@@ -3576,8 +3639,11 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 vfs_generation,
             },
             &mut nullfs_generations,
-            &mut nullfs_readiness_endpoint,
-            &mut nullfs_request_endpoint,
+            NullfsGenerationResources {
+                readiness_endpoint: &mut nullfs_readiness_endpoint,
+                request_endpoint: &mut nullfs_request_endpoint,
+                job: &mut nullfs_job,
+            },
             vfs_request_endpoint,
             nullfs_block_capability,
         );
@@ -3601,6 +3667,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         run_nullfs_block_device_loss_probe(
             &nullfs_service,
             nullfs_generation,
+            &mut nullfs_job,
             vfs_request_endpoint,
             nullfs_service_block_endpoint,
         );
@@ -3609,8 +3676,11 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             &mut nullfs_service,
             nullfs_generation,
             &mut nullfs_generations,
-            &mut nullfs_readiness_endpoint,
-            &mut nullfs_request_endpoint,
+            NullfsGenerationResources {
+                readiness_endpoint: &mut nullfs_readiness_endpoint,
+                request_endpoint: &mut nullfs_request_endpoint,
+                job: &mut nullfs_job,
+            },
             nullfs_capabilities,
             nullfs_crash_hook_endpoint.unwrap_or_else(|| fail(VFS_CRASH_RECOVERY_PROBE_FAILED)),
         );
@@ -3755,7 +3825,11 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             nullfs_generation,
             nullfs_readiness_endpoint,
             nullfs_request_endpoint,
+            &mut nullfs_job,
         ) {
+            if !nullfs_job.drain() {
+                fail(NULLFS_SERVICE_FAILED);
+            }
             match nullfs_service.observe_status(status) {
                 ServiceStatusDisposition::WaitForNextEvent => {}
                 ServiceStatusDisposition::Restart { backoff_yields } => {
@@ -3774,13 +3848,14 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                     nullfs_request_endpoint = ipc::endpoint_create()
                         .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
                     backoff(backoff_yields);
-                    nullfs_generation = start_service(
+                    (nullfs_generation, nullfs_job) = start_contained_service(
                         &mut nullfs_service,
                         &mut nullfs_generations,
                         &mut nullfs_readiness_endpoint,
                         &mut nullfs_request_endpoint,
                         nullfs_capabilities,
                         &NULLFS_MESSAGES,
+                        NULLFS_CONTAINMENT,
                     );
                     register_nullfs_proxy(nullfs_generation, nullfs_request_endpoint);
                     service_control.drain_mutation(
@@ -4130,8 +4205,7 @@ fn run_nullfs_crash_recovery_probe(
     nullfs_service: &mut ServiceRuntime,
     old_generation: ProviderGeneration,
     generations: &mut ProviderGenerationSequence,
-    readiness_endpoint: &mut CapabilityHandle,
-    request_endpoint: &mut CapabilityHandle,
+    resources: NullfsGenerationResources<'_>,
     bootstrap_capabilities: &[BootstrapCapability],
     crash_hook_endpoint: CapabilityHandle,
 ) -> ProviderGeneration {
@@ -4141,8 +4215,8 @@ fn run_nullfs_crash_recovery_probe(
         .process_id()
         .unwrap_or_else(|| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
     let old_restart_count = nullfs_service.restart_count();
-    let old_endpoint_info =
-        ipc::info(*request_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    let old_endpoint_info = ipc::info(*resources.request_endpoint)
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
 
     let ready_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
@@ -4193,7 +4267,7 @@ fn run_nullfs_crash_recovery_probe(
 
     let mut reached_bytes = [0_u8; crash_test::MESSAGE_BYTES];
     let reached = loop {
-        match ipc::try_receive(*readiness_endpoint, &mut reached_bytes) {
+        match ipc::try_receive(*resources.readiness_endpoint, &mut reached_bytes) {
             Ok(message) => {
                 if message.sender_process_id != old_process_id
                     || message.capability.is_some()
@@ -4232,6 +4306,9 @@ fn run_nullfs_crash_recovery_probe(
     if service_status != 37 {
         fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
     }
+    if !resources.job.drain() {
+        fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
+    }
     let backoff_yields = match nullfs_service.observe_status(service_status) {
         ServiceStatusDisposition::Restart { backoff_yields } => backoff_yields,
         _ => fail(VFS_CRASH_RECOVERY_PROBE_FAILED),
@@ -4262,9 +4339,11 @@ fn run_nullfs_crash_recovery_probe(
         VFS_CRASH_RECOVERY_PROBE_FAILED,
     );
 
-    ipc::close(*readiness_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
-    ipc::close(*request_endpoint).unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
-    *readiness_endpoint =
+    ipc::close(*resources.readiness_endpoint)
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    ipc::close(*resources.request_endpoint)
+        .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
+    *resources.readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
     let mut replacement_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
@@ -4275,19 +4354,21 @@ fn run_nullfs_crash_recovery_probe(
         fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
     }
     backoff(backoff_yields);
-    let replacement_generation = start_service(
+    let (replacement_generation, replacement_job) = start_contained_service(
         nullfs_service,
         generations,
-        readiness_endpoint,
+        resources.readiness_endpoint,
         &mut replacement_request_endpoint,
         bootstrap_capabilities,
         &NULLFS_MESSAGES,
+        NULLFS_CONTAINMENT,
     );
     if replacement_generation.get() != old_generation.get().saturating_add(1) {
         fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
     }
     register_nullfs_proxy(replacement_generation, replacement_request_endpoint);
-    *request_endpoint = replacement_request_endpoint;
+    *resources.request_endpoint = replacement_request_endpoint;
+    *resources.job = replacement_job;
     nullfs_service.complete_restart();
     if nullfs_service.state() != ServiceState::Running
         || nullfs_service.controlled_restart_pending()
@@ -4316,6 +4397,7 @@ fn run_nullfs_crash_recovery_probe(
 fn run_nullfs_block_device_loss_probe(
     nullfs_service: &ServiceRuntime,
     nullfs_generation: ProviderGeneration,
+    job: &mut ContainedServiceJob,
     vfs_request_endpoint: CapabilityHandle,
     block_endpoint: CapabilityHandle,
 ) {
@@ -4419,6 +4501,9 @@ fn run_nullfs_block_device_loss_probe(
     if service_status != Some(35) {
         fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
     }
+    if !job.drain() {
+        fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
+    }
     offline_filesystem_provider(
         platform::FilesystemProvider::Nullfs,
         nullfs_generation,
@@ -4483,8 +4568,7 @@ fn run_nullfs_restart_probe(
     control: &mut ServiceControlState,
     registry: ServiceRegistryMut<'_>,
     generations: &mut ProviderGenerationSequence,
-    readiness_endpoint: &mut CapabilityHandle,
-    request_endpoint: &mut CapabilityHandle,
+    resources: NullfsGenerationResources<'_>,
     vfs_request_endpoint: CapabilityHandle,
     block_capability: BootstrapCapability,
 ) -> ProviderGeneration {
@@ -4549,8 +4633,8 @@ fn run_nullfs_restart_probe(
         .unwrap_or_else(|| fail(NULLFS_RESTART_PROBE_FAILED));
     let old_generation = registry.nullfs_generation;
     let restart_count = registry.nullfs.restart_count();
-    let old_endpoint_info =
-        ipc::info(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    let old_endpoint_info = ipc::info(*resources.request_endpoint)
+        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
 
     let restart_barrier =
         syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
@@ -4586,7 +4670,7 @@ fn run_nullfs_restart_probe(
                 vfs: &mut *registry.vfs,
                 vfs_generation: registry.vfs_generation,
             },
-            *request_endpoint,
+            *resources.request_endpoint,
         );
         if registry.nullfs.state() == ServiceState::Restarting {
             restart_requested = true;
@@ -4605,8 +4689,9 @@ fn run_nullfs_restart_probe(
         if let Some(status) = control.nullfs_lifecycle.advance(
             registry.nullfs.process_id(),
             old_generation,
-            *readiness_endpoint,
-            *request_endpoint,
+            *resources.readiness_endpoint,
+            *resources.request_endpoint,
+            resources.job,
         ) {
             break status;
         }
@@ -4625,6 +4710,9 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
+    if !resources.job.drain() {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
 
     run_probe(
         VFS_BOOTSTRAP_PROBE_COMMAND,
@@ -4634,9 +4722,9 @@ fn run_nullfs_restart_probe(
     );
 
     let _ = syscall::write_all(STDOUT, NULLFS_SERVICE_RESTARTING);
-    ipc::close(*readiness_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    ipc::close(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    *readiness_endpoint =
+    ipc::close(*resources.readiness_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    ipc::close(*resources.request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    *resources.readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     let mut replacement_request_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
@@ -4646,13 +4734,14 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
-    let mut generation = start_service(
+    let (mut generation, replacement_job) = start_contained_service(
         registry.nullfs,
         generations,
-        readiness_endpoint,
+        resources.readiness_endpoint,
         &mut replacement_request_endpoint,
         &[block_capability],
         &NULLFS_MESSAGES,
+        NULLFS_CONTAINMENT,
     );
     if generation.get() != old_generation.get().saturating_add(1) {
         fail(NULLFS_RESTART_PROBE_FAILED);
@@ -4667,7 +4756,8 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
-    *request_endpoint = replacement_request_endpoint;
+    *resources.request_endpoint = replacement_request_endpoint;
+    *resources.job = replacement_job;
 
     control.drain_mutation(
         ServiceRegistryMut {
@@ -4680,7 +4770,7 @@ fn run_nullfs_restart_probe(
             vfs: &mut *registry.vfs,
             vfs_generation: registry.vfs_generation,
         },
-        *request_endpoint,
+        *resources.request_endpoint,
     );
     registry.nullfs.complete_restart();
     if registry.nullfs.state() != ServiceState::Running
@@ -4776,7 +4866,7 @@ fn run_nullfs_restart_probe(
                 vfs: &mut *registry.vfs,
                 vfs_generation: registry.vfs_generation,
             },
-            *request_endpoint,
+            *resources.request_endpoint,
         );
         if registry.nullfs.state() == ServiceState::Restarting {
             forced_requested = true;
@@ -4793,8 +4883,9 @@ fn run_nullfs_restart_probe(
         if let Some(status) = control.nullfs_lifecycle.advance(
             registry.nullfs.process_id(),
             generation,
-            *readiness_endpoint,
-            *request_endpoint,
+            *resources.readiness_endpoint,
+            *resources.request_endpoint,
+            resources.job,
         ) {
             break status;
         }
@@ -4807,13 +4898,16 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
+    if !resources.job.drain() {
+        fail(NULLFS_RESTART_PROBE_FAILED);
+    }
 
     let forced_old_generation = generation;
-    let forced_endpoint_info =
-        ipc::info(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    ipc::close(*readiness_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    ipc::close(*request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    *readiness_endpoint =
+    let forced_endpoint_info = ipc::info(*resources.request_endpoint)
+        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    ipc::close(*resources.readiness_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    ipc::close(*resources.request_endpoint).unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+    *resources.readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
     let mut forced_replacement_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
@@ -4823,19 +4917,22 @@ fn run_nullfs_restart_probe(
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
-    generation = start_service(
+    let (replacement_generation, replacement_job) = start_contained_service(
         registry.nullfs,
         generations,
-        readiness_endpoint,
+        resources.readiness_endpoint,
         &mut forced_replacement_endpoint,
         &[block_capability],
         &NULLFS_MESSAGES,
+        NULLFS_CONTAINMENT,
     );
+    generation = replacement_generation;
     if generation.get() != forced_old_generation.get().saturating_add(1) {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
     register_nullfs_proxy(generation, forced_replacement_endpoint);
-    *request_endpoint = forced_replacement_endpoint;
+    *resources.request_endpoint = forced_replacement_endpoint;
+    *resources.job = replacement_job;
     control.drain_mutation(
         ServiceRegistryMut {
             logging: &mut *registry.logging,
@@ -4847,12 +4944,12 @@ fn run_nullfs_restart_probe(
             vfs: &mut *registry.vfs,
             vfs_generation: registry.vfs_generation,
         },
-        *request_endpoint,
+        *resources.request_endpoint,
     );
     registry.nullfs.complete_restart();
     run_probe(
         NULLFS_READINESS_PROBE_COMMAND,
-        *request_endpoint,
+        *resources.request_endpoint,
         NULLFS_RESTART_PROBE_FAILED,
         b"userspace init: NullFS dirty recovery restart passed\n",
     );
@@ -5633,122 +5730,6 @@ fn start_contained_service(
                 Err(error) if error == syscall::Errno::TRY_AGAIN => {}
                 Err(error) if error == syscall::Errno::INTERRUPTED => {}
                 Err(_) => fail_contained_activation(attempt, messages, messages.failed),
-            }
-            let _ = syscall::yield_now();
-        }
-    }
-}
-
-fn start_service(
-    service: &mut ServiceRuntime,
-    generations: &mut ProviderGenerationSequence,
-    readiness_endpoint: &mut CapabilityHandle,
-    request_endpoint: &mut CapabilityHandle,
-    additional_capabilities: &[BootstrapCapability],
-    messages: &ServiceMessages,
-) -> ProviderGeneration {
-    loop {
-        let spec = service.spec();
-        let generation = generations
-            .next_generation()
-            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
-        let generation_handoff_source =
-            ipc::endpoint_create().unwrap_or_else(|_| fail(messages.bootstrap_failed));
-        queue_service_generation(generation_handoff_source, generation)
-            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
-        let _ = syscall::write_all(STDOUT, messages.starting);
-        let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(messages.failed));
-        let process_id = syscall::spawn_command_with_barrier(
-            spec.command,
-            SpawnFlags::NEW_PROCESS_GROUP,
-            None,
-            None,
-            None,
-            None,
-            &barrier,
-        )
-        .unwrap_or_else(|_| fail(messages.failed));
-        service.note_spawned(process_id);
-        if ipc::grant_child(process_id, *readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
-            != Some(READY_HANDLE)
-            || ipc::grant_child(
-                process_id,
-                *request_endpoint,
-                Rights::RECEIVE,
-                REQUEST_HANDLE,
-            )
-            .ok()
-                != Some(REQUEST_HANDLE)
-            || ipc::grant_child(
-                process_id,
-                generation_handoff_source,
-                Rights::RECEIVE,
-                GENERATION_HANDOFF_HANDLE,
-            )
-            .ok()
-                != Some(GENERATION_HANDOFF_HANDLE)
-            || additional_capabilities.iter().copied().any(|capability| {
-                ipc::grant_child(
-                    process_id,
-                    capability.source_handle,
-                    capability.rights,
-                    capability.target_handle,
-                )
-                .ok()
-                    != Some(capability.target_handle)
-            })
-        {
-            fail(messages.bootstrap_failed);
-        }
-        ipc::close(generation_handoff_source).unwrap_or_else(|_| fail(messages.bootstrap_failed));
-        barrier
-            .release()
-            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
-
-        let mut ready_buffer = [0_u8; 64];
-        loop {
-            match ipc::try_receive(*readiness_endpoint, &mut ready_buffer) {
-                Ok(message) => {
-                    if message.sender_process_id != process_id
-                        || message.capability.is_some()
-                        || message.bytes != spec.ready_message.len()
-                        || &ready_buffer[..message.bytes] != spec.ready_message
-                    {
-                        fail(messages.protocol_failed);
-                    }
-                    if service.note_ready() != ReadyDisposition::Accepted {
-                        fail(messages.protocol_failed);
-                    }
-                    let _ = syscall::write_all(STDOUT, messages.ready);
-                    return generation;
-                }
-                Err(error) if error == ipc::Error::TRY_AGAIN => {}
-                Err(_) => fail(messages.protocol_failed),
-            }
-
-            match syscall::try_wait_child(process_id) {
-                Ok(status) => match service.observe_status(status.raw()) {
-                    ServiceStatusDisposition::WaitForNextEvent => {}
-                    ServiceStatusDisposition::Restart { backoff_yields } => {
-                        let _ = syscall::write_all(STDOUT, messages.restarting);
-                        backoff(backoff_yields);
-                        ipc::close(*readiness_endpoint)
-                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
-                        ipc::close(*request_endpoint)
-                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
-                        *readiness_endpoint = ipc::endpoint_create()
-                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
-                        *request_endpoint = ipc::endpoint_create()
-                            .unwrap_or_else(|_| fail(messages.bootstrap_failed));
-                        break;
-                    }
-                    ServiceStatusDisposition::Stopped | ServiceStatusDisposition::Failed => {
-                        fail(messages.failed)
-                    }
-                },
-                Err(error) if error == syscall::Errno::TRY_AGAIN => {}
-                Err(error) if error == syscall::Errno::INTERRUPTED => {}
-                Err(_) => fail(messages.failed),
             }
             let _ = syscall::yield_now();
         }

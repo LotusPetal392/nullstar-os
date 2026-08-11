@@ -35,10 +35,10 @@ The detailed contract is in
 1. **Implemented foundation and service integration:** add capability-backed flat job
    containment, inherited descendants, independent FIFO process-exit observation, and
    bounded whole-job termination. PID 1 assigns policy-pinned definition-backed
-   service attempts and every logging, tmpfs, and VFS generation to fresh jobs before
+   service attempts and every logging, NullFS, tmpfs, and VFS generation to fresh jobs before
    launch-barrier release, retains only `SIGNAL | WAIT`, and drains each complete generation to `ECHILD` before
-   replacement. NullFS containment remains a separate follow-up because its durability and
-   quiesce lifecycle must be preserved; child jobs also remain future work.
+   replacement. NullFS preserves exact quiesce, clean-unmount, and final-exit evidence before clean
+   drainage; forced dirty recovery terminates and drains the complete job. Child jobs remain future work.
 2. replace broad ambient startup assumptions with one bootstrap channel carrying a
    versioned startup message and explicit handles;
 3. define stable service identity, service generation, lifecycle state, readiness,
@@ -70,21 +70,21 @@ NullFS restart now queues a private `NFLC` v1 `QUIESCE` marker behind earlier FI
 `QUIESCED` lets PID 1 offline the exact generation and wake tail work with `EIO`; `UNMOUNT` then closes
 core handles, syncs and publishes a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits `0`.
 Only that exact event plus final exit `0` proves a clean path. Timeout, invalid lifecycle traffic,
-failure, or early/nonzero exit triggers exact-generation offlining, KILL/reap, and dirty recovery.
+failure, or early/nonzero exit triggers exact-generation offlining, whole-generation-job termination
+and drainage, and dirty recovery.
 Replacement still uses a fresh endpoint and strictly newer generation, and controlled restart charges
 no failure budget. Filesystem `Start` and `Stop` stay exactly `Unsupported`; `NSVC` v1 and the public
 filesystem version 1 `Request`/`Reply` operations are unchanged. ABI 1.15 supplies flat jobs,
 non-relaxable descendant inheritance, independent exit records, and whole-job termination. PID 1 now
-assigns each policy-pinned definition-backed service attempt and every logging, tmpfs, and VFS
+assigns each policy-pinned definition-backed service attempt and every logging, NullFS, tmpfs, and VFS
 generation before barrier release, retains only `SIGNAL | WAIT`, and drains the old job to `ECHILD`
 before replacement.
 Logging keeps cooperative process-group termination but uses whole-job KILL for escalation and escaped
 descendants. The logging-lifecycle QEMU gate also injects escaped-process-group descendants into tmpfs
 and VFS generations and requires descendant termination, whole-job drainage to `ECHILD`, and
-replacement. NullFS containment remains a separate future milestone because its durability and
-quiesce lifecycle must be preserved; a separate manager process, general activation, and cross-reboot
-desired-state persistence also remain
-future work.
+replacement. The NullFS restart, crash-recovery, and provider-loss gates additionally preserve its
+durability protocol while proving escaped-descendant termination and complete job drainage. A separate
+manager process, general activation, and cross-reboot desired-state persistence remain future work.
 
 See [Service, session, and application lifecycle](service-and-session-lifecycle.md) and
 [Service management and command line](service-management-and-cli.md).

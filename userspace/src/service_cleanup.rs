@@ -4,6 +4,7 @@
 pub enum Service {
     Definition,
     Logging,
+    Nullfs,
     Tmpfs,
     Vfs,
 }
@@ -13,6 +14,7 @@ impl Service {
         match self {
             Self::Definition => b"definition",
             Self::Logging => b"logging",
+            Self::Nullfs => b"nullfs",
             Self::Tmpfs => b"tmpfs",
             Self::Vfs => b"vfs",
         }
@@ -403,6 +405,18 @@ mod tests {
         assert_eq!(
             &output[..length],
             b"init: cleanup service=tmpfs phase=job-drain operation=job-try-wait result=missing-handle\n"
+        );
+
+        let nullfs = Diagnostic {
+            service: Service::Nullfs,
+            phase: Phase::JobDrain,
+            operation: Operation::JobTryWait,
+            observation: Observation::MissingHandle,
+        };
+        let length = nullfs.encode(&mut output).expect("diagnostic fits");
+        assert_eq!(
+            &output[..length],
+            b"init: cleanup service=nullfs phase=job-drain operation=job-try-wait result=missing-handle\n"
         );
 
         let vfs = Diagnostic {
