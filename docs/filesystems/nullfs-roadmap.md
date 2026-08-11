@@ -304,9 +304,9 @@ bootstrap availability. The dedicated `nullfs-restart-test` image now validates 
 replacements. The first proves exact `QUIESCED`, exact `CLEAN_UNMOUNTED`, final exit `0`,
 stale-descriptor `EIO`, persisted cross-view data, and access through a fresh endpoint at a
 strictly newer generation. The second stops the service so it cannot
-consume `QUIESCE`, then validates timeout, exact-generation offlining, KILL/reap, and a
-replacement mount through dirty recovery. Neither controlled restart charges the failure
-budget.
+consume `QUIESCE`, then validates timeout, exact-generation offlining, whole-generation-job
+termination and drainage, and a replacement mount through dirty recovery. Neither controlled
+restart charges the failure budget.
 
 ```sh
 cargo run --locked --quiet -- --nullfs-restart-check
@@ -423,9 +423,9 @@ combination of exact `CLEAN_UNMOUNTED` and final exit `0` proves the clean path;
 uses a fresh endpoint and a strictly newer generation.
 
 Any timeout, malformed or wrong event, attached event capability, lifecycle `FAILED`, or
-early or nonzero exit takes the non-clean path: exact-generation offline, KILL/reap as
-needed, and replacement mount through dirty recovery. Controlled restart does not charge
-the failure budget. This is not live filesystem stop/start: filesystem `Start` and `Stop`
+early or nonzero exit takes the non-clean path: exact-generation offline, whole-generation-job
+termination and drainage, and replacement mount through dirty recovery. Controlled restart does
+not charge the failure budget. This is not live filesystem stop/start: filesystem `Start` and `Stop`
 remain exactly `Unsupported`, and `NSVC` v1 is unchanged.
 
 ### Deterministic block-device loss — implemented

@@ -123,6 +123,10 @@ const LOGGING_CONTAINMENT_DESCENDANT_MARKER: &str =
     "logging-service: containment descendant escaped process group";
 const LOGGING_SERVICE_JOB_DRAINED_MARKER: &str =
     "userspace init: logging service generation job drained";
+const NULLFS_CONTAINMENT_DESCENDANT_MARKER: &str =
+    "nullfs-service: containment descendant escaped process group";
+const NULLFS_SERVICE_JOB_DRAINED_MARKER: &str =
+    "userspace init: NullFS service generation job drained";
 const TMPFS_CONTAINMENT_DESCENDANT_MARKER: &str =
     "tmpfs-service: containment descendant escaped process group";
 const TMPFS_SERVICE_JOB_DRAINED_MARKER: &str =
@@ -264,10 +268,12 @@ impl OutOfSpaceProgress {
 struct BlockDeviceLossProgress {
     mode_selected: bool,
     nullfs_ready: bool,
+    containment_descendant_observed: bool,
     endpoint_offlined: bool,
     injection_reported: bool,
     fail_stop_reported: bool,
     service_exited: bool,
+    job_drained: bool,
     verified: bool,
 }
 
@@ -275,16 +281,19 @@ impl BlockDeviceLossProgress {
     fn observe(&mut self, line: &str) -> bool {
         self.mode_selected |= line.contains(NULLFS_BLOCK_DEVICE_LOSS_MODE_MARKER);
         self.nullfs_ready |= self.mode_selected && line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
-        self.endpoint_offlined |=
-            self.nullfs_ready && line.contains(NULLFS_BLOCK_ENDPOINT_OFFLINED_MARKER);
+        self.containment_descendant_observed |=
+            self.mode_selected && line.contains(NULLFS_CONTAINMENT_DESCENDANT_MARKER);
+        self.endpoint_offlined |= self.nullfs_ready
+            && self.containment_descendant_observed
+            && line.contains(NULLFS_BLOCK_ENDPOINT_OFFLINED_MARKER);
         self.injection_reported |=
             self.endpoint_offlined && line.contains(NULLFS_BLOCK_DEVICE_LOSS_INJECTED_MARKER);
         self.fail_stop_reported |=
             self.injection_reported && line.contains(NULLFS_BLOCK_DEVICE_LOSS_FAIL_STOP_MARKER);
         self.service_exited |=
             self.fail_stop_reported && line.contains(NULLFS_BLOCK_DEVICE_LOSS_SERVICE_EXIT_MARKER);
-        self.verified |=
-            self.service_exited && line.contains(NULLFS_BLOCK_DEVICE_LOSS_PASSED_MARKER);
+        self.job_drained |= self.service_exited && line.contains(NULLFS_SERVICE_JOB_DRAINED_MARKER);
+        self.verified |= self.job_drained && line.contains(NULLFS_BLOCK_DEVICE_LOSS_PASSED_MARKER);
         self.verified
     }
 }
@@ -293,9 +302,11 @@ impl BlockDeviceLossProgress {
 struct CrashRecoveryProgress {
     mode_selected: bool,
     nullfs_ready: bool,
+    containment_descendant_observed: bool,
     injection_reported: bool,
     durable_mutation_reported: bool,
     service_exited: bool,
+    job_drained: bool,
     verified: bool,
 }
 
@@ -303,13 +314,17 @@ impl CrashRecoveryProgress {
     fn observe(&mut self, line: &str) -> bool {
         self.mode_selected |= line.contains(NULLFS_CRASH_RECOVERY_MODE_MARKER);
         self.nullfs_ready |= self.mode_selected && line.contains(NORMAL_BOOT_NULLFS_SERVICE_MARKER);
-        self.injection_reported |=
-            self.nullfs_ready && line.contains(NULLFS_CRASH_RECOVERY_INJECTED_MARKER);
+        self.containment_descendant_observed |=
+            self.mode_selected && line.contains(NULLFS_CONTAINMENT_DESCENDANT_MARKER);
+        self.injection_reported |= self.nullfs_ready
+            && self.containment_descendant_observed
+            && line.contains(NULLFS_CRASH_RECOVERY_INJECTED_MARKER);
         self.durable_mutation_reported |=
             self.injection_reported && line.contains(NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER);
         self.service_exited |= self.durable_mutation_reported
             && line.contains(NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER);
-        self.verified |= self.service_exited && line.contains(NULLFS_CRASH_RECOVERY_PASSED_MARKER);
+        self.job_drained |= self.service_exited && line.contains(NULLFS_SERVICE_JOB_DRAINED_MARKER);
+        self.verified |= self.job_drained && line.contains(NULLFS_CRASH_RECOVERY_PASSED_MARKER);
         self.verified
     }
 }
@@ -946,6 +961,8 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
     let mut logging_import_count = 0_u8;
     let mut logging_generation_job_drained = false;
     let mut logging_collector_verified = false;
+    let mut nullfs_containment_descendant_count = 0_u8;
+    let mut nullfs_generation_job_drain_count = 0_u8;
     let mut restart_verified = false;
     let mut definition_loading_observed = false;
     let mut definition_first_failure_observed = false;
@@ -971,7 +988,19 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
             }
             logging_collector_verified |= logging_generation_job_drained
                 && line.contains(LOGGING_COLLECTOR_RESTART_PASSED_MARKER);
-            restart_verified |= line.contains(NULLFS_RESTART_PASSED_MARKER);
+            if line.contains(NULLFS_CONTAINMENT_DESCENDANT_MARKER) {
+                nullfs_containment_descendant_count =
+                    nullfs_containment_descendant_count.saturating_add(1);
+            }
+            if line.contains(NULLFS_SERVICE_JOB_DRAINED_MARKER)
+                && nullfs_generation_job_drain_count < nullfs_containment_descendant_count
+            {
+                nullfs_generation_job_drain_count =
+                    nullfs_generation_job_drain_count.saturating_add(1);
+            }
+            restart_verified |= nullfs_containment_descendant_count >= 3
+                && nullfs_generation_job_drain_count >= 2
+                && line.contains(NULLFS_RESTART_PASSED_MARKER);
             definition_loading_observed |=
                 restart_verified && line.contains(DEFINITION_SERVICE_LOADING_MARKER);
             definition_first_failure_observed |= definition_loading_observed
@@ -988,6 +1017,8 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
                 && logging_import_count >= 2
                 && logging_generation_job_drained
                 && logging_collector_verified
+                && nullfs_containment_descendant_count >= 3
+                && nullfs_generation_job_drain_count >= 2
                 && restart_verified
                 && definition_loading_observed
                 && definition_first_failure_observed
@@ -1270,10 +1301,11 @@ mod tests {
         NULLFS_BLOCK_DEVICE_LOSS_SERVICE_EXIT_MARKER, NULLFS_BLOCK_ENDPOINT_OFFLINED_MARKER,
         NULLFS_BOOT_GENERATION_MODE_MARKER, NULLFS_BOOT_GENERATION_PASSED_MARKER,
         NULLFS_BOOT_GENERATION_ROLLBACK_MARKER, NULLFS_BOOT_GENERATION_STAGED_MARKER,
-        NULLFS_BOOT_GENERATION_VERIFIED_MARKER, NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER,
-        NULLFS_CRASH_RECOVERY_INJECTED_MARKER, NULLFS_CRASH_RECOVERY_MODE_MARKER,
-        NULLFS_CRASH_RECOVERY_PASSED_MARKER, NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER,
-        NULLFS_OUT_OF_SPACE_MODE_MARKER, NULLFS_OUT_OF_SPACE_PASSED_MARKER,
+        NULLFS_BOOT_GENERATION_VERIFIED_MARKER, NULLFS_CONTAINMENT_DESCENDANT_MARKER,
+        NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER, NULLFS_CRASH_RECOVERY_INJECTED_MARKER,
+        NULLFS_CRASH_RECOVERY_MODE_MARKER, NULLFS_CRASH_RECOVERY_PASSED_MARKER,
+        NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER, NULLFS_OUT_OF_SPACE_MODE_MARKER,
+        NULLFS_OUT_OF_SPACE_PASSED_MARKER, NULLFS_SERVICE_JOB_DRAINED_MARKER,
         NULLFS_UNAVAILABLE_HANDOFF_MARKER, NULLFS_UNAVAILABLE_INIT_EXIT_MARKER,
         NULLFS_UNAVAILABLE_INIT_TERMINATED_MARKER, NULLFS_UNAVAILABLE_MODE_MARKER,
         NULLFS_UNAVAILABLE_PARTITIONS_MARKER, NormalBootProgress, OutOfSpaceProgress,
@@ -1373,13 +1405,17 @@ mod tests {
         assert!(!progress.observe(NULLFS_BLOCK_DEVICE_LOSS_FAIL_STOP_MARKER));
         assert!(!progress.observe(NULLFS_BLOCK_DEVICE_LOSS_INJECTED_MARKER));
         assert!(!progress.observe(NULLFS_BLOCK_ENDPOINT_OFFLINED_MARKER));
+        assert!(!progress.observe(NULLFS_CONTAINMENT_DESCENDANT_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
         assert!(!progress.observe(NULLFS_BLOCK_DEVICE_LOSS_MODE_MARKER));
+        assert!(!progress.observe(NULLFS_CONTAINMENT_DESCENDANT_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
         assert!(!progress.observe(NULLFS_BLOCK_ENDPOINT_OFFLINED_MARKER));
         assert!(!progress.observe(NULLFS_BLOCK_DEVICE_LOSS_INJECTED_MARKER));
         assert!(!progress.observe(NULLFS_BLOCK_DEVICE_LOSS_FAIL_STOP_MARKER));
         assert!(!progress.observe(NULLFS_BLOCK_DEVICE_LOSS_SERVICE_EXIT_MARKER));
+        assert!(!progress.observe(NULLFS_BLOCK_DEVICE_LOSS_PASSED_MARKER));
+        assert!(!progress.observe(NULLFS_SERVICE_JOB_DRAINED_MARKER));
         assert!(progress.observe(NULLFS_BLOCK_DEVICE_LOSS_PASSED_MARKER));
     }
 
@@ -1391,12 +1427,16 @@ mod tests {
         assert!(!progress.observe(NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER));
         assert!(!progress.observe(NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER));
         assert!(!progress.observe(NULLFS_CRASH_RECOVERY_INJECTED_MARKER));
+        assert!(!progress.observe(NULLFS_CONTAINMENT_DESCENDANT_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
         assert!(!progress.observe(NULLFS_CRASH_RECOVERY_MODE_MARKER));
+        assert!(!progress.observe(NULLFS_CONTAINMENT_DESCENDANT_MARKER));
         assert!(!progress.observe(NORMAL_BOOT_NULLFS_SERVICE_MARKER));
         assert!(!progress.observe(NULLFS_CRASH_RECOVERY_INJECTED_MARKER));
         assert!(!progress.observe(NULLFS_CRASH_RECOVERY_DURABLE_MUTATION_MARKER));
         assert!(!progress.observe(NULLFS_CRASH_RECOVERY_SERVICE_EXIT_MARKER));
+        assert!(!progress.observe(NULLFS_CRASH_RECOVERY_PASSED_MARKER));
+        assert!(!progress.observe(NULLFS_SERVICE_JOB_DRAINED_MARKER));
         assert!(progress.observe(NULLFS_CRASH_RECOVERY_PASSED_MARKER));
     }
 

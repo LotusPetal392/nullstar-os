@@ -275,8 +275,8 @@ handles, syncs and publishes a clean superblock through `try_unmount`, emits exa
 uses a fresh endpoint and strictly newer generation before completing the restart fence.
 
 Timeout, malformed or mismatched events, capability-bearing events, lifecycle failure, or early or
-nonzero exit cannot prove durability. PID 1 exact-generation offlines, forces KILL/reap when needed,
-and lets the replacement perform dirty recovery. Controlled restart charges no failure backoff or
+nonzero exit cannot prove durability. PID 1 exact-generation offlines, terminates and drains the whole
+generation job, and lets the replacement perform dirty recovery. Controlled restart charges no failure backoff or
 budget. Filesystem `Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and the public
 filesystem version 1 request/reply operation set are unchanged. This milestone adds no manager
 process, activation, definitions, or cross-reboot persistence; ABI 1.13 remains the narrow PID-1
@@ -448,10 +448,10 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    current supervisor. **Foundation delivered:** ABI 1.15 supplies capability-backed flat jobs,
    inherited descendant containment, independent FIFO exit records, and bounded termination; the
    allocation-free `NSVC` v1 codec and PID 1 registry supply service observation. Policy-pinned
-   definition-backed service attempts and every logging, tmpfs, and VFS generation now receive
+   definition-backed service attempts and every logging, NullFS, tmpfs, and VFS generation now receive
    fresh jobs before barrier release; PID 1 retains only `SIGNAL | WAIT` and drains each complete generation to
-   `ECHILD` before replacement. NullFS containment remains separate future work because its durability
-   and quiesce lifecycle must be preserved; job hierarchy also remains future work.
+   `ECHILD` before replacement. NullFS preserves exact quiesce and clean-unmount evidence before
+   clean drainage and uses whole-job termination before dirty recovery; job hierarchy remains future work.
 2. Implement `sv list`, `status`, `start`, `stop`, and `restart` against that protocol. **Partly
    delivered:** native `list`, `status`, and restart use separately authorized IPC, logging has live
    in-memory `start`/`stop`, and NullFS restart has exact-generation quiesce, clean unmount, forced

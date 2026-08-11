@@ -28,11 +28,14 @@ Controlled restart is implemented without charging failure policy. Logging now a
 charging failure policy, while start creates and publishes only a fresh ready generation. Restart
 intent remains fenced through replacement startup, queued duplicates receive `Busy`, and PID 1
 escalates an uncooperative generation to uncatchable signal 9 after a bounded grace period.
-Policy-pinned definition-backed service attempts and every logging, tmpfs, and VFS generation are
+Policy-pinned definition-backed service attempts and every logging, NullFS, tmpfs, and VFS generation are
 assigned to fresh flat jobs before launch-barrier release; PID 1 retains only `SIGNAL | WAIT` and
 drains all generation exits to `ECHILD` before closing endpoints or starting a replacement. The
 logging-lifecycle QEMU gate injects tmpfs/VFS descendants that escape their leaders' process groups
 and requires descendant termination, whole-job drainage to `ECHILD`, and generation replacement.
+The NullFS restart, crash-recovery, and block-device-loss gates inject the same escaped descendant;
+clean restart preserves exact `QUIESCED`, `CLEAN_UNMOUNTED`, and final exit `0` before drainage,
+while dirty paths terminate the entire generation job before recovery.
 Starting logging generations also have a bounded
 readiness deadline whose expiry enters normal restart and backoff policy rather than leaving the
 runtime in `Starting` indefinitely. Controlled NullFS restart
@@ -42,7 +45,8 @@ exact generation, waking tail work with `EIO`, and sends `UNMOUNT`. The service 
 uses `try_unmount` to sync and publish a clean superblock, emits exact `CLEAN_UNMOUNTED`, and exits
 `0`. PID 1 requires both the exact event and final exit `0` before fresh-endpoint, newer-generation
 replacement. Invalid lifecycle traffic, timeout, failure, or early/nonzero exit uses exact-generation
-offlining, KILL/reap, and dirty recovery. Controlled restart does not charge failure policy. Filesystem
+offlining, whole-generation-job termination and drainage, and dirty recovery. Controlled restart does
+not charge failure policy. Filesystem
 `Start` and `Stop` remain exactly `Unsupported`; `NSVC` v1 and public filesystem version 1 operations
 are unchanged. One policy-pinned migration pilot now loads
 `/System/services/definition-probe.service` through the canonical VFS/NullFS path, launches its
@@ -619,10 +623,11 @@ The accepted model can be introduced incrementally:
 1. **Implemented foundation and bounded pilot:** provide flat capability-backed job
    containment, non-relaxable descendant inheritance, independent process-exit records,
    and bounded whole-job termination. PID 1 assigns policy-pinned definition-backed
-   service attempts and every logging, tmpfs, and VFS generation while its leader remains
+   service attempts and every logging, NullFS, tmpfs, and VFS generation while its leader remains
    behind the launch barrier, retains only `SIGNAL | WAIT`, and drains the complete generation to `ECHILD`
-   before replacement. NullFS containment remains separate future work because its
-   durability and quiesce lifecycle must be preserved; hierarchy also remains future work.
+   before replacement. NullFS clean replacement preserves the exact quiesce and clean-unmount
+   proof before drainage; forced dirty recovery terminates and drains the complete job. Hierarchy
+   remains future work.
 2. introduce the one-bootstrap-channel startup contract and explicit startup handles;
 3. define stable service identity, generation, lifecycle state, readiness, and control
    protocols;

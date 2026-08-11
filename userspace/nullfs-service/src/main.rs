@@ -18,7 +18,7 @@ use userspace::{
     args::Args,
     block_device::{self, protocol},
     ipc::{self, ObjectKind, Rights},
-    nullfs_primary_volume,
+    nullfs_primary_volume, platform,
     service_route::receive_service_generation,
     syscall,
 };
@@ -31,27 +31,84 @@ const BLOCK_HANDLE: u64 = 3;
 const CRASH_TEST_HANDLE: u64 = 4;
 const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const READY_MESSAGE: &[u8] = b"service-ready: nullfs";
+const CRASH_TEST_ARGUMENT: &[u8] = b"--crash-test";
+const CONTAINMENT_TEST_ARGUMENT: &[u8] = b"--containment-test";
+const CONTAINMENT_DESCENDANT_MARKER: &[u8] =
+    b"nullfs-service: containment descendant escaped process group\n";
 const SHARED_BUFFER_BYTES: usize = 4096;
 const SHARED_BUFFER_ID: u64 = 1;
+
+fn spawn_containment_descendant() {
+    let group_ready = match syscall::pipe_pair() {
+        Ok(pair) => pair,
+        Err(_) => syscall::exit(30),
+    };
+    match syscall::fork() {
+        Ok(0) => {
+            let _ = syscall::close(group_ready.reader);
+            if platform::set_process_group(0, 0).is_err()
+                || syscall::write_all(group_ready.writer, &[1]).is_err()
+                || syscall::close(group_ready.writer).is_err()
+            {
+                syscall::exit(31);
+            }
+            loop {
+                if syscall::yield_now().is_err() {
+                    syscall::exit(32);
+                }
+            }
+        }
+        Ok(_) => {
+            let _ = syscall::close(group_ready.writer);
+            let mut ready = [0_u8; 1];
+            let escaped = loop {
+                match syscall::read(group_ready.reader, &mut ready) {
+                    Ok(1) => break ready[0] == 1,
+                    Ok(_) => break false,
+                    Err(error) if error == syscall::Errno::INTERRUPTED => {}
+                    Err(_) => break false,
+                }
+            };
+            if syscall::close(group_ready.reader).is_err()
+                || !escaped
+                || syscall::write_all(syscall::STDOUT, CONTAINMENT_DESCENDANT_MARKER).is_err()
+            {
+                syscall::exit(33);
+            }
+        }
+        Err(_) => {
+            let _ = syscall::close(group_ready.writer);
+            let _ = syscall::close(group_ready.reader);
+            syscall::exit(30);
+        }
+    }
+}
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     allocator::init();
 
     let arguments = unsafe { Args::from_stack(initial_stack) };
-    let crash_test = if arguments.len() == 2
-        && arguments.get(0) == Some(b"/nullfs-service")
-        && arguments.get(1) == Some(b"--writable")
+    if !(2..=4).contains(&arguments.len())
+        || arguments.get(0) != Some(b"/nullfs-service")
+        || arguments.get(1) != Some(b"--writable")
     {
-        false
-    } else if arguments.len() == 3
-        && arguments.get(0) == Some(b"/nullfs-service")
-        && arguments.get(1) == Some(b"--writable")
-        && arguments.get(2) == Some(b"--crash-test")
-    {
-        true
-    } else {
-        fail(2, b"usage: /nullfs-service --writable [--crash-test]\n");
-    };
+        fail(
+            2,
+            b"usage: /nullfs-service --writable [--crash-test] [--containment-test]\n",
+        );
+    }
+    let mut crash_test = false;
+    let mut containment_test = false;
+    for index in 2..arguments.len() {
+        match arguments.get(index) {
+            Some(CRASH_TEST_ARGUMENT) if !crash_test => crash_test = true,
+            Some(CONTAINMENT_TEST_ARGUMENT) if !containment_test => containment_test = true,
+            _ => fail(
+                2,
+                b"usage: /nullfs-service --writable [--crash-test] [--containment-test]\n",
+            ),
+        }
+    }
 
     require_handle(
         READY_HANDLE,
@@ -87,6 +144,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             Ok(generation) => generation.get(),
             Err(_) => fail(13, b"nullfs: generation handoff failed\n"),
         };
+    if containment_test {
+        spawn_containment_descendant();
+    }
 
     let mut session = match block_device::connect_service(BLOCK_HANDLE, 1) {
         Ok(session) => session,

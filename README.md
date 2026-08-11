@@ -41,10 +41,11 @@ experimentation, not production use or untrusted workloads.
   duplication, parent-process lookup, direct child signaling, and controlled
   process-group reassignment
 - a PID 1 userspace supervisor that gives policy-pinned definition-backed service
-  attempts and every logging, tmpfs, and VFS generation a fresh flat job before
+  attempts and every logging, NullFS, tmpfs, and VFS generation a fresh flat job before
   launch-barrier release, retains only `SIGNAL | WAIT`, and drains the generation
-  to `ECHILD` before replacement. NullFS containment remains future work because
-  its durability and quiesce lifecycle must be preserved. A userspace shell (`ush`)
+  to `ECHILD` before replacement. NullFS clean restart still requires exact quiesce,
+  clean-unmount, and final-exit evidence before job drainage and replacement; failure
+  paths terminate and drain the whole job before dirty recovery. A userspace shell (`ush`)
   provides pipelines, redirection, variables, background jobs and basic job control;
   an emergency kernel diagnostic shell
 - separate normal-boot and destructive smoke-test images, including non-destructive
@@ -95,10 +96,10 @@ prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 | `cargo run -- --headless` | Boot normally without a display; serial output only. |
 | `cargo run -- --boot-check` | Boot headlessly and exit after PID 1 launches the userspace shell. |
 | `cargo run -- --test` | Run the full headless suite, including persistent FAT, NullFS replacement, out-of-space, block-device-loss, crash/remount recovery, three-boot boot-generation rollback, unavailable-primary recovery, and logging lifecycle verification. |
-| `cargo run -- --nullfs-restart-check` | Run only the targeted NullFS replacement and stale-descriptor check. |
+| `cargo run -- --nullfs-restart-check` | Run targeted clean and forced NullFS replacement, escaped-descendant containment, whole-job drainage, and stale-descriptor checks. |
 | `cargo run -- --nullfs-out-of-space-check` | Verify data-block and inode exhaustion, service continuity, reclamation, and subsequent mutation. |
-| `cargo run -- --nullfs-block-device-loss-check` | Verify exact-generation provider loss, uncertain-mutation fail-stop, stale VFS `EIO`, and bootstrap continuity. |
-| `cargo run -- --nullfs-crash-recovery-check` | Crash NullFS after a durable mutation but before its reply, then verify uncertain `EIO`, dirty remount, stale descriptors, and exactly-once recovered content. |
+| `cargo run -- --nullfs-block-device-loss-check` | Verify exact-generation provider loss, whole-job drainage, uncertain-mutation fail-stop, stale VFS `EIO`, and bootstrap continuity. |
+| `cargo run -- --nullfs-crash-recovery-check` | Crash NullFS after a durable mutation but before its reply, then verify whole-job drainage, uncertain `EIO`, dirty remount, stale descriptors, and exactly-once recovered content. |
 | `cargo run -- --nullfs-boot-generation-check` | Use one disposable image across three boots to stage generation 2, select it, roll back to generation 1, and verify that both canonical generations and firmware slots remain intact. |
 | `cargo run -- --nullfs-unavailable-check` | Boot without a primary NullFS partition and verify recovery through the independent emergency shell. |
 | `cargo run -- --logging-lifecycle-check` | Run logging start/stop/restart, route replacement, restart fencing, forced termination, readiness-timeout recovery, and tmpfs/VFS escaped-process-group descendant termination, whole-job drainage, and generation replacement. |
