@@ -18,7 +18,8 @@ tightening-only live-process ceiling inherited by child jobs and enforced agains
 complete subtree. ABI 1.18 permits only an empty child leaf to retire: retirement permanently makes
 the object inert, detaches its parent edge, and allows reclamation after final handle closure. ABI
 1.19 lets `WAIT` authority inspect a job's local configured process ceiling without permitting
-relaxation.
+relaxation. ABI 1.20 adds atomic rights-reduced capability replacement without requiring another
+free handle-table slot.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
@@ -50,7 +51,7 @@ The implemented model establishes these properties:
 1. A process can refer to a protected kernel object only through an unforgeable handle
    in its own capability table.
 2. Every handle carries an explicit rights mask that can only be reduced during
-   duplication or delegation.
+   duplication, atomic replacement, or delegation.
 3. Processes exchange bounded messages and restricted capabilities through endpoints.
 4. Resource use is bounded so exhaustion returns a defined error.
 5. Supervised service replacement does not silently rebind old sessions or handles.
@@ -72,7 +73,9 @@ valid only for descriptor and filesystem I/O.
 
 `DUPLICATE` creates another handle in the same process. `TRANSFER` permits placing a
 rights-reduced copy in an endpoint message or granting it to a live direct child. Neither
-operation removes the source handle.
+operation removes the source handle. Atomic replacement requires `DUPLICATE`, preserves object
+identity, and consumes the source only after a valid nonempty rights subset is accepted. It does
+not need another free table slot; a failed replacement leaves the source valid and unchanged.
 
 A requested rights mask must be nonempty, valid for the object type, and a subset of the
 source rights. Rights can be attenuated but not amplified.

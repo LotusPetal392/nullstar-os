@@ -133,7 +133,7 @@ may replace a handle atomically with a reduced-rights version.
 
 ### Foundational handle operations
 
-The native interface should eventually provide operations equivalent to:
+The current ABI now provides operations equivalent to:
 
 ```text
 handle_close
@@ -142,8 +142,11 @@ handle_replace
 handle_get_info
 ```
 
-`handle_replace` must leave the original valid if replacement fails. Inspection must be
-scoped by `INSPECT` and should reveal only information authorized for the caller.
+ABI 1.20 `handle_replace` requires `DUPLICATE`, accepts only a nonempty rights subset, and leaves
+the original valid if replacement fails. It does not require a second free handle-table slot and
+preserves object identity. Handle values remain opaque, so callers must use the returned replacement
+value even when the current implementation reuses the same numeric slot. Future inspection should
+be scoped by `INSPECT` and reveal only information authorized for the caller.
 
 Closing a handle invalidates that table entry immediately. The object remains alive
 while another handle, queued message, mapping, waiter, or legitimate kernel reference

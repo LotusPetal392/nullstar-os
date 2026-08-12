@@ -184,11 +184,24 @@ fn capability_probe(current_process: u64) -> bool {
         return false;
     }
 
-    let Ok(send_only) = ipc::duplicate(endpoint, Rights::SEND) else {
+    let Ok(replacement_source) = ipc::duplicate(endpoint, Rights::ENDPOINT) else {
+        return false;
+    };
+    if ipc::replace(replacement_source, Rights::EMPTY).err() != Some(ipc::Error::PERMISSION) {
+        return false;
+    }
+    let Ok(send_only) = ipc::replace(replacement_source, Rights::SEND) else {
+        return false;
+    };
+    let Ok(send_only_info) = ipc::info(send_only) else {
         return false;
     };
     let mut denied_buffer = [0_u8; 1];
-    if ipc::try_receive(send_only, &mut denied_buffer).err() != Some(ipc::Error::PERMISSION) {
+    if send_only_info.object_id != endpoint_info.object_id
+        || send_only_info.kind != ObjectKind::Endpoint
+        || send_only_info.rights != Rights::SEND
+        || ipc::try_receive(send_only, &mut denied_buffer).err() != Some(ipc::Error::PERMISSION)
+    {
         return false;
     }
 

@@ -32,12 +32,12 @@ experimentation, not production use or untrusted workloads.
   transactional `exec`, parent/child waiting, environments, process groups,
   terminal ownership, and a focused signal implementation including uncatchable,
   unblockable forced termination
-- bounded per-process capability tables with rights-reduced duplication and
-  delegation, message endpoints, counted notifications, shared byte-memory
-  objects, explicit direct-child bootstrap grants, and immutable hierarchical
-  jobs with deterministic subtree exit observation, whole-subtree termination,
-  tightening-only hierarchy-scoped and inspectable process ceilings, and explicit
-  drained-leaf retirement
+- bounded per-process capability tables with rights-reduced duplication,
+  atomic rights replacement, and delegation, message endpoints, counted
+  notifications, shared byte-memory objects, explicit direct-child bootstrap
+  grants, and immutable hierarchical jobs with deterministic subtree exit
+  observation, whole-subtree termination, tightening-only hierarchy-scoped and
+  inspectable process ceilings, and explicit drained-leaf retirement
 - a documented userspace platform ABI with system discovery, file metadata,
   paged directory reads, per-process working directories, descriptor
   duplication, parent-process lookup, direct child signaling, and controlled

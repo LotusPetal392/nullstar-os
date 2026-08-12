@@ -518,6 +518,7 @@ fn capability_syscall_number(number: u64) -> bool {
         abi::syscall::CAPABILITY_DUPLICATE
             | abi::syscall::CAPABILITY_CLOSE
             | abi::syscall::CAPABILITY_INFO
+            | abi::syscall::CAPABILITY_REPLACE
             | abi::syscall::ENDPOINT_CREATE
             | abi::syscall::ENDPOINT_SEND
             | abi::syscall::ENDPOINT_RECEIVE
@@ -570,6 +571,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         abi::syscall::CAPABILITY_CLOSE => capability_close(process_id, registers.rdi),
         abi::syscall::CAPABILITY_INFO => {
             capability_info(process_id, registers.rdi, registers.rsi, registers.rdx)
+        }
+        abi::syscall::CAPABILITY_REPLACE => {
+            capability_replace(process_id, registers.rdi, registers.rsi)
         }
         abi::syscall::ENDPOINT_CREATE => endpoint_create(process_id),
         abi::syscall::ENDPOINT_SEND => endpoint_send(
@@ -673,6 +677,34 @@ fn capability_duplicate(process_id: u64, handle: u64, rights: u64) -> u64 {
         Ok(handle) => handle,
         Err(error) => error_return(error),
     }
+}
+
+fn capability_replace(process_id: u64, handle: u64, rights: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(source) = registry.entry(process_id, handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(source, abi::capability::RIGHT_DUPLICATE) {
+        return error_return(error);
+    }
+    if rights == 0
+        || rights & !source.rights != 0
+        || rights & !capability_allowed_rights(source.object.kind) != 0
+    {
+        return error_return(abi::errno::PERMISSION);
+    }
+    let Some(table_index) = registry.table_index(process_id) else {
+        return error_return(abi::errno::IO);
+    };
+    let Some(replacement) = registry.tables[table_index]
+        .entries
+        .iter_mut()
+        .find(|entry| entry.handle == handle)
+    else {
+        return error_return(abi::errno::IO);
+    };
+    replacement.rights = rights;
+    handle
 }
 
 fn capability_close(process_id: u64, handle: u64) -> u64 {

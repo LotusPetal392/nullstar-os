@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.19, and a
+The ABI is experimental, but callers can query the current version, 1.20, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -467,6 +467,22 @@ The result is not an effective ancestor minimum, current usage, or remaining adm
 Capability `Info.size` continues to report current live membership across the complete selected
 subtree. Admission still checks every ancestor and the query cannot relax any ceiling.
 
+## Version 1.20 atomic capability replacement
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 68 | `CAPABILITY_REPLACE` | source handle, reduced rights | replacement handle |
+
+`CAPABILITY_REPLACE` requires `DUPLICATE` on the source and accepts the same nonempty, valid
+rights subsets as `CAPABILITY_DUPLICATE`. It atomically consumes the source and installs a
+rights-reduced handle to the same object without requiring another free capability-table slot.
+The replacement preserves diagnostic object identity and cannot amplify authority.
+
+Validation completes before the source is changed. An invalid handle returns `EBADF`; missing
+`DUPLICATE`, an empty mask, unknown rights, or rights outside the source mask return `EPERM`, and
+the source remains valid and unchanged. Handle values are opaque: callers must use the returned
+replacement even when it has the same numeric value as the source.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -496,6 +512,7 @@ subtree. Admission still checks every ancestor and the query cannot relax any ce
 - ABI 1.17 adds a tightening-only hierarchy-scoped process ceiling at syscall 65.
 - ABI 1.18 adds permanent retirement and reclamation for empty child-job leaves at syscall 66.
 - ABI 1.19 adds read-only inspection of a job's configured local process ceiling at syscall 67.
+- ABI 1.20 adds atomic rights-reduced capability replacement at syscall 68.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are
