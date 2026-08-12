@@ -449,7 +449,8 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    inherited descendant containment, independent FIFO exit records, and bounded termination; the
    ABI 1.16 child-creation extension adds immutable hierarchy plus recursive subtree observation and
    termination; ABI 1.17 adds tightening-only hierarchy-scoped process ceilings; ABI 1.18 adds
-   permanent drained-leaf retirement for bounded generation reuse. The
+   permanent drained-leaf retirement for bounded generation reuse; ABI 1.19 adds read-only local
+   process-ceiling inspection. The
    allocation-free `NSVC` v1 codec and PID 1 registry supply service observation. Policy-pinned
    definition-backed service attempts and every logging, NullFS, tmpfs, and VFS generation now receive
    fresh jobs before barrier release; PID 1 retains only `SIGNAL | WAIT` and drains each complete generation to

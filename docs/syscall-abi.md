@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.18, and a
+The ABI is experimental, but callers can query the current version, 1.19, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -426,8 +426,9 @@ this policy ceiling and retain their existing lossless bounded storage.
 
 Tightening below current usage is valid and does not terminate existing processes. It prevents new
 admission until usage falls below every applicable ceiling; setting zero therefore freezes process
-creation in the subtree without being a termination operation. This slice does not add a limit query,
-CPU or memory accounting, reservations, or policy relaxation.
+creation in the subtree without being a termination operation. ABI 1.19 adds the read-only local
+limit query described below. This slice does not add CPU or memory accounting, reservations, or
+policy relaxation.
 
 ## Version 1.18 child-job retirement
 
@@ -450,6 +451,21 @@ generations than the global simultaneous-job bound while preserving non-relaxabl
 This slice does not recursively retire a subtree, implicitly consume completion records, or retire a
 job on last-handle close. Managers must explicitly drain children before retiring them from leaves
 upward.
+
+## Version 1.19 job process-limit inspection
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 67 | `JOB_GET_PROCESS_LIMIT` | job handle | configured local process limit |
+
+`JOB_GET_PROCESS_LIMIT` requires `WAIT`, so the same attenuated authority used to observe subtree
+exits can inspect policy without receiving mutation authority. It accepts root, child, and retired
+job handles and returns that selected job's configured local ceiling in the inclusive range
+`0..=64`. A retired job retains its last configured ceiling for inspection.
+
+The result is not an effective ancestor minimum, current usage, or remaining admission capacity.
+Capability `Info.size` continues to report current live membership across the complete selected
+subtree. Admission still checks every ancestor and the query cannot relax any ceiling.
 
 ## Compatibility rules
 
@@ -479,6 +495,7 @@ upward.
   termination at syscall 64.
 - ABI 1.17 adds a tightening-only hierarchy-scoped process ceiling at syscall 65.
 - ABI 1.18 adds permanent retirement and reclamation for empty child-job leaves at syscall 66.
+- ABI 1.19 adds read-only inspection of a job's configured local process ceiling at syscall 67.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are
