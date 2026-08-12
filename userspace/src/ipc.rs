@@ -288,6 +288,22 @@ pub fn send(endpoint: CapabilityHandle, bytes: &[u8], transfer: Option<Transfer>
     decode(result).map(|_| ())
 }
 
+pub fn send_move(endpoint: CapabilityHandle, bytes: &[u8], transfer: Transfer) -> Result<()> {
+    let mut result = syscall::ENDPOINT_SEND_MOVE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") endpoint,
+            in("rsi") bytes.as_ptr() as u64,
+            in("rdx") bytes.len() as u64,
+            in("r10") transfer.handle,
+            in("r8") transfer.rights.bits(),
+        );
+    }
+    decode(result).map(|_| ())
+}
+
 pub fn try_receive(endpoint: CapabilityHandle, buffer: &mut [u8]) -> Result<ReceivedMessage> {
     let mut raw = abi_capability::MessageInfo::EMPTY;
     let mut result = syscall::ENDPOINT_RECEIVE;
@@ -596,6 +612,7 @@ mod tests {
         assert_eq!(syscall::JOB_RETIRE, 66);
         assert_eq!(syscall::JOB_GET_PROCESS_LIMIT, 67);
         assert_eq!(syscall::CAPABILITY_REPLACE, 68);
+        assert_eq!(syscall::ENDPOINT_SEND_MOVE, 69);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

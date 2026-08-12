@@ -34,8 +34,9 @@ experimentation, not production use or untrusted workloads.
   unblockable forced termination
 - bounded per-process capability tables with rights-reduced duplication,
   atomic rights replacement, and delegation, message endpoints, counted
-  notifications, shared byte-memory objects, explicit direct-child bootstrap
-  grants, and immutable hierarchical jobs with deterministic subtree exit
+  notifications, atomic one-handle endpoint move-transfer, shared byte-memory
+  objects, explicit direct-child bootstrap grants, and immutable hierarchical
+  jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and
   inspectable process ceilings, and explicit drained-leaf retirement
 - a documented userspace platform ABI with system discovery, file metadata,

@@ -521,6 +521,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::CAPABILITY_REPLACE
             | abi::syscall::ENDPOINT_CREATE
             | abi::syscall::ENDPOINT_SEND
+            | abi::syscall::ENDPOINT_SEND_MOVE
             | abi::syscall::ENDPOINT_RECEIVE
             | abi::syscall::NOTIFICATION_CREATE
             | abi::syscall::NOTIFICATION_SIGNAL
@@ -577,6 +578,14 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         }
         abi::syscall::ENDPOINT_CREATE => endpoint_create(process_id),
         abi::syscall::ENDPOINT_SEND => endpoint_send(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            registers.r10,
+            registers.r8,
+        ),
+        abi::syscall::ENDPOINT_SEND_MOVE => endpoint_send_move(
             process_id,
             registers.rdi,
             registers.rsi,
@@ -771,6 +780,45 @@ fn endpoint_send(
     transfer_handle: u64,
     transfer_rights: u64,
 ) -> u64 {
+    endpoint_send_with_disposition(
+        process_id,
+        endpoint_handle,
+        address,
+        length,
+        transfer_handle,
+        transfer_rights,
+        false,
+    )
+}
+
+fn endpoint_send_move(
+    process_id: u64,
+    endpoint_handle: u64,
+    address: u64,
+    length: u64,
+    transfer_handle: u64,
+    transfer_rights: u64,
+) -> u64 {
+    endpoint_send_with_disposition(
+        process_id,
+        endpoint_handle,
+        address,
+        length,
+        transfer_handle,
+        transfer_rights,
+        true,
+    )
+}
+
+fn endpoint_send_with_disposition(
+    process_id: u64,
+    endpoint_handle: u64,
+    address: u64,
+    length: u64,
+    transfer_handle: u64,
+    transfer_rights: u64,
+    move_transfer: bool,
+) -> u64 {
     let bytes = match capability_read_message(process_id, address, length) {
         Ok(bytes) => bytes,
         Err(error) => return error_return(error),
@@ -787,7 +835,7 @@ fn endpoint_send(
     }
 
     let transfer = if transfer_handle == abi::capability::INVALID_HANDLE {
-        if transfer_rights != 0 {
+        if transfer_rights != 0 || move_transfer {
             return error_return(abi::errno::INVALID_ARGUMENT);
         }
         None
@@ -813,12 +861,18 @@ fn endpoint_send(
     let Some(object_index) = registry.object_index(endpoint_entry.object) else {
         return error_return(abi::errno::IO);
     };
-    let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[object_index].data else {
+    let CapabilityObjectData::Endpoint(endpoint) = &registry.objects[object_index].data else {
         return error_return(abi::errno::INVALID_ARGUMENT);
     };
     if endpoint.queue.len() >= abi::limits::MAX_ENDPOINT_MESSAGES {
         return error_return(abi::errno::TRY_AGAIN);
     }
+    if move_transfer && !registry.remove_entry(process_id, transfer_handle) {
+        return error_return(abi::errno::IO);
+    }
+    let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[object_index].data else {
+        return error_return(abi::errno::IO);
+    };
     endpoint.queue.push_back(EndpointMessage {
         sender_process_id: process_id,
         bytes,

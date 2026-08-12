@@ -255,10 +255,13 @@ process. Each transferred handle is checked for:
 - receiver handle-table capacity;
 - receiver job and resource-policy constraints.
 
-The initial native transfer operation should use **move semantics**. The sender loses the
-handle only after the complete message and every transferred handle have been committed
-to the peer queue. A failed send consumes nothing. A retained copy can be created
-explicitly with `handle_duplicate` before sending.
+ABI 1.21 adds **move semantics** for one rights-reduced handle on the existing endpoint queue. The
+sender loses the handle atomically when the complete message and transferred handle are committed;
+a failed send consumes nothing. A retained copy can be created explicitly with `handle_duplicate`
+before sending. The original ABI 1.2 copy-transfer call remains available for compatibility.
+
+Future channel pairs must extend the same all-or-nothing rule to multiple handles and account for
+receiver capacity at send time rather than deferring handle installation until receive.
 
 A later duplicate-transfer disposition is optional and would require both `TRANSFER`
 and `DUPLICATE`.

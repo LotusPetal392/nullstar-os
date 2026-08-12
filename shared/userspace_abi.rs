@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 20;
+pub const ABI_VERSION_MINOR: u64 = 21;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -88,6 +88,7 @@ pub mod syscall {
     pub const JOB_RETIRE: u64 = 66;
     pub const JOB_GET_PROCESS_LIMIT: u64 = 67;
     pub const CAPABILITY_REPLACE: u64 = 68;
+    pub const ENDPOINT_SEND_MOVE: u64 = 69;
 }
 
 pub mod filesystem_provider {

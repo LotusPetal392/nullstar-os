@@ -19,7 +19,8 @@ complete subtree. ABI 1.18 permits only an empty child leaf to retire: retiremen
 the object inert, detaches its parent edge, and allows reclamation after final handle closure. ABI
 1.19 lets `WAIT` authority inspect a job's local configured process ceiling without permitting
 relaxation. ABI 1.20 adds atomic rights-reduced capability replacement without requiring another
-free handle-table slot.
+free handle-table slot. ABI 1.21 adds opt-in atomic move-transfer of one rights-reduced capability
+through an endpoint message.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
@@ -88,6 +89,7 @@ Endpoint operations remain bounded:
 - receiving from an empty queue returns `TRY_AGAIN`;
 - a too-small receive buffer returns `RANGE` without consuming the message;
 - failed capability installation does not consume the message;
+- a failed move-send does not consume the source capability;
 - each message contains at most 256 bytes and at most one transferred capability;
 - each endpoint queue holds at most eight messages.
 
@@ -95,6 +97,11 @@ The kernel provides an endpoint-readiness wait used by service clients and proxi
 Userspace helpers may also yield and retry nonblocking operations. Protocols remain
 responsible for request IDs, deadlines or cancellation where defined, generation checks,
 and bounded reply validation.
+
+The original endpoint send copies a rights-reduced capability and retains the source. ABI 1.21's
+move-send instead removes the source atomically when the bounded message is committed to the queue.
+`TRANSFER` is required in both cases. Queue-full and validation failures leave bytes, queue state,
+and source ownership unchanged; receive-time table exhaustion leaves the committed message queued.
 
 ## Direct-child bootstrap
 
