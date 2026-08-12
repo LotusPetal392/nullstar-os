@@ -7,11 +7,13 @@ documents remain authoritative for behavior that exists today.
 ## IPC and kernel-object foundations
 
 The current system already has bounded process-local capability tables, rights-reduced
-copying, endpoints, counted notifications, copied shared memory, endpoint waiting, and
-direct-child bootstrap grants. The next architecture stages are:
+copying and atomic replacement, diagnostic object identity, endpoints, counted notifications,
+copied shared memory, endpoint waiting, and direct-child bootstrap grants. The next architecture
+stages are:
 
-1. formalize common kernel-object ownership, typed handles, immutable rights, object
-   signals, close, duplicate, replace, inspection, and diagnostic object identity;
+1. finish formalizing common kernel-object ownership, typed handles, immutable rights, object
+   signals, and inspection authorization around the implemented close, duplicate, atomic replace,
+   inspection, and diagnostic object identity operations;
 2. evolve the implemented process and immutable hierarchical-job containment into distinct thread
    and address-space abstractions plus broader hierarchy-scoped resource policy beyond the
    implemented process-count ceiling;

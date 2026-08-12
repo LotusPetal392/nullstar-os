@@ -97,7 +97,7 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.19. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.20. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground

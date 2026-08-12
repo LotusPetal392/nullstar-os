@@ -178,6 +178,19 @@ pub fn duplicate(handle: CapabilityHandle, rights: Rights) -> Result<CapabilityH
     decode(result)
 }
 
+pub fn replace(handle: CapabilityHandle, rights: Rights) -> Result<CapabilityHandle> {
+    let mut result = syscall::CAPABILITY_REPLACE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") handle,
+            in("rsi") rights.bits(),
+        );
+    }
+    decode(result)
+}
+
 pub fn grant_child(
     child_process_id: u64,
     source_handle: CapabilityHandle,
@@ -582,6 +595,7 @@ mod tests {
         assert_eq!(syscall::JOB_SET_PROCESS_LIMIT, 65);
         assert_eq!(syscall::JOB_RETIRE, 66);
         assert_eq!(syscall::JOB_GET_PROCESS_LIMIT, 67);
+        assert_eq!(syscall::CAPABILITY_REPLACE, 68);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,
