@@ -358,6 +358,9 @@ impl CapabilityRegistry {
             let CapabilityObjectData::Job(state) = &self.objects[index].data else {
                 return Err(abi::errno::INVALID_ARGUMENT);
             };
+            if state.is_retired() {
+                return Ok(false);
+            }
             let limit = state.process_limit();
             if self.job_subtree_active_members(job)? >= limit {
                 return Ok(false);
@@ -534,6 +537,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::JOB_TERMINATE
             | abi::syscall::JOB_CREATE_CHILD
             | abi::syscall::JOB_SET_PROCESS_LIMIT
+            | abi::syscall::JOB_RETIRE
     )
 }
 
@@ -629,6 +633,7 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         abi::syscall::JOB_SET_PROCESS_LIMIT => {
             job_set_process_limit(process_id, registers.rdi, registers.rsi)
         }
+        abi::syscall::JOB_RETIRE => job_retire(process_id, registers.rdi),
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
@@ -1144,6 +1149,7 @@ fn job_create_child(process_id: u64, parent_handle: u64) -> u64 {
         }
         Some(Err(kernel::job::ChildError::AlreadyChild)) => Some(abi::errno::PERMISSION),
         Some(Err(kernel::job::ChildError::Full)) => Some(abi::errno::NO_SPACE),
+        Some(Err(kernel::job::ChildError::Retired)) => Some(abi::errno::PERMISSION),
     };
     if let Some(error) = attach_error {
         registry.collect_garbage();
@@ -1187,7 +1193,67 @@ fn job_set_process_limit(process_id: u64, handle: u64, limit: u64) -> u64 {
         Ok(()) => limit as u64,
         Err(kernel::job::LimitError::OutOfRange) => error_return(abi::errno::RANGE),
         Err(kernel::job::LimitError::Relaxation) => error_return(abi::errno::PERMISSION),
+        Err(kernel::job::LimitError::Retired) => error_return(abi::errno::PERMISSION),
     }
+}
+
+fn job_retire(process_id: u64, handle: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_MANAGE) {
+        return error_return(error);
+    }
+    if entry.object.kind != abi::capability::KIND_JOB {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(child_index) = registry.object_index(entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Job(child_state) = &registry.objects[child_index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    let parent_id = match child_state.retirement_parent() {
+        Ok(parent) => parent,
+        Err(kernel::job::RetireError::Root) => {
+            return error_return(abi::errno::INVALID_ARGUMENT);
+        }
+        Err(kernel::job::RetireError::NotEmpty) => return error_return(abi::errno::TRY_AGAIN),
+        Err(kernel::job::RetireError::Retired) => return error_return(abi::errno::PERMISSION),
+    };
+    let parent = CapabilityObjectRef {
+        id: parent_id,
+        kind: abi::capability::KIND_JOB,
+    };
+    let Some(parent_index) = registry.object_index(parent) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Job(parent_state) = &registry.objects[parent_index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    if !parent_state.children().any(|child| child == entry.object.id) {
+        return error_return(abi::errno::IO);
+    }
+    let retired_parent = match &mut registry.objects[child_index].data {
+        CapabilityObjectData::Job(state) => match state.retire() {
+            Ok(parent) => parent,
+            Err(_) => return error_return(abi::errno::IO),
+        },
+        _ => return error_return(abi::errno::INVALID_ARGUMENT),
+    };
+    if retired_parent != parent_id {
+        return error_return(abi::errno::IO);
+    }
+    let removed = match &mut registry.objects[parent_index].data {
+        CapabilityObjectData::Job(state) => state.remove_child(entry.object.id).is_ok(),
+        _ => false,
+    };
+    if !removed {
+        return error_return(abi::errno::IO);
+    }
+    registry.collect_garbage();
+    0
 }
 
 fn job_assign(process_id: u64, handle: u64, child_process_id: u64) -> u64 {
@@ -1340,12 +1406,18 @@ fn job_terminate(process_id: u64, handle: u64) -> u64 {
 
 fn capability_job_add_member(job: CapabilityObjectRef, process_id: u64) -> Result<(), i64> {
     let mut registry = CAPABILITY_REGISTRY.lock();
-    if !registry.job_admits_process(job)? {
-        return Err(abi::errno::NO_SPACE);
-    }
     let Some(index) = registry.object_index(job) else {
         return Err(abi::errno::IO);
     };
+    let CapabilityObjectData::Job(state) = &registry.objects[index].data else {
+        return Err(abi::errno::INVALID_ARGUMENT);
+    };
+    if state.is_retired() {
+        return Err(abi::errno::PERMISSION);
+    }
+    if !registry.job_admits_process(job)? {
+        return Err(abi::errno::NO_SPACE);
+    }
     let CapabilityObjectData::Job(state) = &mut registry.objects[index].data else {
         return Err(abi::errno::INVALID_ARGUMENT);
     };
@@ -1353,6 +1425,7 @@ fn capability_job_add_member(job: CapabilityObjectRef, process_id: u64) -> Resul
         kernel::job::AssignError::InvalidProcess => abi::errno::INVALID_ARGUMENT,
         kernel::job::AssignError::AlreadyMember => abi::errno::PERMISSION,
         kernel::job::AssignError::Full => abi::errno::NO_SPACE,
+        kernel::job::AssignError::Retired => abi::errno::PERMISSION,
     })?;
     kernel_capability_root_add(job);
     Ok(())

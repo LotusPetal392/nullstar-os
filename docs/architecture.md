@@ -97,7 +97,7 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.17. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.18. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
@@ -112,7 +112,8 @@ validates a replacement image before committing it, and `fork` initially shares 
 pages before copying on write. Capability-backed jobs provide immutable child hierarchy,
 leaf-local descendant containment, deterministic subtree exit observation, and whole-subtree
 forced termination. Tightening-only process ceilings apply to a job's complete subtree and every
-ancestor during assignment and inherited process creation. PID 1
+ancestor during assignment and inherited process creation. A manager may permanently retire and
+detach an empty child leaf so bounded hierarchies can reclaim completed generations. PID 1
 uses fresh jobs for policy-pinned definition-backed service attempts and every logging,
 NullFS, tmpfs, and VFS generation before launch-barrier release, retains only `SIGNAL | WAIT`, and drains each
 generation to `ECHILD` before replacement. PID 1 still uses one flat job per service

@@ -18,6 +18,7 @@ pub enum AssignError {
     InvalidProcess,
     AlreadyMember,
     Full,
+    Retired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,12 +26,21 @@ pub enum ChildError {
     InvalidJob,
     AlreadyChild,
     Full,
+    Retired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LimitError {
     OutOfRange,
     Relaxation,
+    Retired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetireError {
+    Root,
+    NotEmpty,
+    Retired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +57,7 @@ pub struct State {
     process_limit: usize,
     child_capacity: usize,
     parent: Option<u64>,
+    retired: bool,
     members: Vec<u64>,
     completions: VecDeque<ExitRecord>,
     children: Vec<u64>,
@@ -59,6 +70,7 @@ impl State {
             process_limit: member_capacity,
             child_capacity,
             parent: None,
+            retired: false,
             members: Vec::new(),
             completions: VecDeque::new(),
             children: Vec::new(),
@@ -80,7 +92,32 @@ impl State {
         self.parent
     }
 
+    pub fn is_retired(&self) -> bool {
+        self.retired
+    }
+
+    pub fn retirement_parent(&self) -> Result<u64, RetireError> {
+        if self.retired {
+            return Err(RetireError::Retired);
+        }
+        let parent = self.parent.ok_or(RetireError::Root)?;
+        if !self.members.is_empty() || !self.completions.is_empty() || !self.children.is_empty() {
+            return Err(RetireError::NotEmpty);
+        }
+        Ok(parent)
+    }
+
+    pub fn retire(&mut self) -> Result<u64, RetireError> {
+        let parent = self.retirement_parent()?;
+        self.parent = None;
+        self.retired = true;
+        Ok(parent)
+    }
+
     pub fn set_process_limit(&mut self, limit: usize) -> Result<(), LimitError> {
+        if self.retired {
+            return Err(LimitError::Retired);
+        }
         if limit > self.member_capacity {
             return Err(LimitError::OutOfRange);
         }
@@ -96,6 +133,9 @@ impl State {
     }
 
     pub fn attach_child(&mut self, job_id: u64) -> Result<(), ChildError> {
+        if self.retired {
+            return Err(ChildError::Retired);
+        }
         if job_id == 0 {
             return Err(ChildError::InvalidJob);
         }
@@ -120,6 +160,9 @@ impl State {
     }
 
     pub fn assign(&mut self, process_id: u64) -> Result<(), AssignError> {
+        if self.retired {
+            return Err(AssignError::Retired);
+        }
         if process_id == 0 {
             return Err(AssignError::InvalidProcess);
         }
@@ -269,5 +312,35 @@ mod tests {
         assert_eq!(state.set_process_limit(3), Err(LimitError::Relaxation));
         assert_eq!(state.set_process_limit(0), Ok(()));
         assert_eq!(state.process_limit(), 0);
+    }
+
+    #[test]
+    fn only_an_empty_child_leaf_can_retire_and_retirement_is_permanent() {
+        let root = State::new(4, 2);
+        assert_eq!(root.retirement_parent(), Err(RetireError::Root));
+
+        let mut child = State::new(4, 2);
+        child.set_parent(70).unwrap();
+        child.attach_child(72).unwrap();
+        assert_eq!(child.retirement_parent(), Err(RetireError::NotEmpty));
+        child.remove_child(72).unwrap();
+        child.assign(11).unwrap();
+        assert_eq!(child.retirement_parent(), Err(RetireError::NotEmpty));
+        child
+            .complete(ExitRecord {
+                process_id: 11,
+                status: 0,
+            })
+            .unwrap();
+        assert_eq!(child.retirement_parent(), Err(RetireError::NotEmpty));
+        assert!(child.take_completion().is_some());
+
+        assert_eq!(child.retire(), Ok(70));
+        assert!(child.is_retired());
+        assert_eq!(child.parent(), None);
+        assert_eq!(child.retire(), Err(RetireError::Retired));
+        assert_eq!(child.assign(12), Err(AssignError::Retired));
+        assert_eq!(child.attach_child(73), Err(ChildError::Retired));
+        assert_eq!(child.set_process_limit(1), Err(LimitError::Retired));
     }
 }

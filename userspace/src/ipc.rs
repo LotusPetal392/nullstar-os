@@ -450,6 +450,18 @@ pub fn job_set_process_limit(handle: CapabilityHandle, limit: usize) -> Result<u
     decode(result).map(|limit| limit as usize)
 }
 
+pub fn job_retire(handle: CapabilityHandle) -> Result<()> {
+    let mut result = syscall::JOB_RETIRE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") handle,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
 pub fn job_assign(handle: CapabilityHandle, child_process_id: u64) -> Result<u64> {
     let mut result = syscall::JOB_ASSIGN;
     unsafe {
@@ -556,6 +568,7 @@ mod tests {
         assert_eq!(syscall::JOB_TERMINATE, 63);
         assert_eq!(syscall::JOB_CREATE_CHILD, 64);
         assert_eq!(syscall::JOB_SET_PROCESS_LIMIT, 65);
+        assert_eq!(syscall::JOB_RETIRE, 66);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,
