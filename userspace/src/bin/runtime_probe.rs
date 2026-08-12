@@ -549,7 +549,92 @@ fn hierarchical_job_probe(
         && waited_status.is_some_and(|status| status.signal() == Some(signal::KILL))
         && ipc::job_try_wait(parent_wait).err() == Some(ipc::Error::NO_CHILD);
 
-    close_hierarchy_handles(child_job, grandchild_job, terminated)
+    let process_limit_verified = terminated && job_process_limit_probe(parent, parent_wait);
+    close_hierarchy_handles(child_job, grandchild_job, process_limit_verified)
+}
+
+fn job_process_limit_probe(
+    parent: ipc::CapabilityHandle,
+    parent_wait: ipc::CapabilityHandle,
+) -> bool {
+    if ipc::job_set_process_limit(parent_wait, 1).err() != Some(ipc::Error::PERMISSION) {
+        return false;
+    }
+    let Ok(limited_job) = ipc::job_create_child(parent) else {
+        return false;
+    };
+    if ipc::job_set_process_limit(limited_job, 1).ok() != Some(1) {
+        let _ = ipc::close(limited_job);
+        return false;
+    }
+    let Ok(leaf_job) = ipc::job_create_child(limited_job) else {
+        let _ = ipc::close(limited_job);
+        return false;
+    };
+    if ipc::job_set_process_limit(leaf_job, 2).err() != Some(ipc::Error::PERMISSION) {
+        return close_hierarchy_handles(limited_job, leaf_job, false);
+    }
+
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return close_hierarchy_handles(limited_job, leaf_job, false);
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return close_hierarchy_handles(limited_job, leaf_job, false);
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.writer);
+        let mut byte = [0_u8; 1];
+        if syscall::read(barrier.reader, &mut byte).ok() != Some(0)
+            || syscall::close(barrier.reader).is_err()
+        {
+            syscall::exit(128);
+        }
+        match syscall::fork() {
+            Err(error) if error == syscall::Errno::NO_SPACE => syscall::exit(46),
+            Ok(0) => syscall::exit(129),
+            Ok(descendant) => {
+                let _ = platform::kill(descendant, signal::KILL);
+                let _ = syscall::wait_child(descendant);
+                syscall::exit(130);
+            }
+            Err(_) => syscall::exit(131),
+        }
+    }
+
+    let reader_closed = syscall::close(barrier.reader).is_ok();
+    let assigned = ipc::job_assign(leaf_job, child).ok() == Some(child);
+    let tightened_below_usage = ipc::job_set_process_limit(limited_job, 0).ok() == Some(0);
+    let relaxation_denied =
+        ipc::job_set_process_limit(limited_job, 1).err() == Some(ipc::Error::PERMISSION);
+    let subtree_visible = [parent, limited_job, leaf_job]
+        .iter()
+        .all(|job| ipc::info(*job).is_ok_and(|info| info.size == 1));
+    let barrier_released = syscall::close(barrier.writer).is_ok();
+    if !reader_closed
+        || !assigned
+        || !tightened_below_usage
+        || !relaxation_denied
+        || !subtree_visible
+        || !barrier_released
+    {
+        let _ = ipc::job_terminate(parent);
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+        return close_hierarchy_handles(limited_job, leaf_job, false);
+    }
+
+    let exit = bounded_job_wait(parent_wait);
+    let waited_status = syscall::wait_child(child).ok();
+    let denied = exit.is_some_and(|exit| exit.process_id == child && exit.status.raw() == 46)
+        && waited_status.is_some_and(|status| status.raw() == 46)
+        && ipc::job_try_wait(parent_wait).err() == Some(ipc::Error::NO_CHILD)
+        && [parent, limited_job, leaf_job]
+            .iter()
+            .all(|job| ipc::info(*job).is_ok_and(|info| info.size == 0));
+
+    close_hierarchy_handles(limited_job, leaf_job, denied)
 }
 
 fn close_hierarchy_handles(

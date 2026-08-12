@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 16;
+pub const ABI_VERSION_MINOR: u64 = 17;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -84,6 +84,7 @@ pub mod syscall {
     pub const JOB_TRY_WAIT: u64 = 62;
     pub const JOB_TERMINATE: u64 = 63;
     pub const JOB_CREATE_CHILD: u64 = 64;
+    pub const JOB_SET_PROCESS_LIMIT: u64 = 65;
 }
 
 pub mod filesystem_provider {
@@ -450,6 +451,7 @@ pub mod limits {
     pub const MAX_NOTIFICATION_OBJECTS: usize = 32;
     pub const MAX_SHARED_MEMORY_OBJECTS: usize = 16;
     pub const MAX_JOB_OBJECTS: usize = 32;
+    pub const MAX_JOB_PROCESSES: usize = 64;
     pub const MAX_ENDPOINT_MESSAGES: usize = 8;
     pub const MAX_IPC_MESSAGE_BYTES: usize = 256;
     pub const MAX_SHARED_MEMORY_BYTES: usize = 16 * 1024;

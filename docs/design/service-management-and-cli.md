@@ -448,7 +448,7 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    current supervisor. **Foundation delivered:** ABI 1.15 supplies capability-backed flat jobs,
    inherited descendant containment, independent FIFO exit records, and bounded termination; the
    ABI 1.16 child-creation extension adds immutable hierarchy plus recursive subtree observation and
-   termination. The
+   termination; ABI 1.17 adds tightening-only hierarchy-scoped process ceilings. The
    allocation-free `NSVC` v1 codec and PID 1 registry supply service observation. Policy-pinned
    definition-backed service attempts and every logging, NullFS, tmpfs, and VFS generation now receive
    fresh jobs before barrier release; PID 1 retains only `SIGNAL | WAIT` and drains each complete generation to

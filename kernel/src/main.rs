@@ -829,7 +829,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     let userspace_rust_runtime_verified = runtime_probe_result.exit_code() == Some(0)
         && runtime_probe_result.path == "/runtime-probe"
-        && runtime_probe_result.syscall_count == 34
+        && runtime_probe_result.syscall_count == 41
         && runtime_probe_result.write_count == 1
         && runtime_probe_result.bytes_written == USERSPACE_RUNTIME_PROBE_BYTES;
     if !userspace_rust_runtime_verified {

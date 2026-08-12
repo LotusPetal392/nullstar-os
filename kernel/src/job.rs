@@ -1,8 +1,8 @@
 //! Bounded process membership, child hierarchy, and exit observation for one job object.
 //!
 //! The live capability registry owns these states. Keeping the state machine independent
-//! makes its containment and lossless-completion rules host-testable before resource limits
-//! or asynchronous wait sets are added.
+//! makes its containment, resource-policy, and lossless-completion rules host-testable before
+//! asynchronous wait sets are added.
 
 use alloc::{collections::VecDeque, vec::Vec};
 
@@ -28,6 +28,12 @@ pub enum ChildError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LimitError {
+    OutOfRange,
+    Relaxation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnknownMember;
 
 /// Fixed-policy state behind one job capability object.
@@ -38,6 +44,7 @@ pub struct UnknownMember;
 #[derive(Debug)]
 pub struct State {
     member_capacity: usize,
+    process_limit: usize,
     child_capacity: usize,
     parent: Option<u64>,
     members: Vec<u64>,
@@ -49,6 +56,7 @@ impl State {
     pub fn new(member_capacity: usize, child_capacity: usize) -> Self {
         Self {
             member_capacity,
+            process_limit: member_capacity,
             child_capacity,
             parent: None,
             members: Vec::new(),
@@ -70,6 +78,21 @@ impl State {
 
     pub fn parent(&self) -> Option<u64> {
         self.parent
+    }
+
+    pub fn set_process_limit(&mut self, limit: usize) -> Result<(), LimitError> {
+        if limit > self.member_capacity {
+            return Err(LimitError::OutOfRange);
+        }
+        if limit > self.process_limit {
+            return Err(LimitError::Relaxation);
+        }
+        self.process_limit = limit;
+        Ok(())
+    }
+
+    pub fn process_limit(&self) -> usize {
+        self.process_limit
     }
 
     pub fn attach_child(&mut self, job_id: u64) -> Result<(), ChildError> {
@@ -232,5 +255,19 @@ mod tests {
         assert_eq!(state.remove_child(71), Err(UnknownMember));
         assert_eq!(state.attach_child(73), Ok(()));
         assert_eq!(state.children().collect::<Vec<_>>(), vec![72, 73]);
+    }
+
+    #[test]
+    fn process_limit_can_only_tighten_within_the_membership_bound() {
+        let mut state = State::new(4, 2);
+
+        assert_eq!(state.process_limit(), 4);
+        assert_eq!(state.set_process_limit(5), Err(LimitError::OutOfRange));
+        assert_eq!(state.set_process_limit(2), Ok(()));
+        assert_eq!(state.process_limit(), 2);
+        assert_eq!(state.set_process_limit(2), Ok(()));
+        assert_eq!(state.set_process_limit(3), Err(LimitError::Relaxation));
+        assert_eq!(state.set_process_limit(0), Ok(()));
+        assert_eq!(state.process_limit(), 0);
     }
 }
