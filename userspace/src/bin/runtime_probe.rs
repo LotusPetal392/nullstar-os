@@ -2,7 +2,7 @@
 #![no_main]
 
 use userspace::{
-    abi::{capability, file, signal},
+    abi::{capability, file, limits, signal},
     args::Args,
     heap::BumpHeap,
     ipc::{self, ObjectKind, Rights, Transfer},
@@ -415,7 +415,10 @@ fn hierarchical_job_probe(
     parent: ipc::CapabilityHandle,
     parent_wait: ipc::CapabilityHandle,
 ) -> bool {
-    if ipc::job_create_child(parent_wait).err() != Some(ipc::Error::PERMISSION) {
+    if ipc::job_retire(parent).err() != Some(ipc::Error::INVALID_ARGUMENT)
+        || ipc::job_retire(parent_wait).err() != Some(ipc::Error::PERMISSION)
+        || ipc::job_create_child(parent_wait).err() != Some(ipc::Error::PERMISSION)
+    {
         return false;
     }
     let Ok(child_job) = ipc::job_create_child(parent) else {
@@ -425,6 +428,9 @@ fn hierarchical_job_probe(
         let _ = ipc::close(child_job);
         return false;
     };
+    if ipc::job_retire(child_job).err() != Some(ipc::Error::TRY_AGAIN) {
+        return close_hierarchy_handles(child_job, grandchild_job, false);
+    }
     let hierarchy_shape = ipc::info(child_job).is_ok_and(|child| {
         ipc::info(grandchild_job).is_ok_and(|grandchild| {
             child.kind == ObjectKind::Job
@@ -550,7 +556,8 @@ fn hierarchical_job_probe(
         && ipc::job_try_wait(parent_wait).err() == Some(ipc::Error::NO_CHILD);
 
     let process_limit_verified = terminated && job_process_limit_probe(parent, parent_wait);
-    close_hierarchy_handles(child_job, grandchild_job, process_limit_verified)
+    let retired = retire_and_close_hierarchy(child_job, grandchild_job, process_limit_verified);
+    retired && job_reclamation_probe(parent)
 }
 
 fn job_process_limit_probe(
@@ -571,7 +578,9 @@ fn job_process_limit_probe(
         let _ = ipc::close(limited_job);
         return false;
     };
-    if ipc::job_set_process_limit(leaf_job, 2).err() != Some(ipc::Error::PERMISSION) {
+    if ipc::job_retire(limited_job).err() != Some(ipc::Error::TRY_AGAIN)
+        || ipc::job_set_process_limit(leaf_job, 2).err() != Some(ipc::Error::PERMISSION)
+    {
         return close_hierarchy_handles(limited_job, leaf_job, false);
     }
 
@@ -634,7 +643,35 @@ fn job_process_limit_probe(
             .iter()
             .all(|job| ipc::info(*job).is_ok_and(|info| info.size == 0));
 
-    close_hierarchy_handles(limited_job, leaf_job, denied)
+    retire_and_close_hierarchy(limited_job, leaf_job, denied)
+}
+
+fn retire_and_close_hierarchy(
+    parent: ipc::CapabilityHandle,
+    child: ipc::CapabilityHandle,
+    result: bool,
+) -> bool {
+    if !result || ipc::job_retire(child).is_err() {
+        return close_hierarchy_handles(parent, child, false);
+    }
+    let child_is_inert = ipc::job_retire(child).err() == Some(ipc::Error::PERMISSION)
+        && ipc::job_create_child(child).err() == Some(ipc::Error::PERMISSION)
+        && ipc::job_set_process_limit(child, 0).err() == Some(ipc::Error::PERMISSION)
+        && ipc::job_try_wait(child).err() == Some(ipc::Error::NO_CHILD);
+    let parent_retired = child_is_inert && ipc::job_retire(parent).is_ok();
+    close_hierarchy_handles(parent, child, parent_retired)
+}
+
+fn job_reclamation_probe(parent: ipc::CapabilityHandle) -> bool {
+    for _ in 0..=limits::MAX_JOB_OBJECTS {
+        let Ok(child) = ipc::job_create_child(parent) else {
+            return false;
+        };
+        if ipc::job_retire(child).is_err() || ipc::close(child).is_err() {
+            return false;
+        }
+    }
+    ipc::info(parent).is_ok_and(|info| info.size == 0)
 }
 
 fn close_hierarchy_handles(

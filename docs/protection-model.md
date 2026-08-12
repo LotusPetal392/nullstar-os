@@ -15,7 +15,8 @@ inheritance, independent process-exit records, and bounded whole-job termination
 immutable child-job creation plus subtree inspection, exit drainage, and termination while reverse
 parent reachability prevents hierarchy relaxation through handle closure. ABI 1.17 adds a
 tightening-only live-process ceiling inherited by child jobs and enforced against every ancestor's
-complete subtree.
+complete subtree. ABI 1.18 permits only an empty child leaf to retire: retirement permanently makes
+the object inert, detaches its parent edge, and allows reclamation after final handle closure.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:

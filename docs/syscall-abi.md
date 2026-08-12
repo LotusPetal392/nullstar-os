@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.17, and a
+The ABI is experimental, but callers can query the current version, 1.18, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -405,9 +405,9 @@ exit exactly once across handles to that job or its ancestors. It returns `EAGAI
 member remains without a completion and `ECHILD` only when the entire subtree has no live members or
 pending completions. Termination snapshots and signals all current subtree members.
 
-This slice does not add hierarchy enumeration or removal, per-job resource budgets, suspension,
-kill-on-close, or blocking/multi-object wait. Empty child jobs remain attached and reusable until the
-connected hierarchy becomes unreachable.
+This slice does not add hierarchy enumeration, reparenting, per-job resource budgets, suspension,
+kill-on-close, or blocking/multi-object wait. ABI 1.18 adds the narrowly scoped permanent leaf
+retirement operation described below.
 
 ## Version 1.17 job process limits
 
@@ -428,6 +428,28 @@ Tightening below current usage is valid and does not terminate existing processe
 admission until usage falls below every applicable ceiling; setting zero therefore freezes process
 creation in the subtree without being a termination operation. This slice does not add a limit query,
 CPU or memory accounting, reservations, or policy relaxation.
+
+## Version 1.18 child-job retirement
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 66 | `JOB_RETIRE` | child-job handle | zero |
+
+`JOB_RETIRE` requires `MANAGE` on the target job. The target must have a parent, no child jobs, no
+live processes, and no pending completion records. A root returns `EINVAL`; a nonempty or nonleaf
+job returns `EAGAIN`. On success, the kernel atomically marks the target retired and detaches its
+single parent edge.
+
+Retirement is permanent and is not reparenting. A retired handle remains a valid job handle for
+inspection, waiting, and closure, but assignment, child creation, process-limit changes, and repeated
+retirement return `EPERM`. Inspection reports size zero, waiting reports `ECHILD`, and termination
+returns zero. With no parent edge, the retired object becomes collectible after its final handle or
+transferred reference closes. This allows a long-lived hierarchy owner to rotate more child
+generations than the global simultaneous-job bound while preserving non-relaxable policy.
+
+This slice does not recursively retire a subtree, implicitly consume completion records, or retire a
+job on last-handle close. Managers must explicitly drain children before retiring them from leaves
+upward.
 
 ## Compatibility rules
 
@@ -456,6 +478,7 @@ CPU or memory accounting, reservations, or policy relaxation.
 - ABI 1.16 adds immutable child-job creation and subtree inspection, exit drainage, and
   termination at syscall 64.
 - ABI 1.17 adds a tightening-only hierarchy-scoped process ceiling at syscall 65.
+- ABI 1.18 adds permanent retirement and reclamation for empty child-job leaves at syscall 66.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are
