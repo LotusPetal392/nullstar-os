@@ -34,7 +34,8 @@ drains all generation exits to `ECHILD` before closing endpoints or starting a r
 ABI also supports immutable child jobs with recursive subtree inspection, drainage, and termination;
 ABI 1.17 adds tightening-only process ceilings enforced across every ancestor subtree. Service
 generations remain flat roots until a separate manager introduces policy subtrees. ABI 1.18 lets
-that future long-lived manager retire a drained generation leaf without relaxing or reparenting it. The
+that future long-lived manager retire a drained generation leaf without relaxing or reparenting it;
+ABI 1.19 lets observation authority report each job's configured local process ceiling. The
 logging-lifecycle QEMU gate injects tmpfs/VFS descendants that escape their leaders' process groups
 and requires descendant termination, whole-job drainage to `ECHILD`, and generation replacement.
 The NullFS restart, crash-recovery, and block-device-loss gates inject the same escaped descendant;

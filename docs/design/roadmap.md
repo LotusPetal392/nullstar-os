@@ -37,7 +37,8 @@ The detailed contract is in
    containment, inherited descendants, independent FIFO process-exit observation, and
    bounded whole-job termination. ABI 1.16 also adds immutable child-job creation with recursive
    inspection, drainage, and termination; ABI 1.17 adds a tightening-only subtree process ceiling.
-   ABI 1.18 adds permanent empty-leaf retirement and bounded reclamation. PID 1 assigns
+   ABI 1.18 adds permanent empty-leaf retirement and bounded reclamation; ABI 1.19 makes the local
+   process ceiling observable through read-only job authority. PID 1 assigns
    policy-pinned definition-backed
    service attempts and every logging, NullFS, tmpfs, and VFS generation to fresh jobs before
    launch-barrier release, retains only `SIGNAL | WAIT`, and drains each complete generation to `ECHILD` before
@@ -82,7 +83,8 @@ no failure budget. Filesystem `Start` and `Stop` stay exactly `Unsupported`; `NS
 filesystem version 1 `Request`/`Reply` operations are unchanged. ABI 1.15 supplies flat jobs,
 non-relaxable descendant inheritance, independent exit records, and whole-job termination; ABI 1.16
 adds immutable child creation with recursive inspection, drainage, and termination; ABI 1.17 adds
-hierarchy-scoped process ceilings; ABI 1.18 adds safe drained-leaf retirement. PID 1 now
+hierarchy-scoped process ceilings; ABI 1.18 adds safe drained-leaf retirement; ABI 1.19 adds
+read-only process-ceiling inspection. PID 1 now
 assigns each policy-pinned definition-backed service attempt and every logging, NullFS, tmpfs, and VFS
 generation before barrier release, retains only `SIGNAL | WAIT`, and drains the old job to `ECHILD`
 before replacement.

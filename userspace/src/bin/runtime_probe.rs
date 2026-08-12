@@ -290,6 +290,8 @@ fn job_probe() -> bool {
     if info.kind != ObjectKind::Job
         || info.rights != Rights::JOB
         || info.size != 0
+        || ipc::job_get_process_limit(job).ok() != Some(limits::MAX_JOB_PROCESSES)
+        || ipc::job_get_process_limit(wait_only).ok() != Some(limits::MAX_JOB_PROCESSES)
         || ipc::job_try_wait(wait_only).err() != Some(ipc::Error::NO_CHILD)
     {
         let _ = ipc::close(wait_only);
@@ -415,9 +417,16 @@ fn hierarchical_job_probe(
     parent: ipc::CapabilityHandle,
     parent_wait: ipc::CapabilityHandle,
 ) -> bool {
+    let Ok(manage_only) = ipc::duplicate(parent, Rights::MANAGE) else {
+        return false;
+    };
+    let query_rights_verified = ipc::job_get_process_limit(manage_only).err()
+        == Some(ipc::Error::PERMISSION)
+        && ipc::close(manage_only).is_ok();
     if ipc::job_retire(parent).err() != Some(ipc::Error::INVALID_ARGUMENT)
         || ipc::job_retire(parent_wait).err() != Some(ipc::Error::PERMISSION)
         || ipc::job_create_child(parent_wait).err() != Some(ipc::Error::PERMISSION)
+        || !query_rights_verified
     {
         return false;
     }
@@ -578,7 +587,9 @@ fn job_process_limit_probe(
         let _ = ipc::close(limited_job);
         return false;
     };
-    if ipc::job_retire(limited_job).err() != Some(ipc::Error::TRY_AGAIN)
+    if ipc::job_get_process_limit(limited_job).ok() != Some(1)
+        || ipc::job_get_process_limit(leaf_job).ok() != Some(1)
+        || ipc::job_retire(limited_job).err() != Some(ipc::Error::TRY_AGAIN)
         || ipc::job_set_process_limit(leaf_job, 2).err() != Some(ipc::Error::PERMISSION)
     {
         return close_hierarchy_handles(limited_job, leaf_job, false);
@@ -643,7 +654,10 @@ fn job_process_limit_probe(
             .iter()
             .all(|job| ipc::info(*job).is_ok_and(|info| info.size == 0));
 
-    retire_and_close_hierarchy(limited_job, leaf_job, denied)
+    let limits_visible = ipc::job_get_process_limit(limited_job).ok() == Some(0)
+        && ipc::job_get_process_limit(leaf_job).ok() == Some(1);
+
+    retire_and_close_hierarchy(limited_job, leaf_job, denied && limits_visible)
 }
 
 fn retire_and_close_hierarchy(
@@ -657,6 +671,7 @@ fn retire_and_close_hierarchy(
     let child_is_inert = ipc::job_retire(child).err() == Some(ipc::Error::PERMISSION)
         && ipc::job_create_child(child).err() == Some(ipc::Error::PERMISSION)
         && ipc::job_set_process_limit(child, 0).err() == Some(ipc::Error::PERMISSION)
+        && ipc::job_get_process_limit(child).is_ok()
         && ipc::job_try_wait(child).err() == Some(ipc::Error::NO_CHILD);
     let parent_retired = child_is_inert && ipc::job_retire(parent).is_ok();
     close_hierarchy_handles(parent, child, parent_retired)

@@ -538,6 +538,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::JOB_CREATE_CHILD
             | abi::syscall::JOB_SET_PROCESS_LIMIT
             | abi::syscall::JOB_RETIRE
+            | abi::syscall::JOB_GET_PROCESS_LIMIT
     )
 }
 
@@ -634,6 +635,7 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
             job_set_process_limit(process_id, registers.rdi, registers.rsi)
         }
         abi::syscall::JOB_RETIRE => job_retire(process_id, registers.rdi),
+        abi::syscall::JOB_GET_PROCESS_LIMIT => job_get_process_limit(process_id, registers.rdi),
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
@@ -1195,6 +1197,26 @@ fn job_set_process_limit(process_id: u64, handle: u64, limit: u64) -> u64 {
         Err(kernel::job::LimitError::Relaxation) => error_return(abi::errno::PERMISSION),
         Err(kernel::job::LimitError::Retired) => error_return(abi::errno::PERMISSION),
     }
+}
+
+fn job_get_process_limit(process_id: u64, handle: u64) -> u64 {
+    let registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
+        return error_return(error);
+    }
+    if entry.object.kind != abi::capability::KIND_JOB {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(index) = registry.object_index(entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Job(state) = &registry.objects[index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    state.process_limit() as u64
 }
 
 fn job_retire(process_id: u64, handle: u64) -> u64 {
