@@ -285,6 +285,69 @@ fn capability_probe(current_process: u64) -> bool {
         && ipc::close(notification).is_ok()
         && ipc::close(send_only).is_ok()
         && ipc::close(endpoint).is_ok()
+        && endpoint_move_transfer_probe(current_process)
+}
+
+fn endpoint_move_transfer_probe(current_process: u64) -> bool {
+    const MOVED_MESSAGE: &[u8] = b"move-capability";
+
+    let Ok(endpoint) = ipc::endpoint_create() else {
+        return false;
+    };
+    let Ok(notification) = ipc::notification_create() else {
+        return false;
+    };
+    let Ok(source_info) = ipc::info(notification) else {
+        return false;
+    };
+    for _ in 0..limits::MAX_ENDPOINT_MESSAGES {
+        if ipc::send(endpoint, &[], None).is_err() {
+            return false;
+        }
+    }
+    let transfer = Transfer {
+        handle: notification,
+        rights: Rights::NOTIFICATION,
+    };
+    if ipc::send_move(endpoint, MOVED_MESSAGE, transfer).err() != Some(ipc::Error::TRY_AGAIN)
+        || !ipc::info(notification).is_ok_and(|info| info == source_info)
+    {
+        return false;
+    }
+
+    let mut buffer = [0_u8; MOVED_MESSAGE.len()];
+    for _ in 0..limits::MAX_ENDPOINT_MESSAGES {
+        let Ok(message) = ipc::try_receive(endpoint, &mut buffer) else {
+            return false;
+        };
+        if message.bytes != 0 || message.capability.is_some() {
+            return false;
+        }
+    }
+    if ipc::send_move(endpoint, MOVED_MESSAGE, transfer).is_err()
+        || ipc::info(notification).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR)
+    {
+        return false;
+    }
+    let Ok(message) = ipc::try_receive(endpoint, &mut buffer) else {
+        return false;
+    };
+    let Some(received) = message.capability else {
+        return false;
+    };
+    let moved = message.sender_process_id == current_process
+        && message.bytes == MOVED_MESSAGE.len()
+        && buffer.as_slice() == MOVED_MESSAGE
+        && received.rights == Rights::NOTIFICATION
+        && ipc::info(received.handle).is_ok_and(|info| {
+            info.object_id == source_info.object_id
+                && info.kind == ObjectKind::Notification
+                && info.rights == Rights::NOTIFICATION
+        })
+        && ipc::notification_signal(received.handle, 1).ok() == Some(1)
+        && ipc::notification_try_wait(received.handle).ok() == Some(0);
+
+    ipc::close(received.handle).is_ok() && ipc::close(endpoint).is_ok() && moved
 }
 
 fn job_probe() -> bool {

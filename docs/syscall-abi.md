@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.20, and a
+The ABI is experimental, but callers can query the current version, 1.21, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -483,6 +483,25 @@ Validation completes before the source is changed. An invalid handle returns `EB
 the source remains valid and unchanged. Handle values are opaque: callers must use the returned
 replacement even when it has the same numeric value as the source.
 
+## Version 1.21 atomic endpoint move-transfer
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 69 | `ENDPOINT_SEND_MOVE` | endpoint, byte address, byte count, transfer handle, transfer rights | zero |
+
+`ENDPOINT_SEND_MOVE` sends one bounded message carrying exactly one rights-reduced capability. The
+endpoint requires `SEND`; the source requires `TRANSFER`; and the requested rights must be a
+nonempty valid subset of the source. Unlike ABI 1.2 `ENDPOINT_SEND`, success consumes the source
+handle atomically when the message and transferred object reference are committed to the endpoint
+queue.
+
+All validation and queue-capacity checks precede source removal. `EBADF`, `EPERM`, `EINVAL`,
+`EFAULT`, `ERANGE`, or queue-full `EAGAIN` therefore leaves the source handle, message queue, and
+object lifetime unchanged. Once committed, receive follows the existing atomic rules: insufficient
+buffer or handle-table capacity does not dequeue the message. This slice moves exactly one handle;
+it does not add channel pairs, peer closure, multi-handle transfer, or sender-side receiver-capacity
+reservation.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -513,6 +532,7 @@ replacement even when it has the same numeric value as the source.
 - ABI 1.18 adds permanent retirement and reclamation for empty child-job leaves at syscall 66.
 - ABI 1.19 adds read-only inspection of a job's configured local process ceiling at syscall 67.
 - ABI 1.20 adds atomic rights-reduced capability replacement at syscall 68.
+- ABI 1.21 adds atomic one-handle endpoint move-transfer at syscall 69.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are
