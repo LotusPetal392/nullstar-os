@@ -8,12 +8,13 @@ documents remain authoritative for behavior that exists today.
 
 The current system already has bounded process-local capability tables, rights-reduced
 copying and atomic replacement, diagnostic object identity, endpoints, counted notifications,
-atomic one-handle move-transfer, copied shared memory, endpoint waiting, and direct-child bootstrap
-grants. The next architecture stages are:
+atomic one-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
+job signal snapshots, endpoint waiting, and direct-child bootstrap grants. The next architecture
+stages are:
 
-1. finish formalizing common kernel-object ownership, typed handles, immutable rights, object
-   signals, and inspection authorization around the implemented close, duplicate, atomic replace,
-   inspection, and diagnostic object identity operations;
+1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
+   inspection authorization around the implemented close, duplicate, atomic replace, inspection,
+   diagnostic object identity, and signal-state operations;
 2. evolve the implemented process and immutable hierarchical-job containment into distinct thread
    and address-space abstractions plus broader hierarchy-scoped resource policy beyond the
    implemented process-count ceiling;

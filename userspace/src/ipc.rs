@@ -10,7 +10,9 @@ use core::{
     ops::{BitOr, BitOrAssign},
 };
 
-use crate::abi::{capability as abi_capability, errno as abi_errno, syscall};
+use crate::abi::{
+    capability as abi_capability, errno as abi_errno, object_signal as abi_object_signal, syscall,
+};
 
 mod phase1_protection_abi {
     include!(concat!(
@@ -107,6 +109,43 @@ impl BitOr for Rights {
 impl BitOrAssign for Rights {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Signals(u64);
+
+impl Signals {
+    pub const EMPTY: Self = Self(0);
+    pub const READABLE: Self = Self(abi_object_signal::READABLE);
+    pub const WRITABLE: Self = Self(abi_object_signal::WRITABLE);
+    pub const PEER_CLOSED: Self = Self(abi_object_signal::PEER_CLOSED);
+    pub const SIGNALED: Self = Self(abi_object_signal::SIGNALED);
+    pub const TERMINATED: Self = Self(abi_object_signal::TERMINATED);
+    pub const TIMER_FIRED: Self = Self(abi_object_signal::TIMER_FIRED);
+
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        if bits & !abi_object_signal::ALL == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl BitOr for Signals {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
     }
 }
 
@@ -244,6 +283,19 @@ pub fn info(handle: CapabilityHandle) -> Result<CapabilityInfo> {
         rights,
         size: raw.size,
     })
+}
+
+pub fn signal_state(handle: CapabilityHandle) -> Result<Signals> {
+    let mut result = syscall::CAPABILITY_SIGNAL_STATE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") handle,
+        );
+    }
+    let signals = decode(result)?;
+    Signals::from_bits(signals).ok_or(Error::IO)
 }
 
 pub fn wait_for_handle(handle: CapabilityHandle) -> Result<CapabilityInfo> {
@@ -566,7 +618,7 @@ pub fn job_terminate(handle: CapabilityHandle) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectKind, Rights, phase1_protection_abi};
+    use super::{ObjectKind, Rights, Signals, phase1_protection_abi};
     use crate::abi::{capability, syscall};
 
     #[test]
@@ -580,6 +632,16 @@ mod tests {
         let rights = Rights::SEND | Rights::TRANSFER;
         assert!(rights.contains(Rights::SEND));
         assert!(!rights.contains(Rights::RECEIVE));
+    }
+
+    #[test]
+    fn object_signal_masks_reject_unknown_bits() {
+        let state = Signals::READABLE | Signals::WRITABLE;
+
+        assert!(state.contains(Signals::READABLE));
+        assert!(!state.contains(Signals::PEER_CLOSED));
+        assert_eq!(Signals::from_bits(state.bits()), Some(state));
+        assert_eq!(Signals::from_bits(1 << 63), None);
     }
 
     #[test]
@@ -613,6 +675,7 @@ mod tests {
         assert_eq!(syscall::JOB_GET_PROCESS_LIMIT, 67);
         assert_eq!(syscall::CAPABILITY_REPLACE, 68);
         assert_eq!(syscall::ENDPOINT_SEND_MOVE, 69);
+        assert_eq!(syscall::CAPABILITY_SIGNAL_STATE, 70);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

@@ -35,7 +35,8 @@ experimentation, not production use or untrusted workloads.
 - bounded per-process capability tables with rights-reduced duplication,
   atomic rights replacement, and delegation, message endpoints, counted
   notifications, atomic one-handle endpoint move-transfer, shared byte-memory
-  objects, explicit direct-child bootstrap grants, and immutable hierarchical
+  objects, level-triggered endpoint, notification, and job signal snapshots,
+  explicit direct-child bootstrap grants, and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and
   inspectable process ceilings, and explicit drained-leaf retirement

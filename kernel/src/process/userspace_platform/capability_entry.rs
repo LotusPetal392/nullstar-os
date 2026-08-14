@@ -519,6 +519,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::CAPABILITY_CLOSE
             | abi::syscall::CAPABILITY_INFO
             | abi::syscall::CAPABILITY_REPLACE
+            | abi::syscall::CAPABILITY_SIGNAL_STATE
             | abi::syscall::ENDPOINT_CREATE
             | abi::syscall::ENDPOINT_SEND
             | abi::syscall::ENDPOINT_SEND_MOVE
@@ -575,6 +576,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         }
         abi::syscall::CAPABILITY_REPLACE => {
             capability_replace(process_id, registers.rdi, registers.rsi)
+        }
+        abi::syscall::CAPABILITY_SIGNAL_STATE => {
+            capability_signal_state(process_id, registers.rdi)
         }
         abi::syscall::ENDPOINT_CREATE => endpoint_create(process_id),
         abi::syscall::ENDPOINT_SEND => endpoint_send(
@@ -750,6 +754,69 @@ fn capability_info(process_id: u64, handle: u64, address: u64, length: u64) -> u
         }
     };
     platform_write_value(process_id, address, length, info)
+}
+
+fn capability_signal_state(process_id: u64, handle: u64) -> u64 {
+    let registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
+        return error_return(error);
+    }
+    let Some(index) = registry.object_index(entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+
+    match &registry.objects[index].data {
+        CapabilityObjectData::Endpoint(endpoint) => {
+            let mut signals = kernel::object::Signals::NONE;
+            if !endpoint.queue.is_empty() {
+                signals = signals.union(kernel::object::Signals::READABLE);
+            }
+            if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES {
+                signals = signals.union(kernel::object::Signals::WRITABLE);
+            }
+            signals.bits()
+        }
+        CapabilityObjectData::Notification(notification) => {
+            if notification.pending == 0 {
+                kernel::object::Signals::NONE.bits()
+            } else {
+                kernel::object::Signals::SIGNALED.bits()
+            }
+        }
+        CapabilityObjectData::Job(_) => {
+            let jobs = match registry.job_subtree(entry.object) {
+                Ok(jobs) => jobs,
+                Err(error) => return error_return(error),
+            };
+            let mut active_members = 0usize;
+            let mut has_completion = false;
+            for job in jobs {
+                let Some(index) = registry.object_index(job) else {
+                    return error_return(abi::errno::IO);
+                };
+                let CapabilityObjectData::Job(state) = &registry.objects[index].data else {
+                    return error_return(abi::errno::INVALID_ARGUMENT);
+                };
+                active_members = active_members.saturating_add(state.active_members());
+                has_completion |= state.pending_completions() != 0;
+            }
+            let mut signals = kernel::object::Signals::NONE;
+            if has_completion {
+                signals = signals.union(kernel::object::Signals::READABLE);
+            }
+            if active_members == 0 {
+                signals = signals.union(kernel::object::Signals::TERMINATED);
+            }
+            signals.bits()
+        }
+        CapabilityObjectData::SharedMemory(_)
+        | CapabilityObjectData::KernelEarlyLogReader(_) => {
+            error_return(abi::errno::INVALID_ARGUMENT)
+        }
+    }
 }
 
 fn endpoint_create(process_id: u64) -> u64 {
