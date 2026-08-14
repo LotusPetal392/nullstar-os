@@ -113,7 +113,10 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
         return blocking_endpoint_wait(current_stack_pointer, registers_pointer);
     }
 
-    if syscall_number == abi::syscall::ENDPOINT_SEND {
+    if matches!(
+        syscall_number,
+        abi::syscall::ENDPOINT_SEND | abi::syscall::ENDPOINT_SEND_MOVE
+    ) {
         let endpoint_object = scheduler::current_process_id().and_then(|process_id| {
             let endpoint_handle = unsafe { (*registers_pointer).rdi };
             endpoint_object_for_handle(

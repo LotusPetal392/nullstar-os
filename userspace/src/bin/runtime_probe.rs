@@ -4,6 +4,7 @@
 use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
+    blocking_ipc,
     heap::BumpHeap,
     ipc::{self, ObjectKind, Rights, Transfer},
     platform::{self, DirectoryEntry},
@@ -347,7 +348,112 @@ fn endpoint_move_transfer_probe(current_process: u64) -> bool {
         && ipc::notification_signal(received.handle, 1).ok() == Some(1)
         && ipc::notification_try_wait(received.handle).ok() == Some(0);
 
-    ipc::close(received.handle).is_ok() && ipc::close(endpoint).is_ok() && moved
+    ipc::close(received.handle).is_ok()
+        && ipc::close(endpoint).is_ok()
+        && moved
+        && endpoint_move_waiter_probe(current_process)
+}
+
+fn endpoint_move_waiter_probe(current_process: u64) -> bool {
+    const ENDPOINT_HANDLE: ipc::CapabilityHandle = 1;
+    const MESSAGE: &[u8] = b"move-wakes-waiter";
+
+    let Ok(endpoint) = ipc::endpoint_create() else {
+        return false;
+    };
+    let Ok(notification) = ipc::notification_create() else {
+        let _ = ipc::close(endpoint);
+        return false;
+    };
+    let Ok(barrier) = syscall::pipe_pair() else {
+        let _ = ipc::close(notification);
+        let _ = ipc::close(endpoint);
+        return false;
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        let _ = ipc::close(notification);
+        let _ = ipc::close(endpoint);
+        return false;
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.reader);
+        if !ipc::wait_for_handle(ENDPOINT_HANDLE)
+            .is_ok_and(|info| info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE)
+            || syscall::write_all(barrier.writer, &[1]).is_err()
+            || syscall::close(barrier.writer).is_err()
+        {
+            syscall::exit(70);
+        }
+        let mut bytes = [0_u8; MESSAGE.len()];
+        let Ok(message) = blocking_ipc::receive(ENDPOINT_HANDLE, &mut bytes) else {
+            syscall::exit(71);
+        };
+        let Some(received) = message.capability else {
+            syscall::exit(72);
+        };
+        let valid = message.sender_process_id == current_process
+            && message.bytes == MESSAGE.len()
+            && bytes.as_slice() == MESSAGE
+            && received.rights == Rights::WAIT
+            && ipc::info(received.handle).is_ok_and(|info| {
+                info.kind == ObjectKind::Notification && info.rights == Rights::WAIT
+            });
+        let closed = ipc::close(received.handle).is_ok() && ipc::close(ENDPOINT_HANDLE).is_ok();
+        syscall::exit(if valid && closed { 0 } else { 73 });
+    }
+
+    let setup = syscall::close(barrier.writer).is_ok()
+        && ipc::grant_child(child, endpoint, Rights::RECEIVE, ENDPOINT_HANDLE).ok()
+            == Some(ENDPOINT_HANDLE);
+    let mut ready = [0_u8; 1];
+    let synchronized = setup
+        && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
+        && ready[0] == 1
+        && syscall::close(barrier.reader).is_ok();
+    if synchronized {
+        for _ in 0..4 {
+            let _ = syscall::yield_now();
+        }
+    }
+    let sent = synchronized
+        && ipc::send_move(
+            endpoint,
+            MESSAGE,
+            Transfer {
+                handle: notification,
+                rights: Rights::WAIT,
+            },
+        )
+        .is_ok()
+        && ipc::info(notification).err() == Some(ipc::Error::BAD_FILE_DESCRIPTOR);
+
+    let mut child_succeeded = false;
+    if sent {
+        for _ in 0..JOB_WAIT_YIELDS {
+            match syscall::try_wait_child(child) {
+                Ok(status) => {
+                    child_succeeded = status.success();
+                    break;
+                }
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                    let _ = syscall::yield_now();
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if !child_succeeded {
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+    }
+    if !sent {
+        let _ = ipc::close(notification);
+    }
+    let _ = syscall::close(barrier.reader);
+    let _ = syscall::close(barrier.writer);
+    ipc::close(endpoint).is_ok() && sent && child_succeeded
 }
 
 fn job_probe() -> bool {
