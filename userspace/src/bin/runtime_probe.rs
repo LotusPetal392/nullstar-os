@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     blocking_ipc,
     heap::BumpHeap,
-    ipc::{self, ObjectKind, Rights, Transfer},
+    ipc::{self, ObjectKind, Rights, Signals, Transfer},
     platform::{self, DirectoryEntry},
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
@@ -181,6 +181,7 @@ fn capability_probe(current_process: u64) -> bool {
             .rights
             .contains(Rights::SEND | Rights::RECEIVE)
         || endpoint_info.size != 0
+        || ipc::signal_state(endpoint).ok() != Some(Signals::WRITABLE)
     {
         return false;
     }
@@ -201,6 +202,7 @@ fn capability_probe(current_process: u64) -> bool {
     if send_only_info.object_id != endpoint_info.object_id
         || send_only_info.kind != ObjectKind::Endpoint
         || send_only_info.rights != Rights::SEND
+        || ipc::signal_state(send_only).err() != Some(ipc::Error::PERMISSION)
         || ipc::try_receive(send_only, &mut denied_buffer).err() != Some(ipc::Error::PERMISSION)
     {
         return false;
@@ -242,6 +244,7 @@ fn capability_probe(current_process: u64) -> bool {
         }),
     )
     .is_err()
+        || ipc::signal_state(endpoint).ok() != Some(Signals::READABLE | Signals::WRITABLE)
     {
         return false;
     }
@@ -257,6 +260,7 @@ fn capability_probe(current_process: u64) -> bool {
         || message.bytes != MESSAGE.len()
         || &message_buffer[..message.bytes] != MESSAGE
         || received_capability.rights != Rights::WAIT
+        || ipc::signal_state(endpoint).ok() != Some(Signals::WRITABLE)
     {
         return false;
     }
@@ -265,6 +269,7 @@ fn capability_probe(current_process: u64) -> bool {
     };
     if received_info.kind != ObjectKind::Notification
         || received_info.rights != Rights::WAIT
+        || ipc::signal_state(received_capability.handle).ok() != Some(Signals::EMPTY)
         || ipc::notification_signal(received_capability.handle, 1).err()
             != Some(ipc::Error::PERMISSION)
     {
@@ -272,10 +277,12 @@ fn capability_probe(current_process: u64) -> bool {
     }
 
     if ipc::notification_signal(notification, 2).ok() != Some(2)
+        || ipc::signal_state(received_capability.handle).ok() != Some(Signals::SIGNALED)
         || ipc::notification_try_wait(received_capability.handle).ok() != Some(1)
         || ipc::notification_try_wait(received_capability.handle).ok() != Some(0)
         || ipc::notification_try_wait(received_capability.handle).err()
             != Some(ipc::Error::TRY_AGAIN)
+        || ipc::signal_state(received_capability.handle).ok() != Some(Signals::EMPTY)
     {
         return false;
     }
@@ -472,6 +479,7 @@ fn job_probe() -> bool {
     if info.kind != ObjectKind::Job
         || info.rights != Rights::JOB
         || info.size != 0
+        || ipc::signal_state(wait_only).ok() != Some(Signals::TERMINATED)
         || ipc::job_get_process_limit(job).ok() != Some(limits::MAX_JOB_PROCESSES)
         || ipc::job_get_process_limit(wait_only).ok() != Some(limits::MAX_JOB_PROCESSES)
         || ipc::job_try_wait(wait_only).err() != Some(ipc::Error::NO_CHILD)
@@ -518,8 +526,13 @@ fn job_probe() -> bool {
     let assigned = ipc::job_assign(job, child).ok() == Some(child);
     let member_visible = ipc::info(job).is_ok_and(|info| info.size == 1);
     let barrier_released = syscall::close(barrier.writer).is_ok();
-    let setup_ok =
-        reader_closed && attenuated_denied && assigned && member_visible && barrier_released;
+    let active_signal_state = ipc::signal_state(wait_only).ok() == Some(Signals::EMPTY);
+    let setup_ok = reader_closed
+        && attenuated_denied
+        && assigned
+        && member_visible
+        && active_signal_state
+        && barrier_released;
     if !setup_ok {
         let _ = ipc::job_terminate(job);
         let _ = platform::kill(child, signal::KILL);
@@ -550,6 +563,7 @@ fn job_probe() -> bool {
         || syscall::wait_child(child).ok().map(|status| status.raw()) != Some(23)
         || ipc::job_try_wait(wait_only).err() != Some(ipc::Error::NO_CHILD)
         || !ipc::info(job).is_ok_and(|info| info.size == 0)
+        || ipc::signal_state(wait_only).ok() != Some(Signals::TERMINATED)
     {
         return close_job_handles(job, wait_only, false);
     }

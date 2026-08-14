@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.21, and a
+The ABI is experimental, but callers can query the current version, 1.22, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -502,6 +502,24 @@ buffer or handle-table capacity does not dequeue the message. This slice moves e
 it does not add channel pairs, peer closure, multi-handle transfer, or sender-side receiver-capacity
 reservation.
 
+## Version 1.22 level-triggered object signal state
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 70 | `CAPABILITY_SIGNAL_STATE` | capability handle | current signal mask |
+
+`CAPABILITY_SIGNAL_STATE` requires `WAIT` on the selected handle and returns an immediate,
+level-triggered snapshot. Endpoint handles report `READABLE` while their queue is nonempty and
+`WRITABLE` while it has capacity. Notification handles report `SIGNALED` while their pending count
+is nonzero. Job handles report `READABLE` while any exit record in the selected subtree is pending
+and `TERMINATED` while that subtree contains no active process. `READABLE | TERMINATED` is valid
+while a fully exited job still has undrained completion records.
+
+An invalid handle returns `EBADF`; missing `WAIT` returns `EPERM`; and object kinds without defined
+waitable signals return `EINVAL`. The query does not consume state, block, accept a deadline, or
+promise that a later operation will still observe the same condition. `OBJECT_SIGNAL_STATE` in
+`SystemInfo.capabilities` advertises the operation.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -533,6 +551,7 @@ reservation.
 - ABI 1.19 adds read-only inspection of a job's configured local process ceiling at syscall 67.
 - ABI 1.20 adds atomic rights-reduced capability replacement at syscall 68.
 - ABI 1.21 adds atomic one-handle endpoint move-transfer at syscall 69.
+- ABI 1.22 adds `WAIT`-authorized, level-triggered object signal snapshots at syscall 70.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

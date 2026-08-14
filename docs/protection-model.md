@@ -20,7 +20,8 @@ the object inert, detaches its parent edge, and allows reclamation after final h
 1.19 lets `WAIT` authority inspect a job's local configured process ceiling without permitting
 relaxation. ABI 1.20 adds atomic rights-reduced capability replacement without requiring another
 free handle-table slot. ABI 1.21 adds opt-in atomic move-transfer of one rights-reduced capability
-through an endpoint message.
+through an endpoint message. ABI 1.22 adds a `WAIT`-authorized, level-triggered signal-state
+snapshot for endpoints, notifications, and job subtrees.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
@@ -67,7 +68,7 @@ valid only for descriptor and filesystem I/O.
 
 | Object | Purpose | Principal rights |
 | --- | --- | --- |
-| Endpoint | Bounded FIFO messages and optional capability delegation | `SEND`, `RECEIVE`, `DUPLICATE`, `TRANSFER` |
+| Endpoint | Bounded FIFO messages and optional capability delegation | `SEND`, `RECEIVE`, `WAIT`, `DUPLICATE`, `TRANSFER` |
 | Notification | Counted asynchronous event delivery | `SIGNAL`, `WAIT`, `DUPLICATE`, `TRANSFER` |
 | Shared memory | Bounded byte storage shared by capability holders | `READ`, `WRITE`, `DUPLICATE`, `TRANSFER` |
 | Job | Flat descendant containment and FIFO process-exit observation | `MANAGE`, `WAIT`, `SIGNAL`, `DUPLICATE`, `TRANSFER` |
@@ -81,7 +82,7 @@ not need another free table slot; a failed replacement leaves the source valid a
 A requested rights mask must be nonempty, valid for the object type, and a subset of the
 source rights. Rights can be attenuated but not amplified.
 
-## Endpoint messages and waiting
+## Endpoint messages and object signals
 
 Endpoint operations remain bounded:
 
@@ -97,6 +98,13 @@ The kernel provides an endpoint-readiness wait used by service clients and proxi
 Userspace helpers may also yield and retry nonblocking operations. Protocols remain
 responsible for request IDs, deadlines or cancellation where defined, generation checks,
 and bounded reply validation.
+
+ABI 1.22 exposes immediate, level-triggered signal snapshots through `WAIT` authority. Endpoints
+report `READABLE` while their queue is nonempty and `WRITABLE` while it has message capacity.
+Notifications report `SIGNALED` while their count is nonzero. Jobs report `READABLE` while any
+subtree exit record is pending and `TERMINATED` while the subtree has no active members; those two
+states may overlap until the final records are drained. This operation is polling only. General
+deadline-based one- and many-object waits remain future work.
 
 The original endpoint send copies a rights-reduced capability and retains the source. ABI 1.21's
 move-send instead removes the source atomically when the bounded message is committed to the queue.

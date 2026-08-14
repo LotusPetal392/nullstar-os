@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 21;
+pub const ABI_VERSION_MINOR: u64 = 22;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -89,6 +89,7 @@ pub mod syscall {
     pub const JOB_GET_PROCESS_LIMIT: u64 = 67;
     pub const CAPABILITY_REPLACE: u64 = 68;
     pub const ENDPOINT_SEND_MOVE: u64 = 69;
+    pub const CAPABILITY_SIGNAL_STATE: u64 = 70;
 }
 
 pub mod filesystem_provider {
@@ -117,6 +118,7 @@ pub mod capability {
     pub const FILESYSTEM_PROVIDER_OFFLINE: u64 = 1 << 16;
     pub const WRITABLE_NULLFS_BLOCK_DEVICE_OFFLINE: u64 = 1 << 17;
     pub const JOB_OBJECTS: u64 = 1 << 18;
+    pub const OBJECT_SIGNAL_STATE: u64 = 1 << 19;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -137,7 +139,8 @@ pub mod capability {
         | KERNEL_EARLY_LOG_READER
         | FILESYSTEM_PROVIDER_OFFLINE
         | WRITABLE_NULLFS_BLOCK_DEVICE_OFFLINE
-        | JOB_OBJECTS;
+        | JOB_OBJECTS
+        | OBJECT_SIGNAL_STATE;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -157,7 +160,8 @@ pub mod capability {
     pub const RIGHT_WRITE: u64 = 1 << 7;
     pub const RIGHT_MANAGE: u64 = 1 << 8;
 
-    pub const ENDPOINT_RIGHTS: u64 = RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SEND | RIGHT_RECEIVE;
+    pub const ENDPOINT_RIGHTS: u64 =
+        RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT;
     pub const NOTIFICATION_RIGHTS: u64 =
         RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SIGNAL | RIGHT_WAIT;
     pub const SHARED_MEMORY_RIGHTS: u64 =
@@ -204,6 +208,18 @@ pub mod capability {
             transferred_rights: 0,
         };
     }
+}
+
+pub mod object_signal {
+    pub const READABLE: u64 = 1 << 0;
+    pub const WRITABLE: u64 = 1 << 1;
+    pub const PEER_CLOSED: u64 = 1 << 2;
+    pub const SIGNALED: u64 = 1 << 3;
+    pub const TERMINATED: u64 = 1 << 4;
+    pub const TIMER_FIRED: u64 = 1 << 5;
+
+    pub const ALL: u64 =
+        READABLE | WRITABLE | PEER_CLOSED | SIGNALED | TERMINATED | TIMER_FIRED;
 }
 
 pub mod job {
