@@ -1,5 +1,5 @@
-// Scheduler-integrated endpoint readiness waits layered over the bounded
-// capability data-movement syscalls.
+// Scheduler-integrated object waits layered over the bounded capability
+// data-movement syscalls.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EndpointWaiter {
@@ -8,6 +8,17 @@ struct EndpointWaiter {
 }
 
 static ENDPOINT_WAITERS: PreemptMutex<Vec<EndpointWaiter>> = PreemptMutex::new(Vec::new());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectWaiter {
+    object: CapabilityObjectRef,
+    requested: kernel::object::Signals,
+    process_id: u64,
+    deadline_ns: u64,
+    registers_pointer: usize,
+}
+
+static OBJECT_WAITERS: PreemptMutex<Vec<ObjectWaiter>> = PreemptMutex::new(Vec::new());
 
 global_asm!(
     r#"
@@ -109,6 +120,15 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
         return current_stack_pointer;
     }
 
+    if syscall_number == abi::syscall::MONOTONIC_TIME {
+        unsafe { (*registers_pointer).rax = crate::interrupts::monotonic_time_ns() };
+        return current_stack_pointer;
+    }
+
+    if syscall_number == abi::syscall::OBJECT_WAIT_ONE {
+        return object_wait_one(current_stack_pointer, registers_pointer);
+    }
+
     if syscall_number == abi::syscall::ENDPOINT_WAIT {
         return blocking_endpoint_wait(current_stack_pointer, registers_pointer);
     }
@@ -133,6 +153,20 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
             && let Some(endpoint_object) = endpoint_object
         {
             wake_endpoint_waiter(endpoint_object);
+        }
+        return next_stack_pointer;
+    }
+
+    if matches!(
+        syscall_number,
+        abi::syscall::ENDPOINT_RECEIVE | abi::syscall::NOTIFICATION_SIGNAL
+    ) {
+        let next_stack_pointer =
+            nullstar_capability_grant_syscall_dispatch(current_stack_pointer);
+        if next_stack_pointer == current_stack_pointer
+            && unsafe { ((*registers_pointer).rax as i64) >= 0 }
+        {
+            wake_satisfied_object_waiters();
         }
         return next_stack_pointer;
     }
@@ -191,6 +225,141 @@ fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
     }
 }
 
+fn object_wait_one(
+    current_stack_pointer: usize,
+    registers_pointer: *mut SavedRegisters,
+) -> usize {
+    let Some(process_id) = scheduler::current_process_id() else {
+        unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
+        return current_stack_pointer;
+    };
+    let handle = unsafe { (*registers_pointer).rdi };
+    let requested_bits = unsafe { (*registers_pointer).rsi };
+    let deadline_ns = unsafe { (*registers_pointer).rdx };
+    if requested_bits == 0 || requested_bits & !abi::object_signal::ALL != 0 {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+        return current_stack_pointer;
+    }
+    let requested = kernel::object::Signals::from_bits(requested_bits);
+
+    // This lock is held through state inspection, waiter registration, and
+    // scheduler blocking. Mutation paths publish their state before taking
+    // this lock, which prevents a readiness transition from being lost.
+    let mut waiters = OBJECT_WAITERS.lock();
+    waiters.retain(|waiter| waiter.process_id != process_id);
+    let registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, handle) else {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::BAD_FILE_DESCRIPTOR) };
+        return current_stack_pointer;
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
+        unsafe { (*registers_pointer).rax = error_return(error) };
+        return current_stack_pointer;
+    }
+    let supported = capability_object_supported_signals(entry.object.kind);
+    if requested.bits() & !supported.bits() != 0 {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+        return current_stack_pointer;
+    }
+    let current = match capability_object_signal_state(&registry, entry.object) {
+        Ok(signals) => signals,
+        Err(error) => {
+            unsafe { (*registers_pointer).rax = error_return(error) };
+            return current_stack_pointer;
+        }
+    };
+    let asserted = current.bits() & requested.bits();
+    if asserted != 0 {
+        unsafe { (*registers_pointer).rax = asserted };
+        return current_stack_pointer;
+    }
+    if deadline_ns == abi::deadline::IMMEDIATE
+        || (deadline_ns != abi::deadline::INFINITE
+            && crate::interrupts::monotonic_time_ns() >= deadline_ns)
+    {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::TIMED_OUT) };
+        return current_stack_pointer;
+    }
+
+    waiters.push(ObjectWaiter {
+        object: entry.object,
+        requested,
+        process_id,
+        deadline_ns,
+        registers_pointer: registers_pointer as usize,
+    });
+    unsafe { (*registers_pointer).rax = 0 };
+    drop(registry);
+    let next_stack_pointer = scheduler::block_current(current_stack_pointer);
+    drop(waiters);
+    next_stack_pointer
+}
+
+fn wake_satisfied_object_waiters() {
+    let mut waiters = OBJECT_WAITERS.lock();
+    if waiters.is_empty() {
+        return;
+    }
+    let registry = CAPABILITY_REGISTRY.lock();
+    let mut wakeups = Vec::new();
+    let mut index = 0usize;
+    while index < waiters.len() {
+        let waiter = waiters[index];
+        let result = capability_object_signal_state(&registry, waiter.object)
+            .map(|signals| signals.bits() & waiter.requested.bits());
+        let return_value = match result {
+            Ok(0) => {
+                index = index.saturating_add(1);
+                continue;
+            }
+            Ok(asserted) => asserted,
+            Err(error) => error_return(error),
+        };
+        let waiter = waiters.remove(index);
+        let registers = unsafe { &mut *(waiter.registers_pointer as *mut SavedRegisters) };
+        registers.rax = return_value;
+        wakeups.push(waiter.process_id);
+    }
+    drop(registry);
+    drop(waiters);
+    for process_id in wakeups {
+        let _ = scheduler::wake_process(process_id);
+    }
+}
+
+pub fn service_object_wait_deadlines(now_ns: u64) {
+    let mut waiters = OBJECT_WAITERS.lock();
+    let mut wakeups = Vec::new();
+    let mut index = 0usize;
+    while index < waiters.len() {
+        let waiter = waiters[index];
+        if waiter.deadline_ns == abi::deadline::INFINITE || now_ns < waiter.deadline_ns {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let waiter = waiters.remove(index);
+        let registers = unsafe { &mut *(waiter.registers_pointer as *mut SavedRegisters) };
+        registers.rax = error_return(abi::errno::TIMED_OUT);
+        wakeups.push(waiter.process_id);
+    }
+    drop(waiters);
+    for process_id in wakeups {
+        let _ = scheduler::wake_process(process_id);
+    }
+}
+
+fn remove_object_waiter(process_id: u64) {
+    OBJECT_WAITERS
+        .lock()
+        .retain(|waiter| waiter.process_id != process_id);
+}
+
+fn retain_live_object_waiters(live_processes: &[u64]) {
+    OBJECT_WAITERS
+        .lock()
+        .retain(|waiter| live_processes.contains(&waiter.process_id));
+}
+
 fn blocking_endpoint_wait(
     current_stack_pointer: usize,
     registers_pointer: *mut SavedRegisters,
@@ -241,14 +410,14 @@ fn blocking_endpoint_wait(
 }
 
 fn wake_endpoint_waiter(object: CapabilityObjectRef) {
-    let mut waiters = ENDPOINT_WAITERS.lock();
-    loop {
-        let Some(index) = waiters.iter().position(|waiter| waiter.object == object) else {
-            return;
-        };
-        let waiter = waiters.remove(index);
-        if scheduler::wake_process(waiter.process_id) {
-            return;
+    {
+        let mut waiters = ENDPOINT_WAITERS.lock();
+        while let Some(index) = waiters.iter().position(|waiter| waiter.object == object) {
+            let waiter = waiters.remove(index);
+            if scheduler::wake_process(waiter.process_id) {
+                break;
+            }
         }
     }
+    wake_satisfied_object_waiters();
 }

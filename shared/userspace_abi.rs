@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 22;
+pub const ABI_VERSION_MINOR: u64 = 23;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -90,6 +90,8 @@ pub mod syscall {
     pub const CAPABILITY_REPLACE: u64 = 68;
     pub const ENDPOINT_SEND_MOVE: u64 = 69;
     pub const CAPABILITY_SIGNAL_STATE: u64 = 70;
+    pub const MONOTONIC_TIME: u64 = 71;
+    pub const OBJECT_WAIT_ONE: u64 = 72;
 }
 
 pub mod filesystem_provider {
@@ -119,6 +121,8 @@ pub mod capability {
     pub const WRITABLE_NULLFS_BLOCK_DEVICE_OFFLINE: u64 = 1 << 17;
     pub const JOB_OBJECTS: u64 = 1 << 18;
     pub const OBJECT_SIGNAL_STATE: u64 = 1 << 19;
+    pub const MONOTONIC_CLOCK: u64 = 1 << 20;
+    pub const OBJECT_WAIT_ONE: u64 = 1 << 21;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -140,7 +144,9 @@ pub mod capability {
         | FILESYSTEM_PROVIDER_OFFLINE
         | WRITABLE_NULLFS_BLOCK_DEVICE_OFFLINE
         | JOB_OBJECTS
-        | OBJECT_SIGNAL_STATE;
+        | OBJECT_SIGNAL_STATE
+        | MONOTONIC_CLOCK
+        | OBJECT_WAIT_ONE;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -220,6 +226,13 @@ pub mod object_signal {
 
     pub const ALL: u64 =
         READABLE | WRITABLE | PEER_CLOSED | SIGNALED | TERMINATED | TIMER_FIRED;
+}
+
+pub mod deadline {
+    /// Return immediately if no requested signal is asserted.
+    pub const IMMEDIATE: u64 = 0;
+    /// Wait without a deadline.
+    pub const INFINITE: u64 = u64::MAX;
 }
 
 pub mod job {
@@ -499,4 +512,5 @@ pub mod errno {
     pub const RANGE: i64 = -34;
     pub const NAME_TOO_LONG: i64 = -36;
     pub const NOT_IMPLEMENTED: i64 = -38;
+    pub const TIMED_OUT: i64 = -110;
 }

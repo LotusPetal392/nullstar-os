@@ -9,8 +9,8 @@ documents remain authoritative for behavior that exists today.
 The current system already has bounded process-local capability tables, rights-reduced
 copying and atomic replacement, diagnostic object identity, endpoints, counted notifications,
 atomic one-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
-job signal snapshots, endpoint waiting, and direct-child bootstrap grants. The next architecture
-stages are:
+job signal snapshots, absolute-deadline single-object waiting, endpoint waiting, and direct-child
+bootstrap grants. The next architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
    inspection authorization around the implemented close, duplicate, atomic replace, inspection,
@@ -20,7 +20,7 @@ stages are:
    implemented process-count ceiling;
 3. evolve the existing bounded endpoint and atomic one-handle move-transfer into channel pairs with
    peer closure, multiple rights-reduced handles, and explicit backpressure accounting;
-4. add general one- and many-object waiting with absolute monotonic deadlines;
+4. extend the implemented absolute-deadline single-object wait into bounded many-object waiting;
 5. evolve shared-memory objects from bounded copies to mapped pages with protection,
    sealing, W^X integration, and job accounting;
 6. add cancellation and a bounded synchronous call/reply path with priority donation;

@@ -24,9 +24,20 @@ A process is removed from any previous endpoint wait before registering a new wa
 
 System information reports ABI minor version 3 and advertises the endpoint-wait feature bit. The original endpoint send and receive operations remain bounded and retain their Phase 1 behavior.
 
+## Generic object waiting
+
+ABI 1.23 adds `OBJECT_WAIT_ONE` alongside this compatibility primitive. It blocks on a requested
+subset of the level-triggered endpoint, notification, or job signals and accepts an absolute
+deadline in the nanosecond domain returned by `MONOTONIC_TIME`. Deadline zero polls immediately,
+`UINT64_MAX` waits indefinitely, and finite expiry returns `ETIMEDOUT`. The generic wait returns the
+requested asserted mask and does not consume object state.
+
 ## Current boundary
 
-This primitive removes cooperative polling from request/reply clients and is the blocking foundation for a future kernel-to-userspace VFS proxy. It does not yet provide transaction identifiers, kernel-owned reply slots, cancellation messages, timeout deadlines, or restart-aware kernel file descriptors.
+The original endpoint primitive removes cooperative polling from request/reply clients and remains
+the blocking foundation for existing proxies. Generic single-object waiting now supplies timeout
+deadlines, but neither interface provides transaction identifiers, kernel-owned reply slots,
+cancellation messages, many-object waiting, or restart-aware kernel file descriptors.
 
 Kernel service completions may arrive while a different userspace address
 space is active. The scheduler therefore provides a bounded

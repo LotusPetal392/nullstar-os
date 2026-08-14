@@ -4070,6 +4070,7 @@ impl Runtime {
         self.service_child_requests()?;
         self.service_exec_requests()?;
         self.service_pending_signals()?;
+        wake_satisfied_object_waiters();
         Ok(reaped)
     }
 
@@ -6231,6 +6232,7 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
             PROCESS_MANAGER.lock().remove_process(process_id)
         })
         .ok_or(Error::ProcessNotFound(process_id))?;
+        remove_object_waiter(process_id);
         let terminal_parent = process.terminal_parent;
         terminal::detach(process_id);
         if let Some(parent_process_id) = terminal_parent {

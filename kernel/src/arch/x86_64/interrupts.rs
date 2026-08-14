@@ -14,7 +14,7 @@ use x86_64::{
 
 use crate::{
     acpi::{HpetInfo, MadtInfo},
-    apic, gdt, hlt_loop, keyboard,
+    apic, gdt, hlt_loop, keyboard, preemption,
     process::userspace,
     scheduler, serial_println,
 };
@@ -33,6 +33,7 @@ pub const TIMER_VECTOR: u8 = PIC_1_OFFSET;
 pub const KEYBOARD_VECTOR: u8 = PIC_1_OFFSET + 1;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const TIMER_HZ: u64 = 100;
+const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
 
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static SPURIOUS_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
@@ -275,6 +276,14 @@ pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
 }
 
+pub const fn monotonic_time_ns_from_ticks(ticks: u64) -> u64 {
+    ticks.saturating_mul(NANOSECONDS_PER_SECOND / TIMER_HZ)
+}
+
+pub fn monotonic_time_ns() -> u64 {
+    monotonic_time_ns_from_ticks(timer_ticks())
+}
+
 pub fn spurious_interrupts() -> u64 {
     SPURIOUS_INTERRUPTS.load(Ordering::Relaxed)
 }
@@ -324,8 +333,13 @@ fn end_of_interrupt(vector: u8) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn galactic_timer_interrupt_dispatch(current_stack_pointer: usize) -> usize {
-    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    let ticks = TIMER_TICKS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
     end_of_interrupt(TIMER_VECTOR);
+    if !preemption::is_disabled() {
+        userspace::service_object_wait_deadlines(monotonic_time_ns_from_ticks(ticks));
+    }
     scheduler::on_timer_interrupt(current_stack_pointer)
 }
 
