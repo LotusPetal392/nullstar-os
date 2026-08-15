@@ -9,6 +9,7 @@ pub mod endpoint_transport;
 pub mod environment;
 pub mod filesystem;
 pub mod filesystem_service;
+pub mod handle;
 pub mod heap;
 pub mod ipc;
 pub mod logctl;

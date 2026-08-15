@@ -37,6 +37,7 @@ experimentation, not production use or untrusted workloads.
   notifications, atomic one-handle endpoint move-transfer, shared byte-memory
   objects, level-triggered endpoint, notification, and job signal snapshots,
   absolute-deadline single- and bounded many-object waits, explicit direct-child bootstrap grants,
+  ownership-safe userspace handle wrappers with typed object markers and automatic close,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and

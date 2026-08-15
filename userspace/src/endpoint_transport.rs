@@ -2,30 +2,31 @@
 
 use nswp_runtime::{TryRecvError, TrySendError, TryTransport};
 
-use crate::ipc::{self, CapabilityHandle, CapabilityInfo, ObjectKind, Rights};
+use crate::{
+    handle::{Endpoint, OwnedHandle},
+    ipc::{self, CapabilityInfo, ObjectKind, Rights},
+};
 
 pub struct EndpointTransport {
-    send_handle: CapabilityHandle,
-    receive_handle: CapabilityHandle,
+    send_handle: Option<OwnedHandle<Endpoint>>,
+    receive_handle: Option<OwnedHandle<Endpoint>>,
     peer_process_id: Option<u64>,
-    closed: bool,
 }
 
 impl EndpointTransport {
     pub fn new(
-        send_handle: CapabilityHandle,
-        receive_handle: CapabilityHandle,
+        send_handle: OwnedHandle<Endpoint>,
+        receive_handle: OwnedHandle<Endpoint>,
     ) -> ipc::Result<Self> {
-        let send_info = ipc::info(send_handle)?;
-        let receive_info = ipc::info(receive_handle)?;
+        let send_info = send_handle.info()?;
+        let receive_info = receive_handle.info()?;
         if !valid_endpoint_pair(send_info, receive_info) {
             return Err(ipc::Error::INVALID_ARGUMENT);
         }
         Ok(Self {
-            send_handle,
-            receive_handle,
+            send_handle: Some(send_handle),
+            receive_handle: Some(receive_handle),
             peer_process_id: None,
-            closed: false,
         })
     }
 
@@ -34,12 +35,8 @@ impl EndpointTransport {
     }
 
     fn close_local(&mut self) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        let _ = ipc::close(self.send_handle);
-        let _ = ipc::close(self.receive_handle);
+        self.send_handle.take();
+        self.receive_handle.take();
     }
 
     fn fail_send(&mut self) -> Result<(), TrySendError> {
@@ -56,10 +53,13 @@ impl EndpointTransport {
 
 impl TryTransport for EndpointTransport {
     fn try_send(&mut self, packet: &[u8]) -> Result<(), TrySendError> {
-        if self.closed || packet.len() > crate::abi::limits::MAX_IPC_MESSAGE_BYTES {
+        let Some(send_handle) = self.send_handle.as_ref() else {
+            return self.fail_send();
+        };
+        if packet.len() > crate::abi::limits::MAX_IPC_MESSAGE_BYTES {
             return self.fail_send();
         }
-        match ipc::send(self.send_handle, packet, None) {
+        match send_handle.send(packet) {
             Ok(()) => Ok(()),
             Err(error) if error == ipc::Error::TRY_AGAIN => Err(TrySendError::Full),
             Err(_) => self.fail_send(),
@@ -67,10 +67,13 @@ impl TryTransport for EndpointTransport {
     }
 
     fn try_recv(&mut self, output: &mut [u8]) -> Result<usize, TryRecvError> {
-        if self.closed || output.len() > crate::abi::limits::MAX_IPC_MESSAGE_BYTES {
+        let Some(receive_handle) = self.receive_handle.as_ref() else {
+            return self.fail_receive();
+        };
+        if output.len() > crate::abi::limits::MAX_IPC_MESSAGE_BYTES {
             return self.fail_receive();
         }
-        let message = match ipc::try_receive(self.receive_handle, output) {
+        let message = match receive_handle.try_receive(output) {
             Ok(message) => message,
             Err(error) if error == ipc::Error::TRY_AGAIN => return Err(TryRecvError::Empty),
             Err(error) if error == ipc::Error::RANGE => {
@@ -81,8 +84,7 @@ impl TryTransport for EndpointTransport {
             Err(_) => return self.fail_receive(),
         };
 
-        if let Some(capability) = message.capability {
-            let _ = ipc::close(capability.handle);
+        if message.capability.is_some() {
             return self.fail_receive();
         }
         if !accept_sender(&mut self.peer_process_id, message.sender_process_id) {
@@ -98,6 +100,7 @@ impl TryTransport for EndpointTransport {
 
 impl Drop for EndpointTransport {
     fn drop(&mut self) {
+        // Taking the owned fields also makes an explicit transport close idempotent.
         self.close_local();
     }
 }

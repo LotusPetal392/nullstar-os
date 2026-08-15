@@ -10,7 +10,8 @@ The current system already has bounded process-local capability tables, rights-r
 copying and atomic replacement, diagnostic object identity, endpoints, counted notifications,
 atomic one-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
 job signal snapshots, absolute-deadline single- and bounded many-object waiting, endpoint waiting,
-and direct-child bootstrap grants. The next architecture stages are:
+direct-child bootstrap grants, and an initial userspace layer of non-cloneable owned, borrowed, and
+kind-validated handles with automatic close. The next architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
    inspection authorization around the implemented close, duplicate, atomic replace, inspection,
@@ -25,7 +26,8 @@ and direct-child bootstrap grants. The next architecture stages are:
 5. add cancellation and a bounded synchronous call/reply path with priority donation;
 6. add persistent event ports or wait sets for IPC, timers, process exit, file and
    network completion, display, device, and media events;
-7. build safe handle types, an asynchronous IPC runtime, typed service bindings,
+7. extend the initial safe handle foundation through ownership-consuming transfer, an asynchronous
+   IPC runtime, typed service bindings,
    tracing, and protocol conformance tests;
 8. introduce an IDL only after stable wire and lifecycle conventions have survived real
    services.
