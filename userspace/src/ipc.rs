@@ -1,8 +1,8 @@
 //! Capability handles and bounded phase-one IPC primitives.
 //!
-//! Kernel operations are non-blocking. `receive`, `notification_wait`, and
-//! `wait_for_handle` add cooperative blocking facades by yielding whenever the
-//! requested state is not ready.
+//! Data movement remains non-blocking. `wait_one` and `wait_many` use the
+//! scheduler-integrated object-wait ABI, while compatibility helpers such as
+//! `receive`, `notification_wait`, and `wait_for_handle` cooperatively yield.
 
 use core::{
     arch::asm,
@@ -27,6 +27,7 @@ pub type CapabilityHandle = u64;
 pub struct Error(i32);
 
 impl Error {
+    pub const ARGUMENT_TOO_LARGE: Self = Self((-abi_errno::ARGUMENT_TOO_LARGE) as i32);
     pub const NO_ENTRY: Self = Self((-abi_errno::NO_ENTRY) as i32);
     pub const NO_PROCESS: Self = Self((-abi_errno::NO_PROCESS) as i32);
     pub const IO: Self = Self((-abi_errno::IO) as i32);
@@ -163,6 +164,30 @@ impl Deadline {
 
     pub const fn as_monotonic_ns(self) -> u64 {
         self.0
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitItem {
+    handle: CapabilityHandle,
+    requested_signals: u64,
+}
+
+impl WaitItem {
+    pub const fn new(handle: CapabilityHandle, requested: Signals) -> Self {
+        Self {
+            handle,
+            requested_signals: requested.bits(),
+        }
+    }
+
+    pub const fn handle(self) -> CapabilityHandle {
+        self.handle
+    }
+
+    pub const fn requested(self) -> Signals {
+        Signals(self.requested_signals)
     }
 }
 
@@ -332,6 +357,25 @@ pub fn wait_one(
     }
     let signals = decode(result)?;
     Signals::from_bits(signals).ok_or(Error::IO)
+}
+
+pub fn wait_many(items: &[WaitItem], deadline: Deadline) -> Result<usize> {
+    let mut result = syscall::OBJECT_WAIT_MANY;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") items.as_ptr(),
+            in("rsi") items.len(),
+            in("rdx") deadline.as_monotonic_ns(),
+        );
+    }
+    let index = usize::try_from(decode(result)?).map_err(|_| Error::IO)?;
+    if index < items.len() {
+        Ok(index)
+    } else {
+        Err(Error::IO)
+    }
 }
 
 pub fn wait_for_handle(handle: CapabilityHandle) -> Result<CapabilityInfo> {
@@ -654,7 +698,9 @@ pub fn job_terminate(handle: CapabilityHandle) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Deadline, ObjectKind, Rights, Signals, phase1_protection_abi};
+    use core::mem::{align_of, size_of};
+
+    use super::{Deadline, ObjectKind, Rights, Signals, WaitItem, phase1_protection_abi};
     use crate::abi::{capability, syscall};
 
     #[test]
@@ -691,6 +737,22 @@ mod tests {
     }
 
     #[test]
+    fn object_wait_items_match_the_shared_abi() {
+        let item = WaitItem::new(42, Signals::READABLE | Signals::TERMINATED);
+        assert_eq!(item.handle(), 42);
+        assert_eq!(item.requested(), Signals::READABLE | Signals::TERMINATED);
+        assert_eq!(
+            size_of::<WaitItem>(),
+            size_of::<crate::abi::ObjectWaitItem>()
+        );
+        assert_eq!(
+            align_of::<WaitItem>(),
+            align_of::<crate::abi::ObjectWaitItem>()
+        );
+        assert_eq!(crate::abi::limits::MAX_OBJECT_WAIT_ITEMS, 16);
+    }
+
+    #[test]
     fn object_kinds_decode() {
         assert_eq!(
             ObjectKind::from_raw(capability::KIND_ENDPOINT),
@@ -724,6 +786,7 @@ mod tests {
         assert_eq!(syscall::CAPABILITY_SIGNAL_STATE, 70);
         assert_eq!(syscall::MONOTONIC_TIME, 71);
         assert_eq!(syscall::OBJECT_WAIT_ONE, 72);
+        assert_eq!(syscall::OBJECT_WAIT_MANY, 73);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

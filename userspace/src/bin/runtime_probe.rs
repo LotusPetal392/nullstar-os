@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     blocking_ipc,
     heap::BumpHeap,
-    ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer},
+    ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
@@ -274,6 +274,31 @@ fn capability_probe(current_process: u64) -> bool {
     if received_info.kind != ObjectKind::Notification
         || received_info.rights != Rights::WAIT
         || ipc::signal_state(received_capability.handle).ok() != Some(Signals::EMPTY)
+        || ipc::wait_many(
+            &[
+                WaitItem::new(received_capability.handle, Signals::SIGNALED),
+                WaitItem::new(endpoint, Signals::WRITABLE),
+            ],
+            Deadline::IMMEDIATE,
+        )
+        .ok()
+            != Some(1)
+        || ipc::wait_many(
+            &[
+                WaitItem::new(endpoint, Signals::WRITABLE),
+                WaitItem::new(send_only, Signals::WRITABLE),
+            ],
+            Deadline::IMMEDIATE,
+        )
+        .err()
+            != Some(ipc::Error::PERMISSION)
+        || ipc::wait_many(&[], Deadline::IMMEDIATE).err() != Some(ipc::Error::INVALID_ARGUMENT)
+        || ipc::wait_many(
+            &[WaitItem::new(endpoint, Signals::WRITABLE); limits::MAX_OBJECT_WAIT_ITEMS + 1],
+            Deadline::IMMEDIATE,
+        )
+        .err()
+            != Some(ipc::Error::ARGUMENT_TOO_LARGE)
         || ipc::wait_one(
             received_capability.handle,
             Signals::SIGNALED,
@@ -339,40 +364,74 @@ fn capability_probe(current_process: u64) -> bool {
 }
 
 fn notification_waiter_probe() -> bool {
-    const NOTIFICATION_HANDLE: ipc::CapabilityHandle = 1;
+    const FIRST_NOTIFICATION_HANDLE: ipc::CapabilityHandle = 1;
+    const SECOND_NOTIFICATION_HANDLE: ipc::CapabilityHandle = 2;
 
-    let Ok(notification) = ipc::notification_create() else {
+    let Ok(first_notification) = ipc::notification_create() else {
+        return false;
+    };
+    let Ok(second_notification) = ipc::notification_create() else {
+        let _ = ipc::close(first_notification);
         return false;
     };
     let Ok(barrier) = syscall::pipe_pair() else {
-        let _ = ipc::close(notification);
+        let _ = ipc::close(first_notification);
+        let _ = ipc::close(second_notification);
         return false;
     };
     let Ok(child) = syscall::fork() else {
         let _ = syscall::close(barrier.reader);
         let _ = syscall::close(barrier.writer);
-        let _ = ipc::close(notification);
+        let _ = ipc::close(first_notification);
+        let _ = ipc::close(second_notification);
         return false;
     };
     if child == 0 {
         let _ = syscall::close(barrier.reader);
-        if !ipc::wait_for_handle(NOTIFICATION_HANDLE)
+        if !ipc::wait_for_handle(FIRST_NOTIFICATION_HANDLE)
             .is_ok_and(|info| info.kind == ObjectKind::Notification && info.rights == Rights::WAIT)
+            || !ipc::wait_for_handle(SECOND_NOTIFICATION_HANDLE).is_ok_and(|info| {
+                info.kind == ObjectKind::Notification && info.rights == Rights::WAIT
+            })
             || syscall::write_all(barrier.writer, &[1]).is_err()
             || syscall::close(barrier.writer).is_err()
         {
             syscall::exit(74);
         }
-        let woke = ipc::wait_one(NOTIFICATION_HANDLE, Signals::SIGNALED, Deadline::INFINITE).ok()
-            == Some(Signals::SIGNALED);
-        let consumed = ipc::notification_try_wait(NOTIFICATION_HANDLE).ok() == Some(0);
-        let closed = ipc::close(NOTIFICATION_HANDLE).is_ok();
+        let woke = ipc::wait_many(
+            &[
+                WaitItem::new(FIRST_NOTIFICATION_HANDLE, Signals::SIGNALED),
+                WaitItem::new(SECOND_NOTIFICATION_HANDLE, Signals::SIGNALED),
+            ],
+            Deadline::INFINITE,
+        )
+        .ok()
+            == Some(1);
+        let consumed = ipc::notification_try_wait(SECOND_NOTIFICATION_HANDLE).ok() == Some(0)
+            && ipc::notification_try_wait(FIRST_NOTIFICATION_HANDLE).err()
+                == Some(ipc::Error::TRY_AGAIN);
+        let closed = ipc::close(FIRST_NOTIFICATION_HANDLE).is_ok()
+            && ipc::close(SECOND_NOTIFICATION_HANDLE).is_ok();
         syscall::exit(if woke && consumed && closed { 0 } else { 75 });
     }
 
     let setup = syscall::close(barrier.writer).is_ok()
-        && ipc::grant_child(child, notification, Rights::WAIT, NOTIFICATION_HANDLE).ok()
-            == Some(NOTIFICATION_HANDLE);
+        && ipc::grant_child(
+            child,
+            first_notification,
+            Rights::WAIT,
+            FIRST_NOTIFICATION_HANDLE,
+        )
+        .ok()
+            == Some(FIRST_NOTIFICATION_HANDLE)
+        && ipc::grant_child(
+            child,
+            second_notification,
+            Rights::WAIT,
+            SECOND_NOTIFICATION_HANDLE,
+        )
+        .ok()
+            == Some(SECOND_NOTIFICATION_HANDLE);
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
@@ -383,7 +442,7 @@ fn notification_waiter_probe() -> bool {
             let _ = syscall::yield_now();
         }
     }
-    let signaled = synchronized && ipc::notification_signal(notification, 1).ok() == Some(1);
+    let signaled = synchronized && ipc::notification_signal(second_notification, 1).ok() == Some(1);
     let mut child_succeeded = false;
     if signaled {
         for _ in 0..JOB_WAIT_YIELDS {
@@ -405,7 +464,10 @@ fn notification_waiter_probe() -> bool {
     }
     let _ = syscall::close(barrier.reader);
     let _ = syscall::close(barrier.writer);
-    ipc::close(notification).is_ok() && signaled && child_succeeded
+    ipc::close(first_notification).is_ok()
+        && ipc::close(second_notification).is_ok()
+        && signaled
+        && child_succeeded
 }
 
 fn endpoint_move_transfer_probe(current_process: u64) -> bool {

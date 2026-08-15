@@ -180,7 +180,7 @@ libraries may build edge-triggered event loops on top when useful.
 
 ### Waiting interfaces
 
-The first general waiting interface should support one or several objects with an
+ABI 1.23 and 1.24 provide the first general waiting interface for one or several objects with an
 absolute monotonic deadline:
 
 ```text
@@ -189,7 +189,8 @@ object_wait_many(items, deadline)
 ```
 
 Absolute deadlines compose across nested service calls without resetting the timeout at
-each layer. Special values may represent an immediate poll and an infinite deadline.
+each layer. Zero represents an immediate poll and `UINT64_MAX` represents an infinite deadline.
+The many-object operation is bounded at 16 entries and returns the lowest ready array index.
 
 A later event port or persistent wait set should aggregate large numbers of registered
 objects and deliver tagged readiness records. It should cover channels, timers, process
