@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.23, and a
+The ABI is experimental, but callers can query the current version, 1.24, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -538,7 +538,36 @@ timestamps in the same nanosecond domain returned by `MONOTONIC_TIME`; finite de
 at the kernel timer's current 100 Hz resolution. An expired deadline returns `ETIMEDOUT`. Invalid or
 empty masks and signals unsupported by the object return `EINVAL`; invalid handles return `EBADF`;
 and missing `WAIT` returns `EPERM`. `MONOTONIC_CLOCK` and `OBJECT_WAIT_ONE` in
-`SystemInfo.capabilities` advertise the two operations. Many-object waits remain future work.
+`SystemInfo.capabilities` advertise the two operations.
+
+## Version 1.24 bounded many-object waiting
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 73 | `OBJECT_WAIT_MANY` | wait-item array address, item count, absolute deadline in monotonic nanoseconds | lowest satisfied array index |
+
+Each wait item is the following exact 16-byte structure:
+
+```rust
+#[repr(C)]
+pub struct ObjectWaitItem {
+    pub handle: u64,
+    pub requested_signals: u64,
+}
+```
+
+The item count must be between one and `MAX_OBJECT_WAIT_ITEMS` (currently 16). The kernel copies and
+validates the complete array before inspecting readiness: every handle must exist, carry `WAIT`, and
+request a nonempty signal subset supported by its object. An unreadable array returns `EFAULT`, zero
+items return `EINVAL`, and an oversized array returns `E2BIG`. A validation error in any item wins
+over readiness in an earlier item.
+
+After validation, the syscall returns the lowest array index whose requested mask intersects the
+object's current level-triggered signal state. Duplicate handles are valid and retain array-order
+priority. If no item is ready, the process blocks under the same immediate, infinite, and finite
+absolute-deadline rules as `OBJECT_WAIT_ONE`; expiry returns `ETIMEDOUT`. The operation does not
+consume object state, and one process may have only one outstanding generic object wait.
+`OBJECT_WAIT_MANY` in `SystemInfo.capabilities` advertises the operation.
 
 ## Compatibility rules
 
@@ -574,6 +603,7 @@ and missing `WAIT` returns `EPERM`. `MONOTONIC_CLOCK` and `OBJECT_WAIT_ONE` in
 - ABI 1.22 adds `WAIT`-authorized, level-triggered object signal snapshots at syscall 70.
 - ABI 1.23 adds monotonic clock discovery and absolute-deadline single-object waiting at syscalls
   71 and 72.
+- ABI 1.24 adds bounded absolute-deadline many-object waiting at syscall 73.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

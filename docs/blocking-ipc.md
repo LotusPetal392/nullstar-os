@@ -32,12 +32,18 @@ deadline in the nanosecond domain returned by `MONOTONIC_TIME`. Deadline zero po
 `UINT64_MAX` waits indefinitely, and finite expiry returns `ETIMEDOUT`. The generic wait returns the
 requested asserted mask and does not consume object state.
 
+ABI 1.24 adds `OBJECT_WAIT_MANY` over one to 16 `{handle, requested_signals}` entries. The kernel
+copies and validates the complete array before inspecting readiness, then returns the lowest array
+index whose requested mask intersects current object state. The same absolute-deadline rules apply,
+and each process may have only one outstanding generic one- or many-object wait.
+
 ## Current boundary
 
 The original endpoint primitive removes cooperative polling from request/reply clients and remains
-the blocking foundation for existing proxies. Generic single-object waiting now supplies timeout
-deadlines, but neither interface provides transaction identifiers, kernel-owned reply slots,
-cancellation messages, many-object waiting, or restart-aware kernel file descriptors.
+the blocking foundation for existing proxies. Generic bounded object waiting now supplies timeout
+deadlines and readiness selection, but neither interface provides transaction identifiers,
+kernel-owned reply slots, cancellation messages, persistent wait sets, or restart-aware kernel file
+descriptors.
 
 Kernel service completions may arrive while a different userspace address
 space is active. The scheduler therefore provides a bounded

@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 23;
+pub const ABI_VERSION_MINOR: u64 = 24;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -92,6 +92,7 @@ pub mod syscall {
     pub const CAPABILITY_SIGNAL_STATE: u64 = 70;
     pub const MONOTONIC_TIME: u64 = 71;
     pub const OBJECT_WAIT_ONE: u64 = 72;
+    pub const OBJECT_WAIT_MANY: u64 = 73;
 }
 
 pub mod filesystem_provider {
@@ -123,6 +124,7 @@ pub mod capability {
     pub const OBJECT_SIGNAL_STATE: u64 = 1 << 19;
     pub const MONOTONIC_CLOCK: u64 = 1 << 20;
     pub const OBJECT_WAIT_ONE: u64 = 1 << 21;
+    pub const OBJECT_WAIT_MANY: u64 = 1 << 22;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -146,7 +148,8 @@ pub mod capability {
         | JOB_OBJECTS
         | OBJECT_SIGNAL_STATE
         | MONOTONIC_CLOCK
-        | OBJECT_WAIT_ONE;
+        | OBJECT_WAIT_ONE
+        | OBJECT_WAIT_MANY;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -233,6 +236,13 @@ pub mod deadline {
     pub const IMMEDIATE: u64 = 0;
     /// Wait without a deadline.
     pub const INFINITE: u64 = u64::MAX;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectWaitItem {
+    pub handle: u64,
+    pub requested_signals: u64,
 }
 
 pub mod job {
@@ -489,6 +499,7 @@ pub mod limits {
     pub const MAX_IPC_MESSAGE_BYTES: usize = 256;
     pub const MAX_SHARED_MEMORY_BYTES: usize = 16 * 1024;
     pub const MAX_SHARED_MEMORY_TOTAL_BYTES: usize = 256 * 1024;
+    pub const MAX_OBJECT_WAIT_ITEMS: usize = 16;
 }
 
 pub mod errno {

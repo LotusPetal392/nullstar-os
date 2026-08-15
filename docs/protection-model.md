@@ -22,7 +22,8 @@ relaxation. ABI 1.20 adds atomic rights-reduced capability replacement without r
 free handle-table slot. ABI 1.21 adds opt-in atomic move-transfer of one rights-reduced capability
 through an endpoint message. ABI 1.22 adds a `WAIT`-authorized, level-triggered signal-state
 snapshot for endpoints, notifications, and job subtrees. ABI 1.23 adds monotonic time discovery
-and scheduler-integrated single-object waits with absolute deadlines.
+and scheduler-integrated single-object waits with absolute deadlines. ABI 1.24 adds bounded
+many-object waits with deterministic lowest-index selection.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
@@ -111,7 +112,14 @@ signal subset supported by the selected object plus an absolute monotonic nanose
 wait returns the requested signals observed asserted, returns `ETIMEDOUT` when the deadline expires,
 and never consumes object state. Deadline zero is an immediate poll and `UINT64_MAX` waits
 indefinitely. Registration, state inspection, and scheduler blocking are ordered to prevent lost
-wakeups. Bounded many-object waits remain future work.
+wakeups.
+
+ABI 1.24 extends that mechanism to arrays of one to 16 wait items. Each item contains one handle and
+one requested signal subset. The kernel copies and validates the entire array before inspecting any
+item's readiness, registers the resolved objects atomically with scheduler blocking, and returns the
+lowest satisfied array index. Duplicate handles are permitted and retain array-order priority. The
+same immediate, infinite, and finite absolute-deadline behavior applies. Larger persistent wait sets
+remain future work.
 
 The original endpoint send copies a rights-reduced capability and retains the source. ABI 1.21's
 move-send instead removes the source atomically when the bounded message is committed to the queue.

@@ -10,9 +10,21 @@ struct EndpointWaiter {
 static ENDPOINT_WAITERS: PreemptMutex<Vec<EndpointWaiter>> = PreemptMutex::new(Vec::new());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ObjectWaiter {
+struct ObjectWaitRegistration {
     object: CapabilityObjectRef,
     requested: kernel::object::Signals,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectWaitReturn {
+    Signals,
+    Index,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectWaiter {
+    registrations: Vec<ObjectWaitRegistration>,
+    return_kind: ObjectWaitReturn,
     process_id: u64,
     deadline_ns: u64,
     registers_pointer: usize,
@@ -129,6 +141,10 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
         return object_wait_one(current_stack_pointer, registers_pointer);
     }
 
+    if syscall_number == abi::syscall::OBJECT_WAIT_MANY {
+        return object_wait_many(current_stack_pointer, registers_pointer);
+    }
+
     if syscall_number == abi::syscall::ENDPOINT_WAIT {
         return blocking_endpoint_wait(current_stack_pointer, registers_pointer);
     }
@@ -236,39 +252,32 @@ fn object_wait_one(
     let handle = unsafe { (*registers_pointer).rdi };
     let requested_bits = unsafe { (*registers_pointer).rsi };
     let deadline_ns = unsafe { (*registers_pointer).rdx };
-    if requested_bits == 0 || requested_bits & !abi::object_signal::ALL != 0 {
-        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
-        return current_stack_pointer;
-    }
-    let requested = kernel::object::Signals::from_bits(requested_bits);
-
     // This lock is held through state inspection, waiter registration, and
     // scheduler blocking. Mutation paths publish their state before taking
     // this lock, which prevents a readiness transition from being lost.
     let mut waiters = OBJECT_WAITERS.lock();
     waiters.retain(|waiter| waiter.process_id != process_id);
     let registry = CAPABILITY_REGISTRY.lock();
-    let Some(entry) = registry.entry(process_id, handle) else {
-        unsafe { (*registers_pointer).rax = error_return(abi::errno::BAD_FILE_DESCRIPTOR) };
-        return current_stack_pointer;
+    let registration = match resolve_object_wait_registration(
+        &registry,
+        process_id,
+        handle,
+        requested_bits,
+    ) {
+        Ok(registration) => registration,
+        Err(error) => {
+            unsafe { (*registers_pointer).rax = error_return(error) };
+            return current_stack_pointer;
+        }
     };
-    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
-        unsafe { (*registers_pointer).rax = error_return(error) };
-        return current_stack_pointer;
-    }
-    let supported = capability_object_supported_signals(entry.object.kind);
-    if requested.bits() & !supported.bits() != 0 {
-        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
-        return current_stack_pointer;
-    }
-    let current = match capability_object_signal_state(&registry, entry.object) {
+    let current = match capability_object_signal_state(&registry, registration.object) {
         Ok(signals) => signals,
         Err(error) => {
             unsafe { (*registers_pointer).rax = error_return(error) };
             return current_stack_pointer;
         }
     };
-    let asserted = current.bits() & requested.bits();
+    let asserted = current.bits() & registration.requested.bits();
     if asserted != 0 {
         unsafe { (*registers_pointer).rax = asserted };
         return current_stack_pointer;
@@ -282,8 +291,8 @@ fn object_wait_one(
     }
 
     waiters.push(ObjectWaiter {
-        object: entry.object,
-        requested,
+        registrations: vec![registration],
+        return_kind: ObjectWaitReturn::Signals,
         process_id,
         deadline_ns,
         registers_pointer: registers_pointer as usize,
@@ -295,6 +304,145 @@ fn object_wait_one(
     next_stack_pointer
 }
 
+fn object_wait_many(
+    current_stack_pointer: usize,
+    registers_pointer: *mut SavedRegisters,
+) -> usize {
+    let Some(process_id) = scheduler::current_process_id() else {
+        unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
+        return current_stack_pointer;
+    };
+    let items_address = unsafe { (*registers_pointer).rdi };
+    let item_count = match usize::try_from(unsafe { (*registers_pointer).rsi }) {
+        Ok(0) => {
+            unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+            return current_stack_pointer;
+        }
+        Ok(count) if count <= abi::limits::MAX_OBJECT_WAIT_ITEMS => count,
+        Ok(_) | Err(_) => {
+            unsafe { (*registers_pointer).rax = error_return(abi::errno::ARGUMENT_TOO_LARGE) };
+            return current_stack_pointer;
+        }
+    };
+    let deadline_ns = unsafe { (*registers_pointer).rdx };
+    let byte_length = item_count.saturating_mul(core::mem::size_of::<abi::ObjectWaitItem>());
+    if !capability_user_range(process_id, items_address, byte_length, false) {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::BAD_ADDRESS) };
+        return current_stack_pointer;
+    }
+    let item_bytes = unsafe { slice::from_raw_parts(items_address as *const u8, byte_length) };
+    let mut items = Vec::with_capacity(item_count);
+    for bytes in item_bytes.chunks_exact(core::mem::size_of::<abi::ObjectWaitItem>()) {
+        items.push(abi::ObjectWaitItem {
+            handle: u64::from_ne_bytes(bytes[..8].try_into().expect("wait handle width")),
+            requested_signals: u64::from_ne_bytes(
+                bytes[8..16].try_into().expect("wait signal width"),
+            ),
+        });
+    }
+
+    let mut waiters = OBJECT_WAITERS.lock();
+    waiters.retain(|waiter| waiter.process_id != process_id);
+    let registry = CAPABILITY_REGISTRY.lock();
+    let mut registrations = Vec::with_capacity(item_count);
+    for item in items {
+        match resolve_object_wait_registration(
+            &registry,
+            process_id,
+            item.handle,
+            item.requested_signals,
+        ) {
+            Ok(registration) => registrations.push(registration),
+            Err(error) => {
+                unsafe { (*registers_pointer).rax = error_return(error) };
+                return current_stack_pointer;
+            }
+        }
+    }
+    match first_satisfied_object_wait(&registry, &registrations) {
+        Ok(Some((index, _))) => {
+            unsafe { (*registers_pointer).rax = index as u64 };
+            return current_stack_pointer;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            unsafe { (*registers_pointer).rax = error_return(error) };
+            return current_stack_pointer;
+        }
+    }
+    if deadline_ns == abi::deadline::IMMEDIATE
+        || (deadline_ns != abi::deadline::INFINITE
+            && crate::interrupts::monotonic_time_ns() >= deadline_ns)
+    {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::TIMED_OUT) };
+        return current_stack_pointer;
+    }
+
+    waiters.push(ObjectWaiter {
+        registrations,
+        return_kind: ObjectWaitReturn::Index,
+        process_id,
+        deadline_ns,
+        registers_pointer: registers_pointer as usize,
+    });
+    unsafe { (*registers_pointer).rax = 0 };
+    drop(registry);
+    let next_stack_pointer = scheduler::block_current(current_stack_pointer);
+    drop(waiters);
+    next_stack_pointer
+}
+
+fn resolve_object_wait_registration(
+    registry: &CapabilityRegistry,
+    process_id: u64,
+    handle: u64,
+    requested_bits: u64,
+) -> Result<ObjectWaitRegistration, i64> {
+    if requested_bits == 0 || requested_bits & !abi::object_signal::ALL != 0 {
+        return Err(abi::errno::INVALID_ARGUMENT);
+    }
+    let requested = kernel::object::Signals::from_bits(requested_bits);
+    let entry = registry
+        .entry(process_id, handle)
+        .ok_or(abi::errno::BAD_FILE_DESCRIPTOR)?;
+    capability_has_right(entry, abi::capability::RIGHT_WAIT)?;
+    let supported = capability_object_supported_signals(entry.object.kind);
+    if requested.bits() & !supported.bits() != 0 {
+        return Err(abi::errno::INVALID_ARGUMENT);
+    }
+    Ok(ObjectWaitRegistration {
+        object: entry.object,
+        requested,
+    })
+}
+
+fn first_satisfied_object_wait(
+    registry: &CapabilityRegistry,
+    registrations: &[ObjectWaitRegistration],
+) -> Result<Option<(usize, u64)>, i64> {
+    for (index, registration) in registrations.iter().enumerate() {
+        let current = capability_object_signal_state(registry, registration.object)?;
+        let asserted = current.bits() & registration.requested.bits();
+        if asserted != 0 {
+            return Ok(Some((index, asserted)));
+        }
+    }
+    Ok(None)
+}
+
+fn object_waiter_result(
+    registry: &CapabilityRegistry,
+    waiter: &ObjectWaiter,
+) -> Result<Option<u64>, i64> {
+    let Some((index, asserted)) = first_satisfied_object_wait(registry, &waiter.registrations)? else {
+        return Ok(None);
+    };
+    Ok(Some(match waiter.return_kind {
+        ObjectWaitReturn::Signals => asserted,
+        ObjectWaitReturn::Index => index as u64,
+    }))
+}
+
 fn wake_satisfied_object_waiters() {
     let mut waiters = OBJECT_WAITERS.lock();
     if waiters.is_empty() {
@@ -304,15 +452,12 @@ fn wake_satisfied_object_waiters() {
     let mut wakeups = Vec::new();
     let mut index = 0usize;
     while index < waiters.len() {
-        let waiter = waiters[index];
-        let result = capability_object_signal_state(&registry, waiter.object)
-            .map(|signals| signals.bits() & waiter.requested.bits());
-        let return_value = match result {
-            Ok(0) => {
+        let return_value = match object_waiter_result(&registry, &waiters[index]) {
+            Ok(None) => {
                 index = index.saturating_add(1);
                 continue;
             }
-            Ok(asserted) => asserted,
+            Ok(Some(result)) => result,
             Err(error) => error_return(error),
         };
         let waiter = waiters.remove(index);
@@ -332,8 +477,9 @@ pub fn service_object_wait_deadlines(now_ns: u64) {
     let mut wakeups = Vec::new();
     let mut index = 0usize;
     while index < waiters.len() {
-        let waiter = waiters[index];
-        if waiter.deadline_ns == abi::deadline::INFINITE || now_ns < waiter.deadline_ns {
+        if waiters[index].deadline_ns == abi::deadline::INFINITE
+            || now_ns < waiters[index].deadline_ns
+        {
             index = index.saturating_add(1);
             continue;
         }
