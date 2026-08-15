@@ -219,7 +219,9 @@ Process A endpoint <------------------------> Process B endpoint
 The kernel transports bounded byte payloads plus transferred handles. It does not parse
 filesystem, display, audio, package, or other application-level protocol fields.
 
-Channels should provide:
+The initial paired-channel ABI provides asynchronous send and receive through the userspace reactor,
+message boundaries, one-handle atomic transfer, bounded queues, deterministic backpressure, and
+readable, writable, and peer-closed signals. The complete channel design should also provide:
 
 - asynchronous send and receive;
 - message boundaries;
@@ -261,7 +263,7 @@ sender loses the handle atomically when the complete message and transferred han
 a failed send consumes nothing. A retained copy can be created explicitly with `handle_duplicate`
 before sending. The original ABI 1.2 copy-transfer call remains available for compatibility.
 
-Future channel pairs must extend the same all-or-nothing rule to multiple handles and account for
+Paired channels must extend the same all-or-nothing rule to multiple handles and account for
 receiver capacity at send time rather than deferring handle installation until receive.
 
 A later duplicate-transfer disposition is optional and would require both `TRANSFER`
@@ -508,13 +510,13 @@ authority delegation.
 ## Implementation sequence
 
 The current system already provides process-local capability tables, rights-reduced
-copying, bounded endpoints, counted notifications, copied shared-memory objects,
+copying, bounded endpoints, paired channels with peer closure, counted notifications, copied shared-memory objects,
 endpoint waiting, and direct-child bootstrap grants. The intended evolution is:
 
 1. formalize a common kernel-object and handle-table implementation with object type,
    lifetime, rights, signals, close, duplicate, replace, and inspection semantics;
-2. replace one-ended endpoint assumptions with channel pairs, peer closure, bounded
-   queues, and atomic move-transfer of multiple handles;
+2. migrate one-ended endpoint consumers onto the implemented channel pairs and extend
+   atomic move-transfer from one handle to bounded handle vectors;
 3. add general object waiting with monotonic deadlines, followed by persistent wait sets
    or event ports;
 4. add mapped shared-memory objects, per-mapping protection, sealing, accounting, and

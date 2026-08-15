@@ -25,7 +25,7 @@ pub trait KnownObjectType: ObjectType {
 #[derive(Debug)]
 pub enum AnyObject {}
 
-/// A mailbox endpoint capability.
+/// A legacy mailbox or paired channel-endpoint capability.
 #[derive(Debug)]
 pub enum Endpoint {}
 
@@ -254,6 +254,18 @@ impl<T: ObjectType> OwnedHandle<T> {
 impl OwnedHandle<Endpoint> {
     pub fn create() -> ipc::Result<Self> {
         Self::adopt(ipc::endpoint_create()?)
+    }
+
+    pub fn create_pair() -> ipc::Result<(Self, Self)> {
+        let (first, second) = ipc::endpoint_create_pair()?;
+        let first = Self::adopt(first)?;
+        match Self::adopt(second) {
+            Ok(second) => Ok((first, second)),
+            Err(error) => {
+                drop(first);
+                Err(error)
+            }
+        }
     }
 
     pub fn send(&self, bytes: &[u8]) -> ipc::Result<()> {

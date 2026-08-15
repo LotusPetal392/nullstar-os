@@ -399,6 +399,7 @@ fn open_block_device_endpoint(
                 queue: alloc::collections::VecDeque::with_capacity(
                     abi::limits::MAX_ENDPOINT_MESSAGES,
                 ),
+                peer: EndpointPeer::Loopback,
             }),
         ) {
             Ok(endpoint) => endpoint,

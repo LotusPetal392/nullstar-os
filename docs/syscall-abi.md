@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.24, and a
+The ABI is experimental, but callers can query the current version, 1.25, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -499,8 +499,7 @@ All validation and queue-capacity checks precede source removal. `EBADF`, `EPERM
 `EFAULT`, `ERANGE`, or queue-full `EAGAIN` therefore leaves the source handle, message queue, and
 object lifetime unchanged. Once committed, receive follows the existing atomic rules: insufficient
 buffer or handle-table capacity does not dequeue the message. This slice moves exactly one handle;
-it does not add channel pairs, peer closure, multi-handle transfer, or sender-side receiver-capacity
-reservation.
+multi-handle transfer and sender-side receiver-capacity reservation remain future work.
 
 ## Version 1.22 level-triggered object signal state
 
@@ -569,6 +568,40 @@ absolute-deadline rules as `OBJECT_WAIT_ONE`; expiry returns `ETIMEDOUT`. The op
 consume object state, and one process may have only one outstanding generic object wait.
 `OBJECT_WAIT_MANY` in `SystemInfo.capabilities` advertises the operation.
 
+## Version 1.25 channel pairs and peer closure
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 74 | `ENDPOINT_CREATE_PAIR` | output address, output bytes | fills `capability::EndpointPair` |
+
+The output is the following exact 16-byte structure:
+
+```rust
+#[repr(C)]
+pub struct EndpointPair {
+    pub first: u64,
+    pub second: u64,
+}
+```
+
+Pair creation atomically reserves two distinct endpoint objects and two handles with full endpoint
+rights. Exhausting either bound returns `ENOSPC` without creating a partial pair. A short output
+buffer returns `ERANGE`, and an invalid writable range returns `EFAULT`, before any allocation.
+
+Each endpoint owns one bounded incoming queue. Sending through one endpoint enqueues on its peer;
+receiving dequeues from the selected endpoint's own queue. `READABLE` is asserted while that queue
+is nonempty. `WRITABLE` is asserted while the peer exists and its incoming queue has capacity.
+Dropping the final reference to either endpoint permanently asserts `PEER_CLOSED` on the survivor
+and clears `WRITABLE`. Unread messages already queued on the surviving endpoint remain readable and
+may be drained; afterward receive and all sends return `EPIPE`. Destroying an endpoint discards its
+own unread queue and closes capabilities held only by those messages.
+
+Duplication and transfer preserve endpoint lifetime, so peer closure occurs only after the final
+handle, queued attachment, and kernel root is gone. Process teardown removes its capability table
+and publishes any resulting closure. The older `ENDPOINT_CREATE` call remains a compatible
+one-ended loopback mailbox: its sends target its own queue and it never asserts `PEER_CLOSED`.
+`CHANNEL_PAIRS` in `SystemInfo.capabilities` advertises the operation.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -604,6 +637,7 @@ consume object state, and one process may have only one outstanding generic obje
 - ABI 1.23 adds monotonic clock discovery and absolute-deadline single-object waiting at syscalls
   71 and 72.
 - ABI 1.24 adds bounded absolute-deadline many-object waiting at syscall 73.
+- ABI 1.25 adds atomic channel-pair creation and level-triggered peer closure at syscall 74.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

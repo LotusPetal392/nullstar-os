@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 24;
+pub const ABI_VERSION_MINOR: u64 = 25;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -93,6 +93,7 @@ pub mod syscall {
     pub const MONOTONIC_TIME: u64 = 71;
     pub const OBJECT_WAIT_ONE: u64 = 72;
     pub const OBJECT_WAIT_MANY: u64 = 73;
+    pub const ENDPOINT_CREATE_PAIR: u64 = 74;
 }
 
 pub mod filesystem_provider {
@@ -125,6 +126,7 @@ pub mod capability {
     pub const MONOTONIC_CLOCK: u64 = 1 << 20;
     pub const OBJECT_WAIT_ONE: u64 = 1 << 21;
     pub const OBJECT_WAIT_MANY: u64 = 1 << 22;
+    pub const CHANNEL_PAIRS: u64 = 1 << 23;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -149,7 +151,8 @@ pub mod capability {
         | OBJECT_SIGNAL_STATE
         | MONOTONIC_CLOCK
         | OBJECT_WAIT_ONE
-        | OBJECT_WAIT_MANY;
+        | OBJECT_WAIT_MANY
+        | CHANNEL_PAIRS;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -197,6 +200,20 @@ pub mod capability {
             kind: 0,
             rights: 0,
             size: 0,
+        };
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EndpointPair {
+        pub first: u64,
+        pub second: u64,
+    }
+
+    impl EndpointPair {
+        pub const EMPTY: Self = Self {
+            first: INVALID_HANDLE,
+            second: INVALID_HANDLE,
         };
     }
 

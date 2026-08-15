@@ -981,21 +981,22 @@ services to the layer and separating final public crates remain Phase 1 work.
 
 ### Phase 2: Channel and wait runtime
 
-- add channel pairs and peer-closure signals;
+- migrate services onto the implemented channel pairs and peer-closure signals;
 - add atomic move-transfer and multiple attached handles;
 - add one- and many-object waiting with absolute deadlines;
 - add event ports or persistent wait sets;
 - add asynchronous channel send and receive;
 - add safe mapped shared memory.
 
-The first asynchronous endpoint slice is implemented ahead of channel pairs and persistent event
-ports: an allocation-free scoped reactor converts endpoint readability and writability into standard
+The first asynchronous channel slice is implemented ahead of persistent event ports: an
+allocation-free scoped reactor converts endpoint readability, writability, and peer closure into standard
 Rust futures, drives bounded `wait_many` registrations with absolute deadlines, and supports byte
 send, typed receive, and ownership-safe move send. Host tests cover bounded registration, merged
 signals, deadline forwarding, and invalid unregistered suspension. The QEMU runtime probe covers a
-real cross-process readiness wakeup plus local async send, receive, and capability move. Persistent
-registrations, independently scheduled tasks, peer closure, and multi-handle channels remain Phase 2
-work.
+real cross-process readiness wakeup plus local async send, receive, and capability move. Atomic pair
+creation, bidirectional delivery, final-reference and process-exit peer closure, and queued-message
+drainage are covered by the QEMU runtime probe. Persistent registrations, independently scheduled
+tasks, service migration, and multi-handle messages remain Phase 2 work.
 
 ### Phase 3: Hand-written protocol runtime
 

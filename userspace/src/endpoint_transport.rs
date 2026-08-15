@@ -41,7 +41,7 @@ impl EndpointTransport {
 
     fn fail_send(&mut self) -> Result<(), TrySendError> {
         self.close_local();
-        // The current mailbox ABI has no peer-close signal; this is the runtime's fatal error.
+        // Legacy mailbox endpoints have no peer-close signal; this is the runtime's fatal error.
         Err(TrySendError::PeerClosed)
     }
 

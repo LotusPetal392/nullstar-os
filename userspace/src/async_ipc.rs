@@ -251,10 +251,11 @@ impl<const N: usize> Future for Send<'_, '_, '_, N> {
                 Poll::Ready(Ok(()))
             }
             Err(error) if error == ipc::Error::TRY_AGAIN => {
-                match self
-                    .reactor
-                    .register(self.endpoint.wait_item(Signals::WRITABLE), context.waker())
-                {
+                match self.reactor.register(
+                    self.endpoint
+                        .wait_item(Signals::WRITABLE | Signals::PEER_CLOSED),
+                    context.waker(),
+                ) {
                     Ok(()) => Poll::Pending,
                     Err(error) => {
                         self.complete = true;
@@ -293,10 +294,10 @@ impl<const N: usize> Future for Receive<'_, '_, '_, N> {
                 Poll::Ready(Ok(message))
             }
             Err(error) if error == ipc::Error::TRY_AGAIN => {
-                match self
-                    .reactor
-                    .register(endpoint.wait_item(Signals::READABLE), context.waker())
-                {
+                match self.reactor.register(
+                    endpoint.wait_item(Signals::READABLE | Signals::PEER_CLOSED),
+                    context.waker(),
+                ) {
                     Ok(()) => Poll::Pending,
                     Err(error) => {
                         self.complete = true;
@@ -336,10 +337,11 @@ impl<T: ObjectType, const N: usize> Future for SendMove<'_, '_, '_, T, N> {
             Ok(()) => Poll::Ready(Ok(())),
             Err(error) if error.error() == ipc::Error::TRY_AGAIN => {
                 let handle = error.into_handle();
-                match this
-                    .reactor
-                    .register(this.endpoint.wait_item(Signals::WRITABLE), context.waker())
-                {
+                match this.reactor.register(
+                    this.endpoint
+                        .wait_item(Signals::WRITABLE | Signals::PEER_CLOSED),
+                    context.waker(),
+                ) {
                     Ok(()) => {
                         this.handle = Some(handle);
                         Poll::Pending
