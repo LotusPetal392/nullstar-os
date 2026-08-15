@@ -5,6 +5,7 @@ use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
     blocking_ipc,
+    handle::{Endpoint, Notification, OwnedHandle},
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
@@ -85,7 +86,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
     {
         return false;
     }
-    if !capability_probe(process_id) || !job_probe() {
+    if !capability_probe(process_id) || !owned_handle_probe() || !job_probe() {
         return false;
     }
     let Ok(process_group) = platform::get_process_group(0) else {
@@ -163,6 +164,97 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
 
 fn supplementary_probes_enabled(argument: &[u8]) -> bool {
     argument != b"runtime-smoke" && argument != b"manual-argv"
+}
+
+fn owned_handle_probe() -> bool {
+    const OWNED_MESSAGE: &[u8] = b"owned-handle";
+
+    let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    if endpoint.info().ok().map(|info| info.kind) != Some(ObjectKind::Endpoint)
+        || endpoint
+            .borrow()
+            .wait(Signals::WRITABLE, Deadline::IMMEDIATE)
+            .ok()
+            != Some(Signals::WRITABLE)
+    {
+        return false;
+    }
+
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
+        return false;
+    };
+    let notification_raw = notification.as_raw();
+    if ipc::send(
+        endpoint.as_raw(),
+        OWNED_MESSAGE,
+        Some(Transfer {
+            handle: notification_raw,
+            rights: Rights::WAIT,
+        }),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut output = [0_u8; OWNED_MESSAGE.len()];
+    let Ok(message) = endpoint.try_receive(&mut output) else {
+        return false;
+    };
+    let Some(received) = message.capability else {
+        return false;
+    };
+    if message.bytes != OWNED_MESSAGE.len()
+        || output != OWNED_MESSAGE
+        || received.rights != Rights::WAIT
+    {
+        return false;
+    }
+    let received_raw = received.handle.as_raw();
+    let Ok(received) = received.handle.try_cast::<Notification>() else {
+        return false;
+    };
+    drop(received);
+    if ipc::info(received_raw).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR)
+        || notification.close().is_err()
+        || ipc::info(notification_raw).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR)
+    {
+        return false;
+    }
+
+    let untyped = endpoint.erase();
+    let untyped = match untyped.try_cast::<Notification>() {
+        Err((ipc::Error::INVALID_ARGUMENT, untyped)) => untyped,
+        Ok(notification) => {
+            drop(notification);
+            return false;
+        }
+        Err((_, untyped)) => {
+            drop(untyped);
+            return false;
+        }
+    };
+    let Ok(mut endpoint) = untyped.try_cast::<Endpoint>() else {
+        return false;
+    };
+
+    let Ok(duplicate) = endpoint.borrow().duplicate(Rights::SEND) else {
+        return false;
+    };
+    let duplicate_raw = duplicate.as_raw();
+    drop(duplicate);
+    if ipc::info(duplicate_raw).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR)
+        || endpoint.replace_rights(Rights::SEND).is_err()
+        || endpoint.info().ok().map(|info| info.rights) != Some(Rights::SEND)
+    {
+        return false;
+    }
+    let endpoint_raw = endpoint.into_raw();
+    if ipc::info(endpoint_raw).is_err() || ipc::close(endpoint_raw).is_err() {
+        return false;
+    }
+    true
 }
 
 fn capability_probe(current_process: u64) -> bool {

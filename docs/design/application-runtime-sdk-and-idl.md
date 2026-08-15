@@ -968,6 +968,15 @@ and application code decide whether an operation is safe to repeat.
 - add host tests for ownership and cleanup;
 - preserve the current endpoint, notification, and copied shared-memory semantics.
 
+The first in-tree slice is implemented in the userspace library without prematurely splitting
+crates: raw calls remain available, while sealed object markers, non-cloneable owned handles,
+lifetime-bound borrows, automatic close, explicit duplication and rights replacement, unsafe raw
+adoption, type erasure and revalidation, and ownership-safe endpoint receive are available to new
+code. Host tests cover close-versus-transfer behavior and the QEMU runtime probe verifies drop,
+explicit close, reduced-rights replacement, failed-cast ownership preservation, and received-handle
+cleanup against the kernel. Moving all services to the layer, consuming owned handles during move
+transfer, and separating final public crates remain Phase 1 work.
+
 ### Phase 2: Channel and wait runtime
 
 - add channel pairs and peer-closure signals;

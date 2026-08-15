@@ -25,6 +25,14 @@ snapshot for endpoints, notifications, and job subtrees. ABI 1.23 adds monotonic
 and scheduler-integrated single-object waits with absolute deadlines. ABI 1.24 adds bounded
 many-object waits with deterministic lowest-index selection.
 
+Userspace now also has an initial ownership-safe layer over the unchanged raw ABI. A non-cloneable
+owned handle closes on drop, produces only lifetime-bound borrowed handles, and can be explicitly
+duplicated, rights-replaced, closed, or transferred back to raw ownership. Sealed marker types retain
+validated endpoint, notification, shared-memory, early-log reader, and job kinds. The typed endpoint
+receive path adopts an attached capability immediately so ignored or rejected attachments are closed
+by ordinary ownership cleanup. This is a library guarantee rather than a new kernel ABI contract;
+legacy raw callers remain supported while services migrate incrementally.
+
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
 

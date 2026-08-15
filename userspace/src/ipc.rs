@@ -459,9 +459,15 @@ pub fn try_receive(endpoint: CapabilityHandle, buffer: &mut [u8]) -> Result<Rece
         }
         None
     } else {
+        let Some(rights) = Rights::from_bits(raw.transferred_rights) else {
+            // The kernel installed the transferred entry before returning metadata.
+            // Do not leak that ownership if the metadata violates the public ABI.
+            let _ = close(raw.transferred_handle);
+            return Err(Error::IO);
+        };
         Some(ReceivedCapability {
             handle: raw.transferred_handle,
-            rights: Rights::from_bits(raw.transferred_rights).ok_or(Error::IO)?,
+            rights,
         })
     };
     Ok(ReceivedMessage {

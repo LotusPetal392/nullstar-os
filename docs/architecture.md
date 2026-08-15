@@ -100,6 +100,15 @@ run in ring 3 with separate page tables and use software interrupt `0x80` for th
 experimental NullStar syscall ABI, currently version 1.24. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
+The userspace library preserves raw numeric capability calls for compatibility and now layers
+non-cloneable ownership-safe handles over them. Owned handles close on drop, borrowed handles are
+lifetime-bound, object markers preserve validated endpoint, notification, shared-memory, early-log,
+and job kinds, and explicit operations cover duplication, rights replacement, raw ownership
+transfer, type erasure, and revalidation. The first typed endpoint receive path adopts attached
+capabilities immediately so an ignored attachment is closed automatically. The runtime probe checks
+these rules against real kernel handles; broad service migration and ownership-consuming move
+transfer remain future runtime work.
+
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh
 shell after final exit. Direct shell children are reaped by `ush`; abandoned descendants
