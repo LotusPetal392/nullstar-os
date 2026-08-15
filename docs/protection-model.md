@@ -30,7 +30,9 @@ owned handle closes on drop, produces only lifetime-bound borrowed handles, and 
 duplicated, rights-replaced, closed, or transferred back to raw ownership. Sealed marker types retain
 validated endpoint, notification, shared-memory, early-log reader, and job kinds. The typed endpoint
 receive path adopts an attached capability immediately so ignored or rejected attachments are closed
-by ordinary ownership cleanup. This is a library guarantee rather than a new kernel ABI contract;
+by ordinary ownership cleanup. Typed move send consumes its source handle on success and returns the
+still-owned source with the syscall error on any failed enqueue, preserving the kernel's atomic retry
+contract in the Rust type flow. This is a library guarantee rather than a new kernel ABI contract;
 legacy raw callers remain supported while services migrate incrementally.
 
 Since that phase, the capability and IPC foundation has been used to move several

@@ -105,9 +105,10 @@ non-cloneable ownership-safe handles over them. Owned handles close on drop, bor
 lifetime-bound, object markers preserve validated endpoint, notification, shared-memory, early-log,
 and job kinds, and explicit operations cover duplication, rights replacement, raw ownership
 transfer, type erasure, and revalidation. The first typed endpoint receive path adopts attached
-capabilities immediately so an ignored attachment is closed automatically. The runtime probe checks
-these rules against real kernel handles; broad service migration and ownership-consuming move
-transfer remain future runtime work.
+capabilities immediately so an ignored attachment is closed automatically. Typed endpoint move sends
+consume the source only after a successful atomic enqueue and return the same owned handle on failure,
+making backpressure retries explicit and leak-free. The runtime probe checks these rules against real
+kernel handles; broad service migration remains future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh

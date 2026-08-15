@@ -972,10 +972,12 @@ The first in-tree slice is implemented in the userspace library without prematur
 crates: raw calls remain available, while sealed object markers, non-cloneable owned handles,
 lifetime-bound borrows, automatic close, explicit duplication and rights replacement, unsafe raw
 adoption, type erasure and revalidation, and ownership-safe endpoint receive are available to new
-code. Host tests cover close-versus-transfer behavior and the QEMU runtime probe verifies drop,
-explicit close, reduced-rights replacement, failed-cast ownership preservation, and received-handle
-cleanup against the kernel. Moving all services to the layer, consuming owned handles during move
-transfer, and separating final public crates remain Phase 1 work.
+code. Ownership-consuming endpoint move send now disarms the source only after a successful atomic
+enqueue and returns the same owned handle with any error so backpressure can be retried safely. Host
+tests cover close-versus-transfer and failed-move recovery, while the QEMU runtime probe verifies
+drop, explicit close, reduced-rights replacement, failed-cast ownership preservation, received-handle
+cleanup, failed-move retention, and successful source invalidation against the kernel. Moving all
+services to the layer and separating final public crates remain Phase 1 work.
 
 ### Phase 2: Channel and wait runtime
 

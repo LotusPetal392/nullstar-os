@@ -565,66 +565,70 @@ fn notification_waiter_probe() -> bool {
 fn endpoint_move_transfer_probe(current_process: u64) -> bool {
     const MOVED_MESSAGE: &[u8] = b"move-capability";
 
-    let Ok(endpoint) = ipc::endpoint_create() else {
+    let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
         return false;
     };
-    let Ok(notification) = ipc::notification_create() else {
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
         return false;
     };
-    let Ok(source_info) = ipc::info(notification) else {
+    let Ok(source_info) = notification.info() else {
         return false;
     };
     for _ in 0..limits::MAX_ENDPOINT_MESSAGES {
-        if ipc::send(endpoint, &[], None).is_err() {
+        if endpoint.send(&[]).is_err() {
             return false;
         }
     }
-    let transfer = Transfer {
-        handle: notification,
-        rights: Rights::NOTIFICATION,
+    let notification = match endpoint.send_move(MOVED_MESSAGE, notification, Rights::NOTIFICATION) {
+        Err(error) if error.error() == ipc::Error::TRY_AGAIN => error.into_handle(),
+        Err(_) | Ok(()) => return false,
     };
-    if ipc::send_move(endpoint, MOVED_MESSAGE, transfer).err() != Some(ipc::Error::TRY_AGAIN)
-        || !ipc::info(notification).is_ok_and(|info| info == source_info)
-    {
+    if notification.info().ok() != Some(source_info) {
         return false;
     }
 
     let mut buffer = [0_u8; MOVED_MESSAGE.len()];
     for _ in 0..limits::MAX_ENDPOINT_MESSAGES {
-        let Ok(message) = ipc::try_receive(endpoint, &mut buffer) else {
+        let Ok(message) = endpoint.try_receive(&mut buffer) else {
             return false;
         };
         if message.bytes != 0 || message.capability.is_some() {
             return false;
         }
     }
-    if ipc::send_move(endpoint, MOVED_MESSAGE, transfer).is_err()
-        || ipc::info(notification).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR)
+    let notification_raw = notification.as_raw();
+    if endpoint
+        .send_move(MOVED_MESSAGE, notification, Rights::NOTIFICATION)
+        .is_err()
+        || ipc::info(notification_raw).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR)
     {
         return false;
     }
-    let Ok(message) = ipc::try_receive(endpoint, &mut buffer) else {
+    let Ok(message) = endpoint.try_receive(&mut buffer) else {
         return false;
     };
     let Some(received) = message.capability else {
         return false;
     };
+    let received_rights = received.rights;
+    let Ok(received) = received.handle.try_cast::<Notification>() else {
+        return false;
+    };
     let moved = message.sender_process_id == current_process
         && message.bytes == MOVED_MESSAGE.len()
         && buffer.as_slice() == MOVED_MESSAGE
-        && received.rights == Rights::NOTIFICATION
-        && ipc::info(received.handle).is_ok_and(|info| {
+        && received_rights == Rights::NOTIFICATION
+        && received.info().is_ok_and(|info| {
             info.object_id == source_info.object_id
                 && info.kind == ObjectKind::Notification
                 && info.rights == Rights::NOTIFICATION
         })
-        && ipc::notification_signal(received.handle, 1).ok() == Some(1)
-        && ipc::notification_try_wait(received.handle).ok() == Some(0);
+        && received.signal(1).ok() == Some(1)
+        && received.try_wait().ok() == Some(0);
 
-    ipc::close(received.handle).is_ok()
-        && ipc::close(endpoint).is_ok()
-        && moved
-        && endpoint_move_waiter_probe(current_process)
+    drop(received);
+    drop(endpoint);
+    moved && endpoint_move_waiter_probe(current_process)
 }
 
 fn endpoint_move_waiter_probe(current_process: u64) -> bool {
