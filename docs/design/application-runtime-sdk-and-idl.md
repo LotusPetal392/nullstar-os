@@ -988,6 +988,15 @@ services to the layer and separating final public crates remain Phase 1 work.
 - add asynchronous channel send and receive;
 - add safe mapped shared memory.
 
+The first asynchronous endpoint slice is implemented ahead of channel pairs and persistent event
+ports: an allocation-free scoped reactor converts endpoint readability and writability into standard
+Rust futures, drives bounded `wait_many` registrations with absolute deadlines, and supports byte
+send, typed receive, and ownership-safe move send. Host tests cover bounded registration, merged
+signals, deadline forwarding, and invalid unregistered suspension. The QEMU runtime probe covers a
+real cross-process readiness wakeup plus local async send, receive, and capability move. Persistent
+registrations, independently scheduled tasks, peer closure, and multi-handle channels remain Phase 2
+work.
+
 ### Phase 3: Hand-written protocol runtime
 
 - implement the provisional NullStar Wire Protocol codec;
@@ -1010,7 +1019,7 @@ A test-only protocol should exercise handle transfer.
 
 ### Phase 4: Asynchronous execution
 
-- implement event-port executor integration;
+- evolve the scoped reactor into event-port executor integration;
 - add task groups and structured cancellation;
 - add timers and deadline propagation;
 - add a bounded blocking pool;

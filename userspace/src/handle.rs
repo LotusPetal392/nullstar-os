@@ -122,6 +122,10 @@ pub struct SendMoveError<T: ObjectType> {
 }
 
 impl<T: ObjectType> SendMoveError<T> {
+    pub(crate) fn new(error: ipc::Error, handle: OwnedHandle<T>) -> Self {
+        Self { error, handle }
+    }
+
     pub const fn error(&self) -> ipc::Error {
         self.error
     }

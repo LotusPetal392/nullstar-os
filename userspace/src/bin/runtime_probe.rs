@@ -4,6 +4,7 @@
 use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
+    async_ipc::Reactor,
     blocking_ipc,
     handle::{Endpoint, Notification, OwnedHandle},
     heap::BumpHeap,
@@ -86,7 +87,11 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
     {
         return false;
     }
-    if !capability_probe(process_id) || !owned_handle_probe() || !job_probe() {
+    if !capability_probe(process_id)
+        || !owned_handle_probe()
+        || !async_ipc_probe(process_id)
+        || !job_probe()
+    {
         return false;
     }
     let Ok(process_group) = platform::get_process_group(0) else {
@@ -255,6 +260,148 @@ fn owned_handle_probe() -> bool {
         return false;
     }
     true
+}
+
+fn async_ipc_probe(current_process: u64) -> bool {
+    const CHILD_ENDPOINT_HANDLE: ipc::CapabilityHandle = 1;
+    const CHILD_MESSAGE: &[u8] = b"async-wakeup";
+    const LOCAL_MESSAGE: &[u8] = b"async-send";
+    const MOVE_MESSAGE: &[u8] = b"async-move";
+
+    let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return false;
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return false;
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.reader);
+        let ready = ipc::wait_for_handle(CHILD_ENDPOINT_HANDLE)
+            .is_ok_and(|info| info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND)
+            && syscall::write_all(barrier.writer, &[1]).is_ok()
+            && syscall::close(barrier.writer).is_ok();
+        if ready {
+            for _ in 0..4 {
+                let _ = syscall::yield_now();
+            }
+        }
+        let sent = ready
+            && ipc::send(CHILD_ENDPOINT_HANDLE, CHILD_MESSAGE, None).is_ok()
+            && ipc::close(CHILD_ENDPOINT_HANDLE).is_ok();
+        syscall::exit(if sent { 0 } else { 80 });
+    }
+
+    let setup = syscall::close(barrier.writer).is_ok()
+        && ipc::grant_child(
+            child,
+            endpoint.as_raw(),
+            Rights::SEND,
+            CHILD_ENDPOINT_HANDLE,
+        )
+        .ok()
+            == Some(CHILD_ENDPOINT_HANDLE);
+    let mut ready = [0_u8; 1];
+    let synchronized = setup
+        && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
+        && ready[0] == 1
+        && syscall::close(barrier.reader).is_ok();
+
+    let reactor = Reactor::<2>::new();
+    let mut buffer = [0_u8; 16];
+    let child_message = if synchronized {
+        let mut receive = reactor.receive(endpoint.borrow(), &mut buffer);
+        match reactor.run(&mut receive) {
+            Ok(Ok(message)) => Some(message),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let child_received = child_message.is_some_and(|message| {
+        message.sender_process_id == child
+            && message.bytes == CHILD_MESSAGE.len()
+            && message.capability.is_none()
+            && buffer[..CHILD_MESSAGE.len()] == *CHILD_MESSAGE
+    });
+
+    let local_sent = if child_received {
+        let mut send = reactor.send(endpoint.borrow(), LOCAL_MESSAGE);
+        matches!(reactor.run(&mut send), Ok(Ok(())))
+    } else {
+        false
+    };
+    let local_received = if local_sent {
+        let mut receive = reactor.receive(endpoint.borrow(), &mut buffer);
+        match reactor.run(&mut receive) {
+            Ok(Ok(message)) => {
+                message.sender_process_id == current_process
+                    && message.bytes == LOCAL_MESSAGE.len()
+                    && message.capability.is_none()
+                    && buffer[..LOCAL_MESSAGE.len()] == *LOCAL_MESSAGE
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    let moved = match local_received
+        .then(OwnedHandle::<Notification>::create)
+        .transpose()
+    {
+        Ok(Some(notification)) => {
+            let mut send =
+                reactor.send_move(endpoint.borrow(), MOVE_MESSAGE, notification, Rights::WAIT);
+            matches!(reactor.run(&mut send), Ok(Ok(())))
+        }
+        _ => false,
+    };
+    let move_received = if moved {
+        let mut receive = reactor.receive(endpoint.borrow(), &mut buffer);
+        match reactor.run(&mut receive) {
+            Ok(Ok(message)) => match message.capability {
+                Some(capability) if capability.rights == Rights::WAIT => {
+                    let typed = capability.handle.try_cast::<Notification>();
+                    message.sender_process_id == current_process
+                        && message.bytes == MOVE_MESSAGE.len()
+                        && buffer[..MOVE_MESSAGE.len()] == *MOVE_MESSAGE
+                        && typed.is_ok()
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    let mut child_succeeded = false;
+    if synchronized {
+        for _ in 0..JOB_WAIT_YIELDS {
+            match syscall::try_wait_child(child) {
+                Ok(status) => {
+                    child_succeeded = status.success();
+                    break;
+                }
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                    let _ = syscall::yield_now();
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if !child_succeeded {
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+    }
+    let _ = syscall::close(barrier.reader);
+    let _ = syscall::close(barrier.writer);
+    child_received && local_received && move_received && child_succeeded
 }
 
 fn capability_probe(current_process: u64) -> bool {

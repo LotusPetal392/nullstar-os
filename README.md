@@ -38,7 +38,8 @@ experimentation, not production use or untrusted workloads.
   objects, level-triggered endpoint, notification, and job signal snapshots,
   absolute-deadline single- and bounded many-object waits, explicit direct-child bootstrap grants,
   ownership-safe userspace handle wrappers with typed object markers, automatic close, and
-  retry-safe ownership-consuming move transfer,
+  retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor for
+  asynchronous endpoint send, receive, and move-send operations,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and
