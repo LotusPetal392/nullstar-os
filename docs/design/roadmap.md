@@ -10,6 +10,7 @@ The current system already has bounded process-local capability tables, rights-r
 copying and atomic replacement, diagnostic object identity, endpoints, counted notifications,
 atomic one-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
 job signal snapshots, absolute-deadline single- and bounded many-object waiting, endpoint waiting,
+atomic channel pairs with final-reference peer closure,
 direct-child bootstrap grants, and an initial userspace layer of non-cloneable owned, borrowed, and
 kind-validated handles with automatic close and retry-safe ownership-consuming move transfer. A
 bounded allocation-free scoped reactor also provides asynchronous endpoint send, receive, and move
@@ -21,8 +22,8 @@ send over the existing many-object wait ABI. The next architecture stages are:
 2. evolve the implemented process and immutable hierarchical-job containment into distinct thread
    and address-space abstractions plus broader hierarchy-scoped resource policy beyond the
    implemented process-count ceiling;
-3. evolve the existing bounded endpoint and atomic one-handle move-transfer into channel pairs with
-   peer closure, multiple rights-reduced handles, and explicit backpressure accounting;
+3. evolve the implemented channel pairs, peer closure, and atomic one-handle move-transfer with
+   multiple rights-reduced handles and explicit per-job backpressure accounting;
 4. evolve shared-memory objects from bounded copies to mapped pages with protection,
    sealing, W^X integration, and job accounting;
 5. add cancellation and a bounded synchronous call/reply path with priority donation;

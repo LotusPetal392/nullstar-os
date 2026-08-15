@@ -37,6 +37,11 @@ copies and validates the complete array before inspecting readiness, then return
 index whose requested mask intersects current object state. The same absolute-deadline rules apply,
 and each process may have only one outstanding generic one- or many-object wait.
 
+ABI 1.25 adds paired endpoints. Generic waits can select `PEER_CLOSED`; `READABLE` may remain
+asserted alongside it while already queued messages are drained. A compatibility `ENDPOINT_WAIT`
+wakes when the peer closes so the receive loop can observe `EPIPE`. Async send, receive, and move-send
+registrations wait on peer closure as well as ordinary readiness.
+
 ## Current boundary
 
 The original endpoint primitive removes cooperative polling from request/reply clients and remains

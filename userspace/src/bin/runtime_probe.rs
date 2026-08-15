@@ -89,6 +89,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
     }
     if !capability_probe(process_id)
         || !owned_handle_probe()
+        || !channel_pair_probe(process_id)
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -260,6 +261,161 @@ fn owned_handle_probe() -> bool {
         return false;
     }
     true
+}
+
+fn channel_pair_probe(current_process: u64) -> bool {
+    const FORWARD: &[u8] = b"channel-forward";
+    const REPLY: &[u8] = b"channel-reply";
+    const QUEUED: &[u8] = b"queued-after-close";
+
+    let Ok((first, second)) = OwnedHandle::<Endpoint>::create_pair() else {
+        return false;
+    };
+    let Ok(first_info) = first.info() else {
+        return false;
+    };
+    let Ok(second_info) = second.info() else {
+        return false;
+    };
+    if first_info.object_id == second_info.object_id
+        || first_info.kind != ObjectKind::Endpoint
+        || second_info.kind != ObjectKind::Endpoint
+        || first_info.rights != Rights::ENDPOINT
+        || second_info.rights != Rights::ENDPOINT
+        || first.signal_state().ok() != Some(Signals::WRITABLE)
+        || second.signal_state().ok() != Some(Signals::WRITABLE)
+    {
+        return false;
+    }
+
+    let mut buffer = [0_u8; QUEUED.len()];
+    if first.send(FORWARD).is_err()
+        || first.signal_state().ok() != Some(Signals::WRITABLE)
+        || second.signal_state().ok() != Some(Signals::READABLE | Signals::WRITABLE)
+    {
+        return false;
+    }
+    let Ok(forward) = second.try_receive(&mut buffer) else {
+        return false;
+    };
+    if forward.sender_process_id != current_process
+        || forward.bytes != FORWARD.len()
+        || forward.capability.is_some()
+        || &buffer[..FORWARD.len()] != FORWARD
+        || second.send(REPLY).is_err()
+    {
+        return false;
+    }
+    let Ok(reply) = first.try_receive(&mut buffer) else {
+        return false;
+    };
+    if reply.sender_process_id != current_process
+        || reply.bytes != REPLY.len()
+        || reply.capability.is_some()
+        || &buffer[..REPLY.len()] != REPLY
+        || first.send(QUEUED).is_err()
+    {
+        return false;
+    }
+
+    let first_raw = first.as_raw();
+    drop(first);
+    if ipc::info(first_raw).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR)
+        || second.signal_state().ok() != Some(Signals::READABLE | Signals::PEER_CLOSED)
+        || second.wait(Signals::PEER_CLOSED, Deadline::IMMEDIATE).ok() != Some(Signals::PEER_CLOSED)
+        || ipc::wait_many(
+            &[WaitItem::new(second.as_raw(), Signals::PEER_CLOSED)],
+            Deadline::IMMEDIATE,
+        )
+        .ok()
+            != Some(0)
+    {
+        return false;
+    }
+    let Ok(queued) = second.try_receive(&mut buffer) else {
+        return false;
+    };
+    if queued.sender_process_id != current_process
+        || queued.bytes != QUEUED.len()
+        || queued.capability.is_some()
+        || buffer != *QUEUED
+        || second.signal_state().ok() != Some(Signals::PEER_CLOSED)
+        || second.send(b"closed").err() != Some(ipc::Error::BROKEN_PIPE)
+        || second.try_receive(&mut buffer).err() != Some(ipc::Error::BROKEN_PIPE)
+    {
+        return false;
+    }
+    drop(second);
+
+    let Ok((first, second)) = OwnedHandle::<Endpoint>::create_pair() else {
+        return false;
+    };
+    let Ok(duplicate) = first.borrow().duplicate(Rights::ENDPOINT) else {
+        return false;
+    };
+    drop(first);
+    if second.signal_state().ok() != Some(Signals::WRITABLE) {
+        return false;
+    }
+    drop(duplicate);
+    if second.signal_state().ok() != Some(Signals::PEER_CLOSED) {
+        return false;
+    }
+    drop(second);
+
+    channel_pair_process_exit_probe()
+}
+
+fn channel_pair_process_exit_probe() -> bool {
+    const CHILD_ENDPOINT_HANDLE: ipc::CapabilityHandle = 1;
+
+    let Ok((first, second)) = OwnedHandle::<Endpoint>::create_pair() else {
+        return false;
+    };
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return false;
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return false;
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.reader);
+        let ready = ipc::wait_for_handle(CHILD_ENDPOINT_HANDLE)
+            .is_ok_and(|info| info.kind == ObjectKind::Endpoint)
+            && syscall::write_all(barrier.writer, &[1]).is_ok()
+            && syscall::close(barrier.writer).is_ok();
+        syscall::exit(if ready { 0 } else { 79 });
+    }
+
+    let setup = syscall::close(barrier.writer).is_ok()
+        && ipc::grant_child(
+            child,
+            second.as_raw(),
+            Rights::ENDPOINT,
+            CHILD_ENDPOINT_HANDLE,
+        )
+        .ok()
+            == Some(CHILD_ENDPOINT_HANDLE);
+    let mut ready = [0_u8; 1];
+    let synchronized = setup
+        && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
+        && ready[0] == 1
+        && syscall::close(barrier.reader).is_ok();
+    drop(second);
+    let child_succeeded =
+        synchronized && syscall::wait_child(child).is_ok_and(|status| status.success());
+    let peer_closed = child_succeeded
+        && first.signal_state().ok() == Some(Signals::PEER_CLOSED)
+        && first.wait(Signals::PEER_CLOSED, Deadline::IMMEDIATE).ok() == Some(Signals::PEER_CLOSED);
+    if !child_succeeded {
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+    }
+    let _ = syscall::close(barrier.reader);
+    let _ = syscall::close(barrier.writer);
+    peer_closed
 }
 
 fn async_ipc_probe(current_process: u64) -> bool {

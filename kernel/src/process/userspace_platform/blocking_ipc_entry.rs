@@ -155,10 +155,9 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
     ) {
         let endpoint_object = scheduler::current_process_id().and_then(|process_id| {
             let endpoint_handle = unsafe { (*registers_pointer).rdi };
-            endpoint_object_for_handle(
+            endpoint_send_target_for_handle(
                 process_id,
                 endpoint_handle,
-                abi::capability::RIGHT_SEND,
             )
             .ok()
         });
@@ -229,11 +228,36 @@ fn endpoint_object_for_handle(
     Ok(entry.object)
 }
 
+fn endpoint_send_target_for_handle(
+    process_id: u64,
+    endpoint_handle: u64,
+) -> Result<CapabilityObjectRef, i64> {
+    let registry = CAPABILITY_REGISTRY.lock();
+    let entry = registry
+        .entry(process_id, endpoint_handle)
+        .ok_or(abi::errno::BAD_FILE_DESCRIPTOR)?;
+    capability_has_right(entry, abi::capability::RIGHT_SEND)?;
+    if entry.object.kind != abi::capability::KIND_ENDPOINT {
+        return Err(abi::errno::INVALID_ARGUMENT);
+    }
+    endpoint_destination(&registry, entry.object)
+}
+
 fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
     let registry = CAPABILITY_REGISTRY.lock();
     let object_index = registry.object_index(object).ok_or(abi::errno::IO)?;
     match &registry.objects[object_index].data {
-        CapabilityObjectData::Endpoint(endpoint) => Ok(!endpoint.queue.is_empty()),
+        CapabilityObjectData::Endpoint(endpoint) => {
+            if !endpoint.queue.is_empty() {
+                return Ok(true);
+            }
+            if let EndpointPeer::Connected(peer) = endpoint.peer
+                && registry.object_index(peer).is_none()
+            {
+                return Err(abi::errno::BROKEN_PIPE);
+            }
+            Ok(false)
+        }
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
         | CapabilityObjectData::KernelEarlyLogReader(_)

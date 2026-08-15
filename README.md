@@ -34,7 +34,8 @@ experimentation, not production use or untrusted workloads.
   unblockable forced termination
 - bounded per-process capability tables with rights-reduced duplication,
   atomic rights replacement, and delegation, message endpoints, counted
-  notifications, atomic one-handle endpoint move-transfer, shared byte-memory
+  notifications, atomic paired channel creation with peer-closure readiness,
+  atomic one-handle endpoint move-transfer, shared byte-memory
   objects, level-triggered endpoint, notification, and job signal snapshots,
   absolute-deadline single- and bounded many-object waits, explicit direct-child bootstrap grants,
   ownership-safe userspace handle wrappers with typed object markers, automatic close, and

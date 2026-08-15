@@ -34,6 +34,13 @@ struct EndpointMessage {
 #[derive(Debug)]
 struct EndpointObject {
     queue: alloc::collections::VecDeque<EndpointMessage>,
+    peer: EndpointPeer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointPeer {
+    Loopback,
+    Connected(CapabilityObjectRef),
 }
 
 #[derive(Debug)]
@@ -225,6 +232,81 @@ impl CapabilityRegistry {
         Ok(reference)
     }
 
+    fn create_endpoint_pair(
+        &mut self,
+        process_id: u64,
+    ) -> Result<abi::capability::EndpointPair, i64> {
+        self.collect_garbage();
+        if self.object_kind_count(abi::capability::KIND_ENDPOINT).saturating_add(2)
+            > abi::limits::MAX_ENDPOINT_OBJECTS
+        {
+            return Err(abi::errno::NO_SPACE);
+        }
+
+        let table_index = self.ensure_table(process_id)?;
+        if self.tables[table_index].entries.len().saturating_add(2)
+            > abi::limits::MAX_CAPABILITIES_PER_PROCESS
+        {
+            return Err(abi::errno::NO_SPACE);
+        }
+        let handles = (1..=abi::limits::MAX_CAPABILITIES_PER_PROCESS as u64)
+            .filter(|candidate| {
+                !self.tables[table_index]
+                    .entries
+                    .iter()
+                    .any(|entry| entry.handle == *candidate)
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        if handles.len() != 2 {
+            return Err(abi::errno::NO_SPACE);
+        }
+
+        let first_id = self.next_object_id;
+        let second_id = first_id.checked_add(1).ok_or(abi::errno::NO_SPACE)?;
+        self.next_object_id = first_id.checked_add(2).ok_or(abi::errno::NO_SPACE)?;
+        let first_object = CapabilityObjectRef {
+            id: first_id,
+            kind: abi::capability::KIND_ENDPOINT,
+        };
+        let second_object = CapabilityObjectRef {
+            id: second_id,
+            kind: abi::capability::KIND_ENDPOINT,
+        };
+        self.objects.push(CapabilityObjectRecord {
+            reference: first_object,
+            data: CapabilityObjectData::Endpoint(EndpointObject {
+                queue: alloc::collections::VecDeque::with_capacity(
+                    abi::limits::MAX_ENDPOINT_MESSAGES,
+                ),
+                peer: EndpointPeer::Connected(second_object),
+            }),
+        });
+        self.objects.push(CapabilityObjectRecord {
+            reference: second_object,
+            data: CapabilityObjectData::Endpoint(EndpointObject {
+                queue: alloc::collections::VecDeque::with_capacity(
+                    abi::limits::MAX_ENDPOINT_MESSAGES,
+                ),
+                peer: EndpointPeer::Connected(first_object),
+            }),
+        });
+        self.tables[table_index].entries.push(CapabilityEntry {
+            handle: handles[0],
+            object: first_object,
+            rights: abi::capability::ENDPOINT_RIGHTS,
+        });
+        self.tables[table_index].entries.push(CapabilityEntry {
+            handle: handles[1],
+            object: second_object,
+            rights: abi::capability::ENDPOINT_RIGHTS,
+        });
+        Ok(abi::capability::EndpointPair {
+            first: handles[0],
+            second: handles[1],
+        })
+    }
+
     fn collect_garbage(&mut self) {
         let mut reachable = Vec::<CapabilityObjectRef>::new();
         for table in &self.tables {
@@ -413,6 +495,64 @@ fn capability_reap_dead_processes() {
         .tables
         .retain(|table| live_processes.contains(&table.process_id));
     registry.collect_garbage();
+    let peer_closed = peer_closed_endpoint_objects(&registry);
+    drop(registry);
+    for object in peer_closed {
+        wake_endpoint_waiter(object);
+    }
+}
+
+fn capability_remove_process(process_id: u64) {
+    let peer_closed = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        registry
+            .tables
+            .retain(|table| table.process_id != process_id);
+        registry.collect_garbage();
+        peer_closed_endpoint_objects(&registry)
+    };
+    for object in peer_closed {
+        wake_endpoint_waiter(object);
+    }
+}
+
+fn peer_closed_endpoint_objects(registry: &CapabilityRegistry) -> Vec<CapabilityObjectRef> {
+    registry
+        .objects
+        .iter()
+        .filter_map(|record| match &record.data {
+            CapabilityObjectData::Endpoint(EndpointObject {
+                peer: EndpointPeer::Connected(peer),
+                ..
+            }) if registry.object_index(*peer).is_none() => Some(record.reference),
+            _ => None,
+        })
+        .collect()
+}
+
+fn endpoint_destination(
+    registry: &CapabilityRegistry,
+    endpoint: CapabilityObjectRef,
+) -> Result<CapabilityObjectRef, i64> {
+    let index = registry.object_index(endpoint).ok_or(abi::errno::IO)?;
+    let CapabilityObjectData::Endpoint(endpoint_data) = &registry.objects[index].data else {
+        return Err(abi::errno::INVALID_ARGUMENT);
+    };
+    let destination = match endpoint_data.peer {
+        EndpointPeer::Loopback => endpoint,
+        EndpointPeer::Connected(peer) => peer,
+    };
+    let Some(destination_index) = registry.object_index(destination) else {
+        return Err(abi::errno::BROKEN_PIPE);
+    };
+    if matches!(
+        registry.objects[destination_index].data,
+        CapabilityObjectData::Endpoint(_)
+    ) {
+        Ok(destination)
+    } else {
+        Err(abi::errno::IO)
+    }
 }
 
 fn capability_user_length(length: u64, maximum: usize) -> Result<usize, i64> {
@@ -522,6 +662,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::CAPABILITY_REPLACE
             | abi::syscall::CAPABILITY_SIGNAL_STATE
             | abi::syscall::ENDPOINT_CREATE
+            | abi::syscall::ENDPOINT_CREATE_PAIR
             | abi::syscall::ENDPOINT_SEND
             | abi::syscall::ENDPOINT_SEND_MOVE
             | abi::syscall::ENDPOINT_RECEIVE
@@ -582,6 +723,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
             capability_signal_state(process_id, registers.rdi)
         }
         abi::syscall::ENDPOINT_CREATE => endpoint_create(process_id),
+        abi::syscall::ENDPOINT_CREATE_PAIR => {
+            endpoint_create_pair(process_id, registers.rdi, registers.rsi)
+        }
         abi::syscall::ENDPOINT_SEND => endpoint_send(
             process_id,
             registers.rdi,
@@ -725,11 +869,17 @@ fn capability_close(process_id: u64, handle: u64) -> u64 {
     if handle == abi::capability::INVALID_HANDLE {
         return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
     }
-    let mut registry = CAPABILITY_REGISTRY.lock();
-    if !registry.remove_entry(process_id, handle) {
-        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    let peer_closed = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        if !registry.remove_entry(process_id, handle) {
+            return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+        }
+        registry.collect_garbage();
+        peer_closed_endpoint_objects(&registry)
+    };
+    for object in peer_closed {
+        wake_endpoint_waiter(object);
     }
-    registry.collect_garbage();
     0
 }
 
@@ -774,7 +924,8 @@ fn capability_signal_state(process_id: u64, handle: u64) -> u64 {
 fn capability_object_supported_signals(kind: u64) -> kernel::object::Signals {
     match kind {
         abi::capability::KIND_ENDPOINT => kernel::object::Signals::READABLE
-            .union(kernel::object::Signals::WRITABLE),
+            .union(kernel::object::Signals::WRITABLE)
+            .union(kernel::object::Signals::PEER_CLOSED),
         abi::capability::KIND_NOTIFICATION => kernel::object::Signals::SIGNALED,
         abi::capability::KIND_JOB => kernel::object::Signals::READABLE
             .union(kernel::object::Signals::TERMINATED),
@@ -796,8 +947,24 @@ fn capability_object_signal_state(
             if !endpoint.queue.is_empty() {
                 signals = signals.union(kernel::object::Signals::READABLE);
             }
-            if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES {
-                signals = signals.union(kernel::object::Signals::WRITABLE);
+            match endpoint.peer {
+                EndpointPeer::Loopback => {
+                    if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES {
+                        signals = signals.union(kernel::object::Signals::WRITABLE);
+                    }
+                }
+                EndpointPeer::Connected(peer) => {
+                    let Some(peer_index) = registry.object_index(peer) else {
+                        return Ok(signals.union(kernel::object::Signals::PEER_CLOSED));
+                    };
+                    let CapabilityObjectData::Endpoint(peer) = &registry.objects[peer_index].data
+                    else {
+                        return Err(abi::errno::IO);
+                    };
+                    if peer.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES {
+                        signals = signals.union(kernel::object::Signals::WRITABLE);
+                    }
+                }
             }
             Ok(signals)
         }
@@ -844,6 +1011,7 @@ fn endpoint_create(process_id: u64) -> u64 {
         abi::capability::KIND_ENDPOINT,
         CapabilityObjectData::Endpoint(EndpointObject {
             queue: alloc::collections::VecDeque::with_capacity(abi::limits::MAX_ENDPOINT_MESSAGES),
+            peer: EndpointPeer::Loopback,
         }),
     ) {
         Ok(object) => object,
@@ -856,6 +1024,29 @@ fn endpoint_create(process_id: u64) -> u64 {
             error_return(error)
         }
     }
+}
+
+fn endpoint_create_pair(process_id: u64, address: u64, length: u64) -> u64 {
+    let required = size_of::<abi::capability::EndpointPair>();
+    let output_length = match usize::try_from(length) {
+        Ok(length) => length,
+        Err(_) => return error_return(abi::errno::RANGE),
+    };
+    if output_length < required {
+        return error_return(abi::errno::RANGE);
+    }
+    if !user_range_allows(process_id, address, required, true) {
+        return error_return(abi::errno::BAD_ADDRESS);
+    }
+    let pair = {
+        let mut registry = CAPABILITY_REGISTRY.lock();
+        match registry.create_endpoint_pair(process_id) {
+            Ok(pair) => pair,
+            Err(error) => return error_return(error),
+        }
+    };
+    unsafe { ptr::write_unaligned(address as *mut abi::capability::EndpointPair, pair) };
+    0
 }
 
 fn endpoint_send(
@@ -944,7 +1135,11 @@ fn endpoint_send_with_disposition(
         })
     };
 
-    let Some(object_index) = registry.object_index(endpoint_entry.object) else {
+    let destination = match endpoint_destination(&registry, endpoint_entry.object) {
+        Ok(destination) => destination,
+        Err(error) => return error_return(error),
+    };
+    let Some(object_index) = registry.object_index(destination) else {
         return error_return(abi::errno::IO);
     };
     let CapabilityObjectData::Endpoint(endpoint) = &registry.objects[object_index].data else {
@@ -1007,7 +1202,14 @@ fn endpoint_receive(
     let (message_length, transfer) = match &registry.objects[object_index].data {
         CapabilityObjectData::Endpoint(endpoint) => match endpoint.queue.front() {
             Some(message) => (message.bytes.len(), message.capability),
-            None => return error_return(abi::errno::TRY_AGAIN),
+            None => {
+                if let EndpointPeer::Connected(peer) = endpoint.peer
+                    && registry.object_index(peer).is_none()
+                {
+                    return error_return(abi::errno::BROKEN_PIPE);
+                }
+                return error_return(abi::errno::TRY_AGAIN);
+            }
         },
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)

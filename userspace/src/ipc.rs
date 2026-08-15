@@ -41,6 +41,7 @@ impl Error {
     pub const RANGE: Self = Self((-abi_errno::RANGE) as i32);
     pub const NOT_IMPLEMENTED: Self = Self((-abi_errno::NOT_IMPLEMENTED) as i32);
     pub const TIMED_OUT: Self = Self((-abi_errno::TIMED_OUT) as i32);
+    pub const BROKEN_PIPE: Self = Self((-abi_errno::BROKEN_PIPE) as i32);
 
     pub const fn code(self) -> i32 {
         self.0
@@ -398,6 +399,33 @@ pub fn endpoint_create() -> Result<CapabilityHandle> {
         asm!("int 0x80", inlateout("rax") result);
     }
     decode(result)
+}
+
+pub fn endpoint_create_pair() -> Result<(CapabilityHandle, CapabilityHandle)> {
+    let mut pair = abi_capability::EndpointPair::EMPTY;
+    let mut result = syscall::ENDPOINT_CREATE_PAIR;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") (&mut pair as *mut abi_capability::EndpointPair) as u64,
+            in("rsi") size_of::<abi_capability::EndpointPair>() as u64,
+        );
+    }
+    decode(result)?;
+    if pair.first == abi_capability::INVALID_HANDLE
+        || pair.second == abi_capability::INVALID_HANDLE
+        || pair.first == pair.second
+    {
+        if pair.first != abi_capability::INVALID_HANDLE {
+            let _ = close(pair.first);
+        }
+        if pair.second != abi_capability::INVALID_HANDLE && pair.second != pair.first {
+            let _ = close(pair.second);
+        }
+        return Err(Error::IO);
+    }
+    Ok((pair.first, pair.second))
 }
 
 pub fn send(endpoint: CapabilityHandle, bytes: &[u8], transfer: Option<Transfer>) -> Result<()> {
@@ -793,6 +821,10 @@ mod tests {
         assert_eq!(syscall::MONOTONIC_TIME, 71);
         assert_eq!(syscall::OBJECT_WAIT_ONE, 72);
         assert_eq!(syscall::OBJECT_WAIT_MANY, 73);
+        assert_eq!(syscall::ENDPOINT_CREATE_PAIR, 74);
+        assert_eq!(core::mem::size_of::<capability::EndpointPair>(), 16);
+        assert_eq!(core::mem::align_of::<capability::EndpointPair>(), 8);
+        assert_eq!(capability::CHANNEL_PAIRS, 1 << 23);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

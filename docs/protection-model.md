@@ -23,7 +23,8 @@ free handle-table slot. ABI 1.21 adds opt-in atomic move-transfer of one rights-
 through an endpoint message. ABI 1.22 adds a `WAIT`-authorized, level-triggered signal-state
 snapshot for endpoints, notifications, and job subtrees. ABI 1.23 adds monotonic time discovery
 and scheduler-integrated single-object waits with absolute deadlines. ABI 1.24 adds bounded
-many-object waits with deterministic lowest-index selection.
+many-object waits with deterministic lowest-index selection. ABI 1.25 adds atomic pairs of
+bidirectional endpoints whose non-owning peer links expose final-reference and process-exit closure.
 
 Userspace now also has an initial ownership-safe layer over the unchanged raw ABI. A non-cloneable
 owned handle closes on drop, produces only lifetime-bound borrowed handles, and can be explicitly
@@ -102,6 +103,8 @@ Endpoint operations remain bounded:
 
 - sending to a full queue returns `TRY_AGAIN`;
 - receiving from an empty queue returns `TRY_AGAIN`;
+- sending after paired-endpoint closure, or receiving after its surviving queue drains, returns
+  `BROKEN_PIPE`;
 - a too-small receive buffer returns `RANGE` without consuming the message;
 - failed capability installation does not consume the message;
 - a failed move-send does not consume the source capability;
@@ -132,6 +135,11 @@ item's readiness, registers the resolved objects atomically with scheduler block
 lowest satisfied array index. Duplicate handles are permitted and retain array-order priority. The
 same immediate, infinite, and finite absolute-deadline behavior applies. Larger persistent wait sets
 remain future work.
+
+ABI 1.25 adds atomic endpoint pairs. Sends target the peer's incoming queue, so `WRITABLE` reflects
+peer capacity rather than local capacity. Final peer destruction permanently asserts `PEER_CLOSED`;
+the survivor may report `READABLE | PEER_CLOSED` until already queued messages are drained. Peer
+links do not retain objects, while duplicated, transferred, and kernel-rooted references do.
 
 The original endpoint send copies a rights-reduced capability and retains the source. ABI 1.21's
 move-send instead removes the source atomically when the bounded message is committed to the queue.
@@ -370,7 +378,7 @@ Future work should preserve the current rules while adding:
 
 - typed MMIO, IRQ, DMA, and device-ownership capabilities;
 - direct shared-memory mappings with explicit cache and protection semantics;
-- cancellation, multi-object waiting, and endpoint peer-liveness notification;
+- cancellation, persistent event ports, and service migration onto paired channels;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
   restartable service-manager broker that owns the sequence and receives its current state;
 - broader job-level resource accounting and limits plus service, session, and application

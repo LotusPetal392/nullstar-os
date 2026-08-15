@@ -97,7 +97,7 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.24. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.25. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 The userspace library preserves raw numeric capability calls for compatibility and now layers
@@ -110,9 +110,11 @@ consume the source only after a successful atomic enqueue and return the same ow
 making backpressure retries explicit and leak-free. A scoped, allocation-free reactor now drives
 standard Rust futures for endpoint send, receive, and ownership-consuming move send over the bounded
 many-object wait ABI. It sleeps in the scheduler after backpressure rather than polling and preserves
-move-send ownership across every pending or failed registration path. The runtime probe checks these
-rules and a real cross-process wakeup against kernel handles; persistent event ports, independent task
-scheduling, and broad service migration remain future runtime work.
+move-send ownership across every pending or failed registration path. Atomic channel-pair creation now
+provides bidirectional peer queues, writable state based on peer capacity, final-reference peer closure,
+and queued-message drainage after closure. The runtime probe checks these rules, process-exit cleanup,
+and real cross-process wakeups against kernel handles; persistent event ports, independent task
+scheduling, multi-handle messages, and broad service migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh

@@ -6233,6 +6233,7 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
         })
         .ok_or(Error::ProcessNotFound(process_id))?;
         remove_object_waiter(process_id);
+        capability_remove_process(process_id);
         let terminal_parent = process.terminal_parent;
         terminal::detach(process_id);
         if let Some(parent_process_id) = terminal_parent {
@@ -8521,6 +8522,7 @@ fn tmpfs_proxy_create_reply_endpoint() -> Result<CapabilityObjectRef, i64> {
                 queue: alloc::collections::VecDeque::with_capacity(
                     abi::limits::MAX_ENDPOINT_MESSAGES,
                 ),
+                peer: EndpointPeer::Loopback,
             }),
         )?
     };
