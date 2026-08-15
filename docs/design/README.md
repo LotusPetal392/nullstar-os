@@ -23,6 +23,7 @@ authoritative when it differs from future design.
 - [Memory hardening](memory-hardening.md)
 - [Userspace architecture](userspace-architecture.md)
 - [Native application runtime, SDK, and service IDL](application-runtime-sdk-and-idl.md)
+- [Nova Foundation application context and profile storage](nova-foundation-profile-storage.md)
 - [NSIDL and the NullStar Wire Protocol](nsidl-and-wire-protocol.md)
 - [NSWP packet header and protocol identifiers](nswp-header-and-protocol-identifiers.md)
 - [Service, session, and application lifecycle](service-and-session-lifecycle.md)
@@ -65,6 +66,8 @@ authoritative when it differs from future design.
 - Keep every wire message, dynamic value, handle set, and decode allocation explicitly
   bounded and validate complete messages before dispatch.
 - Sandbox every application bundle regardless of installation location.
+- Bind application profile storage to verified identity and expose role-specific
+  capabilities rather than ambient paths.
 - Deploy applications as verified immutable generations and keep mutable data outside
   their bundles.
 - Preserve a practical compatibility path without making Unix conventions the
