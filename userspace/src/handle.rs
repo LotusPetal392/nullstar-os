@@ -111,6 +111,30 @@ pub struct ReceivedMessage {
     pub capability: Option<ReceivedCapability>,
 }
 
+/// A failed ownership-consuming endpoint send.
+///
+/// The kernel leaves a moved capability installed when enqueueing fails, so this
+/// error returns the still-owned handle for retry, inspection, or cleanup.
+#[derive(Debug)]
+pub struct SendMoveError<T: ObjectType> {
+    error: ipc::Error,
+    handle: OwnedHandle<T>,
+}
+
+impl<T: ObjectType> SendMoveError<T> {
+    pub const fn error(&self) -> ipc::Error {
+        self.error
+    }
+
+    pub fn into_handle(self) -> OwnedHandle<T> {
+        self.handle
+    }
+
+    pub fn into_parts(self) -> (ipc::Error, OwnedHandle<T>) {
+        (self.error, self.handle)
+    }
+}
+
 impl<T: ObjectType> Copy for BorrowedHandle<'_, T> {}
 
 impl<T: ObjectType> Clone for BorrowedHandle<'_, T> {
@@ -232,6 +256,19 @@ impl OwnedHandle<Endpoint> {
         self.borrow().send(bytes)
     }
 
+    /// Atomically sends a message and moves `handle` into its attachment.
+    ///
+    /// Success consumes the source capability. Failure returns it inside
+    /// [`SendMoveError`], preserving ownership for an explicit retry or drop.
+    pub fn send_move<T: ObjectType>(
+        &self,
+        bytes: &[u8],
+        handle: OwnedHandle<T>,
+        rights: Rights,
+    ) -> Result<(), SendMoveError<T>> {
+        self.borrow().send_move(bytes, handle, rights)
+    }
+
     pub fn try_receive(&self, output: &mut [u8]) -> ipc::Result<ReceivedMessage> {
         self.borrow().try_receive(output)
     }
@@ -306,6 +343,19 @@ impl BorrowedHandle<'_, Endpoint> {
         ipc::send(self.as_raw(), bytes, None)
     }
 
+    /// Atomically sends a message and moves `handle` into its attachment.
+    ///
+    /// Success consumes the source capability. Failure returns it inside
+    /// [`SendMoveError`], preserving ownership for an explicit retry or drop.
+    pub fn send_move<T: ObjectType>(
+        self,
+        bytes: &[u8],
+        handle: OwnedHandle<T>,
+        rights: Rights,
+    ) -> Result<(), SendMoveError<T>> {
+        send_move_with(self.as_raw(), bytes, handle, rights, ipc::send_move)
+    }
+
     pub fn try_receive(self, output: &mut [u8]) -> ipc::Result<ReceivedMessage> {
         let message = ipc::try_receive(self.as_raw(), output)?;
         let capability = match message.capability {
@@ -320,6 +370,32 @@ impl BorrowedHandle<'_, Endpoint> {
             bytes: message.bytes,
             capability,
         })
+    }
+}
+
+fn send_move_with<T, F>(
+    endpoint: CapabilityHandle,
+    bytes: &[u8],
+    handle: OwnedHandle<T>,
+    rights: Rights,
+    send: F,
+) -> Result<(), SendMoveError<T>>
+where
+    T: ObjectType,
+    F: FnOnce(CapabilityHandle, &[u8], ipc::Transfer) -> ipc::Result<()>,
+{
+    let transfer = ipc::Transfer {
+        handle: handle.as_raw(),
+        rights,
+    };
+    match send(endpoint, bytes, transfer) {
+        Ok(()) => {
+            // The successful syscall removed the process-local source entry.
+            // Disarm Drop without attempting to close that now-invalid value.
+            let _ = handle.into_raw();
+            Ok(())
+        }
+        Err(error) => Err(SendMoveError { error, handle }),
     }
 }
 
@@ -346,8 +422,8 @@ fn close_raw(raw: CapabilityHandle) -> ipc::Result<()> {
 mod tests {
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-    use super::{AnyObject, OwnedHandle};
-    use crate::ipc;
+    use super::{AnyObject, OwnedHandle, send_move_with};
+    use crate::ipc::{self, Rights};
 
     static CLOSED_COUNT: AtomicUsize = AtomicUsize::new(0);
     static LAST_CLOSED: AtomicU64 = AtomicU64::new(0);
@@ -363,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_handles_close_once_and_raw_transfer_suppresses_drop() {
+    fn owned_handles_close_once_and_transfers_preserve_ownership() {
         reset_closes();
         {
             let owned = unsafe { OwnedHandle::<AnyObject>::from_raw(41) }.unwrap();
@@ -381,6 +457,33 @@ mod tests {
         assert!(owned.close().is_ok());
         assert_eq!(CLOSED_COUNT.load(Ordering::SeqCst), 2);
         assert_eq!(LAST_CLOSED.load(Ordering::SeqCst), 43);
+
+        let owned = unsafe { OwnedHandle::<AnyObject>::from_raw(44) }.unwrap();
+        let failed = send_move_with(
+            7,
+            b"retry",
+            owned,
+            Rights::WAIT,
+            |endpoint, bytes, transfer| {
+                assert_eq!(endpoint, 7);
+                assert_eq!(bytes, b"retry");
+                assert_eq!(transfer.handle, 44);
+                assert_eq!(transfer.rights, Rights::WAIT);
+                Err(ipc::Error::TRY_AGAIN)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failed.error(), ipc::Error::TRY_AGAIN);
+        let (error, owned) = failed.into_parts();
+        assert_eq!(error, ipc::Error::TRY_AGAIN);
+        assert_eq!(owned.as_raw(), 44);
+        drop(owned);
+        assert_eq!(CLOSED_COUNT.load(Ordering::SeqCst), 3);
+        assert_eq!(LAST_CLOSED.load(Ordering::SeqCst), 44);
+
+        let owned = unsafe { OwnedHandle::<AnyObject>::from_raw(45) }.unwrap();
+        assert!(send_move_with(7, b"sent", owned, Rights::WAIT, |_, _, _| Ok(())).is_ok());
+        assert_eq!(CLOSED_COUNT.load(Ordering::SeqCst), 3);
     }
 
     #[test]

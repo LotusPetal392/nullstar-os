@@ -11,7 +11,8 @@ copying and atomic replacement, diagnostic object identity, endpoints, counted n
 atomic one-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
 job signal snapshots, absolute-deadline single- and bounded many-object waiting, endpoint waiting,
 direct-child bootstrap grants, and an initial userspace layer of non-cloneable owned, borrowed, and
-kind-validated handles with automatic close. The next architecture stages are:
+kind-validated handles with automatic close and retry-safe ownership-consuming move transfer. The
+next architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
    inspection authorization around the implemented close, duplicate, atomic replace, inspection,
@@ -26,8 +27,7 @@ kind-validated handles with automatic close. The next architecture stages are:
 5. add cancellation and a bounded synchronous call/reply path with priority donation;
 6. add persistent event ports or wait sets for IPC, timers, process exit, file and
    network completion, display, device, and media events;
-7. extend the initial safe handle foundation through ownership-consuming transfer, an asynchronous
-   IPC runtime, typed service bindings,
+7. extend the safe handle foundation through an asynchronous IPC runtime, typed service bindings,
    tracing, and protocol conformance tests;
 8. introduce an IDL only after stable wire and lifecycle conventions have survived real
    services.
