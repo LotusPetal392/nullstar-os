@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.22, and a
+The ABI is experimental, but callers can query the current version, 1.23, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -520,6 +520,26 @@ waitable signals return `EINVAL`. The query does not consume state, block, accep
 promise that a later operation will still observe the same condition. `OBJECT_SIGNAL_STATE` in
 `SystemInfo.capabilities` advertises the operation.
 
+## Version 1.23 monotonic clock and single-object waiting
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 71 | `MONOTONIC_TIME` | none | nanoseconds since kernel timer initialization |
+| 72 | `OBJECT_WAIT_ONE` | capability handle, requested signal mask, absolute deadline in monotonic nanoseconds | requested asserted signal mask |
+
+`OBJECT_WAIT_ONE` requires `WAIT`, a nonempty known signal mask, and only signals supported by the
+selected object. It returns immediately when any requested signal is asserted; the return value is
+the intersection of the requested and current masks. Otherwise it registers the process and blocks
+its scheduler task until a relevant level-triggered transition or deadline expiry. Waking does not
+consume messages, notification counts, or job completion records.
+
+Deadline zero is an immediate poll and `UINT64_MAX` means no deadline. Other values are absolute
+timestamps in the same nanosecond domain returned by `MONOTONIC_TIME`; finite deadlines are serviced
+at the kernel timer's current 100 Hz resolution. An expired deadline returns `ETIMEDOUT`. Invalid or
+empty masks and signals unsupported by the object return `EINVAL`; invalid handles return `EBADF`;
+and missing `WAIT` returns `EPERM`. `MONOTONIC_CLOCK` and `OBJECT_WAIT_ONE` in
+`SystemInfo.capabilities` advertise the two operations. Many-object waits remain future work.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -552,6 +572,8 @@ promise that a later operation will still observe the same condition. `OBJECT_SI
 - ABI 1.20 adds atomic rights-reduced capability replacement at syscall 68.
 - ABI 1.21 adds atomic one-handle endpoint move-transfer at syscall 69.
 - ABI 1.22 adds `WAIT`-authorized, level-triggered object signal snapshots at syscall 70.
+- ABI 1.23 adds monotonic clock discovery and absolute-deadline single-object waiting at syscalls
+  71 and 72.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

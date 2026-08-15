@@ -39,6 +39,7 @@ impl Error {
     pub const NO_SPACE: Self = Self((-abi_errno::NO_SPACE) as i32);
     pub const RANGE: Self = Self((-abi_errno::RANGE) as i32);
     pub const NOT_IMPLEMENTED: Self = Self((-abi_errno::NOT_IMPLEMENTED) as i32);
+    pub const TIMED_OUT: Self = Self((-abi_errno::TIMED_OUT) as i32);
 
     pub const fn code(self) -> i32 {
         self.0
@@ -146,6 +147,22 @@ impl BitOr for Signals {
 
     fn bitor(self, rhs: Self) -> Self::Output {
         Self(self.0 | rhs.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Deadline(u64);
+
+impl Deadline {
+    pub const IMMEDIATE: Self = Self(crate::abi::deadline::IMMEDIATE);
+    pub const INFINITE: Self = Self(crate::abi::deadline::INFINITE);
+
+    pub const fn from_monotonic_ns(nanoseconds: u64) -> Self {
+        Self(nanoseconds)
+    }
+
+    pub const fn as_monotonic_ns(self) -> u64 {
+        self.0
     }
 }
 
@@ -292,6 +309,25 @@ pub fn signal_state(handle: CapabilityHandle) -> Result<Signals> {
             "int 0x80",
             inlateout("rax") result,
             in("rdi") handle,
+        );
+    }
+    let signals = decode(result)?;
+    Signals::from_bits(signals).ok_or(Error::IO)
+}
+
+pub fn wait_one(
+    handle: CapabilityHandle,
+    requested: Signals,
+    deadline: Deadline,
+) -> Result<Signals> {
+    let mut result = syscall::OBJECT_WAIT_ONE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") handle,
+            in("rsi") requested.bits(),
+            in("rdx") deadline.as_monotonic_ns(),
         );
     }
     let signals = decode(result)?;
@@ -618,7 +654,7 @@ pub fn job_terminate(handle: CapabilityHandle) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectKind, Rights, Signals, phase1_protection_abi};
+    use super::{Deadline, ObjectKind, Rights, Signals, phase1_protection_abi};
     use crate::abi::{capability, syscall};
 
     #[test]
@@ -642,6 +678,16 @@ mod tests {
         assert!(!state.contains(Signals::PEER_CLOSED));
         assert_eq!(Signals::from_bits(state.bits()), Some(state));
         assert_eq!(Signals::from_bits(1 << 63), None);
+    }
+
+    #[test]
+    fn object_wait_deadlines_preserve_absolute_monotonic_values() {
+        assert_eq!(Deadline::IMMEDIATE.as_monotonic_ns(), 0);
+        assert_eq!(Deadline::INFINITE.as_monotonic_ns(), u64::MAX);
+        assert_eq!(
+            Deadline::from_monotonic_ns(123_456).as_monotonic_ns(),
+            123_456
+        );
     }
 
     #[test]
@@ -676,6 +722,8 @@ mod tests {
         assert_eq!(syscall::CAPABILITY_REPLACE, 68);
         assert_eq!(syscall::ENDPOINT_SEND_MOVE, 69);
         assert_eq!(syscall::CAPABILITY_SIGNAL_STATE, 70);
+        assert_eq!(syscall::MONOTONIC_TIME, 71);
+        assert_eq!(syscall::OBJECT_WAIT_ONE, 72);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

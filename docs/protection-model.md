@@ -21,7 +21,8 @@ the object inert, detaches its parent edge, and allows reclamation after final h
 relaxation. ABI 1.20 adds atomic rights-reduced capability replacement without requiring another
 free handle-table slot. ABI 1.21 adds opt-in atomic move-transfer of one rights-reduced capability
 through an endpoint message. ABI 1.22 adds a `WAIT`-authorized, level-triggered signal-state
-snapshot for endpoints, notifications, and job subtrees.
+snapshot for endpoints, notifications, and job subtrees. ABI 1.23 adds monotonic time discovery
+and scheduler-integrated single-object waits with absolute deadlines.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
@@ -103,8 +104,14 @@ ABI 1.22 exposes immediate, level-triggered signal snapshots through `WAIT` auth
 report `READABLE` while their queue is nonempty and `WRITABLE` while it has message capacity.
 Notifications report `SIGNALED` while their count is nonzero. Jobs report `READABLE` while any
 subtree exit record is pending and `TERMINATED` while the subtree has no active members; those two
-states may overlap until the final records are drained. This operation is polling only. General
-deadline-based one- and many-object waits remain future work.
+states may overlap until the final records are drained.
+
+ABI 1.23 adds a single-object wait over the same signal vocabulary. The caller supplies a nonempty
+signal subset supported by the selected object plus an absolute monotonic nanosecond deadline. The
+wait returns the requested signals observed asserted, returns `ETIMEDOUT` when the deadline expires,
+and never consumes object state. Deadline zero is an immediate poll and `UINT64_MAX` waits
+indefinitely. Registration, state inspection, and scheduler blocking are ordered to prevent lost
+wakeups. Bounded many-object waits remain future work.
 
 The original endpoint send copies a rights-reduced capability and retains the source. ABI 1.21's
 move-send instead removes the source atomically when the bounded message is committed to the queue.

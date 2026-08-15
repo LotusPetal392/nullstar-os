@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     blocking_ipc,
     heap::BumpHeap,
-    ipc::{self, ObjectKind, Rights, Signals, Transfer},
+    ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer},
     platform::{self, DirectoryEntry},
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
@@ -182,6 +182,8 @@ fn capability_probe(current_process: u64) -> bool {
             .contains(Rights::SEND | Rights::RECEIVE)
         || endpoint_info.size != 0
         || ipc::signal_state(endpoint).ok() != Some(Signals::WRITABLE)
+        || ipc::wait_one(endpoint, Signals::WRITABLE, Deadline::IMMEDIATE).ok()
+            != Some(Signals::WRITABLE)
     {
         return false;
     }
@@ -203,6 +205,8 @@ fn capability_probe(current_process: u64) -> bool {
         || send_only_info.kind != ObjectKind::Endpoint
         || send_only_info.rights != Rights::SEND
         || ipc::signal_state(send_only).err() != Some(ipc::Error::PERMISSION)
+        || ipc::wait_one(send_only, Signals::WRITABLE, Deadline::IMMEDIATE).err()
+            != Some(ipc::Error::PERMISSION)
         || ipc::try_receive(send_only, &mut denied_buffer).err() != Some(ipc::Error::PERMISSION)
     {
         return false;
@@ -270,6 +274,20 @@ fn capability_probe(current_process: u64) -> bool {
     if received_info.kind != ObjectKind::Notification
         || received_info.rights != Rights::WAIT
         || ipc::signal_state(received_capability.handle).ok() != Some(Signals::EMPTY)
+        || ipc::wait_one(
+            received_capability.handle,
+            Signals::SIGNALED,
+            Deadline::IMMEDIATE,
+        )
+        .err()
+            != Some(ipc::Error::TIMED_OUT)
+        || ipc::wait_one(
+            received_capability.handle,
+            Signals::READABLE,
+            Deadline::IMMEDIATE,
+        )
+        .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
         || ipc::notification_signal(received_capability.handle, 1).err()
             != Some(ipc::Error::PERMISSION)
     {
@@ -278,11 +296,34 @@ fn capability_probe(current_process: u64) -> bool {
 
     if ipc::notification_signal(notification, 2).ok() != Some(2)
         || ipc::signal_state(received_capability.handle).ok() != Some(Signals::SIGNALED)
+        || ipc::wait_one(
+            received_capability.handle,
+            Signals::SIGNALED,
+            Deadline::IMMEDIATE,
+        )
+        .ok()
+            != Some(Signals::SIGNALED)
         || ipc::notification_try_wait(received_capability.handle).ok() != Some(1)
         || ipc::notification_try_wait(received_capability.handle).ok() != Some(0)
         || ipc::notification_try_wait(received_capability.handle).err()
             != Some(ipc::Error::TRY_AGAIN)
         || ipc::signal_state(received_capability.handle).ok() != Some(Signals::EMPTY)
+    {
+        return false;
+    }
+
+    let Ok(before_timeout) = platform::monotonic_time_ns() else {
+        return false;
+    };
+    let timeout = before_timeout.saturating_add(20_000_000);
+    if ipc::wait_one(
+        received_capability.handle,
+        Signals::SIGNALED,
+        Deadline::from_monotonic_ns(timeout),
+    )
+    .err()
+        != Some(ipc::Error::TIMED_OUT)
+        || !platform::monotonic_time_ns().is_ok_and(|now| now >= timeout)
     {
         return false;
     }
@@ -294,6 +335,77 @@ fn capability_probe(current_process: u64) -> bool {
         && ipc::close(send_only).is_ok()
         && ipc::close(endpoint).is_ok()
         && endpoint_move_transfer_probe(current_process)
+        && notification_waiter_probe()
+}
+
+fn notification_waiter_probe() -> bool {
+    const NOTIFICATION_HANDLE: ipc::CapabilityHandle = 1;
+
+    let Ok(notification) = ipc::notification_create() else {
+        return false;
+    };
+    let Ok(barrier) = syscall::pipe_pair() else {
+        let _ = ipc::close(notification);
+        return false;
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        let _ = ipc::close(notification);
+        return false;
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.reader);
+        if !ipc::wait_for_handle(NOTIFICATION_HANDLE)
+            .is_ok_and(|info| info.kind == ObjectKind::Notification && info.rights == Rights::WAIT)
+            || syscall::write_all(barrier.writer, &[1]).is_err()
+            || syscall::close(barrier.writer).is_err()
+        {
+            syscall::exit(74);
+        }
+        let woke = ipc::wait_one(NOTIFICATION_HANDLE, Signals::SIGNALED, Deadline::INFINITE).ok()
+            == Some(Signals::SIGNALED);
+        let consumed = ipc::notification_try_wait(NOTIFICATION_HANDLE).ok() == Some(0);
+        let closed = ipc::close(NOTIFICATION_HANDLE).is_ok();
+        syscall::exit(if woke && consumed && closed { 0 } else { 75 });
+    }
+
+    let setup = syscall::close(barrier.writer).is_ok()
+        && ipc::grant_child(child, notification, Rights::WAIT, NOTIFICATION_HANDLE).ok()
+            == Some(NOTIFICATION_HANDLE);
+    let mut ready = [0_u8; 1];
+    let synchronized = setup
+        && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
+        && ready[0] == 1
+        && syscall::close(barrier.reader).is_ok();
+    if synchronized {
+        for _ in 0..4 {
+            let _ = syscall::yield_now();
+        }
+    }
+    let signaled = synchronized && ipc::notification_signal(notification, 1).ok() == Some(1);
+    let mut child_succeeded = false;
+    if signaled {
+        for _ in 0..JOB_WAIT_YIELDS {
+            match syscall::try_wait_child(child) {
+                Ok(status) => {
+                    child_succeeded = status.success();
+                    break;
+                }
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                    let _ = syscall::yield_now();
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if !child_succeeded {
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+    }
+    let _ = syscall::close(barrier.reader);
+    let _ = syscall::close(barrier.writer);
+    ipc::close(notification).is_ok() && signaled && child_succeeded
 }
 
 fn endpoint_move_transfer_probe(current_process: u64) -> bool {
@@ -480,6 +592,8 @@ fn job_probe() -> bool {
         || info.rights != Rights::JOB
         || info.size != 0
         || ipc::signal_state(wait_only).ok() != Some(Signals::TERMINATED)
+        || ipc::wait_one(wait_only, Signals::TERMINATED, Deadline::IMMEDIATE).ok()
+            != Some(Signals::TERMINATED)
         || ipc::job_get_process_limit(job).ok() != Some(limits::MAX_JOB_PROCESSES)
         || ipc::job_get_process_limit(wait_only).ok() != Some(limits::MAX_JOB_PROCESSES)
         || ipc::job_try_wait(wait_only).err() != Some(ipc::Error::NO_CHILD)
@@ -526,7 +640,9 @@ fn job_probe() -> bool {
     let assigned = ipc::job_assign(job, child).ok() == Some(child);
     let member_visible = ipc::info(job).is_ok_and(|info| info.size == 1);
     let barrier_released = syscall::close(barrier.writer).is_ok();
-    let active_signal_state = ipc::signal_state(wait_only).ok() == Some(Signals::EMPTY);
+    let active_signal_state = ipc::signal_state(wait_only).ok() == Some(Signals::EMPTY)
+        && ipc::wait_one(wait_only, Signals::TERMINATED, Deadline::IMMEDIATE).err()
+            == Some(ipc::Error::TIMED_OUT);
     let setup_ok = reader_closed
         && attenuated_denied
         && assigned
@@ -564,6 +680,8 @@ fn job_probe() -> bool {
         || ipc::job_try_wait(wait_only).err() != Some(ipc::Error::NO_CHILD)
         || !ipc::info(job).is_ok_and(|info| info.size == 0)
         || ipc::signal_state(wait_only).ok() != Some(Signals::TERMINATED)
+        || ipc::wait_one(wait_only, Signals::TERMINATED, Deadline::IMMEDIATE).ok()
+            != Some(Signals::TERMINATED)
     {
         return close_job_handles(job, wait_only, false);
     }
@@ -897,6 +1015,9 @@ fn close_hierarchy_handles(
 
 fn bounded_job_wait(handle: ipc::CapabilityHandle) -> Option<ipc::JobExit> {
     for _ in 0..JOB_WAIT_YIELDS {
+        if ipc::wait_one(handle, Signals::READABLE, Deadline::INFINITE).is_err() {
+            return None;
+        }
         match ipc::job_try_wait(handle) {
             Ok(exit) => return Some(exit),
             Err(error) if error == ipc::Error::TRY_AGAIN => {

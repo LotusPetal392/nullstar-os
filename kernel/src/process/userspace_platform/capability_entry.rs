@@ -407,6 +407,7 @@ fn capability_reap_dead_processes() {
             .map(|process| process.process_id)
             .collect::<Vec<_>>()
     };
+    retain_live_object_waiters(&live_processes);
     let mut registry = CAPABILITY_REGISTRY.lock();
     registry
         .tables
@@ -764,8 +765,29 @@ fn capability_signal_state(process_id: u64, handle: u64) -> u64 {
     if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
         return error_return(error);
     }
-    let Some(index) = registry.object_index(entry.object) else {
-        return error_return(abi::errno::IO);
+    match capability_object_signal_state(&registry, entry.object) {
+        Ok(signals) => signals.bits(),
+        Err(error) => error_return(error),
+    }
+}
+
+fn capability_object_supported_signals(kind: u64) -> kernel::object::Signals {
+    match kind {
+        abi::capability::KIND_ENDPOINT => kernel::object::Signals::READABLE
+            .union(kernel::object::Signals::WRITABLE),
+        abi::capability::KIND_NOTIFICATION => kernel::object::Signals::SIGNALED,
+        abi::capability::KIND_JOB => kernel::object::Signals::READABLE
+            .union(kernel::object::Signals::TERMINATED),
+        _ => kernel::object::Signals::NONE,
+    }
+}
+
+fn capability_object_signal_state(
+    registry: &CapabilityRegistry,
+    object: CapabilityObjectRef,
+) -> Result<kernel::object::Signals, i64> {
+    let Some(index) = registry.object_index(object) else {
+        return Err(abi::errno::IO);
     };
 
     match &registry.objects[index].data {
@@ -777,28 +799,25 @@ fn capability_signal_state(process_id: u64, handle: u64) -> u64 {
             if endpoint.queue.len() < abi::limits::MAX_ENDPOINT_MESSAGES {
                 signals = signals.union(kernel::object::Signals::WRITABLE);
             }
-            signals.bits()
+            Ok(signals)
         }
         CapabilityObjectData::Notification(notification) => {
             if notification.pending == 0 {
-                kernel::object::Signals::NONE.bits()
+                Ok(kernel::object::Signals::NONE)
             } else {
-                kernel::object::Signals::SIGNALED.bits()
+                Ok(kernel::object::Signals::SIGNALED)
             }
         }
         CapabilityObjectData::Job(_) => {
-            let jobs = match registry.job_subtree(entry.object) {
-                Ok(jobs) => jobs,
-                Err(error) => return error_return(error),
-            };
+            let jobs = registry.job_subtree(object)?;
             let mut active_members = 0usize;
             let mut has_completion = false;
             for job in jobs {
                 let Some(index) = registry.object_index(job) else {
-                    return error_return(abi::errno::IO);
+                    return Err(abi::errno::IO);
                 };
                 let CapabilityObjectData::Job(state) = &registry.objects[index].data else {
-                    return error_return(abi::errno::INVALID_ARGUMENT);
+                    return Err(abi::errno::INVALID_ARGUMENT);
                 };
                 active_members = active_members.saturating_add(state.active_members());
                 has_completion |= state.pending_completions() != 0;
@@ -810,11 +829,11 @@ fn capability_signal_state(process_id: u64, handle: u64) -> u64 {
             if active_members == 0 {
                 signals = signals.union(kernel::object::Signals::TERMINATED);
             }
-            signals.bits()
+            Ok(signals)
         }
         CapabilityObjectData::SharedMemory(_)
         | CapabilityObjectData::KernelEarlyLogReader(_) => {
-            error_return(abi::errno::INVALID_ARGUMENT)
+            Err(abi::errno::INVALID_ARGUMENT)
         }
     }
 }
@@ -1638,5 +1657,6 @@ fn capability_job_record_exit(job: CapabilityObjectRef, process_id: u64, status:
     debug_assert!(recorded, "job member disappeared before process completion");
     if recorded {
         kernel_capability_root_remove(job);
+        wake_satisfied_object_waiters();
     }
 }

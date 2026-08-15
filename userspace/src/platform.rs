@@ -30,6 +30,7 @@ impl Errno {
     pub const RANGE: Self = Self((-abi::errno::RANGE) as i32);
     pub const NAME_TOO_LONG: Self = Self((-abi::errno::NAME_TOO_LONG) as i32);
     pub const NOT_IMPLEMENTED: Self = Self((-abi::errno::NOT_IMPLEMENTED) as i32);
+    pub const TIMED_OUT: Self = Self((-abi::errno::TIMED_OUT) as i32);
 
     pub const fn code(self) -> i32 {
         self.0
@@ -59,6 +60,14 @@ pub fn system_info() -> Result<SystemInfo> {
         );
     }
     decode(result).map(|_| info)
+}
+
+pub fn monotonic_time_ns() -> Result<u64> {
+    let mut result = syscall::MONOTONIC_TIME;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result)
 }
 
 pub fn stat(path: &[u8]) -> Result<Stat> {
