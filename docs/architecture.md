@@ -107,8 +107,12 @@ and job kinds, and explicit operations cover duplication, rights replacement, ra
 transfer, type erasure, and revalidation. The first typed endpoint receive path adopts attached
 capabilities immediately so an ignored attachment is closed automatically. Typed endpoint move sends
 consume the source only after a successful atomic enqueue and return the same owned handle on failure,
-making backpressure retries explicit and leak-free. The runtime probe checks these rules against real
-kernel handles; broad service migration remains future runtime work.
+making backpressure retries explicit and leak-free. A scoped, allocation-free reactor now drives
+standard Rust futures for endpoint send, receive, and ownership-consuming move send over the bounded
+many-object wait ABI. It sleeps in the scheduler after backpressure rather than polling and preserves
+move-send ownership across every pending or failed registration path. The runtime probe checks these
+rules and a real cross-process wakeup against kernel handles; persistent event ports, independent task
+scheduling, and broad service migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh

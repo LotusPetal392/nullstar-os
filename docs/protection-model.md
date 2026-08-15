@@ -33,7 +33,9 @@ receive path adopts an attached capability immediately so ignored or rejected at
 by ordinary ownership cleanup. Typed move send consumes its source handle on success and returns the
 still-owned source with the syscall error on any failed enqueue, preserving the kernel's atomic retry
 contract in the Rust type flow. This is a library guarantee rather than a new kernel ABI contract;
-legacy raw callers remain supported while services migrate incrementally.
+legacy raw callers remain supported while services migrate incrementally. The initial scoped async
+IPC reactor retains that guarantee: a move-send future keeps the exact owned source while endpoint
+backpressure is pending and returns it if readiness registration or the eventual enqueue fails.
 
 Since that phase, the capability and IPC foundation has been used to move several
 filesystem responsibilities across userspace service boundaries:
