@@ -62,7 +62,7 @@ The native IPC stack should provide:
 - bounded queues, resource accounting, and deterministic backpressure;
 - handle transfer with explicit rights and object types;
 - absolute monotonic deadlines and cancellation;
-- waiting on one or many objects, followed by persistent event ports;
+- waiting on one or many objects and persistent tagged wait sets, followed by queued event ports;
 - a synchronous call/reply abstraction for small bounded requests;
 - bounded priority donation across synchronous dependencies;
 - typed versioned userspace protocol bindings and tracing.

@@ -63,6 +63,7 @@ enum CapabilityObjectData {
     SharedMemory(SharedMemoryObject),
     KernelEarlyLogReader(KernelEarlyLogReaderObject),
     Job(kernel::job::State),
+    WaitSet(kernel::wait_set::State),
 }
 
 #[derive(Debug)]
@@ -262,7 +263,8 @@ impl CapabilityRegistry {
                 CapabilityObjectData::Endpoint(_)
                 | CapabilityObjectData::Notification(_)
                 | CapabilityObjectData::KernelEarlyLogReader(_)
-                | CapabilityObjectData::Job(_) => None,
+                | CapabilityObjectData::Job(_)
+                | CapabilityObjectData::WaitSet(_) => None,
             })
             .sum()
     }
@@ -279,6 +281,7 @@ impl CapabilityRegistry {
             abi::capability::KIND_SHARED_MEMORY => abi::limits::MAX_SHARED_MEMORY_OBJECTS,
             abi::capability::KIND_KERNEL_EARLY_LOG_READER => 1,
             abi::capability::KIND_JOB => abi::limits::MAX_JOB_OBJECTS,
+            abi::capability::KIND_WAIT_SET => abi::limits::MAX_WAIT_SET_OBJECTS,
             _ => return Err(abi::errno::INVALID_ARGUMENT),
         };
         if self.object_kind_count(kind) >= limit {
@@ -412,6 +415,15 @@ impl CapabilityRegistry {
                             })
                             .collect::<Vec<_>>(),
                     ),
+                    CapabilityObjectData::WaitSet(wait_set) => Some(
+                        wait_set
+                            .registrations()
+                            .map(|registration| CapabilityObjectRef {
+                                id: registration.target.object_id,
+                                kind: registration.target.object_kind,
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
                     CapabilityObjectData::Notification(_)
                     | CapabilityObjectData::SharedMemory(_)
                     | CapabilityObjectData::KernelEarlyLogReader(_) => None,
@@ -536,6 +548,7 @@ fn capability_allowed_rights(kind: u64) -> u64 {
             abi::capability::KERNEL_EARLY_LOG_READER_RIGHTS
         }
         abi::capability::KIND_JOB => abi::capability::JOB_RIGHTS,
+        abi::capability::KIND_WAIT_SET => abi::capability::WAIT_SET_RIGHTS,
         _ => 0,
     }
 }
@@ -662,6 +675,7 @@ fn capability_object_size(
         CapabilityObjectData::Job(_) => registry
             .job_subtree_active_members(record.reference)
             .and_then(|members| u64::try_from(members).map_err(|_| abi::errno::RANGE)),
+        CapabilityObjectData::WaitSet(wait_set) => Ok(wait_set.len() as u64),
     }
 }
 
@@ -755,6 +769,9 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::JOB_SET_PROCESS_LIMIT
             | abi::syscall::JOB_RETIRE
             | abi::syscall::JOB_GET_PROCESS_LIMIT
+            | abi::syscall::WAIT_SET_CREATE
+            | abi::syscall::WAIT_SET_ADD
+            | abi::syscall::WAIT_SET_REMOVE
     )
 }
 
@@ -886,6 +903,17 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         }
         abi::syscall::JOB_RETIRE => job_retire(process_id, registers.rdi),
         abi::syscall::JOB_GET_PROCESS_LIMIT => job_get_process_limit(process_id, registers.rdi),
+        abi::syscall::WAIT_SET_CREATE => wait_set_create(process_id),
+        abi::syscall::WAIT_SET_ADD => wait_set_add(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            registers.r10,
+        ),
+        abi::syscall::WAIT_SET_REMOVE => {
+            wait_set_remove(process_id, registers.rdi, registers.rsi)
+        }
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
@@ -1087,9 +1115,114 @@ fn capability_object_signal_state(
             Ok(signals)
         }
         CapabilityObjectData::SharedMemory(_)
-        | CapabilityObjectData::KernelEarlyLogReader(_) => {
+        | CapabilityObjectData::KernelEarlyLogReader(_)
+        | CapabilityObjectData::WaitSet(_) => {
             Err(abi::errno::INVALID_ARGUMENT)
         }
+    }
+}
+
+fn wait_set_create(process_id: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let object = match registry.create_object(
+        abi::capability::KIND_WAIT_SET,
+        CapabilityObjectData::WaitSet(kernel::wait_set::State::new(
+            abi::limits::MAX_WAIT_SET_REGISTRATIONS,
+            abi::wait_set::MAX_KEY,
+        )),
+    ) {
+        Ok(object) => object,
+        Err(error) => return error_return(error),
+    };
+    match registry.insert_entry(process_id, object, abi::capability::WAIT_SET_RIGHTS) {
+        Ok(handle) => handle,
+        Err(error) => {
+            registry.collect_garbage();
+            error_return(error)
+        }
+    }
+}
+
+fn wait_set_add(
+    process_id: u64,
+    wait_set_handle: u64,
+    target_handle: u64,
+    requested_bits: u64,
+    key: u64,
+) -> u64 {
+    if requested_bits == 0 || requested_bits & !abi::object_signal::ALL != 0 {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let requested = kernel::object::Signals::from_bits(requested_bits);
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(wait_set_entry) = registry.entry(process_id, wait_set_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(wait_set_entry, abi::capability::RIGHT_MANAGE) {
+        return error_return(error);
+    }
+    if wait_set_entry.object.kind != abi::capability::KIND_WAIT_SET {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(target_entry) = registry.entry(process_id, target_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(target_entry, abi::capability::RIGHT_WAIT) {
+        return error_return(error);
+    }
+    let supported = capability_object_supported_signals(target_entry.object.kind);
+    if requested.bits() & !supported.bits() != 0 {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(index) = registry.object_index(wait_set_entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::WaitSet(wait_set) = &mut registry.objects[index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    let registration = kernel::wait_set::Registration {
+        target: kernel::wait_set::Target {
+            object_id: target_entry.object.id,
+            object_kind: target_entry.object.kind,
+        },
+        requested,
+        key,
+    };
+    match wait_set.add(registration) {
+        Ok(()) => 0,
+        Err(kernel::wait_set::AddError::Full) => error_return(abi::errno::NO_SPACE),
+        Err(
+            kernel::wait_set::AddError::InvalidTarget
+            | kernel::wait_set::AddError::InvalidSignals
+            | kernel::wait_set::AddError::InvalidKey
+            | kernel::wait_set::AddError::DuplicateKey,
+        ) => error_return(abi::errno::INVALID_ARGUMENT),
+    }
+}
+
+fn wait_set_remove(process_id: u64, wait_set_handle: u64, key: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, wait_set_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_MANAGE) {
+        return error_return(error);
+    }
+    if entry.object.kind != abi::capability::KIND_WAIT_SET {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(index) = registry.object_index(entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::WaitSet(wait_set) = &mut registry.objects[index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    match wait_set.remove(key) {
+        Ok(_) => {
+            registry.collect_garbage();
+            0
+        }
+        Err(_) => error_return(abi::errno::NO_ENTRY),
     }
 }
 
@@ -1405,7 +1538,8 @@ fn endpoint_receive(
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
         | CapabilityObjectData::KernelEarlyLogReader(_)
-        | CapabilityObjectData::Job(_) => {
+        | CapabilityObjectData::Job(_)
+        | CapabilityObjectData::WaitSet(_) => {
             return error_return(abi::errno::INVALID_ARGUMENT);
         }
     };
@@ -1431,7 +1565,8 @@ fn endpoint_receive(
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
         | CapabilityObjectData::KernelEarlyLogReader(_)
-        | CapabilityObjectData::Job(_) => {
+        | CapabilityObjectData::Job(_)
+        | CapabilityObjectData::WaitSet(_) => {
             return error_return(abi::errno::IO);
         }
     };
@@ -1531,7 +1666,8 @@ fn endpoint_receive_many(
             CapabilityObjectData::Notification(_)
             | CapabilityObjectData::SharedMemory(_)
             | CapabilityObjectData::KernelEarlyLogReader(_)
-            | CapabilityObjectData::Job(_) => {
+            | CapabilityObjectData::Job(_)
+            | CapabilityObjectData::WaitSet(_) => {
                 return error_return(abi::errno::INVALID_ARGUMENT);
             }
         };
@@ -1558,7 +1694,8 @@ fn endpoint_receive_many(
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
         | CapabilityObjectData::KernelEarlyLogReader(_)
-        | CapabilityObjectData::Job(_) => {
+        | CapabilityObjectData::Job(_)
+        | CapabilityObjectData::WaitSet(_) => {
             return error_return(abi::errno::IO);
         }
     };

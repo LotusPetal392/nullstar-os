@@ -136,8 +136,14 @@ ABI 1.24 extends that mechanism to arrays of one to 16 wait items. Each item con
 one requested signal subset. The kernel copies and validates the entire array before inspecting any
 item's readiness, registers the resolved objects atomically with scheduler blocking, and returns the
 lowest satisfied array index. Duplicate handles are permitted and retain array-order priority. The
-same immediate, infinite, and finite absolute-deadline behavior applies. Larger persistent wait sets
-remain future work.
+same immediate, infinite, and finite absolute-deadline behavior applies.
+
+ABI 1.27 adds capability-backed persistent wait sets with up to 64 tagged registrations. Adding a
+target requires `MANAGE` on the set and `WAIT` on the target; waiting requires only `WAIT` on the
+set, so a reduced or transferred wait-set capability intentionally delegates observation of its
+registered objects without delegating their handles. Registrations retain target object identity
+until removal or final wait-set destruction. Results are level-triggered and insertion ordered, and
+an outstanding wait uses a stable snapshot of the registrations present when it began.
 
 ABI 1.25 adds atomic endpoint pairs. Sends target the peer's incoming queue, so `WRITABLE` reflects
 peer capacity rather than local capacity. Final peer destruction permanently asserts `PEER_CLOSED`;

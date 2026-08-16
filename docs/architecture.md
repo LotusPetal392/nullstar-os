@@ -97,7 +97,7 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.26. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.27. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 The userspace library preserves raw numeric capability calls for compatibility and now layers
@@ -113,9 +113,11 @@ many-object wait ABI. It sleeps in the scheduler after backpressure rather than 
 move-send ownership across every pending or failed registration path. Atomic channel-pair creation now
 provides bidirectional peer queues, writable state based on peer capacity, final-reference peer closure,
 and queued-message drainage after closure. ABI 1.26 adds all-or-nothing messages carrying up to four
-rights-reduced moved handles, including required-capacity reporting without dequeue. The runtime probe checks these rules, process-exit cleanup,
-and real cross-process wakeups against kernel handles; persistent event ports, independent task
-scheduling, sender-side receiver-slot reservation, and broad service migration remain future runtime work.
+rights-reduced moved handles, including required-capacity reporting without dequeue. ABI 1.27 adds
+bounded persistent wait sets with tagged, insertion-ordered, level-triggered registrations and typed
+userspace ownership. The runtime probe checks these rules, process-exit cleanup, and real
+cross-process wakeups against kernel handles; queued event ports, independent task scheduling,
+sender-side receiver-slot reservation, and broad service migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh

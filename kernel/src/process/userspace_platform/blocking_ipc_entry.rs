@@ -13,12 +13,14 @@ static ENDPOINT_WAITERS: PreemptMutex<Vec<EndpointWaiter>> = PreemptMutex::new(V
 struct ObjectWaitRegistration {
     object: CapabilityObjectRef,
     requested: kernel::object::Signals,
+    key: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectWaitReturn {
     Signals,
     Index,
+    WaitSetEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +147,10 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
         return object_wait_many(current_stack_pointer, registers_pointer);
     }
 
+    if syscall_number == abi::syscall::WAIT_SET_WAIT {
+        return wait_set_wait(current_stack_pointer, registers_pointer);
+    }
+
     if syscall_number == abi::syscall::ENDPOINT_WAIT {
         return blocking_endpoint_wait(current_stack_pointer, registers_pointer);
     }
@@ -265,7 +271,8 @@ fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
         CapabilityObjectData::Notification(_)
         | CapabilityObjectData::SharedMemory(_)
         | CapabilityObjectData::KernelEarlyLogReader(_)
-        | CapabilityObjectData::Job(_) => Err(abi::errno::INVALID_ARGUMENT),
+        | CapabilityObjectData::Job(_)
+        | CapabilityObjectData::WaitSet(_) => Err(abi::errno::INVALID_ARGUMENT),
     }
 }
 
@@ -291,6 +298,7 @@ fn object_wait_one(
         process_id,
         handle,
         requested_bits,
+        0,
     ) {
         Ok(registration) => registration,
         Err(error) => {
@@ -373,12 +381,13 @@ fn object_wait_many(
     waiters.retain(|waiter| waiter.process_id != process_id);
     let registry = CAPABILITY_REGISTRY.lock();
     let mut registrations = Vec::with_capacity(item_count);
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
         match resolve_object_wait_registration(
             &registry,
             process_id,
             item.handle,
             item.requested_signals,
+            index as u64,
         ) {
             Ok(registration) => registrations.push(registration),
             Err(error) => {
@@ -420,11 +429,100 @@ fn object_wait_many(
     next_stack_pointer
 }
 
+fn wait_set_wait(
+    current_stack_pointer: usize,
+    registers_pointer: *mut SavedRegisters,
+) -> usize {
+    let Some(process_id) = scheduler::current_process_id() else {
+        unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
+        return current_stack_pointer;
+    };
+    let wait_set_handle = unsafe { (*registers_pointer).rdi };
+    let deadline_ns = unsafe { (*registers_pointer).rsi };
+
+    let mut waiters = OBJECT_WAITERS.lock();
+    waiters.retain(|waiter| waiter.process_id != process_id);
+    let registry = CAPABILITY_REGISTRY.lock();
+    let entry = match registry.entry(process_id, wait_set_handle) {
+        Some(entry) => entry,
+        None => {
+            unsafe { (*registers_pointer).rax = error_return(abi::errno::BAD_FILE_DESCRIPTOR) };
+            return current_stack_pointer;
+        }
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
+        unsafe { (*registers_pointer).rax = error_return(error) };
+        return current_stack_pointer;
+    }
+    if entry.object.kind != abi::capability::KIND_WAIT_SET {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+        return current_stack_pointer;
+    }
+    let Some(object_index) = registry.object_index(entry.object) else {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::IO) };
+        return current_stack_pointer;
+    };
+    let CapabilityObjectData::WaitSet(wait_set) = &registry.objects[object_index].data else {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+        return current_stack_pointer;
+    };
+    if wait_set.is_empty() {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+        return current_stack_pointer;
+    }
+    let registrations = wait_set
+        .registrations()
+        .map(|registration| ObjectWaitRegistration {
+            object: CapabilityObjectRef {
+                id: registration.target.object_id,
+                kind: registration.target.object_kind,
+            },
+            requested: registration.requested,
+            key: registration.key,
+        })
+        .collect::<Vec<_>>();
+
+    match first_satisfied_object_wait(&registry, &registrations) {
+        Ok(Some((index, asserted))) => {
+            let result = abi::wait_set::pack_event(registrations[index].key, asserted)
+                .unwrap_or_else(|| error_return(abi::errno::IO));
+            unsafe { (*registers_pointer).rax = result };
+            return current_stack_pointer;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            unsafe { (*registers_pointer).rax = error_return(error) };
+            return current_stack_pointer;
+        }
+    }
+    if deadline_ns == abi::deadline::IMMEDIATE
+        || (deadline_ns != abi::deadline::INFINITE
+            && crate::interrupts::monotonic_time_ns() >= deadline_ns)
+    {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::TIMED_OUT) };
+        return current_stack_pointer;
+    }
+
+    waiters.push(ObjectWaiter {
+        registrations,
+        return_kind: ObjectWaitReturn::WaitSetEvent,
+        process_id,
+        deadline_ns,
+        registers_pointer: registers_pointer as usize,
+    });
+    unsafe { (*registers_pointer).rax = 0 };
+    drop(registry);
+    let next_stack_pointer = scheduler::block_current(current_stack_pointer);
+    drop(waiters);
+    next_stack_pointer
+}
+
 fn resolve_object_wait_registration(
     registry: &CapabilityRegistry,
     process_id: u64,
     handle: u64,
     requested_bits: u64,
+    key: u64,
 ) -> Result<ObjectWaitRegistration, i64> {
     if requested_bits == 0 || requested_bits & !abi::object_signal::ALL != 0 {
         return Err(abi::errno::INVALID_ARGUMENT);
@@ -441,6 +539,7 @@ fn resolve_object_wait_registration(
     Ok(ObjectWaitRegistration {
         object: entry.object,
         requested,
+        key,
     })
 }
 
@@ -468,6 +567,11 @@ fn object_waiter_result(
     Ok(Some(match waiter.return_kind {
         ObjectWaitReturn::Signals => asserted,
         ObjectWaitReturn::Index => index as u64,
+        ObjectWaitReturn::WaitSetEvent => abi::wait_set::pack_event(
+            waiter.registrations[index].key,
+            asserted,
+        )
+        .ok_or(abi::errno::IO)?,
     }))
 }
 

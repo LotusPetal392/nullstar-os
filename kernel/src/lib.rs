@@ -10,6 +10,7 @@ pub mod nullfs_volume_selection;
 pub mod object;
 pub mod process_completion;
 pub mod tmpfs_abi;
+pub mod wait_set;
 
 #[cfg(test)]
 mod public_api_tests {
