@@ -4,11 +4,12 @@
 //! non-blocking operation first, register level-triggered readiness on
 //! [`crate::ipc::Error::TRY_AGAIN`], and let the runner sleep in the kernel's
 //! bounded `wait_many` syscall. [`RunScope`] propagates one absolute deadline
-//! and optional [`CancellationToken`] through every wait. [`PeriodicTimer`]
+//! and a bounded set of [`CancellationToken`]s through every wait. [`PeriodicTimer`]
 //! builds explicit coalescing periodic behavior over the kernel's one-shot
 //! timer primitive. [`TaskExecutor`] drives independently ready tasks through a
-//! queued event port, while [`TaskGroup`] supplies group cancellation and
-//! deadline inheritance without heap allocation.
+//! queued event port, while [`TaskGroup`] supplies nested role attribution,
+//! cancellation, deadline inheritance, and bounded shutdown draining without
+//! heap allocation.
 
 use core::{
     array,
@@ -17,6 +18,9 @@ use core::{
     pin::Pin,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
+
+#[cfg(test)]
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{
     handle::{
@@ -39,19 +43,22 @@ pub enum RunError {
     Cancelled,
 }
 
-/// One absolute deadline and optional one-way cancellation authority shared by
-/// a scoped future tree.
+/// Maximum number of cancellation owners in one structured task-group lineage.
+pub const MAX_TASK_GROUP_DEPTH: usize = 8;
+
+/// One absolute deadline and bounded one-way cancellation lineage shared by a
+/// scoped future tree.
 #[derive(Debug, Clone, Copy)]
 pub struct RunScope<'token> {
     deadline: Deadline,
-    cancellation: Option<&'token CancellationToken>,
+    cancellations: [Option<&'token CancellationToken>; MAX_TASK_GROUP_DEPTH],
 }
 
 impl<'token> RunScope<'token> {
     pub const fn new(deadline: Deadline) -> Self {
         Self {
             deadline,
-            cancellation: None,
+            cancellations: [None; MAX_TASK_GROUP_DEPTH],
         }
     }
 
@@ -61,7 +68,17 @@ impl<'token> RunScope<'token> {
     ) -> Self {
         RunScope {
             deadline,
-            cancellation: Some(cancellation),
+            cancellations: [Some(cancellation), None, None, None, None, None, None, None],
+        }
+    }
+
+    fn with_cancellations(
+        deadline: Deadline,
+        cancellations: [Option<&'token CancellationToken>; MAX_TASK_GROUP_DEPTH],
+    ) -> Self {
+        Self {
+            deadline,
+            cancellations,
         }
     }
 
@@ -70,7 +87,24 @@ impl<'token> RunScope<'token> {
     }
 
     pub const fn cancellation(self) -> Option<&'token CancellationToken> {
-        self.cancellation
+        self.cancellations[0]
+    }
+
+    pub fn cancellations(self) -> impl Iterator<Item = &'token CancellationToken> {
+        self.cancellations.into_iter().flatten()
+    }
+
+    pub fn cancellation_count(self) -> usize {
+        self.cancellations().count()
+    }
+
+    fn is_cancelled(self) -> ipc::Result<bool> {
+        for token in self.cancellations() {
+            if token.is_cancelled()? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Creates a nested scope without allowing its deadline to extend the
@@ -83,7 +117,7 @@ impl<'token> RunScope<'token> {
         };
         Self {
             deadline,
-            cancellation: self.cancellation,
+            cancellations: self.cancellations,
         }
     }
 }
@@ -91,27 +125,83 @@ impl<'token> RunScope<'token> {
 /// Signal-only authority for one structured cancellation tree.
 #[derive(Debug)]
 pub struct CancellationSource {
-    event: OwnedHandle<Event>,
+    inner: CancellationSourceInner,
 }
 
 /// Wait-only authority for observing one structured cancellation tree.
 #[derive(Debug)]
 pub struct CancellationToken {
-    event: OwnedHandle<Event>,
+    inner: CancellationTokenInner,
 }
+
+#[derive(Debug)]
+enum CancellationSourceInner {
+    #[cfg_attr(test, allow(dead_code))]
+    Kernel(OwnedHandle<Event>),
+    #[cfg(test)]
+    Simulated(usize),
+}
+
+#[derive(Debug)]
+enum CancellationTokenInner {
+    Kernel(OwnedHandle<Event>),
+    #[cfg(test)]
+    Simulated(usize),
+}
+
+#[cfg(test)]
+const TEST_CANCELLATION_CAPACITY: usize = 128;
+#[cfg(test)]
+static TEST_CANCELLATIONS: [AtomicBool; TEST_CANCELLATION_CAPACITY] =
+    [const { AtomicBool::new(false) }; TEST_CANCELLATION_CAPACITY];
+#[cfg(test)]
+static NEXT_TEST_CANCELLATION: AtomicUsize = AtomicUsize::new(0);
 
 impl CancellationSource {
     /// Creates separated signal-only and wait-only cancellation authorities.
     pub fn new() -> ipc::Result<(Self, CancellationToken)> {
-        let mut source = OwnedHandle::<Event>::create()?;
-        let token = source.duplicate(CancellationToken::rights())?;
-        source.replace_rights(Rights::SIGNAL)?;
-        Ok((Self { event: source }, CancellationToken { event: token }))
+        #[cfg(test)]
+        {
+            let index = NEXT_TEST_CANCELLATION.fetch_add(1, Ordering::Relaxed);
+            if index >= TEST_CANCELLATION_CAPACITY {
+                return Err(ipc::Error::NO_SPACE);
+            }
+            TEST_CANCELLATIONS[index].store(false, Ordering::Release);
+            Ok((
+                Self {
+                    inner: CancellationSourceInner::Simulated(index),
+                },
+                CancellationToken {
+                    inner: CancellationTokenInner::Simulated(index),
+                },
+            ))
+        }
+        #[cfg(not(test))]
+        {
+            let mut source = OwnedHandle::<Event>::create()?;
+            let token = source.duplicate(CancellationToken::rights())?;
+            source.replace_rights(Rights::SIGNAL)?;
+            Ok((
+                Self {
+                    inner: CancellationSourceInner::Kernel(source),
+                },
+                CancellationToken {
+                    inner: CancellationTokenInner::Kernel(token),
+                },
+            ))
+        }
     }
 
     /// Permanently cancels the associated token. Repeated calls are harmless.
     pub fn cancel(&self) -> ipc::Result<()> {
-        self.event.set()
+        match &self.inner {
+            CancellationSourceInner::Kernel(event) => event.set(),
+            #[cfg(test)]
+            CancellationSourceInner::Simulated(index) => {
+                TEST_CANCELLATIONS[*index].store(true, Ordering::Release);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -122,17 +212,37 @@ impl CancellationToken {
     }
 
     pub fn try_clone(&self) -> ipc::Result<Self> {
-        Ok(Self {
-            event: self.event.duplicate(Self::rights())?,
-        })
+        match &self.inner {
+            CancellationTokenInner::Kernel(event) => Ok(Self {
+                inner: CancellationTokenInner::Kernel(event.duplicate(Self::rights())?),
+            }),
+            #[cfg(test)]
+            CancellationTokenInner::Simulated(index) => Ok(Self {
+                inner: CancellationTokenInner::Simulated(*index),
+            }),
+        }
     }
 
     pub fn is_cancelled(&self) -> ipc::Result<bool> {
-        Ok(self.event.signal_state()?.contains(Signals::SIGNALED))
+        match &self.inner {
+            CancellationTokenInner::Kernel(event) => {
+                Ok(event.signal_state()?.contains(Signals::SIGNALED))
+            }
+            #[cfg(test)]
+            CancellationTokenInner::Simulated(index) => {
+                Ok(TEST_CANCELLATIONS[*index].load(Ordering::Acquire))
+            }
+        }
     }
 
     pub fn into_handle(self) -> OwnedHandle<Event> {
-        self.event
+        match self.inner {
+            CancellationTokenInner::Kernel(event) => event,
+            #[cfg(test)]
+            CancellationTokenInner::Simulated(_) => {
+                panic!("a simulated cancellation token has no kernel handle")
+            }
+        }
     }
 
     pub fn from_handle(mut event: OwnedHandle<Event>) -> ipc::Result<Self> {
@@ -144,33 +254,95 @@ impl CancellationToken {
         if rights != token_rights {
             event.replace_rights(token_rights)?;
         }
-        Ok(Self { event })
+        Ok(Self {
+            inner: CancellationTokenInner::Kernel(event),
+        })
     }
 
     fn wait_item(&self) -> WaitItem {
-        self.event.borrow().wait_item(Signals::SIGNALED)
+        match &self.inner {
+            CancellationTokenInner::Kernel(event) => event.borrow().wait_item(Signals::SIGNALED),
+            #[cfg(test)]
+            CancellationTokenInner::Simulated(index) => WaitItem::new(
+                u64::try_from(*index).unwrap_or(u64::MAX) + 10_000,
+                Signals::SIGNALED,
+            ),
+        }
     }
+}
+
+/// Lifecycle role used to attribute a bounded task group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRole {
+    Root,
+    UserInterface,
+    Activation,
+    Document,
+    Background,
+    Service,
+    Request,
+}
+
+/// Stable lifecycle metadata retained with every task slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskAttribution {
+    pub role: TaskRole,
+    pub group_depth: usize,
 }
 
 /// A bounded lifecycle owner for independently scheduled tasks.
 ///
 /// Every task spawned through [`TaskExecutor`] inherits this group's absolute
-/// deadline and one-way cancellation token. A task may further shorten its
-/// deadline, but it cannot extend the group deadline.
+/// deadline and the cancellation tokens of every ancestor. A task may further
+/// shorten its deadline, but it cannot extend the group deadline. Cancelling a
+/// group affects its descendants without cancelling its parent or siblings.
 #[derive(Debug)]
 pub struct TaskGroup {
     cancellation: CancellationSource,
-    token: CancellationToken,
+    tokens: [Option<CancellationToken>; MAX_TASK_GROUP_DEPTH],
+    depth: usize,
     deadline: Deadline,
+    role: TaskRole,
 }
 
 impl TaskGroup {
     pub fn new(deadline: Deadline) -> ipc::Result<Self> {
+        Self::root(TaskRole::Root, deadline)
+    }
+
+    pub fn root(role: TaskRole, deadline: Deadline) -> ipc::Result<Self> {
         let (cancellation, token) = CancellationSource::new()?;
+        let mut tokens = array::from_fn(|_| None);
+        tokens[0] = Some(token);
         Ok(Self {
             cancellation,
-            token,
+            tokens,
+            depth: 1,
             deadline,
+            role,
+        })
+    }
+
+    /// Creates a child with inherited cancellation and a clamped deadline.
+    pub fn child(&self, role: TaskRole, deadline: Deadline) -> ipc::Result<Self> {
+        if self.depth >= MAX_TASK_GROUP_DEPTH {
+            return Err(ipc::Error::NO_SPACE);
+        }
+        let (cancellation, token) = CancellationSource::new()?;
+        let mut tokens = array::from_fn(|_| None);
+        for (slot, ancestor) in tokens
+            .iter_mut()
+            .zip(self.tokens[..self.depth].iter().flatten())
+        {
+            *slot = Some(ancestor.try_clone()?);
+        }
+        tokens[self.depth] = Some(token);
+        Ok(Self {
+            cancellation,
+            tokens,
+            depth: self.depth + 1,
+            deadline: earlier_deadline(self.deadline, deadline),
+            role,
         })
     }
 
@@ -178,8 +350,30 @@ impl TaskGroup {
         self.deadline
     }
 
+    pub const fn role(&self) -> TaskRole {
+        self.role
+    }
+
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub const fn attribution(&self) -> TaskAttribution {
+        TaskAttribution {
+            role: self.role,
+            group_depth: self.depth,
+        }
+    }
+
     pub fn is_cancelled(&self) -> ipc::Result<bool> {
-        self.token.is_cancelled()
+        self.scope().is_cancelled()
+    }
+
+    pub fn is_locally_cancelled(&self) -> ipc::Result<bool> {
+        self.tokens[self.depth - 1]
+            .as_ref()
+            .ok_or(ipc::Error::IO)?
+            .is_cancelled()
     }
 
     /// Permanently cancels every unfinished task in this group.
@@ -188,12 +382,53 @@ impl TaskGroup {
     }
 
     pub fn scope(&self) -> RunScope<'_> {
-        RunScope::with_cancellation(self.deadline, &self.token)
+        RunScope::with_cancellations(
+            self.deadline,
+            array::from_fn(|index| self.tokens[index].as_ref()),
+        )
     }
 
     /// Creates a task scope whose deadline cannot extend the group deadline.
     pub fn task_scope(&self, deadline: Deadline) -> RunScope<'_> {
         self.scope().child(deadline)
+    }
+}
+
+/// Cooperative process-runtime shutdown signal.
+///
+/// Tasks observe [`Shutdown::token`] and return after finishing bounded cleanup.
+/// [`TaskExecutor::shutdown`] requests the signal and gives them until one
+/// absolute drain deadline before recording forced shutdown outcomes.
+#[derive(Debug)]
+pub struct Shutdown {
+    source: CancellationSource,
+    token: CancellationToken,
+}
+
+impl Shutdown {
+    pub fn new() -> ipc::Result<Self> {
+        let (source, token) = CancellationSource::new()?;
+        Ok(Self { source, token })
+    }
+
+    pub fn request(&self) -> ipc::Result<()> {
+        self.source.cancel()
+    }
+
+    pub fn is_requested(&self) -> ipc::Result<bool> {
+        self.token.is_cancelled()
+    }
+
+    pub const fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
+const fn earlier_deadline(left: Deadline, right: Deadline) -> Deadline {
+    if left.as_monotonic_ns() <= right.as_monotonic_ns() {
+        left
+    } else {
+        right
     }
 }
 
@@ -558,9 +793,7 @@ impl<const N: usize> Reactor<N> {
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
         loop {
-            if let Some(token) = scope.cancellation()
-                && token.is_cancelled().map_err(RunError::Wait)?
-            {
+            if scope.is_cancelled().map_err(RunError::Wait)? {
                 return Err(RunError::Cancelled);
             }
             self.clear_registrations();
@@ -570,17 +803,16 @@ impl<const N: usize> Reactor<N> {
 
             let mut items = [WaitItem::new(0, Signals::EMPTY); N];
             let mut count = self.snapshot(&mut items);
-            let cancellation_handle = if let Some(token) = scope.cancellation() {
+            let mut cancellation_handles = [0; MAX_TASK_GROUP_DEPTH];
+            for (index, token) in scope.cancellations().enumerate() {
                 if count >= N || count >= crate::abi::limits::MAX_OBJECT_WAIT_ITEMS {
                     return Err(RunError::Wait(ipc::Error::NO_SPACE));
                 }
                 let item = token.wait_item();
                 items[count] = item;
                 count += 1;
-                Some(item.handle())
-            } else {
-                None
-            };
+                cancellation_handles[index] = item.handle();
+            }
             if count == 0 {
                 return Err(RunError::UnregisteredPending);
             }
@@ -588,7 +820,7 @@ impl<const N: usize> Reactor<N> {
             let Some(item) = items.get(ready) else {
                 return Err(RunError::Wait(ipc::Error::IO));
             };
-            if cancellation_handle == Some(item.handle()) {
+            if cancellation_handles.contains(&item.handle()) {
                 return Err(RunError::Cancelled);
             }
             self.wake_handle(item.handle());
@@ -636,6 +868,23 @@ pub enum TaskOutcome {
     Cancelled,
     /// The task's inherited absolute deadline expired before completion.
     TimedOut,
+    /// The task did not finish before the executor's shutdown drain deadline.
+    ShutdownTimedOut,
+}
+
+/// Terminal task totals captured after a bounded shutdown drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainReport {
+    pub completed: usize,
+    pub cancelled: usize,
+    pub timed_out: usize,
+    pub shutdown_timed_out: usize,
+}
+
+impl DrainReport {
+    pub const fn total(self) -> usize {
+        self.completed + self.cancelled + self.timed_out + self.shutdown_timed_out
+    }
 }
 
 /// Failure in the task executor itself rather than in an individual task.
@@ -653,6 +902,7 @@ struct TaskSlot<'task, 'group> {
     id: TaskId,
     future: Pin<&'task mut (dyn Future<Output = ipc::Result<()>> + 'task)>,
     scope: RunScope<'group>,
+    attribution: TaskAttribution,
     outcome: Option<TaskOutcome>,
     ready: bool,
 }
@@ -667,8 +917,10 @@ struct BoundRegistration {
 ///
 /// `TASKS` bounds independently scheduled futures and `WAITS` bounds their
 /// combined reactor registrations. Every spawned task belongs to a
-/// [`TaskGroup`]. Registration keys include task-slot generations so a stale
-/// event can never wake a later occupant of the same slot.
+/// [`TaskGroup`]. The constructor reserves enough event-port registrations for
+/// every task's maximum cancellation lineage. Registration keys include
+/// task-slot generations so a stale event can never wake a later occupant of
+/// the same slot.
 pub struct TaskExecutor<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize> {
     reactor: &'reactor Reactor<WAITS>,
     event_port: Option<OwnedHandle<EventPort>>,
@@ -686,7 +938,8 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             || WAITS == 0
             || WAITS > crate::abi::limits::MAX_OBJECT_WAIT_ITEMS
             || TASKS
-                .checked_add(WAITS)
+                .checked_mul(MAX_TASK_GROUP_DEPTH)
+                .and_then(|cancellations| cancellations.checked_add(WAITS))
                 .is_none_or(|total| total > crate::abi::limits::MAX_EVENT_PORT_REGISTRATIONS)
         {
             return Err(ipc::Error::INVALID_ARGUMENT);
@@ -724,13 +977,33 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
     where
         F: Future<Output = ipc::Result<()>> + 'task,
     {
-        self.spawn_scoped(future, group.task_scope(deadline))
+        self.spawn_attributed(future, group.task_scope(deadline), group.attribution())
     }
 
+    #[cfg(test)]
     fn spawn_scoped<F>(
         &mut self,
         future: Pin<&'task mut F>,
         scope: RunScope<'group>,
+    ) -> ipc::Result<TaskId>
+    where
+        F: Future<Output = ipc::Result<()>> + 'task,
+    {
+        self.spawn_attributed(
+            future,
+            scope,
+            TaskAttribution {
+                role: TaskRole::Root,
+                group_depth: 1,
+            },
+        )
+    }
+
+    fn spawn_attributed<F>(
+        &mut self,
+        future: Pin<&'task mut F>,
+        scope: RunScope<'group>,
+        attribution: TaskAttribution,
     ) -> ipc::Result<TaskId>
     where
         F: Future<Output = ipc::Result<()>> + 'task,
@@ -747,6 +1020,7 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             id,
             future,
             scope,
+            attribution,
             outcome: None,
             ready: true,
         });
@@ -759,6 +1033,14 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             .and_then(Option::as_ref)
             .filter(|task| task.id == id)
             .and_then(|task| task.outcome)
+    }
+
+    pub fn attribution(&self, id: TaskId) -> Option<TaskAttribution> {
+        self.tasks
+            .get(id.slot)
+            .and_then(Option::as_ref)
+            .filter(|task| task.id == id)
+            .map(|task| task.attribution)
     }
 
     /// Releases a completed slot and returns its terminal outcome.
@@ -792,6 +1074,28 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
         )
     }
 
+    /// Requests cooperative shutdown and bounds how long unfinished tasks may
+    /// drain. Tasks that do not finish by `deadline` retain
+    /// [`TaskOutcome::ShutdownTimedOut`].
+    pub fn shutdown(
+        &mut self,
+        shutdown: &Shutdown,
+        deadline: Deadline,
+    ) -> Result<DrainReport, TaskRunError> {
+        let Some(event_port) = self.event_port.as_ref() else {
+            return Err(TaskRunError::Runtime(ipc::Error::IO));
+        };
+        let raw = event_port.as_raw();
+        self.shutdown_with(
+            shutdown,
+            deadline,
+            |item, key| ipc::event_port_add(raw, item.handle(), item.requested(), key),
+            |key| ipc::event_port_remove(raw, key),
+            |wait_deadline| ipc::event_port_wait(raw, wait_deadline),
+            || crate::platform::monotonic_time_ns().map_err(|_| ipc::Error::IO),
+        )
+    }
+
     fn run_with<A, R, W, C>(
         &mut self,
         mut add: A,
@@ -805,12 +1109,49 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
         W: FnMut(Deadline) -> ipc::Result<EventPortEvent>,
         C: FnMut() -> ipc::Result<u64>,
     {
+        self.run_with_limit(&mut add, &mut remove, &mut wait, &mut clock, None)
+    }
+
+    fn shutdown_with<A, R, W, C>(
+        &mut self,
+        shutdown: &Shutdown,
+        deadline: Deadline,
+        mut add: A,
+        mut remove: R,
+        mut wait: W,
+        mut clock: C,
+    ) -> Result<DrainReport, TaskRunError>
+    where
+        A: FnMut(WaitItem, u64) -> ipc::Result<()>,
+        R: FnMut(u64) -> ipc::Result<()>,
+        W: FnMut(Deadline) -> ipc::Result<EventPortEvent>,
+        C: FnMut() -> ipc::Result<u64>,
+    {
+        shutdown.request().map_err(TaskRunError::Runtime)?;
+        self.run_with_limit(&mut add, &mut remove, &mut wait, &mut clock, Some(deadline))?;
+        Ok(self.drain_report())
+    }
+
+    fn run_with_limit<A, R, W, C>(
+        &mut self,
+        add: &mut A,
+        remove: &mut R,
+        wait: &mut W,
+        clock: &mut C,
+        drain_deadline: Option<Deadline>,
+    ) -> Result<(), TaskRunError>
+    where
+        A: FnMut(WaitItem, u64) -> ipc::Result<()>,
+        R: FnMut(u64) -> ipc::Result<()>,
+        W: FnMut(Deadline) -> ipc::Result<EventPortEvent>,
+        C: FnMut() -> ipc::Result<u64>,
+    {
         if self.running {
             return Err(TaskRunError::AlreadyRunning);
         }
         self.running = true;
-        let result = self.drive(&mut add, &mut remove, &mut wait, &mut clock);
-        let cleanup = self.remove_bindings(&mut remove);
+        let result = self.drive(add, remove, wait, clock, drain_deadline);
+        let cleanup = self.remove_bindings(remove);
         self.reset_unfinished_tasks();
         self.running = false;
         result.and(cleanup)
@@ -832,6 +1173,7 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
         remove: &mut R,
         wait: &mut W,
         clock: &mut C,
+        drain_deadline: Option<Deadline>,
     ) -> Result<(), TaskRunError>
     where
         A: FnMut(WaitItem, u64) -> ipc::Result<()>,
@@ -850,7 +1192,7 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
                 return Ok(());
             }
             self.sync_bindings(add, remove)?;
-            let deadline = self.earliest_deadline();
+            let deadline = self.earliest_deadline(drain_deadline);
             match wait(deadline) {
                 Ok(event) => {
                     self.mark_ready(event);
@@ -864,7 +1206,14 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
                 }
                 Err(error) if error == ipc::Error::TIMED_OUT => {
                     let now = clock().map_err(TaskRunError::Runtime)?;
-                    if !self.expire_deadlines(now) {
+                    let expired = self.expire_deadlines(now);
+                    if drain_deadline.is_some_and(|deadline| {
+                        deadline != Deadline::INFINITE && deadline.as_monotonic_ns() <= now
+                    }) {
+                        self.expire_shutdown();
+                        return Ok(());
+                    }
+                    if !expired {
                         return Err(TaskRunError::Runtime(ipc::Error::TIMED_OUT));
                     }
                 }
@@ -883,9 +1232,7 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             }
             task.ready = false;
             let waker = task_waker(task.id);
-            if let Some(token) = task.scope.cancellation()
-                && token.is_cancelled().map_err(TaskRunError::Runtime)?
-            {
+            if task.scope.is_cancelled().map_err(TaskRunError::Runtime)? {
                 self.reactor.clear_registrations_for(&waker);
                 task.outcome = Some(TaskOutcome::Cancelled);
                 continue;
@@ -930,8 +1277,11 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
                 self.bindings[bound] = Some(BoundRegistration { key, task: id });
                 bound += 1;
             }
-            if let Some(token) = scope.cancellation() {
-                let key = Self::registration_key(id, WAITS)?;
+            for (index, token) in scope.cancellations().enumerate() {
+                let ordinal = WAITS
+                    .checked_add(index)
+                    .ok_or(TaskRunError::Runtime(ipc::Error::RANGE))?;
+                let key = Self::registration_key(id, ordinal)?;
                 add(token.wait_item(), key).map_err(TaskRunError::Runtime)?;
                 self.bindings[bound] = Some(BoundRegistration { key, task: id });
                 bound += 1;
@@ -954,8 +1304,8 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
     }
 
     fn registration_key(id: TaskId, ordinal: usize) -> Result<u64, TaskRunError> {
-        let stride =
-            u64::try_from(WAITS + 1).map_err(|_| TaskRunError::Runtime(ipc::Error::RANGE))?;
+        let stride = u64::try_from(WAITS + MAX_TASK_GROUP_DEPTH)
+            .map_err(|_| TaskRunError::Runtime(ipc::Error::RANGE))?;
         let task_index = u64::from(id.generation)
             .checked_mul(
                 u64::try_from(TASKS).map_err(|_| TaskRunError::Runtime(ipc::Error::RANGE))?,
@@ -990,14 +1340,18 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
         }
     }
 
-    fn earliest_deadline(&self) -> Deadline {
-        self.tasks
+    fn earliest_deadline(&self, drain_deadline: Option<Deadline>) -> Deadline {
+        let task_deadline = self
+            .tasks
             .iter()
             .flatten()
             .filter(|task| task.outcome.is_none())
             .map(|task| task.scope.deadline())
             .min_by_key(|deadline| deadline.as_monotonic_ns())
-            .unwrap_or(Deadline::INFINITE)
+            .unwrap_or(Deadline::INFINITE);
+        drain_deadline.map_or(task_deadline, |deadline| {
+            earlier_deadline(task_deadline, deadline)
+        })
     }
 
     fn expire_deadlines(&mut self, now: u64) -> bool {
@@ -1014,6 +1368,29 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             }
         }
         expired
+    }
+
+    fn expire_shutdown(&mut self) {
+        for task in self.tasks.iter_mut().flatten() {
+            if task.outcome.is_none() {
+                let waker = task_waker(task.id);
+                self.reactor.clear_registrations_for(&waker);
+                task.outcome = Some(TaskOutcome::ShutdownTimedOut);
+            }
+        }
+    }
+
+    fn drain_report(&self) -> DrainReport {
+        let mut report = DrainReport::default();
+        for outcome in self.tasks.iter().flatten().filter_map(|task| task.outcome) {
+            match outcome {
+                TaskOutcome::Completed(_) => report.completed += 1,
+                TaskOutcome::Cancelled => report.cancelled += 1,
+                TaskOutcome::TimedOut => report.timed_out += 1,
+                TaskOutcome::ShutdownTimedOut => report.shutdown_timed_out += 1,
+            }
+        }
+        report
     }
 }
 
@@ -1372,7 +1749,8 @@ mod tests {
     };
 
     use super::{
-        PeriodicSchedule, Reactor, RunError, RunScope, TaskExecutor, TaskOutcome, TaskRunError,
+        DrainReport, PeriodicSchedule, Reactor, RunError, RunScope, Shutdown, TaskAttribution,
+        TaskExecutor, TaskGroup, TaskOutcome, TaskRole, TaskRunError,
     };
     use crate::ipc::{self, Deadline, EventPortEvent, Signals, WaitItem};
 
@@ -1483,6 +1861,71 @@ mod tests {
             parent.child(Deadline::INFINITE).deadline(),
             Deadline::from_monotonic_ns(100)
         );
+    }
+
+    #[test]
+    fn nested_task_groups_inherit_deadlines_and_ancestor_cancellation() {
+        let root = TaskGroup::root(TaskRole::Service, Deadline::from_monotonic_ns(100)).unwrap();
+        let child = root
+            .child(TaskRole::Request, Deadline::from_monotonic_ns(40))
+            .unwrap();
+        let grandchild = child
+            .child(TaskRole::Background, Deadline::from_monotonic_ns(90))
+            .unwrap();
+        let sibling = root
+            .child(TaskRole::Activation, Deadline::from_monotonic_ns(80))
+            .unwrap();
+
+        assert_eq!(root.depth(), 1);
+        assert_eq!(child.depth(), 2);
+        assert_eq!(grandchild.depth(), 3);
+        assert_eq!(grandchild.deadline(), Deadline::from_monotonic_ns(40));
+        assert_eq!(sibling.deadline(), Deadline::from_monotonic_ns(80));
+        assert_eq!(grandchild.scope().cancellation_count(), 3);
+        assert_eq!(grandchild.role(), TaskRole::Background);
+
+        child.cancel().unwrap();
+        assert!(!root.is_cancelled().unwrap());
+        assert!(child.is_locally_cancelled().unwrap());
+        assert!(grandchild.is_cancelled().unwrap());
+        assert!(!grandchild.is_locally_cancelled().unwrap());
+        assert!(!sibling.is_cancelled().unwrap());
+
+        root.cancel().unwrap();
+        assert!(root.is_locally_cancelled().unwrap());
+        assert!(sibling.is_cancelled().unwrap());
+    }
+
+    #[test]
+    fn task_group_depth_is_bounded() {
+        let root = TaskGroup::new(Deadline::INFINITE).unwrap();
+        let first = root
+            .child(TaskRole::Background, Deadline::INFINITE)
+            .unwrap();
+        let second = first
+            .child(TaskRole::Background, Deadline::INFINITE)
+            .unwrap();
+        let third = second
+            .child(TaskRole::Background, Deadline::INFINITE)
+            .unwrap();
+        let fourth = third
+            .child(TaskRole::Background, Deadline::INFINITE)
+            .unwrap();
+        let fifth = fourth
+            .child(TaskRole::Background, Deadline::INFINITE)
+            .unwrap();
+        let sixth = fifth
+            .child(TaskRole::Background, Deadline::INFINITE)
+            .unwrap();
+        let seventh = sixth
+            .child(TaskRole::Background, Deadline::INFINITE)
+            .unwrap();
+
+        assert_eq!(seventh.depth(), super::MAX_TASK_GROUP_DEPTH);
+        assert!(matches!(
+            seventh.child(TaskRole::Background, Deadline::INFINITE),
+            Err(ipc::Error::NO_SPACE)
+        ));
     }
 
     #[test]
@@ -1647,6 +2090,182 @@ mod tests {
         assert_eq!(executor.outcome(first_id), None);
         assert_eq!(first_polls.get(), 2);
         assert_eq!(second_polls.get(), 2);
+    }
+
+    #[test]
+    fn task_executor_binds_ancestor_cancellation_and_retains_attribution() {
+        struct Waiting<'a> {
+            reactor: &'a Reactor<3>,
+        }
+
+        impl Future for Waiting<'_> {
+            type Output = ipc::Result<()>;
+
+            fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+                self.reactor
+                    .register(WaitItem::new(42, Signals::READABLE), context.waker())
+                    .unwrap();
+                Poll::Pending
+            }
+        }
+
+        let reactor = Reactor::<3>::new();
+        let root = TaskGroup::root(TaskRole::Service, Deadline::INFINITE).unwrap();
+        let child = root.child(TaskRole::Request, Deadline::INFINITE).unwrap();
+        let mut task = Waiting { reactor: &reactor };
+        let mut executor = TaskExecutor::<1, 3> {
+            reactor: &reactor,
+            event_port: None,
+            tasks: core::array::from_fn(|_| None),
+            generations: [0; 1],
+            bindings: core::array::from_fn(|_| None),
+            running: false,
+        };
+        let id = executor
+            .spawn(&mut task, &child, Deadline::INFINITE)
+            .unwrap();
+        assert_eq!(
+            executor.attribution(id),
+            Some(TaskAttribution {
+                role: TaskRole::Request,
+                group_depth: 2,
+            })
+        );
+
+        let bindings = RefCell::new([None; 3]);
+        executor
+            .run_with(
+                |item, key| {
+                    let mut bindings = bindings.borrow_mut();
+                    *bindings
+                        .iter_mut()
+                        .find(|binding| binding.is_none())
+                        .unwrap() = Some((item.handle(), key));
+                    Ok(())
+                },
+                |key| {
+                    for binding in bindings.borrow_mut().iter_mut() {
+                        if binding.is_some_and(|(_, binding_key)| binding_key == key) {
+                            *binding = None;
+                        }
+                    }
+                    Ok(())
+                },
+                |deadline| {
+                    if deadline == Deadline::IMMEDIATE {
+                        return Err(ipc::Error::TIMED_OUT);
+                    }
+                    assert_eq!(bindings.borrow().iter().flatten().count(), 3);
+                    root.cancel().unwrap();
+                    let key = bindings
+                        .borrow()
+                        .iter()
+                        .flatten()
+                        .find(|(handle, _)| *handle != 42)
+                        .unwrap()
+                        .1;
+                    Ok(EventPortEvent {
+                        key,
+                        signals: Signals::SIGNALED,
+                    })
+                },
+                || unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(executor.outcome(id), Some(TaskOutcome::Cancelled));
+        assert!(!child.is_locally_cancelled().unwrap());
+    }
+
+    #[test]
+    fn shutdown_drains_cooperative_tasks_and_expires_stubborn_tasks() {
+        struct Cooperative<'a> {
+            shutdown: &'a Shutdown,
+        }
+
+        impl Future for Cooperative<'_> {
+            type Output = ipc::Result<()>;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.shutdown.is_requested().unwrap() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        struct Stubborn<'a> {
+            reactor: &'a Reactor<1>,
+        }
+
+        impl Future for Stubborn<'_> {
+            type Output = ipc::Result<()>;
+
+            fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+                self.reactor
+                    .register(WaitItem::new(50, Signals::READABLE), context.waker())
+                    .unwrap();
+                Poll::Pending
+            }
+        }
+
+        let reactor = Reactor::<1>::new();
+        let shutdown = Shutdown::new().unwrap();
+        let mut cooperative = Cooperative {
+            shutdown: &shutdown,
+        };
+        let mut stubborn = Stubborn { reactor: &reactor };
+        let mut executor = TaskExecutor::<2, 1> {
+            reactor: &reactor,
+            event_port: None,
+            tasks: core::array::from_fn(|_| None),
+            generations: [0; 2],
+            bindings: core::array::from_fn(|_| None),
+            running: false,
+        };
+        let cooperative_id = executor
+            .spawn_scoped(
+                Pin::new(&mut cooperative),
+                RunScope::new(Deadline::INFINITE),
+            )
+            .unwrap();
+        let stubborn_id = executor
+            .spawn_scoped(Pin::new(&mut stubborn), RunScope::new(Deadline::INFINITE))
+            .unwrap();
+
+        let report = executor
+            .shutdown_with(
+                &shutdown,
+                Deadline::from_monotonic_ns(50),
+                |_, _| Ok(()),
+                |_| Ok(()),
+                |deadline| {
+                    assert_eq!(deadline, Deadline::from_monotonic_ns(50));
+                    Err(ipc::Error::TIMED_OUT)
+                },
+                || Ok(50),
+            )
+            .unwrap();
+
+        assert!(shutdown.is_requested().unwrap());
+        assert_eq!(
+            executor.outcome(cooperative_id),
+            Some(TaskOutcome::Completed(Ok(())))
+        );
+        assert_eq!(
+            executor.outcome(stubborn_id),
+            Some(TaskOutcome::ShutdownTimedOut)
+        );
+        assert_eq!(
+            report,
+            DrainReport {
+                completed: 1,
+                cancelled: 0,
+                timed_out: 0,
+                shutdown_timed_out: 1,
+            }
+        );
+        assert_eq!(report.total(), 2);
     }
 
     #[test]

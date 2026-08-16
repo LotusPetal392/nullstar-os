@@ -1031,21 +1031,21 @@ A test-only protocol should exercise handle transfer.
 ### Phase 4: Asynchronous execution
 
 - extend the bounded event-port executor beyond reactor-backed object waits;
-- extend bounded task groups into nested role-specific task hierarchies;
 - carry task attribution and lifecycle policy into generated service bindings;
 - add a bounded blocking pool;
-- integrate application and service shutdown;
-- expose role-specific runtime contexts.
+- expose capability-bearing role-specific process contexts.
 
 The initial Phase 4 runtime is implemented without introducing an unbounded executor. `RunScope`
-propagates one absolute deadline and optional cancellation token, manual-reset events separate
+propagates one absolute deadline and a bounded cancellation lineage, manual-reset events separate
 cancellation signal and observation authority, and `PeriodicTimer` rearms one kernel one-shot timer
 while returning a bounded coalesced expiration count. `TaskExecutor` adds fixed task and aggregate-wait
 capacities, generation-tagged event-port registrations, queued wakeup draining, independent ready-task
-selection, terminal outcome retention, and safe slot reaping. Every task belongs to a `TaskGroup` and
-inherits its cancellation token and deadline; a task may shorten but never extend that deadline.
-Nested role-specific group hierarchies, blocking pools, shutdown draining, and broader completion
-sources remain future work.
+selection, terminal outcome retention, and safe slot reaping. Every task belongs to a fixed-depth,
+role-attributed `TaskGroup` and inherits every ancestor cancellation token plus the earliest ancestor
+deadline; cancelling a group leaves its parent and siblings running. `Shutdown` provides a distinct
+cooperative signal, and `TaskExecutor::shutdown` drains until one absolute deadline while retaining a
+separate forced-shutdown outcome and terminal report. Blocking pools, generated binding integration,
+capability-bearing process contexts, and broader completion sources remain future work.
 
 ### Phase 5: NSIDL compiler MVP
 

@@ -415,7 +415,8 @@ Future work should preserve the current rules while adding:
 
 - typed MMIO, IRQ, DMA, and device-ownership capabilities;
 - direct shared-memory mappings with explicit cache and protection semantics;
-- protocol and kernel-call cancellation beyond the implemented scoped event-backed task groups,
+- protocol and kernel-call cancellation beyond the implemented nested event-backed task groups and
+  bounded cooperative runtime shutdown,
   kernel periodic timers beyond the implemented userspace one-shot rearming schedule, additional I/O
   event sources, and service migration onto paired channels;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,

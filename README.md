@@ -44,8 +44,8 @@ experimentation, not production use or untrusted workloads.
   retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor and
   queued-event-port task executor for
   asynchronous endpoint send, receive, and single- or multi-handle move-send operations with
-  independently scheduled task groups, propagated deadlines, structured cancellation, and
-  coalescing periodic timers,
+  independently scheduled fixed-depth role task groups, inherited deadlines and cancellation,
+  coalescing periodic timers, and deadline-bounded cooperative shutdown draining,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and
