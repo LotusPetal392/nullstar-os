@@ -145,6 +145,13 @@ registered objects without delegating their handles. Registrations retain target
 until removal or final wait-set destruction. Results are level-triggered and insertion ordered, and
 an outstanding wait uses a stable snapshot of the registrations present when it began.
 
+ABI 1.28 adds capability-backed event ports with the same `DUPLICATE | TRANSFER | WAIT | MANAGE`
+rights split. `MANAGE` plus target `WAIT` authority controls registration; a reduced port carrying
+only `WAIT` may consume queued events without receiving any target handle. Registrations retain
+their targets, keys are unique, and nested event ports are rejected to keep observation and object
+lifetime graphs acyclic. Removing a registration purges its queued event and releases the retained
+target when no other legitimate reference remains.
+
 ABI 1.25 adds atomic endpoint pairs. Sends target the peer's incoming queue, so `WRITABLE` reflects
 peer capacity rather than local capacity. Final peer destruction permanently asserts `PEER_CLOSED`;
 the survivor may report `READABLE | PEER_CLOSED` until already queued messages are drained. Peer
@@ -391,7 +398,7 @@ Future work should preserve the current rules while adding:
 
 - typed MMIO, IRQ, DMA, and device-ownership capabilities;
 - direct shared-memory mappings with explicit cache and protection semantics;
-- cancellation, persistent event ports, and service migration onto paired channels;
+- cancellation, additional timer and I/O event sources, and service migration onto paired channels;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
   restartable service-manager broker that owns the sequence and receives its current state;
 - broader job-level resource accounting and limits plus service, session, and application

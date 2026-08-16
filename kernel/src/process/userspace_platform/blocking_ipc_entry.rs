@@ -21,6 +21,7 @@ enum ObjectWaitReturn {
     Signals,
     Index,
     WaitSetEvent,
+    EventPortEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +152,10 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
         return wait_set_wait(current_stack_pointer, registers_pointer);
     }
 
+    if syscall_number == abi::syscall::EVENT_PORT_WAIT {
+        return event_port_wait(current_stack_pointer, registers_pointer);
+    }
+
     if syscall_number == abi::syscall::ENDPOINT_WAIT {
         return blocking_endpoint_wait(current_stack_pointer, registers_pointer);
     }
@@ -185,6 +190,9 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
         abi::syscall::ENDPOINT_RECEIVE
             | abi::syscall::ENDPOINT_RECEIVE_MANY
             | abi::syscall::NOTIFICATION_SIGNAL
+            | abi::syscall::NOTIFICATION_TRY_WAIT
+            | abi::syscall::CAPABILITY_CLOSE
+            | abi::syscall::EVENT_PORT_ADD
     ) {
         let next_stack_pointer =
             nullstar_capability_grant_syscall_dispatch(current_stack_pointer);
@@ -272,7 +280,8 @@ fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
         | CapabilityObjectData::SharedMemory(_)
         | CapabilityObjectData::KernelEarlyLogReader(_)
         | CapabilityObjectData::Job(_)
-        | CapabilityObjectData::WaitSet(_) => Err(abi::errno::INVALID_ARGUMENT),
+        | CapabilityObjectData::WaitSet(_)
+        | CapabilityObjectData::EventPort(_) => Err(abi::errno::INVALID_ARGUMENT),
     }
 }
 
@@ -517,6 +526,80 @@ fn wait_set_wait(
     next_stack_pointer
 }
 
+fn event_port_wait(
+    current_stack_pointer: usize,
+    registers_pointer: *mut SavedRegisters,
+) -> usize {
+    let Some(process_id) = scheduler::current_process_id() else {
+        unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
+        return current_stack_pointer;
+    };
+    let event_port_handle = unsafe { (*registers_pointer).rdi };
+    let deadline_ns = unsafe { (*registers_pointer).rsi };
+
+    let mut waiters = OBJECT_WAITERS.lock();
+    waiters.retain(|waiter| waiter.process_id != process_id);
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    if let Err(error) = refresh_event_ports(&mut registry) {
+        unsafe { (*registers_pointer).rax = error_return(error) };
+        return current_stack_pointer;
+    }
+    let entry = match registry.entry(process_id, event_port_handle) {
+        Some(entry) => entry,
+        None => {
+            unsafe { (*registers_pointer).rax = error_return(abi::errno::BAD_FILE_DESCRIPTOR) };
+            return current_stack_pointer;
+        }
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_WAIT) {
+        unsafe { (*registers_pointer).rax = error_return(error) };
+        return current_stack_pointer;
+    }
+    if entry.object.kind != abi::capability::KIND_EVENT_PORT {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+        return current_stack_pointer;
+    }
+    let Some(object_index) = registry.object_index(entry.object) else {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::IO) };
+        return current_stack_pointer;
+    };
+    let CapabilityObjectData::EventPort(event_port) = &mut registry.objects[object_index].data
+    else {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::INVALID_ARGUMENT) };
+        return current_stack_pointer;
+    };
+    if let Some(event) = event_port.pop_event() {
+        let result = abi::event_port::pack_event(event.key, event.signals.bits())
+            .unwrap_or_else(|| error_return(abi::errno::IO));
+        unsafe { (*registers_pointer).rax = result };
+        return current_stack_pointer;
+    }
+    if deadline_ns == abi::deadline::IMMEDIATE
+        || (deadline_ns != abi::deadline::INFINITE
+            && crate::interrupts::monotonic_time_ns() >= deadline_ns)
+    {
+        unsafe { (*registers_pointer).rax = error_return(abi::errno::TIMED_OUT) };
+        return current_stack_pointer;
+    }
+
+    waiters.push(ObjectWaiter {
+        registrations: vec![ObjectWaitRegistration {
+            object: entry.object,
+            requested: kernel::object::Signals::READABLE,
+            key: 0,
+        }],
+        return_kind: ObjectWaitReturn::EventPortEvent,
+        process_id,
+        deadline_ns,
+        registers_pointer: registers_pointer as usize,
+    });
+    unsafe { (*registers_pointer).rax = 0 };
+    drop(registry);
+    let next_stack_pointer = scheduler::block_current(current_stack_pointer);
+    drop(waiters);
+    next_stack_pointer
+}
+
 fn resolve_object_wait_registration(
     registry: &CapabilityRegistry,
     process_id: u64,
@@ -558,9 +641,26 @@ fn first_satisfied_object_wait(
 }
 
 fn object_waiter_result(
-    registry: &CapabilityRegistry,
+    registry: &mut CapabilityRegistry,
     waiter: &ObjectWaiter,
 ) -> Result<Option<u64>, i64> {
+    if waiter.return_kind == ObjectWaitReturn::EventPortEvent {
+        let registration = waiter.registrations.first().ok_or(abi::errno::IO)?;
+        let object_index = registry
+            .object_index(registration.object)
+            .ok_or(abi::errno::IO)?;
+        let CapabilityObjectData::EventPort(event_port) =
+            &mut registry.objects[object_index].data
+        else {
+            return Err(abi::errno::INVALID_ARGUMENT);
+        };
+        let Some(event) = event_port.pop_event() else {
+            return Ok(None);
+        };
+        return abi::event_port::pack_event(event.key, event.signals.bits())
+            .map(Some)
+            .ok_or(abi::errno::IO);
+    }
     let Some((index, asserted)) = first_satisfied_object_wait(registry, &waiter.registrations)? else {
         return Ok(None);
     };
@@ -572,19 +672,24 @@ fn object_waiter_result(
             asserted,
         )
         .ok_or(abi::errno::IO)?,
+        ObjectWaitReturn::EventPortEvent => unreachable!("event-port waits return above"),
     }))
 }
 
 fn wake_satisfied_object_waiters() {
     let mut waiters = OBJECT_WAITERS.lock();
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let refresh_error = refresh_event_ports(&mut registry).err();
     if waiters.is_empty() {
         return;
     }
-    let registry = CAPABILITY_REGISTRY.lock();
     let mut wakeups = Vec::new();
     let mut index = 0usize;
     while index < waiters.len() {
-        let return_value = match object_waiter_result(&registry, &waiters[index]) {
+        let return_value = match refresh_error
+            .map(Err)
+            .unwrap_or_else(|| object_waiter_result(&mut registry, &waiters[index]))
+        {
             Ok(None) => {
                 index = index.saturating_add(1);
                 continue;

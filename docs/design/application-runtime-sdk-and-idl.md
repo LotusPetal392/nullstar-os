@@ -988,8 +988,8 @@ services to the layer and separating final public crates remain Phase 1 work.
 - add asynchronous channel send and receive;
 - add safe mapped shared memory.
 
-The first asynchronous channel slice is implemented ahead of persistent event ports: an
-allocation-free scoped reactor converts endpoint readability, writability, and peer closure into standard
+The first asynchronous channel slice remains an allocation-free scoped reactor that converts
+endpoint readability, writability, and peer closure into standard
 Rust futures, drives bounded `wait_many` registrations with absolute deadlines, and supports byte
 send, typed receive, and ownership-safe move send. Host tests cover bounded registration, merged
 signals, deadline forwarding, and invalid unregistered suspension. The QEMU runtime probe covers a
@@ -999,8 +999,10 @@ drainage are covered by the QEMU runtime probe. ABI 1.26 and the typed runtime n
 up to four heterogeneous handles, return every source on failed enqueue, report insufficient receive
 capacity without dequeue, and expose the same operations as scoped futures. ABI 1.27 adds bounded
 persistent wait-set registrations, caller-defined readiness tags, typed ownership, and cross-process
-blocking coverage. Queued event delivery, independently scheduled tasks, sender-side receiver-slot
-reservation, and service migration remain Phase 2 work.
+blocking coverage. ABI 1.28 adds bounded queued rising-edge delivery, per-key coalescing and rearming,
+typed event-port ownership, and cross-process blocking coverage. Timer and I/O completion sources,
+independently scheduled tasks, sender-side receiver-slot reservation, and service migration remain
+Phase 2 work.
 
 ### Phase 3: Hand-written protocol runtime
 

@@ -53,13 +53,22 @@ The same immediate, finite absolute-deadline, infinite, lost-wakeup, and one-out
 process rules apply. Registration changes affect the next wait rather than mutating an in-flight
 snapshot.
 
+ABI 1.28 adds event ports with up to 64 persistent registrations and 64 queued events. Registration
+captures the target's current requested state and queues it immediately when already asserted.
+Subsequent events contain only newly asserted bits. One pending FIFO entry is retained per key;
+additional rising bits coalesce into that entry, and the registration rearms only after the relevant
+state deasserts. Waiting atomically removes one queued event but never consumes the target state.
+Removal also purges a pending event for that key. The same deadline and lost-wakeup rules apply, and
+a port may be waited while empty because a separately held `MANAGE` capability can add registrations.
+
 ## Current boundary
 
 The original endpoint primitive removes cooperative polling from request/reply clients and remains
 the blocking foundation for existing proxies. Generic bounded object waiting now supplies timeout
 deadlines and readiness selection, and persistent wait sets remove repeated registration copying for
-larger stable sets. The current interfaces still do not provide transaction identifiers,
-kernel-owned reply slots, cancellation messages, queued edge events, or restart-aware kernel file
+larger stable sets. Queued event ports add bounded edge delivery for current endpoint, notification,
+and job signals. The current interfaces still do not provide transaction identifiers, kernel-owned
+reply slots, cancellation messages, timer or I/O completion sources, or restart-aware kernel file
 descriptors.
 
 Kernel service completions may arrive while a different userspace address

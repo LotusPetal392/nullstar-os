@@ -195,9 +195,15 @@ The many-object operation is bounded at 16 entries and returns the lowest ready 
 ABI 1.27 adds the first persistent wait set: up to 64 wait-authorized endpoint, notification, or job
 registrations are retained under caller-defined tags and checked in insertion order with the same
 absolute deadlines and level-triggered signals. A registration retains its target object, and a
-wait snapshots the current set. Later queued event-port semantics should extend this foundation to
-timers, sockets, file completion, display events, device events, and media events rather than forcing
-every subsystem to invent a separate polling API.
+wait snapshots the current set.
+
+ABI 1.28 adds a separate queued event port with up to 64 retained registrations and one pending FIFO
+event per key. Existing requested state produces an initial event; later events contain rising signal
+bits, coalesce with an already pending event for the same key, and rearm only after deassertion.
+Waiting removes the queued event without consuming target state. Event ports expose `READABLE` to
+generic waits and wait sets, but cannot register another event port. Later timer, socket, file,
+display, device, and media sources should feed this common port rather than inventing separate
+polling APIs.
 
 ### Events and timers
 
@@ -523,8 +529,8 @@ endpoint waiting, and direct-child bootstrap grants. The intended evolution is:
    lifetime, rights, signals, close, duplicate, replace, and inspection semantics;
 2. migrate one-ended endpoint consumers onto the implemented channel pairs and extend
    atomic move-transfer from one handle to bounded handle vectors;
-3. extend the implemented general object waiting and persistent tagged wait sets with queued event
-   ports and additional timer, file, network, display, device, and media sources;
+3. extend the implemented general object waiting, persistent tagged wait sets, and queued event
+   ports with timer, file, network, display, device, and media sources;
 4. add mapped shared-memory objects, per-mapping protection, sealing, accounting, and
    explicit W^X integration;
 5. add cancellation and an optimized synchronous call/reply path with bounded priority

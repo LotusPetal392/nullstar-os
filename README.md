@@ -38,6 +38,7 @@ experimentation, not production use or untrusted workloads.
   atomic one- and bounded multi-handle endpoint move-transfer, shared byte-memory
   objects, level-triggered endpoint, notification, and job signal snapshots,
   absolute-deadline single- and bounded many-object waits, bounded persistent tagged wait sets,
+  bounded queued edge-event ports,
   explicit direct-child bootstrap grants,
   ownership-safe userspace handle wrappers with typed object markers, automatic close, and
   retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor for

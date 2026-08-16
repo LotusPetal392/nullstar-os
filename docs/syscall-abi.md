@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.26, and a
+The ABI is experimental, but callers can query the current version, 1.28, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -692,6 +692,41 @@ asserted_signals = event & 0xff
 The key bound keeps bit 63 clear, so a successful event cannot overlap the negative errno encoding.
 `WAIT_SETS` in `SystemInfo.capabilities` advertises the object and all four calls.
 
+## Version 1.28 bounded queued event ports
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 81 | `EVENT_PORT_CREATE` | none | event-port handle |
+| 82 | `EVENT_PORT_ADD` | event port, target, requested signals, key | zero |
+| 83 | `EVENT_PORT_REMOVE` | event port, key | zero |
+| 84 | `EVENT_PORT_WAIT` | event port, absolute deadline | packed queued event |
+
+An event port is a transferable kernel object with `DUPLICATE | TRANSFER | WAIT | MANAGE` rights.
+The system permits at most 16 live event ports, 64 registrations per port, and 64 queued events per
+port. `EVENT_PORT_ADD` requires `MANAGE` on the port and `WAIT` on an endpoint, notification, or job
+target. Signal masks must be nonempty and supported by the target, and keys use the same unique
+`2^55 - 1` bound and packed result format as wait sets. Duplicate or nested event-port registrations,
+unsupported masks, and invalid keys return `EINVAL`; registration exhaustion returns `ENOSPC`.
+
+Registration records the target's currently asserted requested bits. If any are already asserted,
+one initial event is queued. Later observation queues only bits that transition from deasserted to
+asserted. At most one event is pending per key: new rising bits are ORed into that event without
+changing its FIFO position. This coalescing makes queue occupancy no larger than registration
+occupancy, so sustained level state cannot overflow the queue. A registration rearms a bit only
+after that bit is observed deasserted.
+
+`EVENT_PORT_WAIT` requires `WAIT`, atomically removes the oldest queued event, and uses the existing
+immediate, finite absolute-deadline, and infinite deadline rules. Removing a registration also
+purges its pending event. Neither operation consumes or clears the target's underlying state. An
+empty port may be waited because another process holding a `MANAGE` capability can add a
+registration. The event port itself exposes level-triggered `READABLE` while its queue is nonempty,
+so generic object waits and persistent wait sets can observe it.
+
+Registrations retain target object identity. A rights-reduced `WAIT` capability therefore delegates
+consumption of the queued observations without delegating the registered target handles or
+registration management. `CapabilityInfo.size` reports queued event count. `EVENT_PORTS` in
+`SystemInfo.capabilities` advertises the object and all four calls.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -730,6 +765,7 @@ The key bound keeps bit 63 clear, so a successful event cannot overlap the negat
 - ABI 1.25 adds atomic channel-pair creation and level-triggered peer closure at syscall 74.
 - ABI 1.26 adds atomic move and receive of up to four message handles at syscalls 75 and 76.
 - ABI 1.27 adds bounded persistent tagged wait sets at syscalls 77 through 80.
+- ABI 1.28 adds bounded queued edge-event ports at syscalls 81 through 84.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

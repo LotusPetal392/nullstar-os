@@ -80,13 +80,15 @@ impl Rights {
     pub const KERNEL_EARLY_LOG_READER: Self = Self(abi_capability::KERNEL_EARLY_LOG_READER_RIGHTS);
     pub const JOB: Self = Self(abi_capability::JOB_RIGHTS);
     pub const WAIT_SET: Self = Self(abi_capability::WAIT_SET_RIGHTS);
+    pub const EVENT_PORT: Self = Self(abi_capability::EVENT_PORT_RIGHTS);
 
     pub const fn from_bits(bits: u64) -> Option<Self> {
         let all = abi_capability::ENDPOINT_RIGHTS
             | abi_capability::NOTIFICATION_RIGHTS
             | abi_capability::SHARED_MEMORY_RIGHTS
             | abi_capability::JOB_RIGHTS
-            | abi_capability::WAIT_SET_RIGHTS;
+            | abi_capability::WAIT_SET_RIGHTS
+            | abi_capability::EVENT_PORT_RIGHTS;
         if bits & !all == 0 {
             Some(Self(bits))
         } else {
@@ -183,6 +185,12 @@ pub struct WaitSetEvent {
     pub signals: Signals,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventPortEvent {
+    pub key: u64,
+    pub signals: Signals,
+}
+
 impl WaitItem {
     pub const fn new(handle: CapabilityHandle, requested: Signals) -> Self {
         Self {
@@ -208,6 +216,7 @@ pub enum ObjectKind {
     KernelEarlyLogReader,
     Job,
     WaitSet,
+    EventPort,
 }
 
 impl ObjectKind {
@@ -219,6 +228,7 @@ impl ObjectKind {
             abi_capability::KIND_KERNEL_EARLY_LOG_READER => Some(Self::KernelEarlyLogReader),
             abi_capability::KIND_JOB => Some(Self::Job),
             abi_capability::KIND_WAIT_SET => Some(Self::WaitSet),
+            abi_capability::KIND_EVENT_PORT => Some(Self::EventPort),
             _ => None,
         }
     }
@@ -482,6 +492,67 @@ pub fn wait_set_wait(wait_set: CapabilityHandle, deadline: Deadline) -> Result<W
         .ok_or(Error::IO)?;
     Ok(WaitSetEvent {
         key: crate::abi::wait_set::event_key(event),
+        signals,
+    })
+}
+
+pub fn event_port_create() -> Result<CapabilityHandle> {
+    let mut result = syscall::EVENT_PORT_CREATE;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result)
+}
+
+pub fn event_port_add(
+    event_port: CapabilityHandle,
+    target: CapabilityHandle,
+    requested: Signals,
+    key: u64,
+) -> Result<()> {
+    let mut result = syscall::EVENT_PORT_ADD;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") event_port,
+            in("rsi") target,
+            in("rdx") requested.bits(),
+            in("r10") key,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn event_port_remove(event_port: CapabilityHandle, key: u64) -> Result<()> {
+    let mut result = syscall::EVENT_PORT_REMOVE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") event_port,
+            in("rsi") key,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn event_port_wait(event_port: CapabilityHandle, deadline: Deadline) -> Result<EventPortEvent> {
+    let mut result = syscall::EVENT_PORT_WAIT;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") event_port,
+            in("rsi") deadline.as_monotonic_ns(),
+        );
+    }
+    let event = decode(result)?;
+    let signals = Signals::from_bits(crate::abi::event_port::event_signals(event))
+        .filter(|signals| signals.bits() != 0)
+        .ok_or(Error::IO)?;
+    Ok(EventPortEvent {
+        key: crate::abi::event_port::event_key(event),
         signals,
     })
 }
@@ -1042,6 +1113,10 @@ mod tests {
             ObjectKind::from_raw(capability::KIND_WAIT_SET),
             Some(ObjectKind::WaitSet)
         );
+        assert_eq!(
+            ObjectKind::from_raw(capability::KIND_EVENT_PORT),
+            Some(ObjectKind::EventPort)
+        );
         assert_eq!(ObjectKind::from_raw(99), None);
     }
 
@@ -1070,6 +1145,10 @@ mod tests {
         assert_eq!(syscall::WAIT_SET_ADD, 78);
         assert_eq!(syscall::WAIT_SET_REMOVE, 79);
         assert_eq!(syscall::WAIT_SET_WAIT, 80);
+        assert_eq!(syscall::EVENT_PORT_CREATE, 81);
+        assert_eq!(syscall::EVENT_PORT_ADD, 82);
+        assert_eq!(syscall::EVENT_PORT_REMOVE, 83);
+        assert_eq!(syscall::EVENT_PORT_WAIT, 84);
         assert_eq!(core::mem::size_of::<capability::EndpointPair>(), 16);
         assert_eq!(core::mem::align_of::<capability::EndpointPair>(), 8);
         assert_eq!(core::mem::size_of::<capability::HandleDisposition>(), 16);
@@ -1078,6 +1157,7 @@ mod tests {
         assert_eq!(capability::CHANNEL_PAIRS, 1 << 23);
         assert_eq!(capability::MULTI_HANDLE_MESSAGES, 1 << 24);
         assert_eq!(capability::WAIT_SETS, 1 << 25);
+        assert_eq!(capability::EVENT_PORTS, 1 << 26);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,
@@ -1106,6 +1186,24 @@ mod tests {
         assert_eq!(
             crate::abi::wait_set::pack_event(crate::abi::wait_set::MAX_KEY + 1, 1),
             None
+        );
+    }
+
+    #[test]
+    fn event_port_events_share_the_stable_tagged_result_encoding() {
+        let event = crate::abi::event_port::pack_event(
+            crate::abi::event_port::MAX_KEY,
+            crate::abi::object_signal::SIGNALED,
+        )
+        .unwrap();
+        assert!(event <= i64::MAX as u64);
+        assert_eq!(
+            crate::abi::event_port::event_key(event),
+            crate::abi::event_port::MAX_KEY
+        );
+        assert_eq!(
+            crate::abi::event_port::event_signals(event),
+            crate::abi::object_signal::SIGNALED
         );
     }
 

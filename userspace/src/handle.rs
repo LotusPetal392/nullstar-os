@@ -8,7 +8,8 @@
 use core::{marker::PhantomData, num::NonZeroU64};
 
 use crate::ipc::{
-    self, CapabilityHandle, CapabilityInfo, Deadline, ObjectKind, Rights, Signals, WaitSetEvent,
+    self, CapabilityHandle, CapabilityInfo, Deadline, EventPortEvent, ObjectKind, Rights, Signals,
+    WaitSetEvent,
 };
 
 mod sealed {
@@ -51,6 +52,10 @@ pub enum Job {}
 #[derive(Debug)]
 pub enum WaitSet {}
 
+/// A bounded FIFO of coalesced object-signal edges.
+#[derive(Debug)]
+pub enum EventPort {}
+
 impl sealed::Sealed for AnyObject {}
 impl sealed::Sealed for Endpoint {}
 impl sealed::Sealed for Notification {}
@@ -58,6 +63,7 @@ impl sealed::Sealed for SharedMemory {}
 impl sealed::Sealed for KernelEarlyLogReader {}
 impl sealed::Sealed for Job {}
 impl sealed::Sealed for WaitSet {}
+impl sealed::Sealed for EventPort {}
 
 impl ObjectType for AnyObject {}
 impl ObjectType for Endpoint {}
@@ -66,6 +72,7 @@ impl ObjectType for SharedMemory {}
 impl ObjectType for KernelEarlyLogReader {}
 impl ObjectType for Job {}
 impl ObjectType for WaitSet {}
+impl ObjectType for EventPort {}
 
 impl KnownObjectType for Endpoint {
     const KIND: ObjectKind = ObjectKind::Endpoint;
@@ -89,6 +96,10 @@ impl KnownObjectType for Job {
 
 impl KnownObjectType for WaitSet {
     const KIND: ObjectKind = ObjectKind::WaitSet;
+}
+
+impl KnownObjectType for EventPort {
+    const KIND: ObjectKind = ObjectKind::EventPort;
 }
 
 /// Exclusive ownership of one process-local capability-table entry.
@@ -441,6 +452,29 @@ impl OwnedHandle<WaitSet> {
 
     pub fn wait_next(&self, deadline: Deadline) -> ipc::Result<WaitSetEvent> {
         ipc::wait_set_wait(self.as_raw(), deadline)
+    }
+}
+
+impl OwnedHandle<EventPort> {
+    pub fn create() -> ipc::Result<Self> {
+        Self::adopt(ipc::event_port_create()?)
+    }
+
+    pub fn add<T: ObjectType>(
+        &self,
+        target: BorrowedHandle<'_, T>,
+        requested: Signals,
+        key: u64,
+    ) -> ipc::Result<()> {
+        ipc::event_port_add(self.as_raw(), target.as_raw(), requested, key)
+    }
+
+    pub fn remove(&self, key: u64) -> ipc::Result<()> {
+        ipc::event_port_remove(self.as_raw(), key)
+    }
+
+    pub fn wait_next(&self, deadline: Deadline) -> ipc::Result<EventPortEvent> {
+        ipc::event_port_wait(self.as_raw(), deadline)
     }
 }
 
