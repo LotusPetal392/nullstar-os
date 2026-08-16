@@ -418,7 +418,9 @@ Future work should preserve the current rules while adding:
 - protocol and kernel-call cancellation beyond the implemented nested event-backed task groups and
   bounded cooperative runtime shutdown,
   kernel periodic timers beyond the implemented userspace one-shot rearming schedule, additional I/O
-  event sources, and service migration onto paired channels;
+  event sources, startup-message population of the implemented rights-tightening process contexts,
+  generated integration for the implemented typed service bindings, and service migration onto paired
+  channels;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
   restartable service-manager broker that owns the sequence and receives its current state;
 - broader job-level resource accounting and limits plus service, session, and application

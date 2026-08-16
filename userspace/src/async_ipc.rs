@@ -849,6 +849,106 @@ pub struct TaskId {
     generation: u32,
 }
 
+/// Maximum retained executor lifecycle events. Older events are overwritten in
+/// a deterministic ring and reported as missed to the next reader.
+pub const MAX_TASK_TRACE_EVENTS: usize = 64;
+
+/// One bounded executor lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskTraceKind {
+    Spawned,
+    Polled,
+    Waiting { registrations: usize },
+    Woken { signals: Signals },
+    Completed(ipc::Result<()>),
+    Cancelled,
+    TimedOut,
+    ShutdownTimedOut,
+    Reaped,
+}
+
+/// Stable trace record retained independently of task-slot reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskTraceEvent {
+    pub sequence: u64,
+    pub task: TaskId,
+    pub attribution: TaskAttribution,
+    pub kind: TaskTraceKind,
+}
+
+/// Result of copying a bounded page of executor trace events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskTraceRead {
+    pub events: usize,
+    pub next_cursor: u64,
+    pub missed: u64,
+}
+
+struct TaskTraceBuffer {
+    events: [Option<TaskTraceEvent>; MAX_TASK_TRACE_EVENTS],
+    next_sequence: u64,
+    len: usize,
+}
+
+impl TaskTraceBuffer {
+    fn new() -> Self {
+        Self {
+            events: array::from_fn(|_| None),
+            next_sequence: 1,
+            len: 0,
+        }
+    }
+
+    fn record(&mut self, task: TaskId, attribution: TaskAttribution, kind: TaskTraceKind) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let index = usize::try_from(sequence.saturating_sub(1)).unwrap_or(usize::MAX)
+            % MAX_TASK_TRACE_EVENTS;
+        self.events[index] = Some(TaskTraceEvent {
+            sequence,
+            task,
+            attribution,
+            kind,
+        });
+        self.len = self.len.saturating_add(1).min(MAX_TASK_TRACE_EVENTS);
+    }
+
+    fn read(&self, after: u64, output: &mut [TaskTraceEvent]) -> TaskTraceRead {
+        if output.is_empty() || self.len == 0 {
+            return TaskTraceRead {
+                events: 0,
+                next_cursor: after,
+                missed: 0,
+            };
+        }
+        let oldest = self.next_sequence.saturating_sub(self.len as u64);
+        let requested = after.saturating_add(1);
+        let start = requested.max(oldest);
+        let missed = start.saturating_sub(requested);
+        let mut copied = 0;
+        let mut cursor = after;
+        let newest = self.next_sequence.saturating_sub(1);
+        for sequence in start..=newest {
+            if copied == output.len() {
+                break;
+            }
+            let index = usize::try_from(sequence.saturating_sub(1)).unwrap_or(usize::MAX)
+                % MAX_TASK_TRACE_EVENTS;
+            let Some(event) = self.events[index].filter(|event| event.sequence == sequence) else {
+                continue;
+            };
+            output[copied] = event;
+            copied += 1;
+            cursor = sequence;
+        }
+        TaskTraceRead {
+            events: copied,
+            next_cursor: cursor,
+            missed,
+        }
+    }
+}
+
 impl TaskId {
     pub const fn slot(self) -> usize {
         self.slot
@@ -927,6 +1027,7 @@ pub struct TaskExecutor<'reactor, 'task, 'group, const TASKS: usize, const WAITS
     tasks: [Option<TaskSlot<'task, 'group>>; TASKS],
     generations: [u32; TASKS],
     bindings: [Option<BoundRegistration>; crate::abi::limits::MAX_EVENT_PORT_REGISTRATIONS],
+    trace: TaskTraceBuffer,
     running: bool,
 }
 
@@ -950,6 +1051,7 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             tasks: array::from_fn(|_| None),
             generations: [0; TASKS],
             bindings: array::from_fn(|_| None),
+            trace: TaskTraceBuffer::new(),
             running: false,
         })
     }
@@ -1024,6 +1126,7 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             outcome: None,
             ready: true,
         });
+        self.trace.record(id, attribution, TaskTraceKind::Spawned);
         Ok(id)
     }
 
@@ -1043,6 +1146,13 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             .map(|task| task.attribution)
     }
 
+    /// Copies trace events newer than `after` into `output` without allocating.
+    /// The returned cursor resumes the next page, while `missed` reports events
+    /// overwritten before the requested cursor could be served.
+    pub fn read_trace(&self, after: u64, output: &mut [TaskTraceEvent]) -> TaskTraceRead {
+        self.trace.read(after, output)
+    }
+
     /// Releases a completed slot and returns its terminal outcome.
     ///
     /// Reusing the slot advances its generation, so already-drained events
@@ -1056,6 +1166,8 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             return None;
         }
         let outcome = task.outcome?;
+        self.trace
+            .record(id, task.attribution, TaskTraceKind::Reaped);
         self.tasks[id.slot] = None;
         Some(outcome)
     }
@@ -1231,21 +1343,37 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
                 continue;
             }
             task.ready = false;
+            self.trace
+                .record(task.id, task.attribution, TaskTraceKind::Polled);
             let waker = task_waker(task.id);
             if task.scope.is_cancelled().map_err(TaskRunError::Runtime)? {
                 self.reactor.clear_registrations_for(&waker);
                 task.outcome = Some(TaskOutcome::Cancelled);
+                self.trace
+                    .record(task.id, task.attribution, TaskTraceKind::Cancelled);
                 continue;
             }
             self.reactor.clear_registrations_for(&waker);
             let mut context = Context::from_waker(&waker);
             match task.future.as_mut().poll(&mut context) {
-                Poll::Ready(result) => task.outcome = Some(TaskOutcome::Completed(result)),
+                Poll::Ready(result) => {
+                    task.outcome = Some(TaskOutcome::Completed(result));
+                    self.trace
+                        .record(task.id, task.attribution, TaskTraceKind::Completed(result));
+                }
                 Poll::Pending => {
                     let mut registrations = [WaitItem::new(0, Signals::EMPTY); WAITS];
-                    if self.reactor.snapshot_for(&waker, &mut registrations) == 0 {
+                    let count = self.reactor.snapshot_for(&waker, &mut registrations);
+                    if count == 0 {
                         return Err(TaskRunError::UnregisteredPending(task.id));
                     }
+                    self.trace.record(
+                        task.id,
+                        task.attribution,
+                        TaskTraceKind::Waiting {
+                            registrations: count,
+                        },
+                    );
                 }
             }
         }
@@ -1337,6 +1465,13 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
             && task.outcome.is_none()
         {
             task.ready = true;
+            self.trace.record(
+                task.id,
+                task.attribution,
+                TaskTraceKind::Woken {
+                    signals: event.signals,
+                },
+            );
         }
     }
 
@@ -1364,6 +1499,8 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
                 let waker = task_waker(task.id);
                 self.reactor.clear_registrations_for(&waker);
                 task.outcome = Some(TaskOutcome::TimedOut);
+                self.trace
+                    .record(task.id, task.attribution, TaskTraceKind::TimedOut);
                 expired = true;
             }
         }
@@ -1376,6 +1513,8 @@ impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
                 let waker = task_waker(task.id);
                 self.reactor.clear_registrations_for(&waker);
                 task.outcome = Some(TaskOutcome::ShutdownTimedOut);
+                self.trace
+                    .record(task.id, task.attribution, TaskTraceKind::ShutdownTimedOut);
             }
         }
     }
@@ -1750,7 +1889,8 @@ mod tests {
 
     use super::{
         DrainReport, PeriodicSchedule, Reactor, RunError, RunScope, Shutdown, TaskAttribution,
-        TaskExecutor, TaskGroup, TaskOutcome, TaskRole, TaskRunError,
+        TaskExecutor, TaskGroup, TaskOutcome, TaskRole, TaskRunError, TaskTraceEvent,
+        TaskTraceKind,
     };
     use crate::ipc::{self, Deadline, EventPortEvent, Signals, WaitItem};
 
@@ -2018,6 +2158,7 @@ mod tests {
             tasks: core::array::from_fn(|_| None),
             generations: [0; 2],
             bindings: core::array::from_fn(|_| None),
+            trace: super::TaskTraceBuffer::new(),
             running: false,
         };
         let first_id = executor
@@ -2119,6 +2260,7 @@ mod tests {
             tasks: core::array::from_fn(|_| None),
             generations: [0; 1],
             bindings: core::array::from_fn(|_| None),
+            trace: super::TaskTraceBuffer::new(),
             running: false,
         };
         let id = executor
@@ -2221,6 +2363,7 @@ mod tests {
             tasks: core::array::from_fn(|_| None),
             generations: [0; 2],
             bindings: core::array::from_fn(|_| None),
+            trace: super::TaskTraceBuffer::new(),
             running: false,
         };
         let cooperative_id = executor
@@ -2285,6 +2428,76 @@ mod tests {
     }
 
     #[test]
+    fn task_trace_pages_lifecycle_events_and_reports_overwrite_gaps() {
+        let reactor = Reactor::<1>::new();
+        let group = TaskGroup::root(TaskRole::Service, Deadline::INFINITE).unwrap();
+        let mut task = future::ready(Ok(()));
+        let mut executor = TaskExecutor::<1, 1> {
+            reactor: &reactor,
+            event_port: None,
+            tasks: core::array::from_fn(|_| None),
+            generations: [0; 1],
+            bindings: core::array::from_fn(|_| None),
+            trace: super::TaskTraceBuffer::new(),
+            running: false,
+        };
+        let id = executor
+            .spawn(&mut task, &group, Deadline::INFINITE)
+            .unwrap();
+        executor
+            .run_with(
+                |_, _| unreachable!(),
+                |_| unreachable!(),
+                |_| unreachable!(),
+                || unreachable!(),
+            )
+            .unwrap();
+
+        let placeholder = TaskTraceEvent {
+            sequence: 0,
+            task: id,
+            attribution: group.attribution(),
+            kind: TaskTraceKind::Spawned,
+        };
+        let mut page = [placeholder; 2];
+        let first = executor.read_trace(0, &mut page);
+        assert_eq!(first.events, 2);
+        assert_eq!(first.next_cursor, 2);
+        assert_eq!(first.missed, 0);
+        assert_eq!(page[0].kind, TaskTraceKind::Spawned);
+        assert_eq!(page[1].kind, TaskTraceKind::Polled);
+
+        let second = executor.read_trace(first.next_cursor, &mut page);
+        assert_eq!(second.events, 1);
+        assert_eq!(page[0].kind, TaskTraceKind::Completed(Ok(())));
+        assert_eq!(executor.reap(id), Some(TaskOutcome::Completed(Ok(()))));
+        let reaped = executor.read_trace(second.next_cursor, &mut page);
+        assert_eq!(reaped.events, 1);
+        assert_eq!(page[0].kind, TaskTraceKind::Reaped);
+
+        let attribution = group.attribution();
+        for generation in 2..=70 {
+            executor.trace.record(
+                super::TaskId {
+                    slot: 0,
+                    generation,
+                },
+                attribution,
+                TaskTraceKind::Spawned,
+            );
+        }
+        let mut retained = [placeholder; super::MAX_TASK_TRACE_EVENTS];
+        let overwritten = executor.read_trace(0, &mut retained);
+        assert_eq!(overwritten.events, super::MAX_TASK_TRACE_EVENTS);
+        assert_eq!(overwritten.missed, 9);
+        assert!(
+            retained
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+    }
+
+    #[test]
     fn task_executor_expires_pending_task_at_inherited_deadline() {
         struct Waiting<'a> {
             reactor: &'a Reactor<1>,
@@ -2309,6 +2522,7 @@ mod tests {
             tasks: core::array::from_fn(|_| None),
             generations: [0; 1],
             bindings: core::array::from_fn(|_| None),
+            trace: super::TaskTraceBuffer::new(),
             running: false,
         };
         let id = executor
@@ -2350,6 +2564,7 @@ mod tests {
             tasks: core::array::from_fn(|_| None),
             generations: [0; 1],
             bindings: core::array::from_fn(|_| None),
+            trace: super::TaskTraceBuffer::new(),
             running: false,
         };
         let id = executor

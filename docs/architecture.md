@@ -125,11 +125,17 @@ through every wait, and rearms one-shot timers into periodic schedules with expl
 coalescing. A fixed-capacity executor assigns generation-tagged event-port registrations to independent
 tasks, polls only selected task slots, and gives every task fixed-depth role attribution plus inherited
 ancestor cancellation and deadlines. A distinct cooperative shutdown signal lets the executor drain
-until one absolute deadline and records any remaining task as a shutdown timeout. The runtime probe
+until one absolute deadline and records any remaining task as a shutdown timeout. A fixed 64-record
+lifecycle ring traces spawn, poll, wait, wake, terminal, and reap transitions with sequence cursors and
+explicit overwrite counts. Role-specific process contexts own explicit capabilities, reject duplicate
+roles, validate claimed object kinds, and irreversibly tighten authority to the consumer's requested
+rights. Provisional protocol descriptors bound names, versions, message sizes, and handle counts;
+client/server service bindings pair those declarations with typed endpoint ownership. The runtime probe
 checks these rules, process-exit cleanup, real cross-process wakeups, interrupt-driven timer delivery,
-periodic rearming, ancestor cancellation isolation, deadline termination, and bounded shutdown against
-kernel handles. Additional I/O event sources, sender-side receiver-slot reservation, generated binding
-integration, blocking workers, and broad service migration remain future runtime work.
+periodic rearming, ancestor cancellation isolation, deadline termination, trace ordering, rights
+tightening, and bounded shutdown against kernel handles. Startup-message integration, additional I/O
+event sources, sender-side receiver-slot reservation, generated bindings, blocking workers, and broad
+service migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh

@@ -359,7 +359,13 @@ retain explicit application, cancellation, task-timeout, or shutdown-timeout out
 and reuse advances the generation. A separate cooperative shutdown event wakes participating tasks;
 the executor drains them until one absolute deadline, then records each unfinished task distinctly.
 The executor rejects pending futures that register no waitable object and bounds task slots, reactor
-waits, hierarchy depth, and worst-case event-port registrations at compile time.
+waits, hierarchy depth, and worst-case event-port registrations at compile time. Its fixed 64-record
+trace retains sequence-numbered lifecycle transitions and reports records overwritten before a reader's
+cursor. A separate allocation-free process-context layer owns explicit role-tagged capabilities,
+rejects ambiguous duplicate roles, validates object kinds on claim, and reduces rights before yielding
+typed authority. Provisional protocol declarations bound identity, version, message bytes, attached
+handles, and directional endpoint rights; typed client and server bindings consume those declarations.
+This is runtime metadata and authority validation, not yet the startup-message or NSIDL wire contract.
 
 ### Scheduling integration
 

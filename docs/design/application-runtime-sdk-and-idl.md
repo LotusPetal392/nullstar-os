@@ -1044,8 +1044,14 @@ selection, terminal outcome retention, and safe slot reaping. Every task belongs
 role-attributed `TaskGroup` and inherits every ancestor cancellation token plus the earliest ancestor
 deadline; cancelling a group leaves its parent and siblings running. `Shutdown` provides a distinct
 cooperative signal, and `TaskExecutor::shutdown` drains until one absolute deadline while retaining a
-separate forced-shutdown outcome and terminal report. Blocking pools, generated binding integration,
-capability-bearing process contexts, and broader completion sources remain future work.
+separate forced-shutdown outcome and terminal report. A fixed 64-event trace exposes sequence-paged
+spawn, poll, wait, wake, terminal, and reap transitions and reports overwritten gaps. `ProcessContext`
+adds fixed-capacity role-specific ownership for explicit capabilities, rejects duplicate semantic roles,
+validates claimed object kinds, preserves ownership on failure, and rights-reduces successful claims.
+Bounded protocol descriptors and client/server `ServiceBinding` types provide the first pre-generated
+binding and conformance layer; host tests check identity and transport bounds, while the QEMU probe
+checks real capability adoption and rights tightening. The eventual startup message, generated binding
+integration, privacy-aware tracing, blocking pools, and broader completion sources remain future work.
 
 ### Phase 5: NSIDL compiler MVP
 

@@ -7,8 +7,9 @@ use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
     async_ipc::{
-        CancellationSource, DrainReport, PeriodicTimer, Reactor, RunError, RunScope, Shutdown,
-        TaskAttribution, TaskExecutor, TaskGroup, TaskOutcome, TaskRole,
+        CancellationSource, DrainReport, MAX_TASK_TRACE_EVENTS, PeriodicTimer, Reactor, RunError,
+        RunScope, Shutdown, TaskAttribution, TaskExecutor, TaskGroup, TaskOutcome, TaskRole,
+        TaskTraceEvent, TaskTraceKind,
     },
     blocking_ipc,
     handle::{
@@ -18,6 +19,10 @@ use userspace::{
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
+    runtime_context::{
+        self, CapabilityRole, Client, ContextCapability, ContextError, ProcessContext,
+        ProtocolDescriptor, ServiceBinding, ServiceProcess, ServiceProtocol,
+    },
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
 
@@ -27,6 +32,26 @@ userspace::panic_handler!();
 const SUCCESS: &[u8] = b"userspace Rust runtime probe passed\n";
 const DIRECTORY_PAGE: usize = 8;
 const JOB_WAIT_YIELDS: usize = 4096;
+
+const PROBE_CLIENT_RIGHTS: Rights =
+    match Rights::from_bits(Rights::SEND.bits() | Rights::WAIT.bits() | Rights::TRANSFER.bits()) {
+        Some(rights) => rights,
+        None => panic!("runtime probe client rights must be valid"),
+    };
+
+struct RuntimeProbeProtocol;
+
+impl ServiceProtocol for RuntimeProbeProtocol {
+    const DESCRIPTOR: ProtocolDescriptor = ProtocolDescriptor {
+        name: "test.runtime-context",
+        major: 1,
+        minor: 0,
+        max_message_bytes: 32,
+        max_handles: 1,
+    };
+    const CLIENT_RIGHTS: Rights = PROBE_CLIENT_RIGHTS;
+    const SERVER_RIGHTS: Rights = Rights::RECEIVE;
+}
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
@@ -103,6 +128,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || !event_port_probe()
         || !timer_probe()
         || !event_probe()
+        || !runtime_context_probe()
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -179,6 +205,65 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         return false;
     }
     true
+}
+
+fn runtime_context_probe() -> bool {
+    let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(mut restricted) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    if restricted.replace_rights(Rights::SEND).is_err() {
+        return false;
+    }
+    let capabilities = [
+        Some(ContextCapability::new(
+            CapabilityRole::SERVICE_NAMESPACE,
+            endpoint,
+        )),
+        Some(ContextCapability::new(
+            CapabilityRole::CONFIGURATION,
+            restricted,
+        )),
+    ];
+    let Ok(mut context) = ProcessContext::<ServiceProcess, 2>::new(capabilities) else {
+        return false;
+    };
+    if context.runtime_role() != "service"
+        || !context.contains(CapabilityRole::SERVICE_NAMESPACE)
+        || context.len() != 2
+        || runtime_context::validate_protocol::<RuntimeProbeProtocol>().is_err()
+        || runtime_context::validate_message_shape::<RuntimeProbeProtocol>(32, 1).is_err()
+        || runtime_context::validate_message_shape::<RuntimeProbeProtocol>(33, 1).is_ok()
+    {
+        return false;
+    }
+    if ServiceBinding::<RuntimeProbeProtocol, Client>::from_context(
+        &mut context,
+        CapabilityRole::CONFIGURATION,
+    )
+    .err()
+        != Some(ContextError::InsufficientRights(
+            CapabilityRole::CONFIGURATION,
+        ))
+        || !context.contains(CapabilityRole::CONFIGURATION)
+    {
+        return false;
+    }
+    let Ok(binding) = ServiceBinding::<RuntimeProbeProtocol, Client>::from_context(
+        &mut context,
+        CapabilityRole::SERVICE_NAMESPACE,
+    ) else {
+        return false;
+    };
+    binding.descriptor() == RuntimeProbeProtocol::DESCRIPTOR
+        && binding
+            .endpoint()
+            .info()
+            .is_ok_and(|info| info.rights == PROBE_CLIENT_RIGHTS)
+        && context.len() == 1
+        && context.contains(CapabilityRole::CONFIGURATION)
 }
 
 fn wait_set_probe() -> bool {
@@ -1266,7 +1351,32 @@ fn task_executor_probe() -> bool {
         return false;
     };
 
-    executor.run().is_ok()
+    if executor.run().is_err() {
+        return false;
+    }
+    let mut trace = [TaskTraceEvent {
+        sequence: 0,
+        task: receiver_id,
+        attribution: root_group.attribution(),
+        kind: TaskTraceKind::Spawned,
+    }; MAX_TASK_TRACE_EVENTS];
+    let trace_read = executor.read_trace(0, &mut trace);
+    let trace = &trace[..trace_read.events];
+    let trace_is_conformant = trace_read.missed == 0
+        && trace
+            .windows(2)
+            .all(|events| events[0].sequence < events[1].sequence)
+        && trace
+            .iter()
+            .any(|event| event.task == cancelled_id && event.kind == TaskTraceKind::Cancelled)
+        && trace
+            .iter()
+            .any(|event| event.task == timed_out_id && event.kind == TaskTraceKind::TimedOut)
+        && trace.iter().any(|event| {
+            event.task == receiver_id && event.kind == TaskTraceKind::Completed(Ok(()))
+        });
+
+    trace_is_conformant
         && executor.outcome(receiver_id) == Some(TaskOutcome::Completed(Ok(())))
         && executor.outcome(producer_id) == Some(TaskOutcome::Completed(Ok(())))
         && executor.outcome(cancelled_id) == Some(TaskOutcome::Cancelled)

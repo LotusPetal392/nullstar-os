@@ -45,7 +45,10 @@ experimentation, not production use or untrusted workloads.
   queued-event-port task executor for
   asynchronous endpoint send, receive, and single- or multi-handle move-send operations with
   independently scheduled fixed-depth role task groups, inherited deadlines and cancellation,
-  coalescing periodic timers, and deadline-bounded cooperative shutdown draining,
+  coalescing periodic timers, deadline-bounded cooperative shutdown draining, and a bounded
+  cursor-readable lifecycle trace. Role-specific process contexts own explicit startup capabilities,
+  reject duplicate roles, validate object kinds, tighten rights on claim, and produce protocol- and
+  side-typed service bindings from bounded protocol declarations,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and
