@@ -97,13 +97,13 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.28. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.29. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 The userspace library preserves raw numeric capability calls for compatibility and now layers
 non-cloneable ownership-safe handles over them. Owned handles close on drop, borrowed handles are
 lifetime-bound, object markers preserve validated endpoint, notification, shared-memory, early-log,
-and job kinds, and explicit operations cover duplication, rights replacement, raw ownership
+job, wait-set, event-port, and timer kinds, and explicit operations cover duplication, rights replacement, raw ownership
 transfer, type erasure, and revalidation. The first typed endpoint receive path adopts attached
 capabilities immediately so ignored attachments are closed automatically. Typed endpoint move sends
 consume their sources only after a successful atomic enqueue and return every owned handle on failure,
@@ -116,9 +116,10 @@ and queued-message drainage after closure. ABI 1.26 adds all-or-nothing messages
 rights-reduced moved handles, including required-capacity reporting without dequeue. ABI 1.27 adds
 bounded persistent wait sets with tagged, insertion-ordered, level-triggered registrations and typed
 userspace ownership. ABI 1.28 adds bounded queued event ports with FIFO rising-edge delivery,
-per-key coalescing, explicit rearming, and the same typed ownership and delegation rules. The runtime
-probe checks these rules, process-exit cleanup, and real cross-process wakeups against kernel handles;
-additional timer and I/O event sources, independent task scheduling,
+per-key coalescing, explicit rearming, and the same typed ownership and delegation rules. ABI 1.29
+adds capability-backed one-shot monotonic timers that feed generic waits, wait sets, and event ports.
+The runtime probe checks these rules, process-exit cleanup, real cross-process wakeups, and
+interrupt-driven timer delivery against kernel handles; additional I/O event sources, independent task scheduling,
 sender-side receiver-slot reservation, and broad service migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground

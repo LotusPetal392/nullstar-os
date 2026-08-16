@@ -62,7 +62,8 @@ The native IPC stack should provide:
 - bounded queues, resource accounting, and deterministic backpressure;
 - handle transfer with explicit rights and object types;
 - absolute monotonic deadlines and cancellation;
-- waiting on one or many objects, persistent tagged wait sets, and bounded queued event ports;
+- waiting on one or many objects, persistent tagged wait sets, bounded queued event ports, and
+  one-shot monotonic timers;
 - a synchronous call/reply abstraction for small bounded requests;
 - bounded priority donation across synchronous dependencies;
 - typed versioned userspace protocol bindings and tracing.
@@ -147,7 +148,7 @@ futex-like wait/wake primitive so uncontended locking remains outside the kernel
 - Whether the normal scheduler should remain MLFQ or later evolve toward a virtual-
   runtime or eligible-deadline model.
 - The exact realtime admission and CPU-budget policy.
-- The event-port ABI and registration model.
+- Periodic timer overrun and coalescing semantics.
 - Exact limits on synchronous IPC depth and priority-donation chains.
 - Which compatibility descriptor operations remain temporarily kernel-resident during
   userspace migration.

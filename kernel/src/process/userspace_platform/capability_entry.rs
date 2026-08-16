@@ -65,6 +65,7 @@ enum CapabilityObjectData {
     Job(kernel::job::State),
     WaitSet(kernel::wait_set::State),
     EventPort(kernel::event_port::State),
+    Timer(kernel::timer::State),
 }
 
 #[derive(Debug)]
@@ -266,7 +267,8 @@ impl CapabilityRegistry {
                 | CapabilityObjectData::KernelEarlyLogReader(_)
                 | CapabilityObjectData::Job(_)
                 | CapabilityObjectData::WaitSet(_)
-                | CapabilityObjectData::EventPort(_) => None,
+                | CapabilityObjectData::EventPort(_)
+                | CapabilityObjectData::Timer(_) => None,
             })
             .sum()
     }
@@ -285,6 +287,7 @@ impl CapabilityRegistry {
             abi::capability::KIND_JOB => abi::limits::MAX_JOB_OBJECTS,
             abi::capability::KIND_WAIT_SET => abi::limits::MAX_WAIT_SET_OBJECTS,
             abi::capability::KIND_EVENT_PORT => abi::limits::MAX_EVENT_PORT_OBJECTS,
+            abi::capability::KIND_TIMER => abi::limits::MAX_TIMER_OBJECTS,
             _ => return Err(abi::errno::INVALID_ARGUMENT),
         };
         if self.object_kind_count(kind) >= limit {
@@ -438,7 +441,8 @@ impl CapabilityRegistry {
                     ),
                     CapabilityObjectData::Notification(_)
                     | CapabilityObjectData::SharedMemory(_)
-                    | CapabilityObjectData::KernelEarlyLogReader(_) => None,
+                    | CapabilityObjectData::KernelEarlyLogReader(_)
+                    | CapabilityObjectData::Timer(_) => None,
                 })
                 .unwrap_or_default();
             for object in linked {
@@ -562,6 +566,7 @@ fn capability_allowed_rights(kind: u64) -> u64 {
         abi::capability::KIND_JOB => abi::capability::JOB_RIGHTS,
         abi::capability::KIND_WAIT_SET => abi::capability::WAIT_SET_RIGHTS,
         abi::capability::KIND_EVENT_PORT => abi::capability::EVENT_PORT_RIGHTS,
+        abi::capability::KIND_TIMER => abi::capability::TIMER_RIGHTS,
         _ => 0,
     }
 }
@@ -690,6 +695,7 @@ fn capability_object_size(
             .and_then(|members| u64::try_from(members).map_err(|_| abi::errno::RANGE)),
         CapabilityObjectData::WaitSet(wait_set) => Ok(wait_set.len() as u64),
         CapabilityObjectData::EventPort(event_port) => Ok(event_port.queued_len() as u64),
+        CapabilityObjectData::Timer(timer) => Ok(u64::from(timer.is_armed())),
     }
 }
 
@@ -789,6 +795,9 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::EVENT_PORT_CREATE
             | abi::syscall::EVENT_PORT_ADD
             | abi::syscall::EVENT_PORT_REMOVE
+            | abi::syscall::TIMER_CREATE
+            | abi::syscall::TIMER_ARM
+            | abi::syscall::TIMER_CANCEL
     )
 }
 
@@ -942,6 +951,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         abi::syscall::EVENT_PORT_REMOVE => {
             event_port_remove(process_id, registers.rdi, registers.rsi)
         }
+        abi::syscall::TIMER_CREATE => timer_create(process_id),
+        abi::syscall::TIMER_ARM => timer_arm(process_id, registers.rdi, registers.rsi),
+        abi::syscall::TIMER_CANCEL => timer_cancel(process_id, registers.rdi),
         _ => error_return(ERR_NOT_IMPLEMENTED),
     };
     current_stack_pointer
@@ -1074,6 +1086,7 @@ fn capability_object_supported_signals(kind: u64) -> kernel::object::Signals {
         abi::capability::KIND_JOB => kernel::object::Signals::READABLE
             .union(kernel::object::Signals::TERMINATED),
         abi::capability::KIND_EVENT_PORT => kernel::object::Signals::READABLE,
+        abi::capability::KIND_TIMER => kernel::object::Signals::TIMER_FIRED,
         _ => kernel::object::Signals::NONE,
     }
 }
@@ -1146,6 +1159,13 @@ fn capability_object_signal_state(
         CapabilityObjectData::EventPort(event_port) => {
             if event_port.is_readable() {
                 Ok(kernel::object::Signals::READABLE)
+            } else {
+                Ok(kernel::object::Signals::NONE)
+            }
+        }
+        CapabilityObjectData::Timer(timer) => {
+            if timer.is_fired() {
+                Ok(kernel::object::Signals::TIMER_FIRED)
             } else {
                 Ok(kernel::object::Signals::NONE)
             }
@@ -1406,6 +1426,96 @@ fn refresh_event_ports(registry: &mut CapabilityRegistry) -> Result<(), i64> {
         }
     }
     Ok(())
+}
+
+fn timer_create(process_id: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let object = match registry.create_object(
+        abi::capability::KIND_TIMER,
+        CapabilityObjectData::Timer(kernel::timer::State::new()),
+    ) {
+        Ok(object) => object,
+        Err(error) => return error_return(error),
+    };
+    match registry.insert_entry(process_id, object, abi::capability::TIMER_RIGHTS) {
+        Ok(handle) => handle,
+        Err(error) => {
+            registry.collect_garbage();
+            error_return(error)
+        }
+    }
+}
+
+fn timer_arm(process_id: u64, timer_handle: u64, deadline_ns: u64) -> u64 {
+    if deadline_ns == abi::deadline::INFINITE {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, timer_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_MANAGE) {
+        return error_return(error);
+    }
+    if entry.object.kind != abi::capability::KIND_TIMER {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let object = entry.object;
+    let Some(index) = registry.object_index(object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Timer(timer) = &mut registry.objects[index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    timer.cancel();
+    if let Err(error) = refresh_event_ports(&mut registry) {
+        return error_return(error);
+    }
+    let Some(index) = registry.object_index(object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Timer(timer) = &mut registry.objects[index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    match timer.arm(
+        deadline_ns,
+        crate::interrupts::monotonic_time_ns(),
+    ) {
+        Ok(()) => 0,
+        Err(_) => error_return(abi::errno::INVALID_ARGUMENT),
+    }
+}
+
+fn timer_cancel(process_id: u64, timer_handle: u64) -> u64 {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(entry) = registry.entry(process_id, timer_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(entry, abi::capability::RIGHT_MANAGE) {
+        return error_return(error);
+    }
+    if entry.object.kind != abi::capability::KIND_TIMER {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(index) = registry.object_index(entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Timer(timer) = &mut registry.objects[index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    timer.cancel();
+    0
+}
+
+fn advance_timers(now_ns: u64) -> bool {
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let mut fired = false;
+    for record in &mut registry.objects {
+        if let CapabilityObjectData::Timer(timer) = &mut record.data {
+            fired |= timer.advance(now_ns);
+        }
+    }
+    fired
 }
 
 fn endpoint_create(process_id: u64) -> u64 {
@@ -1722,7 +1832,8 @@ fn endpoint_receive(
         | CapabilityObjectData::KernelEarlyLogReader(_)
         | CapabilityObjectData::Job(_)
         | CapabilityObjectData::WaitSet(_)
-        | CapabilityObjectData::EventPort(_) => {
+        | CapabilityObjectData::EventPort(_)
+        | CapabilityObjectData::Timer(_) => {
             return error_return(abi::errno::INVALID_ARGUMENT);
         }
     };
@@ -1750,7 +1861,8 @@ fn endpoint_receive(
         | CapabilityObjectData::KernelEarlyLogReader(_)
         | CapabilityObjectData::Job(_)
         | CapabilityObjectData::WaitSet(_)
-        | CapabilityObjectData::EventPort(_) => {
+        | CapabilityObjectData::EventPort(_)
+        | CapabilityObjectData::Timer(_) => {
             return error_return(abi::errno::IO);
         }
     };
@@ -1852,7 +1964,8 @@ fn endpoint_receive_many(
             | CapabilityObjectData::KernelEarlyLogReader(_)
             | CapabilityObjectData::Job(_)
             | CapabilityObjectData::WaitSet(_)
-            | CapabilityObjectData::EventPort(_) => {
+            | CapabilityObjectData::EventPort(_)
+            | CapabilityObjectData::Timer(_) => {
                 return error_return(abi::errno::INVALID_ARGUMENT);
             }
         };
@@ -1881,7 +1994,8 @@ fn endpoint_receive_many(
         | CapabilityObjectData::KernelEarlyLogReader(_)
         | CapabilityObjectData::Job(_)
         | CapabilityObjectData::WaitSet(_)
-        | CapabilityObjectData::EventPort(_) => {
+        | CapabilityObjectData::EventPort(_)
+        | CapabilityObjectData::Timer(_) => {
             return error_return(abi::errno::IO);
         }
     };

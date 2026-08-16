@@ -114,7 +114,7 @@ The platform ABI must not assume applications remain single-threaded. Planned su
 includes thread creation, thread-local storage, join and detach, names, affinity, and a
 futex-like wait/wake primitive.
 
-A unified object-waiting and later event-port model should cover IPC, timers, process
+A unified object-waiting and event-port model now covers IPC and one-shot timers; it should extend to process
 exit, file and network completion, display events, device notifications, and media
 events. Subsystems should not invent incompatible polling mechanisms.
 
