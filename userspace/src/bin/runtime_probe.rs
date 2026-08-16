@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     async_ipc::Reactor,
     blocking_ipc,
-    handle::{Endpoint, MoveHandle, Notification, OwnedHandle, SharedMemory, WaitSet},
+    handle::{Endpoint, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, WaitSet},
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
@@ -92,6 +92,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || !channel_pair_probe(process_id)
         || !endpoint_multi_handle_probe(process_id)
         || !wait_set_probe()
+        || !event_port_probe()
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -279,6 +280,155 @@ fn wait_set_waiter_probe() -> bool {
         )
         .ok()
             == Some(CHILD_WAIT_SET_HANDLE);
+    let mut ready = [0_u8; 1];
+    let synchronized = setup
+        && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
+        && ready[0] == 1
+        && syscall::close(barrier.reader).is_ok();
+    if synchronized {
+        for _ in 0..4 {
+            let _ = syscall::yield_now();
+        }
+    }
+    let signaled = synchronized && notification.signal(1).ok() == Some(1);
+    let mut child_succeeded = false;
+    if signaled {
+        for _ in 0..JOB_WAIT_YIELDS {
+            match syscall::try_wait_child(child) {
+                Ok(status) => {
+                    child_succeeded = status.success();
+                    break;
+                }
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                    let _ = syscall::yield_now();
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if !child_succeeded {
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+    }
+    let _ = syscall::close(barrier.reader);
+    let _ = syscall::close(barrier.writer);
+    signaled && child_succeeded
+}
+
+fn event_port_probe() -> bool {
+    const NOTIFICATION_KEY: u64 = 101;
+
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
+        return false;
+    };
+    let Ok(event_port) = OwnedHandle::<EventPort>::create() else {
+        return false;
+    };
+    if !event_port.info().is_ok_and(|info| {
+        info.kind == ObjectKind::EventPort && info.rights == Rights::EVENT_PORT && info.size == 0
+    }) || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || event_port
+            .add(
+                notification.borrow(),
+                Signals::SIGNALED,
+                userspace::abi::event_port::MAX_KEY + 1,
+            )
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || event_port
+            .add(notification.borrow(), Signals::READABLE, NOTIFICATION_KEY)
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || event_port
+            .add(notification.borrow(), Signals::SIGNALED, NOTIFICATION_KEY)
+            .is_err()
+        || event_port
+            .add(notification.borrow(), Signals::SIGNALED, NOTIFICATION_KEY)
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || event_port.info().ok().map(|info| info.size) != Some(0)
+        || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || notification.signal(1).ok() != Some(1)
+        || event_port.wait_next(Deadline::IMMEDIATE).ok()
+            != Some(ipc::EventPortEvent {
+                key: NOTIFICATION_KEY,
+                signals: Signals::SIGNALED,
+            })
+        || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || notification.signal(1).ok() != Some(2)
+        || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || notification.try_wait().ok() != Some(1)
+        || notification.try_wait().ok() != Some(0)
+        || notification.signal(1).ok() != Some(1)
+        || event_port.wait_next(Deadline::IMMEDIATE).ok()
+            != Some(ipc::EventPortEvent {
+                key: NOTIFICATION_KEY,
+                signals: Signals::SIGNALED,
+            })
+        || notification.try_wait().ok() != Some(0)
+        || notification.signal(1).ok() != Some(1)
+        || event_port.remove(NOTIFICATION_KEY).is_err()
+        || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || event_port.remove(NOTIFICATION_KEY).err() != Some(ipc::Error::NO_ENTRY)
+        || event_port.info().ok().map(|info| info.size) != Some(0)
+    {
+        return false;
+    }
+
+    event_port_waiter_probe()
+}
+
+fn event_port_waiter_probe() -> bool {
+    const CHILD_EVENT_PORT_HANDLE: ipc::CapabilityHandle = 1;
+    const NOTIFICATION_KEY: u64 = 131;
+
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
+        return false;
+    };
+    let Ok(event_port) = OwnedHandle::<EventPort>::create() else {
+        return false;
+    };
+    if event_port
+        .add(notification.borrow(), Signals::SIGNALED, NOTIFICATION_KEY)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return false;
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return false;
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.reader);
+        if !ipc::wait_for_handle(CHILD_EVENT_PORT_HANDLE)
+            .is_ok_and(|info| info.kind == ObjectKind::EventPort && info.rights == Rights::WAIT)
+            || syscall::write_all(barrier.writer, &[1]).is_err()
+            || syscall::close(barrier.writer).is_err()
+        {
+            syscall::exit(78);
+        }
+        let woke = ipc::event_port_wait(CHILD_EVENT_PORT_HANDLE, Deadline::INFINITE).ok()
+            == Some(ipc::EventPortEvent {
+                key: NOTIFICATION_KEY,
+                signals: Signals::SIGNALED,
+            });
+        let closed = ipc::close(CHILD_EVENT_PORT_HANDLE).is_ok();
+        syscall::exit(if woke && closed { 0 } else { 79 });
+    }
+
+    let setup = syscall::close(barrier.writer).is_ok()
+        && ipc::grant_child(
+            child,
+            event_port.as_raw(),
+            Rights::WAIT,
+            CHILD_EVENT_PORT_HANDLE,
+        )
+        .ok()
+            == Some(CHILD_EVENT_PORT_HANDLE);
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)

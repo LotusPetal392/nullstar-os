@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod boot_mode;
 pub mod early_log;
+pub mod event_port;
 pub mod job;
 pub mod nullfs_volume_selection;
 pub mod object;

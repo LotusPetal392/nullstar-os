@@ -5253,7 +5253,8 @@ fn vfs_route_begin_registration(
                 | CapabilityObjectData::SharedMemory(_)
                 | CapabilityObjectData::KernelEarlyLogReader(_)
                 | CapabilityObjectData::Job(_)
-                | CapabilityObjectData::WaitSet(_) => Err(ERR_IO),
+                | CapabilityObjectData::WaitSet(_)
+                | CapabilityObjectData::EventPort(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -8162,7 +8163,8 @@ fn tmpfs_proxy_begin_connect(
                 | CapabilityObjectData::SharedMemory(_)
                 | CapabilityObjectData::KernelEarlyLogReader(_)
                 | CapabilityObjectData::Job(_)
-                | CapabilityObjectData::WaitSet(_) => Err(ERR_IO),
+                | CapabilityObjectData::WaitSet(_)
+                | CapabilityObjectData::EventPort(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -8437,7 +8439,8 @@ fn tmpfs_proxy_begin_attach() -> Result<(), i64> {
                 | CapabilityObjectData::SharedMemory(_)
                 | CapabilityObjectData::KernelEarlyLogReader(_)
                 | CapabilityObjectData::Job(_)
-                | CapabilityObjectData::WaitSet(_) => Err(ERR_IO),
+                | CapabilityObjectData::WaitSet(_)
+                | CapabilityObjectData::EventPort(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -9096,7 +9099,8 @@ fn tmpfs_proxy_begin_filesystem_request(
                 | CapabilityObjectData::SharedMemory(_)
                 | CapabilityObjectData::KernelEarlyLogReader(_)
                 | CapabilityObjectData::Job(_)
-                | CapabilityObjectData::WaitSet(_) => Err(ERR_IO),
+                | CapabilityObjectData::WaitSet(_)
+                | CapabilityObjectData::EventPort(_) => Err(ERR_IO),
             },
             None => Err(ERR_IO),
         }
@@ -9768,7 +9772,8 @@ fn nullfs_proxy_push_request(
             | CapabilityObjectData::SharedMemory(_)
             | CapabilityObjectData::KernelEarlyLogReader(_)
             | CapabilityObjectData::Job(_)
-            | CapabilityObjectData::WaitSet(_) => Err(ERR_IO),
+            | CapabilityObjectData::WaitSet(_)
+            | CapabilityObjectData::EventPort(_) => Err(ERR_IO),
         },
         None => Err(ERR_IO),
     }
