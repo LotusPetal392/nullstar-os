@@ -120,9 +120,12 @@ per-key coalescing, explicit rearming, and the same typed ownership and delegati
 adds capability-backed one-shot monotonic timers that feed generic waits, wait sets, and event ports.
 ABI 1.30 adds user-controlled manual-reset events with persistent `SIGNALED` state and the same
 generic wait, wait-set, event-port, typed ownership, and delegation paths.
-The runtime probe checks these rules, process-exit cleanup, real cross-process wakeups, and
-interrupt-driven timer delivery against kernel handles; additional I/O event sources, independent task scheduling,
-sender-side receiver-slot reservation, and broad service migration remain future runtime work.
+The scoped reactor now carries one absolute deadline plus an optional event-backed cancellation token
+through every bounded wait, and rearms one-shot timers into periodic schedules with explicit missed-tick
+coalescing. The runtime probe checks these rules, process-exit cleanup, real cross-process wakeups,
+interrupt-driven timer delivery, cancellation, and periodic rearming against kernel handles; additional
+I/O event sources, independent task scheduling, sender-side receiver-slot reservation, and broad service
+migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh

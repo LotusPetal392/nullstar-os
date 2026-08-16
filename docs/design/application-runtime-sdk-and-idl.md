@@ -1002,7 +1002,9 @@ persistent wait-set registrations, caller-defined readiness tags, typed ownershi
 blocking coverage. ABI 1.28 adds bounded queued rising-edge delivery, per-key coalescing and rearming,
 typed event-port ownership, and cross-process blocking coverage. ABI 1.29 adds typed one-shot timers,
 absolute monotonic arming, cancellation, and interrupt-driven event-port delivery. ABI 1.30 adds
-typed manual-reset events with separated signal/wait authority and level/edge integration. Periodic timers and I/O completion sources,
+typed manual-reset events with separated signal/wait authority and level/edge integration. The scoped
+runtime now adds one-way cancellation sources and clonable tokens, nested absolute-deadline clamping,
+and periodic one-shot rearming with explicit missed-expiration coalescing. I/O completion sources,
 independently scheduled tasks, sender-side receiver-slot reservation, and service migration remain
 Phase 2 work.
 
@@ -1029,11 +1031,17 @@ A test-only protocol should exercise handle transfer.
 ### Phase 4: Asynchronous execution
 
 - evolve the scoped reactor into event-port executor integration;
-- add task groups and structured cancellation;
-- add periodic timers and deadline propagation over the implemented one-shot timer primitive;
+- extend structured cancellation into independently scheduled task groups;
+- carry the implemented periodic schedules and deadline propagation into those task groups;
 - add a bounded blocking pool;
 - integrate application and service shutdown;
 - expose role-specific runtime contexts.
+
+The first Phase 4 control slice is implemented without introducing an unbounded executor: `RunScope`
+propagates one absolute deadline and optional cancellation token through the existing bounded reactor,
+manual-reset events separate cancellation signal and observation authority, and `PeriodicTimer`
+rearms one kernel one-shot timer while returning a bounded coalesced expiration count. Independent
+task groups, event-port executor integration, blocking pools, and shutdown draining remain future work.
 
 ### Phase 5: NSIDL compiler MVP
 

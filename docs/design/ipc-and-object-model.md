@@ -342,6 +342,14 @@ Transport failure and service-level failure must remain distinct. `PEER_CLOSED`,
 `TIMED_OUT`, or malformed IPC is not the same as a filesystem `NOT_FOUND` or package
 validation error.
 
+The current userspace reactor provides the bounded local foundation for this contract. A
+`RunScope` carries one absolute deadline and an optional manual-reset-event cancellation token
+through every kernel wait. Child scopes may shorten but never extend the parent deadline. The
+source retains only `SIGNAL`; clonable and transferable tokens retain lifecycle rights plus `WAIT`
+but never mutation authority. Cancellation is one-way and stops the scoped future tree with a
+distinct runtime result. Protocol cancellation messages, transaction cleanup, and rollback remain
+separate higher-level responsibilities.
+
 ### Scheduling integration
 
 Bounded synchronous IPC should support limited priority inheritance or donation so a

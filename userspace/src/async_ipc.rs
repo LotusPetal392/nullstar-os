@@ -3,9 +3,11 @@
 //! [`Reactor`] drives one scoped future tree. Endpoint futures attempt their
 //! non-blocking operation first, register level-triggered readiness on
 //! [`crate::ipc::Error::TRY_AGAIN`], and let the runner sleep in the kernel's
-//! bounded `wait_many` syscall. This is the initial single-threaded runtime
-//! layer; migration onto the implemented persistent wait sets and queued event
-//! ports, plus independently spawned task scheduling, remain future work.
+//! bounded `wait_many` syscall. [`RunScope`] propagates one absolute deadline
+//! and optional [`CancellationToken`] through every wait. [`PeriodicTimer`]
+//! builds explicit coalescing periodic behavior over the kernel's one-shot
+//! timer primitive. Migration onto persistent wait sets or queued event ports,
+//! plus independently spawned task scheduling, remain future work.
 
 use core::{
     array,
@@ -17,8 +19,8 @@ use core::{
 
 use crate::{
     handle::{
-        BorrowedHandle, Endpoint, MoveHandle, ObjectType, OwnedHandle, ReceivedMessage,
-        ReceivedMessageMany, SendMoveError, SendMoveManyError,
+        BorrowedHandle, Endpoint, Event, MoveHandle, ObjectType, OwnedHandle, ReceivedMessage,
+        ReceivedMessageMany, SendMoveError, SendMoveManyError, Timer,
     },
     ipc::{self, CapabilityHandle, Deadline, Rights, Signals, WaitItem},
 };
@@ -32,6 +34,222 @@ pub enum RunError {
     UnregisteredPending,
     /// The same reactor was entered recursively.
     AlreadyRunning,
+    /// The run scope's cancellation token was asserted.
+    Cancelled,
+}
+
+/// One absolute deadline and optional one-way cancellation authority shared by
+/// a scoped future tree.
+#[derive(Debug, Clone, Copy)]
+pub struct RunScope<'token> {
+    deadline: Deadline,
+    cancellation: Option<&'token CancellationToken>,
+}
+
+impl<'token> RunScope<'token> {
+    pub const fn new(deadline: Deadline) -> Self {
+        Self {
+            deadline,
+            cancellation: None,
+        }
+    }
+
+    pub const fn with_cancellation(
+        deadline: Deadline,
+        cancellation: &'token CancellationToken,
+    ) -> Self {
+        RunScope {
+            deadline,
+            cancellation: Some(cancellation),
+        }
+    }
+
+    pub const fn deadline(self) -> Deadline {
+        self.deadline
+    }
+
+    pub const fn cancellation(self) -> Option<&'token CancellationToken> {
+        self.cancellation
+    }
+
+    /// Creates a nested scope without allowing its deadline to extend the
+    /// parent's absolute deadline.
+    pub const fn child(self, deadline: Deadline) -> Self {
+        let deadline = if deadline.as_monotonic_ns() < self.deadline.as_monotonic_ns() {
+            deadline
+        } else {
+            self.deadline
+        };
+        Self {
+            deadline,
+            cancellation: self.cancellation,
+        }
+    }
+}
+
+/// Signal-only authority for one structured cancellation tree.
+#[derive(Debug)]
+pub struct CancellationSource {
+    event: OwnedHandle<Event>,
+}
+
+/// Wait-only authority for observing one structured cancellation tree.
+#[derive(Debug)]
+pub struct CancellationToken {
+    event: OwnedHandle<Event>,
+}
+
+impl CancellationSource {
+    /// Creates separated signal-only and wait-only cancellation authorities.
+    pub fn new() -> ipc::Result<(Self, CancellationToken)> {
+        let mut source = OwnedHandle::<Event>::create()?;
+        let token = source.duplicate(CancellationToken::rights())?;
+        source.replace_rights(Rights::SIGNAL)?;
+        Ok((Self { event: source }, CancellationToken { event: token }))
+    }
+
+    /// Permanently cancels the associated token. Repeated calls are harmless.
+    pub fn cancel(&self) -> ipc::Result<()> {
+        self.event.set()
+    }
+}
+
+impl CancellationToken {
+    /// Observation, fan-out, and transfer authority without mutation rights.
+    pub fn rights() -> Rights {
+        Rights::DUPLICATE | Rights::TRANSFER | Rights::WAIT
+    }
+
+    pub fn try_clone(&self) -> ipc::Result<Self> {
+        Ok(Self {
+            event: self.event.duplicate(Self::rights())?,
+        })
+    }
+
+    pub fn is_cancelled(&self) -> ipc::Result<bool> {
+        Ok(self.event.signal_state()?.contains(Signals::SIGNALED))
+    }
+
+    pub fn into_handle(self) -> OwnedHandle<Event> {
+        self.event
+    }
+
+    pub fn from_handle(mut event: OwnedHandle<Event>) -> ipc::Result<Self> {
+        let rights = event.info()?.rights;
+        let token_rights = Self::rights();
+        if !rights.contains(token_rights) {
+            return Err(ipc::Error::PERMISSION);
+        }
+        if rights != token_rights {
+            event.replace_rights(token_rights)?;
+        }
+        Ok(Self { event })
+    }
+
+    fn wait_item(&self) -> WaitItem {
+        self.event.borrow().wait_item(Signals::SIGNALED)
+    }
+}
+
+/// One coalesced periodic expiration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodicTick {
+    /// The absolute deadline assigned to the earliest represented expiration.
+    pub scheduled: Deadline,
+    /// The monotonic time at which the fired timer was observed.
+    pub observed_ns: u64,
+    /// Number of elapsed periods represented by this tick.
+    pub expirations: u64,
+}
+
+/// Pure periodic deadline state used by [`PeriodicTimer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodicSchedule {
+    period_ns: u64,
+    next_deadline: Deadline,
+}
+
+impl PeriodicSchedule {
+    pub fn new(first_deadline: Deadline, period_ns: u64) -> ipc::Result<Self> {
+        if period_ns == 0 || first_deadline == Deadline::INFINITE {
+            return Err(ipc::Error::INVALID_ARGUMENT);
+        }
+        Ok(Self {
+            period_ns,
+            next_deadline: first_deadline,
+        })
+    }
+
+    pub const fn period_ns(self) -> u64 {
+        self.period_ns
+    }
+
+    pub const fn next_deadline(self) -> Deadline {
+        self.next_deadline
+    }
+
+    /// Coalesces every elapsed period into one bounded tick and advances to the
+    /// first future deadline. The schedule is unchanged on overflow.
+    pub fn advance(&mut self, observed_ns: u64) -> ipc::Result<PeriodicTick> {
+        let scheduled_ns = self.next_deadline.as_monotonic_ns();
+        let elapsed = observed_ns.saturating_sub(scheduled_ns);
+        let expirations = elapsed / self.period_ns + 1;
+        let advance = self
+            .period_ns
+            .checked_mul(expirations)
+            .ok_or(ipc::Error::RANGE)?;
+        let next_ns = scheduled_ns
+            .checked_add(advance)
+            .filter(|deadline| *deadline != Deadline::INFINITE.as_monotonic_ns())
+            .ok_or(ipc::Error::RANGE)?;
+        let tick = PeriodicTick {
+            scheduled: self.next_deadline,
+            observed_ns,
+            expirations,
+        };
+        self.next_deadline = Deadline::from_monotonic_ns(next_ns);
+        Ok(tick)
+    }
+}
+
+/// A bounded periodic timer built by rearming one kernel one-shot timer.
+#[derive(Debug)]
+pub struct PeriodicTimer {
+    timer: OwnedHandle<Timer>,
+    schedule: PeriodicSchedule,
+}
+
+impl PeriodicTimer {
+    pub fn start_at(first_deadline: Deadline, period_ns: u64) -> ipc::Result<Self> {
+        let schedule = PeriodicSchedule::new(first_deadline, period_ns)?;
+        let timer = OwnedHandle::<Timer>::create()?;
+        timer.arm(first_deadline)?;
+        Ok(Self { timer, schedule })
+    }
+
+    pub fn start_after(period_ns: u64) -> ipc::Result<Self> {
+        if period_ns == 0 {
+            return Err(ipc::Error::INVALID_ARGUMENT);
+        }
+        let now = crate::platform::monotonic_time_ns().map_err(|_| ipc::Error::IO)?;
+        let first = now.checked_add(period_ns).ok_or(ipc::Error::RANGE)?;
+        if first == Deadline::INFINITE.as_monotonic_ns() {
+            return Err(ipc::Error::RANGE);
+        }
+        Self::start_at(Deadline::from_monotonic_ns(first), period_ns)
+    }
+
+    pub const fn period_ns(&self) -> u64 {
+        self.schedule.period_ns()
+    }
+
+    pub const fn next_deadline(&self) -> Deadline {
+        self.schedule.next_deadline()
+    }
+
+    pub fn cancel(&self) -> ipc::Result<()> {
+        self.timer.cancel()
+    }
 }
 
 struct Registration {
@@ -41,9 +259,10 @@ struct Registration {
 
 /// A bounded, allocation-free reactor for one scoped future tree.
 ///
-/// `N` bounds wait registrations in one poll cycle. It may not
-/// exceed the kernel's `MAX_OBJECT_WAIT_ITEMS`; excess registrations fail with
-/// [`ipc::Error::NO_SPACE`] through the operation future.
+/// `N` bounds total wait registrations in one poll cycle. A cancellation-aware
+/// [`RunScope`] reserves one of those slots. `N` may not exceed the kernel's
+/// `MAX_OBJECT_WAIT_ITEMS`; excess registrations fail with
+/// [`ipc::Error::NO_SPACE`] through the operation future or [`RunError::Wait`].
 pub struct Reactor<const N: usize> {
     registrations: RefCell<[Option<Registration>; N]>,
     running: Cell<bool>,
@@ -68,7 +287,17 @@ impl<const N: usize> Reactor<N> {
         future: &mut F,
         deadline: Deadline,
     ) -> Result<F::Output, RunError> {
-        self.run_pinned_until(Pin::new(future), deadline)
+        self.run_scoped(future, RunScope::new(deadline))
+    }
+
+    /// Drives an `Unpin` future under one propagated deadline and optional
+    /// cancellation token.
+    pub fn run_scoped<F: Future + Unpin>(
+        &self,
+        future: &mut F,
+        scope: RunScope<'_>,
+    ) -> Result<F::Output, RunError> {
+        self.run_pinned_scoped(Pin::new(future), scope)
     }
 
     /// Drives a pinned future with no deadline.
@@ -85,11 +314,21 @@ impl<const N: usize> Reactor<N> {
         future: Pin<&mut F>,
         deadline: Deadline,
     ) -> Result<F::Output, RunError> {
+        self.run_pinned_scoped(future, RunScope::new(deadline))
+    }
+
+    /// Drives a pinned future under one propagated deadline and optional
+    /// cancellation token.
+    pub fn run_pinned_scoped<F: Future + ?Sized>(
+        &self,
+        future: Pin<&mut F>,
+        scope: RunScope<'_>,
+    ) -> Result<F::Output, RunError> {
         if self.running.replace(true) {
             return Err(RunError::AlreadyRunning);
         }
         let _running = RunningGuard(&self.running);
-        self.run_with_wait(future, deadline, ipc::wait_many)
+        self.run_with_wait(future, scope, ipc::wait_many)
     }
 
     pub fn send<'reactor, 'handle, 'bytes>(
@@ -161,6 +400,30 @@ impl<const N: usize> Reactor<N> {
         }
     }
 
+    /// A future that completes when `token` is cancelled.
+    pub fn cancelled<'reactor, 'token>(
+        &'reactor self,
+        token: &'token CancellationToken,
+    ) -> Cancelled<'reactor, 'token, N> {
+        Cancelled {
+            reactor: self,
+            token,
+            complete: false,
+        }
+    }
+
+    /// A future for the next coalesced expiration of `timer`.
+    pub fn next_tick<'reactor, 'timer>(
+        &'reactor self,
+        timer: &'timer mut PeriodicTimer,
+    ) -> NextTick<'reactor, 'timer, N> {
+        NextTick {
+            reactor: self,
+            timer,
+            complete: false,
+        }
+    }
+
     fn register(&self, item: WaitItem, waker: &Waker) -> ipc::Result<()> {
         if item.handle() == 0 || item.requested() == Signals::EMPTY {
             return Err(ipc::Error::INVALID_ARGUMENT);
@@ -216,7 +479,7 @@ impl<const N: usize> Reactor<N> {
     fn run_with_wait<F, W>(
         &self,
         mut future: Pin<&mut F>,
-        deadline: Deadline,
+        scope: RunScope<'_>,
         mut wait: W,
     ) -> Result<F::Output, RunError>
     where
@@ -226,20 +489,39 @@ impl<const N: usize> Reactor<N> {
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
         loop {
+            if let Some(token) = scope.cancellation()
+                && token.is_cancelled().map_err(RunError::Wait)?
+            {
+                return Err(RunError::Cancelled);
+            }
             self.clear_registrations();
             if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
                 return Ok(output);
             }
 
             let mut items = [WaitItem::new(0, Signals::EMPTY); N];
-            let count = self.snapshot(&mut items);
+            let mut count = self.snapshot(&mut items);
+            let cancellation_handle = if let Some(token) = scope.cancellation() {
+                if count >= N || count >= crate::abi::limits::MAX_OBJECT_WAIT_ITEMS {
+                    return Err(RunError::Wait(ipc::Error::NO_SPACE));
+                }
+                let item = token.wait_item();
+                items[count] = item;
+                count += 1;
+                Some(item.handle())
+            } else {
+                None
+            };
             if count == 0 {
                 return Err(RunError::UnregisteredPending);
             }
-            let ready = wait(&items[..count], deadline).map_err(RunError::Wait)?;
+            let ready = wait(&items[..count], scope.deadline()).map_err(RunError::Wait)?;
             let Some(item) = items.get(ready) else {
                 return Err(RunError::Wait(ipc::Error::IO));
             };
+            if cancellation_handle == Some(item.handle()) {
+                return Err(RunError::Cancelled);
+            }
             self.wake_handle(item.handle());
         }
     }
@@ -256,6 +538,99 @@ struct RunningGuard<'a>(&'a Cell<bool>);
 impl Drop for RunningGuard<'_> {
     fn drop(&mut self) {
         self.0.set(false);
+    }
+}
+
+/// A readiness-driven cancellation observation.
+pub struct Cancelled<'reactor, 'token, const N: usize> {
+    reactor: &'reactor Reactor<N>,
+    token: &'token CancellationToken,
+    complete: bool,
+}
+
+impl<const N: usize> Future for Cancelled<'_, '_, N> {
+    type Output = ipc::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(
+            !self.complete,
+            "cancellation future polled after completion"
+        );
+        match self.token.is_cancelled() {
+            Ok(true) => {
+                self.complete = true;
+                Poll::Ready(Ok(()))
+            }
+            Ok(false) => match self
+                .reactor
+                .register(self.token.wait_item(), context.waker())
+            {
+                Ok(()) => Poll::Pending,
+                Err(error) => {
+                    self.complete = true;
+                    Poll::Ready(Err(error))
+                }
+            },
+            Err(error) => {
+                self.complete = true;
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+}
+
+/// A readiness-driven periodic timer expiration.
+pub struct NextTick<'reactor, 'timer, const N: usize> {
+    reactor: &'reactor Reactor<N>,
+    timer: &'timer mut PeriodicTimer,
+    complete: bool,
+}
+
+impl<const N: usize> Future for NextTick<'_, '_, N> {
+    type Output = ipc::Result<PeriodicTick>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(!self.complete, "periodic tick polled after completion");
+        match self.timer.timer.signal_state() {
+            Ok(signals) if signals.contains(Signals::TIMER_FIRED) => {
+                let observed = match crate::platform::monotonic_time_ns() {
+                    Ok(observed) => observed,
+                    Err(_) => {
+                        self.complete = true;
+                        return Poll::Ready(Err(ipc::Error::IO));
+                    }
+                };
+                let mut schedule = self.timer.schedule;
+                let tick = match schedule.advance(observed) {
+                    Ok(tick) => tick,
+                    Err(error) => {
+                        self.complete = true;
+                        return Poll::Ready(Err(error));
+                    }
+                };
+                if let Err(error) = self.timer.timer.arm(schedule.next_deadline()) {
+                    self.complete = true;
+                    return Poll::Ready(Err(error));
+                }
+                self.timer.schedule = schedule;
+                self.complete = true;
+                Poll::Ready(Ok(tick))
+            }
+            Ok(_) => match self.reactor.register(
+                self.timer.timer.borrow().wait_item(Signals::TIMER_FIRED),
+                context.waker(),
+            ) {
+                Ok(()) => Poll::Pending,
+                Err(error) => {
+                    self.complete = true;
+                    Poll::Ready(Err(error))
+                }
+            },
+            Err(error) => {
+                self.complete = true;
+                Poll::Ready(Err(error))
+            }
+        }
     }
 }
 
@@ -500,7 +875,7 @@ mod tests {
         task::{Poll, RawWaker, RawWakerVTable, Waker},
     };
 
-    use super::{Reactor, RunError};
+    use super::{PeriodicSchedule, Reactor, RunError, RunScope};
     use crate::ipc::{self, Deadline, Signals, WaitItem};
 
     #[test]
@@ -568,7 +943,7 @@ mod tests {
         let output = reactor
             .run_with_wait(
                 Pin::new(&mut future),
-                Deadline::from_monotonic_ns(99),
+                RunScope::new(Deadline::from_monotonic_ns(99)),
                 |items, deadline| {
                     waits += 1;
                     assert_eq!(items, &[WaitItem::new(42, Signals::READABLE)]);
@@ -588,10 +963,63 @@ mod tests {
         assert_eq!(
             reactor.run_with_wait(
                 Pin::new(&mut future),
-                Deadline::INFINITE,
+                RunScope::new(Deadline::INFINITE),
                 |_, _| unreachable!(),
             ),
             Err(RunError::UnregisteredPending)
+        );
+    }
+
+    #[test]
+    fn child_scope_never_extends_parent_deadline() {
+        let parent = RunScope::new(Deadline::from_monotonic_ns(100));
+        assert_eq!(
+            parent.child(Deadline::from_monotonic_ns(40)).deadline(),
+            Deadline::from_monotonic_ns(40)
+        );
+        assert_eq!(
+            parent.child(Deadline::from_monotonic_ns(140)).deadline(),
+            Deadline::from_monotonic_ns(100)
+        );
+        assert_eq!(
+            parent.child(Deadline::INFINITE).deadline(),
+            Deadline::from_monotonic_ns(100)
+        );
+    }
+
+    #[test]
+    fn periodic_schedule_coalesces_missed_expirations() {
+        let mut schedule = PeriodicSchedule::new(Deadline::from_monotonic_ns(100), 25).unwrap();
+        let first = schedule.advance(100).unwrap();
+        assert_eq!(first.scheduled, Deadline::from_monotonic_ns(100));
+        assert_eq!(first.observed_ns, 100);
+        assert_eq!(first.expirations, 1);
+        assert_eq!(schedule.next_deadline(), Deadline::from_monotonic_ns(125));
+
+        let coalesced = schedule.advance(181).unwrap();
+        assert_eq!(coalesced.scheduled, Deadline::from_monotonic_ns(125));
+        assert_eq!(coalesced.observed_ns, 181);
+        assert_eq!(coalesced.expirations, 3);
+        assert_eq!(schedule.next_deadline(), Deadline::from_monotonic_ns(200));
+    }
+
+    #[test]
+    fn periodic_schedule_rejects_invalid_or_overflowing_deadlines() {
+        assert_eq!(
+            PeriodicSchedule::new(Deadline::IMMEDIATE, 0),
+            Err(ipc::Error::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            PeriodicSchedule::new(Deadline::INFINITE, 1),
+            Err(ipc::Error::INVALID_ARGUMENT)
+        );
+
+        let mut schedule =
+            PeriodicSchedule::new(Deadline::from_monotonic_ns(u64::MAX - 2), 2).unwrap();
+        assert_eq!(schedule.advance(u64::MAX - 2), Err(ipc::Error::RANGE));
+        assert_eq!(
+            schedule.next_deadline(),
+            Deadline::from_monotonic_ns(u64::MAX - 2)
         );
     }
 

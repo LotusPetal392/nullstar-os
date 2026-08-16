@@ -415,7 +415,9 @@ Future work should preserve the current rules while adding:
 
 - typed MMIO, IRQ, DMA, and device-ownership capabilities;
 - direct shared-memory mappings with explicit cache and protection semantics;
-- cancellation, periodic timers, additional I/O event sources, and service migration onto paired channels;
+- protocol and kernel-call cancellation beyond the implemented scoped event-backed tokens,
+  kernel periodic timers beyond the implemented userspace one-shot rearming schedule, additional I/O
+  event sources, and service migration onto paired channels;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
   restartable service-manager broker that owns the sequence and receives its current state;
 - broader job-level resource accounting and limits plus service, session, and application
