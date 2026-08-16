@@ -16,6 +16,7 @@ pub mod ipc;
 pub mod logctl;
 pub mod logging_session;
 pub mod platform;
+pub mod runtime_context;
 pub mod service_cleanup;
 pub mod service_control;
 pub mod service_route;

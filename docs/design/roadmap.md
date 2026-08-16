@@ -20,7 +20,11 @@ signal-only cancellation sources from clonable wait-only tokens, and supplies co
 schedules over one-shot timers. A fixed-capacity task executor maps generation-tagged reactor waits
 onto queued event ports, schedules only ready task slots, and retains fixed-depth role attribution,
 ancestor cancellation, inherited deadlines, bounded shutdown draining, and distinct terminal outcomes
-without heap allocation. The next architecture stages are:
+without heap allocation. A bounded lifecycle trace now retains sequence-ordered task transitions with
+overwrite accounting. Role-specific process contexts own explicitly supplied capabilities, validate
+typed claims, tighten rights, and construct client/server-typed bindings from bounded protocol
+descriptors whose common transport invariants have host and QEMU conformance coverage. The next
+architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
    inspection authorization around the implemented close, duplicate, atomic replace, inspection,
@@ -36,8 +40,9 @@ without heap allocation. The next architecture stages are:
    late-reply cleanup, protocol cancellation, and priority donation;
 6. extend the implemented queued event ports beyond one-shot timers and manual-reset events to process-exit, file and network completion,
    display, device, and media event sources;
-7. evolve the implemented bounded role-attributed task hierarchy and shutdown draining into typed
-   service bindings, tracing, capability-bearing process contexts, and protocol conformance tests;
+7. integrate the implemented typed service bindings, bounded tracing, capability-bearing process
+   contexts, and protocol conformance checks with the eventual startup message, generated bindings,
+   privacy metadata, and real service migrations;
 8. introduce an IDL only after stable wire and lifecycle conventions have survived real
    services.
 
