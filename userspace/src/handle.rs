@@ -60,6 +60,10 @@ pub enum EventPort {}
 #[derive(Debug)]
 pub enum Timer {}
 
+/// A persistent user-controlled manual-reset event capability.
+#[derive(Debug)]
+pub enum Event {}
+
 impl sealed::Sealed for AnyObject {}
 impl sealed::Sealed for Endpoint {}
 impl sealed::Sealed for Notification {}
@@ -69,6 +73,7 @@ impl sealed::Sealed for Job {}
 impl sealed::Sealed for WaitSet {}
 impl sealed::Sealed for EventPort {}
 impl sealed::Sealed for Timer {}
+impl sealed::Sealed for Event {}
 
 impl ObjectType for AnyObject {}
 impl ObjectType for Endpoint {}
@@ -79,6 +84,7 @@ impl ObjectType for Job {}
 impl ObjectType for WaitSet {}
 impl ObjectType for EventPort {}
 impl ObjectType for Timer {}
+impl ObjectType for Event {}
 
 impl KnownObjectType for Endpoint {
     const KIND: ObjectKind = ObjectKind::Endpoint;
@@ -110,6 +116,10 @@ impl KnownObjectType for EventPort {
 
 impl KnownObjectType for Timer {
     const KIND: ObjectKind = ObjectKind::Timer;
+}
+
+impl KnownObjectType for Event {
+    const KIND: ObjectKind = ObjectKind::Event;
 }
 
 /// Exclusive ownership of one process-local capability-table entry.
@@ -499,6 +509,20 @@ impl OwnedHandle<Timer> {
 
     pub fn cancel(&self) -> ipc::Result<()> {
         ipc::timer_cancel(self.as_raw())
+    }
+}
+
+impl OwnedHandle<Event> {
+    pub fn create() -> ipc::Result<Self> {
+        Self::adopt(ipc::event_create()?)
+    }
+
+    pub fn set(&self) -> ipc::Result<()> {
+        ipc::event_set(self.as_raw())
+    }
+
+    pub fn reset(&self) -> ipc::Result<()> {
+        ipc::event_reset(self.as_raw())
     }
 }
 

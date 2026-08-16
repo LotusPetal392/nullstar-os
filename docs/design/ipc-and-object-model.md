@@ -192,8 +192,8 @@ Absolute deadlines compose across nested service calls without resetting the tim
 each layer. Zero represents an immediate poll and `UINT64_MAX` represents an infinite deadline.
 The many-object operation is bounded at 16 entries and returns the lowest ready array index.
 
-ABI 1.27 adds the first persistent wait set: up to 64 wait-authorized endpoint, notification, or job
-registrations are retained under caller-defined tags and checked in insertion order with the same
+ABI 1.27 adds the first persistent wait set: up to 64 wait-authorized endpoint, notification, job,
+timer, or event registrations are retained under caller-defined tags and checked in insertion order with the same
 absolute deadlines and level-triggered signals. A registration retains its target object, and a
 wait snapshots the current set.
 
@@ -208,9 +208,10 @@ polling APIs.
 
 ### Events and timers
 
-An event is a basic waitable signal object. Manual-reset behavior should be the initial
-primitive; auto-reset behavior may be added only with precisely documented wake and
-fairness semantics.
+ABI 1.30 adds basic waitable manual-reset events. They begin clear, remain `SIGNALED` after set until
+explicitly reset, and use distinct `SIGNAL` and `WAIT` authority. Repeated set or reset is
+idempotent. Auto-reset behavior may be added only with precisely documented wake and fairness
+semantics.
 
 One-shot timers use absolute monotonic deadlines, remain fired until canceled or rearmed, and feed
 the common object-wait and event-port paths. Periodic timers must define overrun and coalescing
@@ -524,7 +525,7 @@ authority delegation.
 ## Implementation sequence
 
 The current system already provides process-local capability tables, rights-reduced
-copying, bounded endpoints, paired channels with peer closure, counted notifications, copied shared-memory objects,
+copying, bounded endpoints, paired channels with peer closure, counted notifications, manual-reset events, copied shared-memory objects,
 endpoint waiting, and direct-child bootstrap grants. The intended evolution is:
 
 1. formalize a common kernel-object and handle-table implementation with object type,

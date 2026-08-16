@@ -82,6 +82,7 @@ impl Rights {
     pub const WAIT_SET: Self = Self(abi_capability::WAIT_SET_RIGHTS);
     pub const EVENT_PORT: Self = Self(abi_capability::EVENT_PORT_RIGHTS);
     pub const TIMER: Self = Self(abi_capability::TIMER_RIGHTS);
+    pub const EVENT: Self = Self(abi_capability::EVENT_RIGHTS);
 
     pub const fn from_bits(bits: u64) -> Option<Self> {
         let all = abi_capability::ENDPOINT_RIGHTS
@@ -90,7 +91,8 @@ impl Rights {
             | abi_capability::JOB_RIGHTS
             | abi_capability::WAIT_SET_RIGHTS
             | abi_capability::EVENT_PORT_RIGHTS
-            | abi_capability::TIMER_RIGHTS;
+            | abi_capability::TIMER_RIGHTS
+            | abi_capability::EVENT_RIGHTS;
         if bits & !all == 0 {
             Some(Self(bits))
         } else {
@@ -220,6 +222,7 @@ pub enum ObjectKind {
     WaitSet,
     EventPort,
     Timer,
+    Event,
 }
 
 impl ObjectKind {
@@ -233,6 +236,7 @@ impl ObjectKind {
             abi_capability::KIND_WAIT_SET => Some(Self::WaitSet),
             abi_capability::KIND_EVENT_PORT => Some(Self::EventPort),
             abi_capability::KIND_TIMER => Some(Self::Timer),
+            abi_capability::KIND_EVENT => Some(Self::Event),
             _ => None,
         }
     }
@@ -586,6 +590,30 @@ pub fn timer_cancel(timer: CapabilityHandle) -> Result<()> {
     let mut result = syscall::TIMER_CANCEL;
     unsafe {
         asm!("int 0x80", inlateout("rax") result, in("rdi") timer);
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn event_create() -> Result<CapabilityHandle> {
+    let mut result = syscall::EVENT_CREATE;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result)
+}
+
+pub fn event_set(event: CapabilityHandle) -> Result<()> {
+    let mut result = syscall::EVENT_SET;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result, in("rdi") event);
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn event_reset(event: CapabilityHandle) -> Result<()> {
+    let mut result = syscall::EVENT_RESET;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result, in("rdi") event);
     }
     decode(result).map(|_| ())
 }
@@ -1154,6 +1182,10 @@ mod tests {
             ObjectKind::from_raw(capability::KIND_TIMER),
             Some(ObjectKind::Timer)
         );
+        assert_eq!(
+            ObjectKind::from_raw(capability::KIND_EVENT),
+            Some(ObjectKind::Event)
+        );
         assert_eq!(ObjectKind::from_raw(99), None);
     }
 
@@ -1189,6 +1221,9 @@ mod tests {
         assert_eq!(syscall::TIMER_CREATE, 85);
         assert_eq!(syscall::TIMER_ARM, 86);
         assert_eq!(syscall::TIMER_CANCEL, 87);
+        assert_eq!(syscall::EVENT_CREATE, 88);
+        assert_eq!(syscall::EVENT_SET, 89);
+        assert_eq!(syscall::EVENT_RESET, 90);
         assert_eq!(core::mem::size_of::<capability::EndpointPair>(), 16);
         assert_eq!(core::mem::align_of::<capability::EndpointPair>(), 8);
         assert_eq!(core::mem::size_of::<capability::HandleDisposition>(), 16);
@@ -1199,6 +1234,7 @@ mod tests {
         assert_eq!(capability::WAIT_SETS, 1 << 25);
         assert_eq!(capability::EVENT_PORTS, 1 << 26);
         assert_eq!(capability::TIMER_OBJECTS, 1 << 27);
+        assert_eq!(capability::EVENT_OBJECTS, 1 << 28);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

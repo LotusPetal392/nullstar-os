@@ -1001,7 +1001,8 @@ capacity without dequeue, and expose the same operations as scoped futures. ABI 
 persistent wait-set registrations, caller-defined readiness tags, typed ownership, and cross-process
 blocking coverage. ABI 1.28 adds bounded queued rising-edge delivery, per-key coalescing and rearming,
 typed event-port ownership, and cross-process blocking coverage. ABI 1.29 adds typed one-shot timers,
-absolute monotonic arming, cancellation, and interrupt-driven event-port delivery. Periodic timers and I/O completion sources,
+absolute monotonic arming, cancellation, and interrupt-driven event-port delivery. ABI 1.30 adds
+typed manual-reset events with separated signal/wait authority and level/edge integration. Periodic timers and I/O completion sources,
 independently scheduled tasks, sender-side receiver-slot reservation, and service migration remain
 Phase 2 work.
 

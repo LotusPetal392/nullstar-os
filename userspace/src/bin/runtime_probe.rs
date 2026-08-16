@@ -7,7 +7,8 @@ use userspace::{
     async_ipc::Reactor,
     blocking_ipc,
     handle::{
-        Endpoint, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, Timer, WaitSet,
+        Endpoint, Event, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, Timer,
+        WaitSet,
     },
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
@@ -96,6 +97,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || !wait_set_probe()
         || !event_port_probe()
         || !timer_probe()
+        || !event_probe()
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -475,6 +477,88 @@ fn timer_probe() -> bool {
             })
         || timer.cancel().is_err()
         || timer.signal_state().ok() != Some(Signals::EMPTY)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn event_probe() -> bool {
+    const EVENT_PORT_KEY: u64 = 181;
+    const WAIT_SET_KEY: u64 = 182;
+
+    let Ok(event) = OwnedHandle::<Event>::create() else {
+        return false;
+    };
+    let Ok(wait_only) = event.borrow().duplicate(Rights::WAIT) else {
+        return false;
+    };
+    let Ok(signal_only) = event.borrow().duplicate(Rights::SIGNAL) else {
+        return false;
+    };
+    let Ok(wait_set) = OwnedHandle::<WaitSet>::create() else {
+        return false;
+    };
+    let Ok(event_port) = OwnedHandle::<EventPort>::create() else {
+        return false;
+    };
+
+    if !event.info().is_ok_and(|info| {
+        info.kind == ObjectKind::Event && info.rights == Rights::EVENT && info.size == 0
+    }) || event.signal_state().ok() != Some(Signals::EMPTY)
+        || event
+            .borrow()
+            .wait(Signals::SIGNALED, Deadline::IMMEDIATE)
+            .err()
+            != Some(ipc::Error::TIMED_OUT)
+        || wait_only.set().err() != Some(ipc::Error::PERMISSION)
+        || wait_only.reset().err() != Some(ipc::Error::PERMISSION)
+        || signal_only.signal_state().err() != Some(ipc::Error::PERMISSION)
+        || event_port
+            .add(event.borrow(), Signals::READABLE, EVENT_PORT_KEY)
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || event_port
+            .add(event.borrow(), Signals::SIGNALED, EVENT_PORT_KEY)
+            .is_err()
+        || wait_set
+            .add(event.borrow(), Signals::SIGNALED, WAIT_SET_KEY)
+            .is_err()
+        || signal_only.set().is_err()
+        || event.info().ok().map(|info| info.size) != Some(1)
+        || wait_only.signal_state().ok() != Some(Signals::SIGNALED)
+        || wait_only
+            .borrow()
+            .wait(Signals::SIGNALED, Deadline::IMMEDIATE)
+            .ok()
+            != Some(Signals::SIGNALED)
+        || wait_set.wait_next(Deadline::IMMEDIATE).ok()
+            != Some(ipc::WaitSetEvent {
+                key: WAIT_SET_KEY,
+                signals: Signals::SIGNALED,
+            })
+        || event_port.wait_next(Deadline::IMMEDIATE).ok()
+            != Some(ipc::EventPortEvent {
+                key: EVENT_PORT_KEY,
+                signals: Signals::SIGNALED,
+            })
+        || signal_only.set().is_err()
+        || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || signal_only.reset().is_err()
+        || event.info().ok().map(|info| info.size) != Some(0)
+        || event.signal_state().ok() != Some(Signals::EMPTY)
+        || wait_set.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || signal_only.reset().is_err()
+        || event.set().is_err()
+        || event_port.wait_next(Deadline::IMMEDIATE).ok()
+            != Some(ipc::EventPortEvent {
+                key: EVENT_PORT_KEY,
+                signals: Signals::SIGNALED,
+            })
+        || event.reset().is_err()
+        || event.signal_state().ok() != Some(Signals::EMPTY)
     {
         return false;
     }

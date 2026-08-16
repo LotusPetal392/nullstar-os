@@ -97,13 +97,13 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.29. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.30. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 The userspace library preserves raw numeric capability calls for compatibility and now layers
 non-cloneable ownership-safe handles over them. Owned handles close on drop, borrowed handles are
 lifetime-bound, object markers preserve validated endpoint, notification, shared-memory, early-log,
-job, wait-set, event-port, and timer kinds, and explicit operations cover duplication, rights replacement, raw ownership
+job, wait-set, event-port, timer, and manual-reset event kinds, and explicit operations cover duplication, rights replacement, raw ownership
 transfer, type erasure, and revalidation. The first typed endpoint receive path adopts attached
 capabilities immediately so ignored attachments are closed automatically. Typed endpoint move sends
 consume their sources only after a successful atomic enqueue and return every owned handle on failure,
@@ -118,6 +118,8 @@ bounded persistent wait sets with tagged, insertion-ordered, level-triggered reg
 userspace ownership. ABI 1.28 adds bounded queued event ports with FIFO rising-edge delivery,
 per-key coalescing, explicit rearming, and the same typed ownership and delegation rules. ABI 1.29
 adds capability-backed one-shot monotonic timers that feed generic waits, wait sets, and event ports.
+ABI 1.30 adds user-controlled manual-reset events with persistent `SIGNALED` state and the same
+generic wait, wait-set, event-port, typed ownership, and delegation paths.
 The runtime probe checks these rules, process-exit cleanup, real cross-process wakeups, and
 interrupt-driven timer delivery against kernel handles; additional I/O event sources, independent task scheduling,
 sender-side receiver-slot reservation, and broad service migration remain future runtime work.

@@ -72,6 +72,7 @@ pub enum ObjectType {
     Timer = 8,
     EventPort = 9,
     Device = 10,
+    Event = 11,
 }
 
 /// Immutable rights attached to one handle.

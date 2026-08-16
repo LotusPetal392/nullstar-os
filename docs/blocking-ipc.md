@@ -22,12 +22,12 @@ A process is removed from any previous endpoint wait before registering a new wa
 
 ## ABI discovery
 
-System information reports ABI minor version 29 and advertises the endpoint-wait feature bit. The original endpoint send and receive operations remain bounded and retain their Phase 1 behavior.
+System information reports ABI minor version 30 and advertises the endpoint-wait feature bit. The original endpoint send and receive operations remain bounded and retain their Phase 1 behavior.
 
 ## Generic object waiting
 
 ABI 1.23 adds `OBJECT_WAIT_ONE` alongside this compatibility primitive. It blocks on a requested
-subset of the level-triggered endpoint, notification, or job signals and accepts an absolute
+subset of the level-triggered endpoint, notification, job, timer, or event signals and accepts an absolute
 deadline in the nanosecond domain returned by `MONOTONIC_TIME`. Deadline zero polls immediately,
 `UINT64_MAX` waits indefinitely, and finite expiry returns `ETIMEDOUT`. The generic wait returns the
 requested asserted mask and does not consume object state.
@@ -68,13 +68,19 @@ explicit. Expiration disarms the timer and asserts `TIMER_FIRED` until cancellat
 Timers work with generic waits, persistent wait sets, and event ports, so a delayed event-port wait
 uses the same lost-wakeup ordering as other object signals.
 
+ABI 1.30 adds manual-reset event objects. `EVENT_SET` persistently asserts `SIGNALED` until an
+explicit `EVENT_RESET`; both operations are idempotent. Set and reset flow through the same
+scheduler-integrated wake and event-port refresh path as other signal mutations. Repeated set while
+already asserted does not queue another edge, while reset followed by set rearms exactly one new
+event-port edge. Generic waits and wait sets remain level-triggered and never clear the event.
+
 ## Current boundary
 
 The original endpoint primitive removes cooperative polling from request/reply clients and remains
 the blocking foundation for existing proxies. Generic bounded object waiting now supplies timeout
 deadlines and readiness selection, and persistent wait sets remove repeated registration copying for
 larger stable sets. Queued event ports add bounded edge delivery for endpoint, notification, job,
-and timer signals. The current interfaces still do not provide transaction identifiers, kernel-owned
+timer, and manual-reset event signals. The current interfaces still do not provide transaction identifiers, kernel-owned
 reply slots, cancellation messages, periodic timers, I/O completion sources, or restart-aware kernel file
 descriptors.
 
