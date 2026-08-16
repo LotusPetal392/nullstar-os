@@ -1,10 +1,15 @@
 #![no_std]
 #![no_main]
 
+use core::cell::Cell;
+
 use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
-    async_ipc::{CancellationSource, PeriodicTimer, Reactor, RunError, RunScope},
+    async_ipc::{
+        CancellationSource, PeriodicTimer, Reactor, RunError, RunScope, TaskExecutor, TaskGroup,
+        TaskOutcome,
+    },
     blocking_ipc,
     handle::{
         Endpoint, Event, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, Timer,
@@ -1148,6 +1153,129 @@ fn async_control_probe(reactor: &Reactor<2>) -> bool {
         && coalesced.expirations >= 3
         && periodic.next_deadline().as_monotonic_ns() > coalesced.observed_ns
         && periodic.cancel().is_ok()
+        && task_executor_probe()
+}
+
+fn task_executor_probe() -> bool {
+    const PRODUCER_PERIOD_NS: u64 = 10_000_000;
+    const CANCELLER_PERIOD_NS: u64 = 20_000_000;
+    const TASK_TIMEOUT_NS: u64 = 50_000_000;
+
+    let reactor = Reactor::<8>::new();
+    let Ok(root_group) = TaskGroup::new(Deadline::INFINITE) else {
+        return false;
+    };
+    let Ok(cancelled_group) = TaskGroup::new(Deadline::INFINITE) else {
+        return false;
+    };
+    let Ok(now) = platform::monotonic_time_ns() else {
+        return false;
+    };
+    let timeout_deadline = Deadline::from_monotonic_ns(now.saturating_add(TASK_TIMEOUT_NS));
+    let Ok(timeout_group) = TaskGroup::new(timeout_deadline) else {
+        return false;
+    };
+    let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(cancelled_endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(timeout_endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(mut producer_timer) = PeriodicTimer::start_after(PRODUCER_PERIOD_NS) else {
+        return false;
+    };
+    let Ok(mut canceller_timer) = PeriodicTimer::start_after(CANCELLER_PERIOD_NS) else {
+        return false;
+    };
+
+    let receiver_completed = Cell::new(false);
+    let producer_completed = Cell::new(false);
+    let canceller_completed = Cell::new(false);
+    let mut receiver = core::pin::pin!(async {
+        let mut bytes = [0_u8; 1];
+        let message = reactor.receive(endpoint.borrow(), &mut bytes).await?;
+        if message.bytes != 1 || bytes[0] != 0x5a {
+            return Err(ipc::Error::IO);
+        }
+        receiver_completed.set(true);
+        Ok(())
+    });
+    let mut producer = core::pin::pin!(async {
+        let tick = reactor.next_tick(&mut producer_timer).await?;
+        if tick.expirations == 0 {
+            return Err(ipc::Error::IO);
+        }
+        reactor.send(endpoint.borrow(), &[0x5a]).await?;
+        producer_completed.set(true);
+        Ok(())
+    });
+    let mut cancelled = core::pin::pin!(async {
+        let mut bytes = [0_u8; 1];
+        let _ = reactor
+            .receive(cancelled_endpoint.borrow(), &mut bytes)
+            .await?;
+        Err(ipc::Error::IO)
+    });
+    let mut canceller = core::pin::pin!(async {
+        let tick = reactor.next_tick(&mut canceller_timer).await?;
+        if tick.expirations == 0 {
+            return Err(ipc::Error::IO);
+        }
+        cancelled_group.cancel()?;
+        canceller_completed.set(true);
+        Ok(())
+    });
+    let mut timed_out = core::pin::pin!(async {
+        let mut bytes = [0_u8; 1];
+        let _ = reactor
+            .receive(timeout_endpoint.borrow(), &mut bytes)
+            .await?;
+        Err(ipc::Error::IO)
+    });
+
+    let Ok(mut executor) = TaskExecutor::<5, 8>::new(&reactor) else {
+        return false;
+    };
+    let Ok(receiver_id) = executor.spawn_pinned(receiver.as_mut(), &root_group, Deadline::INFINITE)
+    else {
+        return false;
+    };
+    let Ok(producer_id) = executor.spawn_pinned(producer.as_mut(), &root_group, Deadline::INFINITE)
+    else {
+        return false;
+    };
+    let Ok(cancelled_id) =
+        executor.spawn_pinned(cancelled.as_mut(), &cancelled_group, Deadline::INFINITE)
+    else {
+        return false;
+    };
+    let Ok(canceller_id) =
+        executor.spawn_pinned(canceller.as_mut(), &root_group, Deadline::INFINITE)
+    else {
+        return false;
+    };
+    let Ok(timed_out_id) =
+        executor.spawn_pinned(timed_out.as_mut(), &timeout_group, Deadline::INFINITE)
+    else {
+        return false;
+    };
+
+    executor.run().is_ok()
+        && executor.outcome(receiver_id) == Some(TaskOutcome::Completed(Ok(())))
+        && executor.outcome(producer_id) == Some(TaskOutcome::Completed(Ok(())))
+        && executor.outcome(cancelled_id) == Some(TaskOutcome::Cancelled)
+        && executor.outcome(canceller_id) == Some(TaskOutcome::Completed(Ok(())))
+        && executor.outcome(timed_out_id) == Some(TaskOutcome::TimedOut)
+        && receiver_completed.get()
+        && producer_completed.get()
+        && canceller_completed.get()
+        && cancelled_group.is_cancelled().ok() == Some(true)
+        && timeout_group.is_cancelled().ok() == Some(false)
+        && producer_timer.cancel().is_ok()
+        && canceller_timer.cancel().is_ok()
 }
 
 fn capability_probe(current_process: u64) -> bool {

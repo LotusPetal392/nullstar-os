@@ -1,13 +1,14 @@
 //! Allocation-free asynchronous endpoint operations over bounded object waits.
 //!
-//! [`Reactor`] drives one scoped future tree. Endpoint futures attempt their
+//! [`Reactor`] drives scoped futures. Endpoint futures attempt their
 //! non-blocking operation first, register level-triggered readiness on
 //! [`crate::ipc::Error::TRY_AGAIN`], and let the runner sleep in the kernel's
 //! bounded `wait_many` syscall. [`RunScope`] propagates one absolute deadline
 //! and optional [`CancellationToken`] through every wait. [`PeriodicTimer`]
 //! builds explicit coalescing periodic behavior over the kernel's one-shot
-//! timer primitive. Migration onto persistent wait sets or queued event ports,
-//! plus independently spawned task scheduling, remain future work.
+//! timer primitive. [`TaskExecutor`] drives independently ready tasks through a
+//! queued event port, while [`TaskGroup`] supplies group cancellation and
+//! deadline inheritance without heap allocation.
 
 use core::{
     array,
@@ -19,10 +20,10 @@ use core::{
 
 use crate::{
     handle::{
-        BorrowedHandle, Endpoint, Event, MoveHandle, ObjectType, OwnedHandle, ReceivedMessage,
-        ReceivedMessageMany, SendMoveError, SendMoveManyError, Timer,
+        BorrowedHandle, Endpoint, Event, EventPort, MoveHandle, ObjectType, OwnedHandle,
+        ReceivedMessage, ReceivedMessageMany, SendMoveError, SendMoveManyError, Timer,
     },
-    ipc::{self, CapabilityHandle, Deadline, Rights, Signals, WaitItem},
+    ipc::{self, CapabilityHandle, Deadline, EventPortEvent, Rights, Signals, WaitItem},
 };
 
 /// Failure from the scoped reactor itself rather than from the driven future.
@@ -148,6 +149,51 @@ impl CancellationToken {
 
     fn wait_item(&self) -> WaitItem {
         self.event.borrow().wait_item(Signals::SIGNALED)
+    }
+}
+
+/// A bounded lifecycle owner for independently scheduled tasks.
+///
+/// Every task spawned through [`TaskExecutor`] inherits this group's absolute
+/// deadline and one-way cancellation token. A task may further shorten its
+/// deadline, but it cannot extend the group deadline.
+#[derive(Debug)]
+pub struct TaskGroup {
+    cancellation: CancellationSource,
+    token: CancellationToken,
+    deadline: Deadline,
+}
+
+impl TaskGroup {
+    pub fn new(deadline: Deadline) -> ipc::Result<Self> {
+        let (cancellation, token) = CancellationSource::new()?;
+        Ok(Self {
+            cancellation,
+            token,
+            deadline,
+        })
+    }
+
+    pub const fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+
+    pub fn is_cancelled(&self) -> ipc::Result<bool> {
+        self.token.is_cancelled()
+    }
+
+    /// Permanently cancels every unfinished task in this group.
+    pub fn cancel(&self) -> ipc::Result<()> {
+        self.cancellation.cancel()
+    }
+
+    pub fn scope(&self) -> RunScope<'_> {
+        RunScope::with_cancellation(self.deadline, &self.token)
+    }
+
+    /// Creates a task scope whose deadline cannot extend the group deadline.
+    pub fn task_scope(&self, deadline: Deadline) -> RunScope<'_> {
+        self.scope().child(deadline)
     }
 }
 
@@ -458,12 +504,35 @@ impl<const N: usize> Reactor<N> {
         }
     }
 
+    fn clear_registrations_for(&self, waker: &Waker) {
+        for registration in self.registrations.borrow_mut().iter_mut() {
+            if registration
+                .as_ref()
+                .is_some_and(|registration| registration.waker.will_wake(waker))
+            {
+                *registration = None;
+            }
+        }
+    }
+
     fn snapshot(&self, output: &mut [WaitItem; N]) -> usize {
         let registrations = self.registrations.borrow();
         let mut count = 0;
         for registration in registrations.iter().flatten() {
             output[count] = registration.item;
             count += 1;
+        }
+        count
+    }
+
+    fn snapshot_for(&self, waker: &Waker, output: &mut [WaitItem; N]) -> usize {
+        let registrations = self.registrations.borrow();
+        let mut count = 0;
+        for registration in registrations.iter().flatten() {
+            if registration.waker.will_wake(waker) {
+                output[count] = registration.item;
+                count += 1;
+            }
         }
         count
     }
@@ -540,6 +609,432 @@ impl Drop for RunningGuard<'_> {
         self.0.set(false);
     }
 }
+
+/// Stable identity for one bounded executor task slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskId {
+    slot: usize,
+    generation: u32,
+}
+
+impl TaskId {
+    pub const fn slot(self) -> usize {
+        self.slot
+    }
+
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
+/// Terminal state retained for a task after the executor finishes driving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOutcome {
+    /// The future completed, retaining its application-level result.
+    Completed(ipc::Result<()>),
+    /// The owning task group was cancelled before completion.
+    Cancelled,
+    /// The task's inherited absolute deadline expired before completion.
+    TimedOut,
+}
+
+/// Failure in the task executor itself rather than in an individual task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRunError {
+    /// An event-port, cancellation-state, or monotonic-clock operation failed.
+    Runtime(ipc::Error),
+    /// A task returned `Pending` without registering a waitable object.
+    UnregisteredPending(TaskId),
+    /// The same executor was entered recursively.
+    AlreadyRunning,
+}
+
+struct TaskSlot<'task, 'group> {
+    id: TaskId,
+    future: Pin<&'task mut (dyn Future<Output = ipc::Result<()>> + 'task)>,
+    scope: RunScope<'group>,
+    outcome: Option<TaskOutcome>,
+    ready: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoundRegistration {
+    key: u64,
+    task: TaskId,
+}
+
+/// Allocation-free cooperative executor over one queued kernel event port.
+///
+/// `TASKS` bounds independently scheduled futures and `WAITS` bounds their
+/// combined reactor registrations. Every spawned task belongs to a
+/// [`TaskGroup`]. Registration keys include task-slot generations so a stale
+/// event can never wake a later occupant of the same slot.
+pub struct TaskExecutor<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize> {
+    reactor: &'reactor Reactor<WAITS>,
+    event_port: Option<OwnedHandle<EventPort>>,
+    tasks: [Option<TaskSlot<'task, 'group>>; TASKS],
+    generations: [u32; TASKS],
+    bindings: [Option<BoundRegistration>; crate::abi::limits::MAX_EVENT_PORT_REGISTRATIONS],
+    running: bool,
+}
+
+impl<'reactor, 'task, 'group, const TASKS: usize, const WAITS: usize>
+    TaskExecutor<'reactor, 'task, 'group, TASKS, WAITS>
+{
+    pub fn new(reactor: &'reactor Reactor<WAITS>) -> ipc::Result<Self> {
+        if TASKS == 0
+            || WAITS == 0
+            || WAITS > crate::abi::limits::MAX_OBJECT_WAIT_ITEMS
+            || TASKS
+                .checked_add(WAITS)
+                .is_none_or(|total| total > crate::abi::limits::MAX_EVENT_PORT_REGISTRATIONS)
+        {
+            return Err(ipc::Error::INVALID_ARGUMENT);
+        }
+        Ok(Self {
+            reactor,
+            event_port: Some(OwnedHandle::<EventPort>::create()?),
+            tasks: array::from_fn(|_| None),
+            generations: [0; TASKS],
+            bindings: array::from_fn(|_| None),
+            running: false,
+        })
+    }
+
+    /// Adds an `Unpin` task to `group` with an optional shorter deadline.
+    pub fn spawn<F>(
+        &mut self,
+        future: &'task mut F,
+        group: &'group TaskGroup,
+        deadline: Deadline,
+    ) -> ipc::Result<TaskId>
+    where
+        F: Future<Output = ipc::Result<()>> + Unpin + 'task,
+    {
+        self.spawn_pinned(Pin::new(future), group, deadline)
+    }
+
+    /// Adds a pinned task to `group` with an optional shorter deadline.
+    pub fn spawn_pinned<F>(
+        &mut self,
+        future: Pin<&'task mut F>,
+        group: &'group TaskGroup,
+        deadline: Deadline,
+    ) -> ipc::Result<TaskId>
+    where
+        F: Future<Output = ipc::Result<()>> + 'task,
+    {
+        self.spawn_scoped(future, group.task_scope(deadline))
+    }
+
+    fn spawn_scoped<F>(
+        &mut self,
+        future: Pin<&'task mut F>,
+        scope: RunScope<'group>,
+    ) -> ipc::Result<TaskId>
+    where
+        F: Future<Output = ipc::Result<()>> + 'task,
+    {
+        let Some(slot) = self.tasks.iter().position(Option::is_none) else {
+            return Err(ipc::Error::NO_SPACE);
+        };
+        let generation = self.generations[slot]
+            .checked_add(1)
+            .ok_or(ipc::Error::RANGE)?;
+        self.generations[slot] = generation;
+        let id = TaskId { slot, generation };
+        self.tasks[slot] = Some(TaskSlot {
+            id,
+            future,
+            scope,
+            outcome: None,
+            ready: true,
+        });
+        Ok(id)
+    }
+
+    pub fn outcome(&self, id: TaskId) -> Option<TaskOutcome> {
+        self.tasks
+            .get(id.slot)
+            .and_then(Option::as_ref)
+            .filter(|task| task.id == id)
+            .and_then(|task| task.outcome)
+    }
+
+    /// Releases a completed slot and returns its terminal outcome.
+    ///
+    /// Reusing the slot advances its generation, so already-drained events
+    /// cannot be confused with registrations owned by the replacement task.
+    pub fn reap(&mut self, id: TaskId) -> Option<TaskOutcome> {
+        if self.running {
+            return None;
+        }
+        let task = self.tasks.get(id.slot)?.as_ref()?;
+        if task.id != id {
+            return None;
+        }
+        let outcome = task.outcome?;
+        self.tasks[id.slot] = None;
+        Some(outcome)
+    }
+
+    /// Drives every task to completion, cancellation, or deadline expiry.
+    pub fn run(&mut self) -> Result<(), TaskRunError> {
+        let Some(event_port) = self.event_port.as_ref() else {
+            return Err(TaskRunError::Runtime(ipc::Error::IO));
+        };
+        let raw = event_port.as_raw();
+        self.run_with(
+            |item, key| ipc::event_port_add(raw, item.handle(), item.requested(), key),
+            |key| ipc::event_port_remove(raw, key),
+            |deadline| ipc::event_port_wait(raw, deadline),
+            || crate::platform::monotonic_time_ns().map_err(|_| ipc::Error::IO),
+        )
+    }
+
+    fn run_with<A, R, W, C>(
+        &mut self,
+        mut add: A,
+        mut remove: R,
+        mut wait: W,
+        mut clock: C,
+    ) -> Result<(), TaskRunError>
+    where
+        A: FnMut(WaitItem, u64) -> ipc::Result<()>,
+        R: FnMut(u64) -> ipc::Result<()>,
+        W: FnMut(Deadline) -> ipc::Result<EventPortEvent>,
+        C: FnMut() -> ipc::Result<u64>,
+    {
+        if self.running {
+            return Err(TaskRunError::AlreadyRunning);
+        }
+        self.running = true;
+        let result = self.drive(&mut add, &mut remove, &mut wait, &mut clock);
+        let cleanup = self.remove_bindings(&mut remove);
+        self.reset_unfinished_tasks();
+        self.running = false;
+        result.and(cleanup)
+    }
+
+    fn reset_unfinished_tasks(&mut self) {
+        for task in self.tasks.iter_mut().flatten() {
+            let waker = task_waker(task.id);
+            self.reactor.clear_registrations_for(&waker);
+            if task.outcome.is_none() {
+                task.ready = true;
+            }
+        }
+    }
+
+    fn drive<A, R, W, C>(
+        &mut self,
+        add: &mut A,
+        remove: &mut R,
+        wait: &mut W,
+        clock: &mut C,
+    ) -> Result<(), TaskRunError>
+    where
+        A: FnMut(WaitItem, u64) -> ipc::Result<()>,
+        R: FnMut(u64) -> ipc::Result<()>,
+        W: FnMut(Deadline) -> ipc::Result<EventPortEvent>,
+        C: FnMut() -> ipc::Result<u64>,
+    {
+        loop {
+            self.poll_ready_tasks()?;
+            if self
+                .tasks
+                .iter()
+                .flatten()
+                .all(|task| task.outcome.is_some())
+            {
+                return Ok(());
+            }
+            self.sync_bindings(add, remove)?;
+            let deadline = self.earliest_deadline();
+            match wait(deadline) {
+                Ok(event) => {
+                    self.mark_ready(event);
+                    loop {
+                        match wait(Deadline::IMMEDIATE) {
+                            Ok(event) => self.mark_ready(event),
+                            Err(error) if error == ipc::Error::TIMED_OUT => break,
+                            Err(error) => return Err(TaskRunError::Runtime(error)),
+                        }
+                    }
+                }
+                Err(error) if error == ipc::Error::TIMED_OUT => {
+                    let now = clock().map_err(TaskRunError::Runtime)?;
+                    if !self.expire_deadlines(now) {
+                        return Err(TaskRunError::Runtime(ipc::Error::TIMED_OUT));
+                    }
+                }
+                Err(error) => return Err(TaskRunError::Runtime(error)),
+            }
+        }
+    }
+
+    fn poll_ready_tasks(&mut self) -> Result<(), TaskRunError> {
+        for slot in 0..TASKS {
+            let Some(task) = self.tasks[slot].as_mut() else {
+                continue;
+            };
+            if task.outcome.is_some() || !task.ready {
+                continue;
+            }
+            task.ready = false;
+            let waker = task_waker(task.id);
+            if let Some(token) = task.scope.cancellation()
+                && token.is_cancelled().map_err(TaskRunError::Runtime)?
+            {
+                self.reactor.clear_registrations_for(&waker);
+                task.outcome = Some(TaskOutcome::Cancelled);
+                continue;
+            }
+            self.reactor.clear_registrations_for(&waker);
+            let mut context = Context::from_waker(&waker);
+            match task.future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => task.outcome = Some(TaskOutcome::Completed(result)),
+                Poll::Pending => {
+                    let mut registrations = [WaitItem::new(0, Signals::EMPTY); WAITS];
+                    if self.reactor.snapshot_for(&waker, &mut registrations) == 0 {
+                        return Err(TaskRunError::UnregisteredPending(task.id));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_bindings<A, R>(&mut self, add: &mut A, remove: &mut R) -> Result<(), TaskRunError>
+    where
+        A: FnMut(WaitItem, u64) -> ipc::Result<()>,
+        R: FnMut(u64) -> ipc::Result<()>,
+    {
+        self.remove_bindings(remove)?;
+        let mut bound = 0;
+        for slot in 0..TASKS {
+            let Some(task) = self.tasks[slot].as_ref() else {
+                continue;
+            };
+            if task.outcome.is_some() {
+                continue;
+            }
+            let id = task.id;
+            let scope = task.scope;
+            let waker = task_waker(id);
+            let mut registrations = [WaitItem::new(0, Signals::EMPTY); WAITS];
+            let count = self.reactor.snapshot_for(&waker, &mut registrations);
+            for (ordinal, item) in registrations[..count].iter().copied().enumerate() {
+                let key = Self::registration_key(id, ordinal)?;
+                add(item, key).map_err(TaskRunError::Runtime)?;
+                self.bindings[bound] = Some(BoundRegistration { key, task: id });
+                bound += 1;
+            }
+            if let Some(token) = scope.cancellation() {
+                let key = Self::registration_key(id, WAITS)?;
+                add(token.wait_item(), key).map_err(TaskRunError::Runtime)?;
+                self.bindings[bound] = Some(BoundRegistration { key, task: id });
+                bound += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_bindings<R>(&mut self, remove: &mut R) -> Result<(), TaskRunError>
+    where
+        R: FnMut(u64) -> ipc::Result<()>,
+    {
+        for binding in &mut self.bindings {
+            if let Some(current) = *binding {
+                remove(current.key).map_err(TaskRunError::Runtime)?;
+                *binding = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn registration_key(id: TaskId, ordinal: usize) -> Result<u64, TaskRunError> {
+        let stride =
+            u64::try_from(WAITS + 1).map_err(|_| TaskRunError::Runtime(ipc::Error::RANGE))?;
+        let task_index = u64::from(id.generation)
+            .checked_mul(
+                u64::try_from(TASKS).map_err(|_| TaskRunError::Runtime(ipc::Error::RANGE))?,
+            )
+            .and_then(|base| base.checked_add(id.slot as u64))
+            .ok_or(TaskRunError::Runtime(ipc::Error::RANGE))?;
+        task_index
+            .checked_mul(stride)
+            .and_then(|base| base.checked_add(ordinal as u64))
+            .filter(|key| *key <= crate::abi::event_port::MAX_KEY)
+            .ok_or(TaskRunError::Runtime(ipc::Error::RANGE))
+    }
+
+    fn mark_ready(&mut self, event: EventPortEvent) {
+        let Some(binding) = self
+            .bindings
+            .iter()
+            .flatten()
+            .find(|binding| binding.key == event.key)
+            .copied()
+        else {
+            return;
+        };
+        if let Some(task) = self
+            .tasks
+            .get_mut(binding.task.slot)
+            .and_then(Option::as_mut)
+            && task.id == binding.task
+            && task.outcome.is_none()
+        {
+            task.ready = true;
+        }
+    }
+
+    fn earliest_deadline(&self) -> Deadline {
+        self.tasks
+            .iter()
+            .flatten()
+            .filter(|task| task.outcome.is_none())
+            .map(|task| task.scope.deadline())
+            .min_by_key(|deadline| deadline.as_monotonic_ns())
+            .unwrap_or(Deadline::INFINITE)
+    }
+
+    fn expire_deadlines(&mut self, now: u64) -> bool {
+        let mut expired = false;
+        for task in self.tasks.iter_mut().flatten() {
+            if task.outcome.is_none()
+                && task.scope.deadline() != Deadline::INFINITE
+                && task.scope.deadline().as_monotonic_ns() <= now
+            {
+                let waker = task_waker(task.id);
+                self.reactor.clear_registrations_for(&waker);
+                task.outcome = Some(TaskOutcome::TimedOut);
+                expired = true;
+            }
+        }
+        expired
+    }
+}
+
+fn task_waker(id: TaskId) -> Waker {
+    let tag = ((id.generation as usize) << 8) | id.slot.saturating_add(1);
+    // SAFETY: the executor's task waker vtable never dereferences the encoded tag.
+    unsafe { Waker::from_raw(RawWaker::new(tag as *const (), &TASK_WAKER_VTABLE)) }
+}
+
+unsafe fn task_waker_clone(data: *const ()) -> RawWaker {
+    RawWaker::new(data, &TASK_WAKER_VTABLE)
+}
+
+unsafe fn task_waker_noop(_: *const ()) {}
+
+static TASK_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    task_waker_clone,
+    task_waker_noop,
+    task_waker_noop,
+    task_waker_noop,
+);
 
 /// A readiness-driven cancellation observation.
 pub struct Cancelled<'reactor, 'token, const N: usize> {
@@ -870,13 +1365,16 @@ static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 #[cfg(test)]
 mod tests {
     use core::{
+        cell::{Cell, RefCell},
         future,
         pin::Pin,
-        task::{Poll, RawWaker, RawWakerVTable, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     };
 
-    use super::{PeriodicSchedule, Reactor, RunError, RunScope};
-    use crate::ipc::{self, Deadline, Signals, WaitItem};
+    use super::{
+        PeriodicSchedule, Reactor, RunError, RunScope, TaskExecutor, TaskOutcome, TaskRunError,
+    };
+    use crate::ipc::{self, Deadline, EventPortEvent, Signals, WaitItem};
 
     #[test]
     fn registrations_merge_only_for_the_same_waker_and_enforce_capacity() {
@@ -1020,6 +1518,232 @@ mod tests {
         assert_eq!(
             schedule.next_deadline(),
             Deadline::from_monotonic_ns(u64::MAX - 2)
+        );
+    }
+
+    #[test]
+    fn task_executor_polls_only_tasks_selected_by_event_keys() {
+        struct PendingOnce<'a> {
+            reactor: &'a Reactor<2>,
+            handle: u64,
+            polls: &'a Cell<u32>,
+        }
+
+        impl Future for PendingOnce<'_> {
+            type Output = ipc::Result<()>;
+
+            fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                let polls = this.polls.get() + 1;
+                this.polls.set(polls);
+                if polls == 1 {
+                    this.reactor
+                        .register(
+                            WaitItem::new(this.handle, Signals::READABLE),
+                            context.waker(),
+                        )
+                        .unwrap();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct FakePort {
+            bindings: [Option<(u64, u64)>; 2],
+            waits: usize,
+        }
+
+        let reactor = Reactor::<2>::new();
+        let first_polls = Cell::new(0);
+        let second_polls = Cell::new(0);
+        let mut first = PendingOnce {
+            reactor: &reactor,
+            handle: 10,
+            polls: &first_polls,
+        };
+        let mut second = PendingOnce {
+            reactor: &reactor,
+            handle: 20,
+            polls: &second_polls,
+        };
+        let mut executor = TaskExecutor::<2, 2> {
+            reactor: &reactor,
+            event_port: None,
+            tasks: core::array::from_fn(|_| None),
+            generations: [0; 2],
+            bindings: core::array::from_fn(|_| None),
+            running: false,
+        };
+        let first_id = executor
+            .spawn_scoped(Pin::new(&mut first), RunScope::new(Deadline::INFINITE))
+            .unwrap();
+        let second_id = executor
+            .spawn_scoped(Pin::new(&mut second), RunScope::new(Deadline::INFINITE))
+            .unwrap();
+        let port = RefCell::new(FakePort::default());
+
+        executor
+            .run_with(
+                |item, key| {
+                    let mut port = port.borrow_mut();
+                    let binding = port
+                        .bindings
+                        .iter_mut()
+                        .find(|binding| binding.is_none())
+                        .unwrap();
+                    *binding = Some((item.handle(), key));
+                    Ok(())
+                },
+                |key| {
+                    for binding in &mut port.borrow_mut().bindings {
+                        if binding.is_some_and(|(_, binding_key)| binding_key == key) {
+                            *binding = None;
+                        }
+                    }
+                    Ok(())
+                },
+                |deadline| {
+                    if deadline == Deadline::IMMEDIATE {
+                        return Err(ipc::Error::TIMED_OUT);
+                    }
+                    let mut port = port.borrow_mut();
+                    let handle = if port.waits == 0 { 20 } else { 10 };
+                    if port.waits == 1 {
+                        assert_eq!(first_polls.get(), 1);
+                        assert_eq!(second_polls.get(), 2);
+                    }
+                    port.waits += 1;
+                    let key = port
+                        .bindings
+                        .iter()
+                        .flatten()
+                        .find(|(bound_handle, _)| *bound_handle == handle)
+                        .unwrap()
+                        .1;
+                    Ok(EventPortEvent {
+                        key,
+                        signals: Signals::READABLE,
+                    })
+                },
+                || Ok(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            executor.outcome(first_id),
+            Some(TaskOutcome::Completed(Ok(())))
+        );
+        assert_eq!(
+            executor.outcome(second_id),
+            Some(TaskOutcome::Completed(Ok(())))
+        );
+        assert_eq!(
+            executor.reap(first_id),
+            Some(TaskOutcome::Completed(Ok(())))
+        );
+        assert_eq!(executor.outcome(first_id), None);
+        assert_eq!(first_polls.get(), 2);
+        assert_eq!(second_polls.get(), 2);
+    }
+
+    #[test]
+    fn task_registration_keys_change_when_a_slot_generation_advances() {
+        let first = super::TaskId {
+            slot: 0,
+            generation: 1,
+        };
+        let replacement = super::TaskId {
+            slot: 0,
+            generation: 2,
+        };
+        assert_ne!(
+            TaskExecutor::<2, 2>::registration_key(first, 0).unwrap(),
+            TaskExecutor::<2, 2>::registration_key(replacement, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn task_executor_expires_pending_task_at_inherited_deadline() {
+        struct Waiting<'a> {
+            reactor: &'a Reactor<1>,
+        }
+
+        impl Future for Waiting<'_> {
+            type Output = ipc::Result<()>;
+
+            fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+                self.reactor
+                    .register(WaitItem::new(30, Signals::READABLE), context.waker())
+                    .unwrap();
+                Poll::Pending
+            }
+        }
+
+        let reactor = Reactor::<1>::new();
+        let mut task = Waiting { reactor: &reactor };
+        let mut executor = TaskExecutor::<1, 1> {
+            reactor: &reactor,
+            event_port: None,
+            tasks: core::array::from_fn(|_| None),
+            generations: [0; 1],
+            bindings: core::array::from_fn(|_| None),
+            running: false,
+        };
+        let id = executor
+            .spawn_scoped(
+                Pin::new(&mut task),
+                RunScope::new(Deadline::from_monotonic_ns(50)),
+            )
+            .unwrap();
+        let key = Cell::new(None);
+        executor
+            .run_with(
+                |_, bound_key| {
+                    key.set(Some(bound_key));
+                    Ok(())
+                },
+                |bound_key| {
+                    if key.get() == Some(bound_key) {
+                        key.set(None);
+                    }
+                    Ok(())
+                },
+                |deadline| {
+                    assert_eq!(deadline, Deadline::from_monotonic_ns(50));
+                    Err(ipc::Error::TIMED_OUT)
+                },
+                || Ok(50),
+            )
+            .unwrap();
+        assert_eq!(executor.outcome(id), Some(TaskOutcome::TimedOut));
+    }
+
+    #[test]
+    fn task_executor_rejects_unregistered_pending_task() {
+        let reactor = Reactor::<1>::new();
+        let mut task = future::pending::<ipc::Result<()>>();
+        let mut executor = TaskExecutor::<1, 1> {
+            reactor: &reactor,
+            event_port: None,
+            tasks: core::array::from_fn(|_| None),
+            generations: [0; 1],
+            bindings: core::array::from_fn(|_| None),
+            running: false,
+        };
+        let id = executor
+            .spawn_scoped(Pin::new(&mut task), RunScope::new(Deadline::INFINITE))
+            .unwrap();
+        assert_eq!(
+            executor.run_with(
+                |_, _| unreachable!(),
+                |_| unreachable!(),
+                |_| unreachable!(),
+                || unreachable!(),
+            ),
+            Err(TaskRunError::UnregisteredPending(id))
         );
     }
 

@@ -122,10 +122,13 @@ ABI 1.30 adds user-controlled manual-reset events with persistent `SIGNALED` sta
 generic wait, wait-set, event-port, typed ownership, and delegation paths.
 The scoped reactor now carries one absolute deadline plus an optional event-backed cancellation token
 through every bounded wait, and rearms one-shot timers into periodic schedules with explicit missed-tick
-coalescing. The runtime probe checks these rules, process-exit cleanup, real cross-process wakeups,
-interrupt-driven timer delivery, cancellation, and periodic rearming against kernel handles; additional
-I/O event sources, independent task scheduling, sender-side receiver-slot reservation, and broad service
-migration remain future runtime work.
+coalescing. A fixed-capacity executor assigns generation-tagged event-port registrations to independent
+tasks, polls only selected task slots, and gives every task a group cancellation token plus an inherited
+absolute deadline. The runtime probe checks these rules, process-exit cleanup, real cross-process wakeups,
+interrupt-driven timer delivery, cancellation, periodic rearming, independent task wakeups, group
+cancellation, and deadline termination against kernel handles. Additional I/O event sources,
+sender-side receiver-slot reservation, nested role-specific task hierarchies, and broad service migration
+remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh
