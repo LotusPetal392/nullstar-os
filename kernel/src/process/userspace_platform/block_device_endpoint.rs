@@ -471,8 +471,14 @@ fn service_block_device_endpoints() {
         return;
     };
 
+    if message.capabilities.len() > 1 {
+        block_device_release_transferred_many(&message.capabilities);
+        return;
+    }
+    let capability = message.capabilities.first().copied();
+
     if message.bytes.len() != size_of::<block_device_protocol::Request>() {
-        block_device_release_transferred(message.capability);
+        block_device_release_transferred(capability);
         return;
     }
     let request = unsafe {
@@ -490,7 +496,7 @@ fn service_block_device_endpoints() {
             access,
             message.sender_process_id,
             request,
-            message.capability,
+            capability,
         );
         return;
     }
@@ -501,19 +507,19 @@ fn service_block_device_endpoints() {
         message.sender_process_id,
         request.session_id,
     ) else {
-        block_device_release_transferred(message.capability);
+        block_device_release_transferred(capability);
         return;
     };
     let mut reply = block_device_reply(&request);
     if request.generation != snapshot.session.generation {
         reply.status = block_device_protocol::status::STALE_SESSION;
-        block_device_release_transferred(message.capability);
+        block_device_release_transferred(capability);
         block_device_queue_reply_or_remove_session(snapshot, reply);
         return;
     }
     if !canonical_block_device_request(&request) {
         reply.status = block_device_protocol::status::INVALID;
-        block_device_release_transferred(message.capability);
+        block_device_release_transferred(capability);
         block_device_queue_reply_or_remove_session(snapshot, reply);
         return;
     }
@@ -525,17 +531,17 @@ fn service_block_device_endpoints() {
         )
     {
         reply.status = block_device_protocol::status::IO;
-        block_device_release_transferred(message.capability);
+        block_device_release_transferred(capability);
         block_device_queue_reply_or_remove_session(snapshot, reply);
         return;
     }
 
     match request.operation {
         block_device_protocol::operation::ATTACH_BUFFER => {
-            block_device_attach_buffer(snapshot, request, message.capability, &mut reply)
+            block_device_attach_buffer(snapshot, request, capability, &mut reply)
         }
         block_device_protocol::operation::INFO => {
-            if block_device_reject_unexpected_transfer(message.capability, &mut reply) {
+            if block_device_reject_unexpected_transfer(capability, &mut reply) {
                 reply.features = snapshot.access.features();
                 reply.block_count = snapshot.partition.block_count;
                 reply.logical_block_size = snapshot.partition.logical_block_size as u32;
@@ -543,12 +549,12 @@ fn service_block_device_endpoints() {
             }
         }
         block_device_protocol::operation::READ => {
-            if block_device_reject_unexpected_transfer(message.capability, &mut reply) {
+            if block_device_reject_unexpected_transfer(capability, &mut reply) {
                 block_device_read(snapshot, &request, &mut reply);
             }
         }
         block_device_protocol::operation::WRITE => {
-            if block_device_reject_unexpected_transfer(message.capability, &mut reply) {
+            if block_device_reject_unexpected_transfer(capability, &mut reply) {
                 if snapshot.access.is_writable() {
                     block_device_write(snapshot, &request, &mut reply);
                 } else {
@@ -557,7 +563,7 @@ fn service_block_device_endpoints() {
             }
         }
         block_device_protocol::operation::FLUSH => {
-            if block_device_reject_unexpected_transfer(message.capability, &mut reply) {
+            if block_device_reject_unexpected_transfer(capability, &mut reply) {
                 if snapshot.access.is_writable() {
                     block_device_flush(&mut reply);
                 } else {
@@ -566,7 +572,7 @@ fn service_block_device_endpoints() {
             }
         }
         block_device_protocol::operation::DISCONNECT => {
-            if !block_device_reject_unexpected_transfer(message.capability, &mut reply) {
+            if !block_device_reject_unexpected_transfer(capability, &mut reply) {
                 block_device_queue_reply_or_remove_session(snapshot, reply);
                 return;
             }
@@ -620,12 +626,10 @@ fn block_device_take_message() -> Option<(u32, BlockDeviceAccess, EndpointMessag
             let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[index].data else {
                 continue;
             };
-            if let Some(capability) = endpoint
-                .queue
-                .front()
-                .and_then(|message| message.capability)
-            {
-                kernel_capability_root_add(capability.object);
+            if let Some(message) = endpoint.queue.front() {
+                for capability in &message.capabilities {
+                    kernel_capability_root_add(capability.object);
+                }
             }
             endpoint.queue.pop_front()
         };
@@ -1163,6 +1167,14 @@ fn block_device_release_transferred(capability: Option<TransferredCapability>) {
     }
 }
 
+fn block_device_release_transferred_many(capabilities: &[TransferredCapability]) {
+    let objects = capabilities
+        .iter()
+        .map(|capability| capability.object)
+        .collect::<Vec<_>>();
+    block_device_release_roots(&objects);
+}
+
 fn block_device_release_roots(objects: &[CapabilityObjectRef]) {
     if objects.is_empty() {
         return;
@@ -1280,7 +1292,7 @@ fn block_device_queue_reply(
             endpoint.queue.push_back(EndpointMessage {
                 sender_process_id: 0,
                 bytes,
-                capability: None,
+                capabilities: Vec::new(),
             });
             true
         }

@@ -220,7 +220,7 @@ The kernel transports bounded byte payloads plus transferred handles. It does no
 filesystem, display, audio, package, or other application-level protocol fields.
 
 The initial paired-channel ABI provides asynchronous send and receive through the userspace reactor,
-message boundaries, one-handle atomic transfer, bounded queues, deterministic backpressure, and
+message boundaries, bounded multi-handle atomic transfer, bounded queues, deterministic backpressure, and
 readable, writable, and peer-closed signals. The complete channel design should also provide:
 
 - asynchronous send and receive;
@@ -263,8 +263,12 @@ sender loses the handle atomically when the complete message and transferred han
 a failed send consumes nothing. A retained copy can be created explicitly with `handle_duplicate`
 before sending. The original ABI 1.2 copy-transfer call remains available for compatibility.
 
-Paired channels must extend the same all-or-nothing rule to multiple handles and account for
-receiver capacity at send time rather than deferring handle installation until receive.
+ABI 1.26 extends the all-or-nothing move rule to one through four distinct handles. Validation,
+queue-capacity checks, and duplicate-source rejection occur before any source is consumed. The
+multi-handle receive reports required byte and handle capacities without dequeueing, reserves all
+local handle-table entries before dequeue, and publishes all bytes and handles together. Accounting
+for receiver capacity at send time remains future work because receive authority is not yet bound to
+one process.
 
 A later duplicate-transfer disposition is optional and would require both `TRANSFER`
 and `DUPLICATE`.

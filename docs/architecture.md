@@ -97,7 +97,7 @@ is global while the system is single-CPU and must become per-CPU before SMP.
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
 run in ring 3 with separate page tables and use software interrupt `0x80` for the
-experimental NullStar syscall ABI, currently version 1.25. Shared numeric and structure
+experimental NullStar syscall ABI, currently version 1.26. Shared numeric and structure
 definitions are included by both kernel and userspace.
 
 The userspace library preserves raw numeric capability calls for compatibility and now layers
@@ -105,16 +105,17 @@ non-cloneable ownership-safe handles over them. Owned handles close on drop, bor
 lifetime-bound, object markers preserve validated endpoint, notification, shared-memory, early-log,
 and job kinds, and explicit operations cover duplication, rights replacement, raw ownership
 transfer, type erasure, and revalidation. The first typed endpoint receive path adopts attached
-capabilities immediately so an ignored attachment is closed automatically. Typed endpoint move sends
-consume the source only after a successful atomic enqueue and return the same owned handle on failure,
+capabilities immediately so ignored attachments are closed automatically. Typed endpoint move sends
+consume their sources only after a successful atomic enqueue and return every owned handle on failure,
 making backpressure retries explicit and leak-free. A scoped, allocation-free reactor now drives
-standard Rust futures for endpoint send, receive, and ownership-consuming move send over the bounded
+standard Rust futures for endpoint send, receive, and ownership-consuming single- or multi-handle move send over the bounded
 many-object wait ABI. It sleeps in the scheduler after backpressure rather than polling and preserves
 move-send ownership across every pending or failed registration path. Atomic channel-pair creation now
 provides bidirectional peer queues, writable state based on peer capacity, final-reference peer closure,
-and queued-message drainage after closure. The runtime probe checks these rules, process-exit cleanup,
+and queued-message drainage after closure. ABI 1.26 adds all-or-nothing messages carrying up to four
+rights-reduced moved handles, including required-capacity reporting without dequeue. The runtime probe checks these rules, process-exit cleanup,
 and real cross-process wakeups against kernel handles; persistent event ports, independent task
-scheduling, multi-handle messages, and broad service migration remain future runtime work.
+scheduling, sender-side receiver-slot reservation, and broad service migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh
@@ -144,8 +145,8 @@ signal, wait, job, capability-close, launch-barrier, yield, and budget-exhaustio
 
 The allocation-free [service route protocol](service-route-protocol.md) provides the first generic
 userspace-managed route layer. `NSRT` v1 uses exact 40-byte request and response records keyed by a
-UUIDv4 service ID and nonzero role. The current endpoint ABI permits at most one transferred
-capability per message, so a route request carries exactly one fresh send-only reply endpoint and an
+UUIDv4 service ID and nonzero role. The protocol deliberately uses one transferred
+capability per message: a route request carries exactly one fresh send-only reply endpoint and an
 accepted response carries exactly one send-only provider ingress; failure responses carry none.
 
 PID 1 is the temporary broker for the logging service ID

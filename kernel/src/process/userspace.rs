@@ -5241,10 +5241,10 @@ fn vfs_route_begin_registration(
                     endpoint.queue.push_back(EndpointMessage {
                         sender_process_id: 0,
                         bytes,
-                        capability: Some(TransferredCapability {
+                        capabilities: vec![TransferredCapability {
                             object: reply_endpoint,
                             rights: abi::capability::RIGHT_SEND,
-                        }),
+                        }],
                     });
                     Ok(())
                 }
@@ -5439,7 +5439,7 @@ fn vfs_route_service_registration() -> bool {
     let Some(message) = message else {
         return false;
     };
-    let valid = if message.capability.is_none()
+    let valid = if message.capabilities.is_empty()
         && message.bytes.len() == size_of::<vfs_protocol::Reply>()
     {
         let reply =
@@ -5938,10 +5938,10 @@ fn vfs_route_request(
                     target.queue.push_back(EndpointMessage {
                         sender_process_id: 0,
                         bytes: tmpfs_proxy_value_bytes(&request).to_vec(),
-                        capability: Some(TransferredCapability {
+                        capabilities: vec![TransferredCapability {
                             object: reply_endpoint,
                             rights: abi::capability::RIGHT_SEND,
-                        }),
+                        }],
                     });
                     true
                 }
@@ -5992,7 +5992,7 @@ fn vfs_request_take_reply(pending: &PendingVfsRequest) -> Option<Result<vfs_prot
         };
         endpoint.queue.pop_front()
     }?;
-    if message.capability.is_some() || message.bytes.len() != size_of::<vfs_protocol::Reply>() {
+    if !message.capabilities.is_empty() || message.bytes.len() != size_of::<vfs_protocol::Reply>() {
         return Some(Err(ERR_IO));
     }
     let reply =
@@ -8149,10 +8149,10 @@ fn tmpfs_proxy_begin_connect(
                     endpoint.queue.push_back(EndpointMessage {
                         sender_process_id: 0,
                         bytes,
-                        capability: Some(TransferredCapability {
+                        capabilities: vec![TransferredCapability {
                             object: reply_endpoint,
                             rights: abi::capability::RIGHT_SEND,
-                        }),
+                        }],
                     });
                     Ok(())
                 }
@@ -8322,7 +8322,7 @@ fn tmpfs_proxy_service_connect() -> bool {
     let Some(message) = message else {
         return false;
     };
-    let valid = if message.capability.is_none()
+    let valid = if message.capabilities.is_empty()
         && message.bytes.len() == size_of::<filesystem_protocol::Reply>()
     {
         let reply = unsafe {
@@ -8423,10 +8423,10 @@ fn tmpfs_proxy_begin_attach() -> Result<(), i64> {
                     endpoint.queue.push_back(EndpointMessage {
                         sender_process_id: 0,
                         bytes,
-                        capability: Some(TransferredCapability {
+                        capabilities: vec![TransferredCapability {
                             object: buffer,
                             rights: abi::capability::RIGHT_READ | abi::capability::RIGHT_WRITE,
-                        }),
+                        }],
                     });
                     Ok(())
                 }
@@ -8477,7 +8477,7 @@ fn tmpfs_proxy_service_attach(state: TmpfsProxyState) -> bool {
     let Some(message) = message else {
         return false;
     };
-    let valid = if message.capability.is_none()
+    let valid = if message.capabilities.is_empty()
         && message.bytes.len() == size_of::<filesystem_protocol::Reply>()
     {
         let reply = unsafe {
@@ -8555,7 +8555,7 @@ fn tmpfs_proxy_decode_filesystem_reply(
     message: EndpointMessage,
     pending: &PendingTmpfsProxyRequest,
 ) -> Result<tmpfs_protocol::Reply, i64> {
-    if message.capability.is_some()
+    if !message.capabilities.is_empty()
         || message.bytes.len() != size_of::<filesystem_protocol::Reply>()
     {
         return Err(ERR_IO);
@@ -8967,7 +8967,7 @@ fn tmpfs_proxy_service_close() -> bool {
                         endpoint.queue.push_back(EndpointMessage {
                             sender_process_id: 0,
                             bytes,
-                            capability: None,
+                            capabilities: Vec::new(),
                         });
                         true
                     }
@@ -8995,7 +8995,7 @@ fn tmpfs_proxy_validate_close_reply(
     message: EndpointMessage,
     active: ActiveTmpfsClose,
 ) -> Option<i32> {
-    if message.capability.is_some()
+    if !message.capabilities.is_empty()
         || message.bytes.len() != size_of::<filesystem_protocol::Reply>()
     {
         return None;
@@ -9084,7 +9084,7 @@ fn tmpfs_proxy_begin_filesystem_request(
                     endpoint.queue.push_back(EndpointMessage {
                         sender_process_id: 0,
                         bytes,
-                        capability: None,
+                        capabilities: Vec::new(),
                     });
                     Ok(())
                 }
@@ -9755,7 +9755,7 @@ fn nullfs_proxy_push_request(
                 endpoint.queue.push_back(EndpointMessage {
                     sender_process_id: 0,
                     bytes,
-                    capability,
+                    capabilities: capability.into_iter().collect(),
                 });
                 Ok(())
             }
@@ -10017,7 +10017,7 @@ fn nullfs_proxy_service_connect() -> bool {
     let Some(message) = message else {
         return false;
     };
-    let valid = if message.capability.is_none()
+    let valid = if message.capabilities.is_empty()
         && message.bytes.len() == size_of::<filesystem_protocol::Reply>()
     {
         let reply = unsafe {
@@ -10150,7 +10150,7 @@ fn nullfs_proxy_service_attach(state: TmpfsProxyState) -> bool {
     let Some(message) = message else {
         return false;
     };
-    let valid = if message.capability.is_none()
+    let valid = if message.capabilities.is_empty()
         && message.bytes.len() == size_of::<filesystem_protocol::Reply>()
     {
         let reply = unsafe {
@@ -10357,7 +10357,7 @@ fn nullfs_proxy_decode_reply(
     message: EndpointMessage,
     pending: &PendingNullfsProxyRequest,
 ) -> Result<filesystem_protocol::Reply, i64> {
-    if message.capability.is_some()
+    if !message.capabilities.is_empty()
         || message.bytes.len() != size_of::<filesystem_protocol::Reply>()
     {
         return Err(ERR_IO);

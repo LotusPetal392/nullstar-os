@@ -972,8 +972,8 @@ The first in-tree slice is implemented in the userspace library without prematur
 crates: raw calls remain available, while sealed object markers, non-cloneable owned handles,
 lifetime-bound borrows, automatic close, explicit duplication and rights replacement, unsafe raw
 adoption, type erasure and revalidation, and ownership-safe endpoint receive are available to new
-code. Ownership-consuming endpoint move send now disarms the source only after a successful atomic
-enqueue and returns the same owned handle with any error so backpressure can be retried safely. Host
+code. Ownership-consuming endpoint move send now disarms its one or more sources only after a
+successful atomic enqueue and returns every owned handle with any error so backpressure can be retried safely. Host
 tests cover close-versus-transfer and failed-move recovery, while the QEMU runtime probe verifies
 drop, explicit close, reduced-rights replacement, failed-cast ownership preservation, received-handle
 cleanup, failed-move retention, and successful source invalidation against the kernel. Moving all
@@ -995,8 +995,11 @@ send, typed receive, and ownership-safe move send. Host tests cover bounded regi
 signals, deadline forwarding, and invalid unregistered suspension. The QEMU runtime probe covers a
 real cross-process readiness wakeup plus local async send, receive, and capability move. Atomic pair
 creation, bidirectional delivery, final-reference and process-exit peer closure, and queued-message
-drainage are covered by the QEMU runtime probe. Persistent registrations, independently scheduled
-tasks, service migration, and multi-handle messages remain Phase 2 work.
+drainage are covered by the QEMU runtime probe. ABI 1.26 and the typed runtime now atomically move
+up to four heterogeneous handles, return every source on failed enqueue, report insufficient receive
+capacity without dequeue, and expose the same operations as scoped futures. Persistent registrations,
+independently scheduled tasks, sender-side receiver-slot reservation, and service migration remain
+Phase 2 work.
 
 ### Phase 3: Hand-written protocol runtime
 

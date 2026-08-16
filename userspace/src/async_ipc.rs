@@ -16,7 +16,10 @@ use core::{
 };
 
 use crate::{
-    handle::{BorrowedHandle, Endpoint, ObjectType, OwnedHandle, ReceivedMessage, SendMoveError},
+    handle::{
+        BorrowedHandle, Endpoint, MoveHandle, ObjectType, OwnedHandle, ReceivedMessage,
+        ReceivedMessageMany, SendMoveError, SendMoveManyError,
+    },
     ipc::{self, CapabilityHandle, Deadline, Rights, Signals, WaitItem},
 };
 
@@ -128,6 +131,33 @@ impl<const N: usize> Reactor<N> {
             bytes,
             handle: Some(handle),
             rights,
+        }
+    }
+
+    pub fn send_move_many<'reactor, 'handle, 'bytes, const M: usize>(
+        &'reactor self,
+        endpoint: BorrowedHandle<'handle, Endpoint>,
+        bytes: &'bytes [u8],
+        handles: [MoveHandle; M],
+    ) -> SendMoveMany<'reactor, 'handle, 'bytes, M, N> {
+        SendMoveMany {
+            reactor: self,
+            endpoint,
+            bytes,
+            handles: Some(handles),
+        }
+    }
+
+    pub fn receive_many<'reactor, 'handle, 'buffer, const M: usize>(
+        &'reactor self,
+        endpoint: BorrowedHandle<'handle, Endpoint>,
+        buffer: &'buffer mut [u8],
+    ) -> ReceiveMany<'reactor, 'handle, 'buffer, M, N> {
+        ReceiveMany {
+            reactor: self,
+            endpoint,
+            buffer,
+            complete: false,
         }
     }
 
@@ -350,6 +380,88 @@ impl<T: ObjectType, const N: usize> Future for SendMove<'_, '_, '_, T, N> {
                 }
             }
             Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+/// A readiness-driven ownership-consuming multi-handle endpoint send.
+pub struct SendMoveMany<'reactor, 'handle, 'bytes, const M: usize, const N: usize> {
+    reactor: &'reactor Reactor<N>,
+    endpoint: BorrowedHandle<'handle, Endpoint>,
+    bytes: &'bytes [u8],
+    handles: Option<[MoveHandle; M]>,
+}
+
+impl<const M: usize, const N: usize> Unpin for SendMoveMany<'_, '_, '_, M, N> {}
+
+impl<const M: usize, const N: usize> Future for SendMoveMany<'_, '_, '_, M, N> {
+    type Output = Result<(), SendMoveManyError<M>>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        let handles = this
+            .handles
+            .take()
+            .expect("async endpoint multi-handle send polled after completion");
+        match this.endpoint.send_move_many(this.bytes, handles) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(error) if error.error() == ipc::Error::TRY_AGAIN => {
+                let handles = error.into_handles();
+                match this.reactor.register(
+                    this.endpoint
+                        .wait_item(Signals::WRITABLE | Signals::PEER_CLOSED),
+                    context.waker(),
+                ) {
+                    Ok(()) => {
+                        this.handles = Some(handles);
+                        Poll::Pending
+                    }
+                    Err(error) => Poll::Ready(Err(SendMoveManyError::new(error, handles))),
+                }
+            }
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+/// A readiness-driven typed multi-handle endpoint receive.
+pub struct ReceiveMany<'reactor, 'handle, 'buffer, const M: usize, const N: usize> {
+    reactor: &'reactor Reactor<N>,
+    endpoint: BorrowedHandle<'handle, Endpoint>,
+    buffer: &'buffer mut [u8],
+    complete: bool,
+}
+
+impl<const M: usize, const N: usize> Future for ReceiveMany<'_, '_, '_, M, N> {
+    type Output = Result<ReceivedMessageMany<M>, ipc::ReceiveManyError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(
+            !self.complete,
+            "async endpoint multi-handle receive polled after completion"
+        );
+        let endpoint = self.endpoint;
+        match endpoint.try_receive_many(self.buffer) {
+            Ok(message) => {
+                self.complete = true;
+                Poll::Ready(Ok(message))
+            }
+            Err(error) if error.error() == ipc::Error::TRY_AGAIN => {
+                match self.reactor.register(
+                    endpoint.wait_item(Signals::READABLE | Signals::PEER_CLOSED),
+                    context.waker(),
+                ) {
+                    Ok(()) => Poll::Pending,
+                    Err(wait_error) => {
+                        self.complete = true;
+                        Poll::Ready(Err(ipc::ReceiveManyError::from_error(wait_error)))
+                    }
+                }
+            }
+            Err(error) => {
+                self.complete = true;
+                Poll::Ready(Err(error))
+            }
         }
     }
 }

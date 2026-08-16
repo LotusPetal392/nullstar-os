@@ -242,6 +242,42 @@ pub struct ReceivedMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedMessageMany {
+    pub sender_process_id: u64,
+    pub bytes: usize,
+    pub capabilities: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveManyError {
+    error: Error,
+    required_bytes: usize,
+    required_capabilities: usize,
+}
+
+impl ReceiveManyError {
+    pub(crate) const fn from_error(error: Error) -> Self {
+        Self {
+            error,
+            required_bytes: 0,
+            required_capabilities: 0,
+        }
+    }
+
+    pub const fn error(self) -> Error {
+        self.error
+    }
+
+    pub const fn required_bytes(self) -> usize {
+        self.required_bytes
+    }
+
+    pub const fn required_capabilities(self) -> usize {
+        self.required_capabilities
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobExit {
     pub process_id: u64,
     pub status: crate::syscall::ChildStatus,
@@ -464,6 +500,40 @@ pub fn send_move(endpoint: CapabilityHandle, bytes: &[u8], transfer: Transfer) -
     decode(result).map(|_| ())
 }
 
+pub fn send_move_many(
+    endpoint: CapabilityHandle,
+    bytes: &[u8],
+    transfers: &[Transfer],
+) -> Result<()> {
+    if transfers.is_empty() {
+        return Err(Error::INVALID_ARGUMENT);
+    }
+    if transfers.len() > crate::abi::limits::MAX_IPC_MESSAGE_HANDLES {
+        return Err(Error::ARGUMENT_TOO_LARGE);
+    }
+    let mut dispositions =
+        [abi_capability::HandleDisposition::EMPTY; crate::abi::limits::MAX_IPC_MESSAGE_HANDLES];
+    for (output, transfer) in dispositions.iter_mut().zip(transfers) {
+        *output = abi_capability::HandleDisposition {
+            handle: transfer.handle,
+            rights: transfer.rights.bits(),
+        };
+    }
+    let mut result = syscall::ENDPOINT_SEND_MOVE_MANY;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") endpoint,
+            in("rsi") bytes.as_ptr() as u64,
+            in("rdx") bytes.len() as u64,
+            in("r10") dispositions.as_ptr() as u64,
+            in("r8") transfers.len() as u64,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
 pub fn try_receive(endpoint: CapabilityHandle, buffer: &mut [u8]) -> Result<ReceivedMessage> {
     let mut raw = abi_capability::MessageInfo::EMPTY;
     let mut result = syscall::ENDPOINT_RECEIVE;
@@ -515,6 +585,103 @@ pub fn receive(endpoint: CapabilityHandle, buffer: &mut [u8]) -> Result<Received
                 }
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+pub fn try_receive_many(
+    endpoint: CapabilityHandle,
+    buffer: &mut [u8],
+    capabilities: &mut [Option<ReceivedCapability>],
+) -> core::result::Result<ReceivedMessageMany, ReceiveManyError> {
+    capabilities.fill(None);
+    if capabilities.len() > crate::abi::limits::MAX_IPC_MESSAGE_HANDLES {
+        return Err(ReceiveManyError {
+            error: Error::ARGUMENT_TOO_LARGE,
+            required_bytes: 0,
+            required_capabilities: 0,
+        });
+    }
+    let mut raw_capabilities =
+        [abi_capability::ReceivedHandle::EMPTY; crate::abi::limits::MAX_IPC_MESSAGE_HANDLES];
+    let mut raw = abi_capability::MessageInfoMany::EMPTY;
+    let mut result = syscall::ENDPOINT_RECEIVE_MANY;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") endpoint,
+            in("rsi") buffer.as_mut_ptr() as u64,
+            in("rdx") buffer.len() as u64,
+            in("r10") raw_capabilities.as_mut_ptr() as u64,
+            in("r8") capabilities.len() as u64,
+            in("r9") (&mut raw as *mut abi_capability::MessageInfoMany) as u64,
+        );
+    }
+    let required_bytes = raw.byte_count as usize;
+    let required_capabilities = raw.handle_count as usize;
+    let bytes = match decode(result) {
+        Ok(bytes) => bytes as usize,
+        Err(error) => {
+            return Err(ReceiveManyError {
+                error,
+                required_bytes,
+                required_capabilities,
+            });
+        }
+    };
+    if raw.reserved != 0
+        || bytes != required_bytes
+        || bytes > buffer.len()
+        || required_capabilities > capabilities.len()
+    {
+        close_received_handles(&raw_capabilities, required_capabilities);
+        return Err(ReceiveManyError {
+            error: Error::IO,
+            required_bytes,
+            required_capabilities,
+        });
+    }
+    for index in 0..required_capabilities {
+        let received = raw_capabilities[index];
+        let Some(rights) = Rights::from_bits(received.rights) else {
+            close_received_handles(&raw_capabilities, required_capabilities);
+            capabilities.fill(None);
+            return Err(ReceiveManyError {
+                error: Error::IO,
+                required_bytes,
+                required_capabilities,
+            });
+        };
+        if received.handle == abi_capability::INVALID_HANDLE
+            || raw_capabilities[..index]
+                .iter()
+                .any(|prior| prior.handle == received.handle)
+        {
+            close_received_handles(&raw_capabilities, required_capabilities);
+            capabilities.fill(None);
+            return Err(ReceiveManyError {
+                error: Error::IO,
+                required_bytes,
+                required_capabilities,
+            });
+        }
+        capabilities[index] = Some(ReceivedCapability {
+            handle: received.handle,
+            rights,
+        });
+    }
+    Ok(ReceivedMessageMany {
+        sender_process_id: raw.sender_process_id,
+        bytes,
+        capabilities: required_capabilities,
+    })
+}
+
+fn close_received_handles(handles: &[abi_capability::ReceivedHandle], count: usize) {
+    for handle in handles.iter().take(count) {
+        if handle.handle != abi_capability::INVALID_HANDLE {
+            let _ = close(handle.handle);
         }
     }
 }
@@ -822,9 +989,15 @@ mod tests {
         assert_eq!(syscall::OBJECT_WAIT_ONE, 72);
         assert_eq!(syscall::OBJECT_WAIT_MANY, 73);
         assert_eq!(syscall::ENDPOINT_CREATE_PAIR, 74);
+        assert_eq!(syscall::ENDPOINT_SEND_MOVE_MANY, 75);
+        assert_eq!(syscall::ENDPOINT_RECEIVE_MANY, 76);
         assert_eq!(core::mem::size_of::<capability::EndpointPair>(), 16);
         assert_eq!(core::mem::align_of::<capability::EndpointPair>(), 8);
+        assert_eq!(core::mem::size_of::<capability::HandleDisposition>(), 16);
+        assert_eq!(core::mem::size_of::<capability::ReceivedHandle>(), 16);
+        assert_eq!(core::mem::size_of::<capability::MessageInfoMany>(), 32);
         assert_eq!(capability::CHANNEL_PAIRS, 1 << 23);
+        assert_eq!(capability::MULTI_HANDLE_MESSAGES, 1 << 24);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

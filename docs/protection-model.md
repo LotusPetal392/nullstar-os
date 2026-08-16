@@ -25,6 +25,8 @@ snapshot for endpoints, notifications, and job subtrees. ABI 1.23 adds monotonic
 and scheduler-integrated single-object waits with absolute deadlines. ABI 1.24 adds bounded
 many-object waits with deterministic lowest-index selection. ABI 1.25 adds atomic pairs of
 bidirectional endpoints whose non-owning peer links expose final-reference and process-exit closure.
+ABI 1.26 adds atomic move-transfer and receive of up to four rights-reduced capabilities in one
+message, with duplicate-source rejection and required receive-capacity reporting.
 
 Userspace now also has an initial ownership-safe layer over the unchanged raw ABI. A non-cloneable
 owned handle closes on drop, produces only lifetime-bound borrowed handles, and can be explicitly
@@ -108,7 +110,8 @@ Endpoint operations remain bounded:
 - a too-small receive buffer returns `RANGE` without consuming the message;
 - failed capability installation does not consume the message;
 - a failed move-send does not consume the source capability;
-- each message contains at most 256 bytes and at most one transferred capability;
+- each message contains at most 256 bytes and at most four transferred capabilities through the
+  ABI 1.26 multi-handle calls; compatibility calls remain limited to one;
 - each endpoint queue holds at most eight messages.
 
 The kernel provides an endpoint-readiness wait used by service clients and proxies.
@@ -145,6 +148,10 @@ The original endpoint send copies a rights-reduced capability and retains the so
 move-send instead removes the source atomically when the bounded message is committed to the queue.
 `TRANSFER` is required in both cases. Queue-full and validation failures leave bytes, queue state,
 and source ownership unchanged; receive-time table exhaustion leaves the committed message queued.
+ABI 1.26 extends the move rule to one through four distinct sources. All are validated before any
+source is removed, and receive reserves every required local table slot before dequeueing. A short
+byte or handle output reports both required counts without consuming the message. Sender-side
+reservation against a future receiving process and per-job queued-resource accounting remain future work.
 
 ## Direct-child bootstrap
 
@@ -210,7 +217,7 @@ nothing.
 `NSRT` v1 records are exactly 40 bytes. A request must transfer exactly one fresh empty reply
 endpoint with exact `SEND` rights. An accepted reply transfers exactly one current provider ingress
 with exact `SEND` rights; a failure transfers no capability. These cardinalities use the implemented
-endpoint limit of at most one transferred capability per message. The broker validates the granted
+single-handle compatibility calls even though ABI 1.26 supports bounded multi-handle messages. The broker validates the granted
 key and kernel-stamped sender PID, authorizes before checking availability, and never parses NSWP or
 logging packets.
 
