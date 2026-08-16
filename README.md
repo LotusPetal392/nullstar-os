@@ -42,7 +42,8 @@ experimentation, not production use or untrusted workloads.
   explicit direct-child bootstrap grants,
   ownership-safe userspace handle wrappers with typed object markers, automatic close, and
   retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor for
-  asynchronous endpoint send, receive, and single- or multi-handle move-send operations,
+  asynchronous endpoint send, receive, and single- or multi-handle move-send operations with
+  propagated deadlines, structured cancellation, and coalescing periodic timers,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and

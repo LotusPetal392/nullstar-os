@@ -702,13 +702,37 @@ fn close_raw(raw: CapabilityHandle) -> ipc::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use core::{
+        hint::spin_loop,
+        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    };
 
     use super::{AnyObject, MoveHandle, OwnedHandle, send_move_many_with, send_move_with};
     use crate::ipc::{self, Rights};
 
     static CLOSED_COUNT: AtomicUsize = AtomicUsize::new(0);
     static LAST_CLOSED: AtomicU64 = AtomicU64::new(0);
+    static OWNERSHIP_TEST_LOCK: AtomicBool = AtomicBool::new(false);
+
+    struct OwnershipTestGuard;
+
+    impl OwnershipTestGuard {
+        fn lock() -> Self {
+            while OWNERSHIP_TEST_LOCK
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                spin_loop();
+            }
+            Self
+        }
+    }
+
+    impl Drop for OwnershipTestGuard {
+        fn drop(&mut self) {
+            OWNERSHIP_TEST_LOCK.store(false, Ordering::Release);
+        }
+    }
 
     pub(super) fn record_close(raw: u64) {
         LAST_CLOSED.store(raw, Ordering::SeqCst);
@@ -722,6 +746,7 @@ mod tests {
 
     #[test]
     fn owned_handles_close_once_and_transfers_preserve_ownership() {
+        let _guard = OwnershipTestGuard::lock();
         reset_closes();
         {
             let owned = unsafe { OwnedHandle::<AnyObject>::from_raw(41) }.unwrap();
@@ -778,6 +803,7 @@ mod tests {
 
     #[test]
     fn multi_handle_move_is_all_or_nothing_for_ownership() {
+        let _guard = OwnershipTestGuard::lock();
         reset_closes();
         let first = unsafe { OwnedHandle::<AnyObject>::from_raw(51) }.unwrap();
         let second = unsafe { OwnedHandle::<AnyObject>::from_raw(52) }.unwrap();

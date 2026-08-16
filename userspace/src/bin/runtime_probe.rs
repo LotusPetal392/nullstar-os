@@ -4,7 +4,7 @@
 use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
-    async_ipc::Reactor,
+    async_ipc::{CancellationSource, PeriodicTimer, Reactor, RunError, RunScope},
     blocking_ipc,
     handle::{
         Endpoint, Event, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, Timer,
@@ -1041,7 +1041,113 @@ fn async_ipc_probe(current_process: u64) -> bool {
     }
     let _ = syscall::close(barrier.reader);
     let _ = syscall::close(barrier.writer);
-    child_received && local_received && move_received && child_succeeded
+    child_received
+        && local_received
+        && move_received
+        && child_succeeded
+        && async_control_probe(&reactor)
+}
+
+fn async_control_probe(reactor: &Reactor<2>) -> bool {
+    const PERIOD_NS: u64 = 20_000_000;
+    const WAIT_MARGIN_NS: u64 = 500_000_000;
+
+    let Ok((source, token)) = CancellationSource::new() else {
+        return false;
+    };
+    let Ok(cloned_token) = token.try_clone() else {
+        return false;
+    };
+    let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(start) = platform::monotonic_time_ns() else {
+        return false;
+    };
+    let deadline_ns = start.saturating_add(PERIOD_NS);
+    let scope = RunScope::with_cancellation(Deadline::from_monotonic_ns(deadline_ns), &token);
+    let mut buffer = [0_u8; 1];
+    let timed_out = {
+        let mut receive = reactor.receive(endpoint.borrow(), &mut buffer);
+        matches!(
+            reactor.run_scoped(&mut receive, scope),
+            Err(RunError::Wait(error)) if error == ipc::Error::TIMED_OUT
+        )
+    };
+    if !timed_out
+        || !platform::monotonic_time_ns().is_ok_and(|now| now >= deadline_ns)
+        || token.is_cancelled().ok() != Some(false)
+        || source.cancel().is_err()
+        || token.is_cancelled().ok() != Some(true)
+        || cloned_token.is_cancelled().ok() != Some(true)
+    {
+        return false;
+    }
+
+    let mut canceled_receive = reactor.receive(endpoint.borrow(), &mut buffer);
+    if !matches!(
+        reactor.run_scoped(
+            &mut canceled_receive,
+            RunScope::with_cancellation(Deadline::INFINITE, &token),
+        ),
+        Err(RunError::Cancelled)
+    ) {
+        return false;
+    }
+    let mut cancelled = reactor.cancelled(&cloned_token);
+    if !matches!(reactor.run(&mut cancelled), Ok(Ok(()))) {
+        return false;
+    }
+
+    let Ok(mut periodic) = PeriodicTimer::start_after(PERIOD_NS) else {
+        return false;
+    };
+    let first_deadline = periodic.next_deadline();
+    let mut first_tick = reactor.next_tick(&mut periodic);
+    let first = match reactor.run_until(
+        &mut first_tick,
+        Deadline::from_monotonic_ns(
+            first_deadline
+                .as_monotonic_ns()
+                .saturating_add(WAIT_MARGIN_NS),
+        ),
+    ) {
+        Ok(Ok(tick)) => tick,
+        _ => return false,
+    };
+    if first.scheduled != first_deadline
+        || first.observed_ns < first.scheduled.as_monotonic_ns()
+        || first.expirations == 0
+    {
+        return false;
+    }
+
+    let coalesce_at = periodic
+        .next_deadline()
+        .as_monotonic_ns()
+        .saturating_add(PERIOD_NS.saturating_mul(2));
+    loop {
+        match platform::monotonic_time_ns() {
+            Ok(now) if now >= coalesce_at => break,
+            Ok(_) => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    let scheduled = periodic.next_deadline();
+    let mut coalesced_tick = reactor.next_tick(&mut periodic);
+    let coalesced = match reactor.run(&mut coalesced_tick) {
+        Ok(Ok(tick)) => tick,
+        _ => return false,
+    };
+    coalesced.scheduled == scheduled
+        && coalesced.observed_ns >= coalesce_at
+        && coalesced.expirations >= 3
+        && periodic.next_deadline().as_monotonic_ns() > coalesced.observed_ns
+        && periodic.cancel().is_ok()
 }
 
 fn capability_probe(current_process: u64) -> bool {

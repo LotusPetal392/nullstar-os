@@ -15,7 +15,9 @@ atomic channel pairs with final-reference peer closure,
 direct-child bootstrap grants, and an initial userspace layer of non-cloneable owned, borrowed, and
 kind-validated handles with automatic close and retry-safe ownership-consuming move transfer. A
 bounded allocation-free scoped reactor also provides asynchronous endpoint send, receive, and move
-send over the existing many-object wait ABI. The next architecture stages are:
+send over the existing many-object wait ABI. It now propagates nested absolute deadlines, separates
+signal-only cancellation sources from clonable wait-only tokens, and supplies coalescing periodic
+schedules over one-shot timers. The next architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
    inspection authorization around the implemented close, duplicate, atomic replace, inspection,
@@ -27,10 +29,12 @@ send over the existing many-object wait ABI. The next architecture stages are:
    sender-side receiver-capacity reservation and explicit per-job backpressure accounting;
 4. evolve shared-memory objects from bounded copies to mapped pages with protection,
    sealing, W^X integration, and job accounting;
-5. add cancellation and a bounded synchronous call/reply path with priority donation;
+5. extend the implemented scoped cancellation foundation into bounded synchronous call/reply,
+   late-reply cleanup, protocol cancellation, and priority donation;
 6. extend the implemented queued event ports beyond one-shot timers and manual-reset events to process-exit, file and network completion,
    display, device, and media event sources;
-7. evolve the scoped asynchronous IPC reactor into independent task scheduling, typed service
+7. evolve the scoped asynchronous IPC reactor beyond propagated deadlines, cancellation, and periodic
+   scheduling into independent task scheduling, typed service
    bindings, tracing, and protocol conformance tests;
 8. introduce an IDL only after stable wire and lifecycle conventions have survived real
    services.
