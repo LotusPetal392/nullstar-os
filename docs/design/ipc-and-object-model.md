@@ -343,20 +343,23 @@ Transport failure and service-level failure must remain distinct. `PEER_CLOSED`,
 validation error.
 
 The current userspace reactor provides the bounded local foundation for this contract. A
-`RunScope` carries one absolute deadline and an optional manual-reset-event cancellation token
-through every kernel wait. Child scopes may shorten but never extend the parent deadline. The
+`RunScope` carries one absolute deadline and up to eight manual-reset-event cancellation tokens
+through every kernel wait. Child scopes may shorten but never extend the parent deadline. Each
 source retains only `SIGNAL`; clonable and transferable tokens retain lifecycle rights plus `WAIT`
 but never mutation authority. Cancellation is one-way and stops the scoped future tree with a
 distinct runtime result. Protocol cancellation messages, transaction cleanup, and rollback remain
 separate higher-level responsibilities.
 
 The fixed-capacity `TaskExecutor` carries that contract across independently scheduled futures. Every
-task is borrowed under a `TaskGroup`, inherits the group's cancellation token and deadline, and may
-only shorten that deadline. Reactor registrations are rebound to one queued event port using keys that
-include task-slot generations; unknown or late keys are discarded, completed slots retain explicit
-application, cancellation, or timeout outcomes until reaped, and reuse advances the generation. The
-executor rejects pending futures that register no waitable object and bounds both task slots and total
-reactor waits at compile time.
+task is borrowed under a role-attributed `TaskGroup`, inherits the cancellation tokens and earliest
+deadline of every ancestor, and may only shorten that deadline. Cancelling a group affects descendants
+without affecting its parent or siblings. Reactor registrations are rebound to one queued event port
+using keys that include task-slot generations; unknown or late keys are discarded, completed slots
+retain explicit application, cancellation, task-timeout, or shutdown-timeout outcomes until reaped,
+and reuse advances the generation. A separate cooperative shutdown event wakes participating tasks;
+the executor drains them until one absolute deadline, then records each unfinished task distinctly.
+The executor rejects pending futures that register no waitable object and bounds task slots, reactor
+waits, hierarchy depth, and worst-case event-port registrations at compile time.
 
 ### Scheduling integration
 

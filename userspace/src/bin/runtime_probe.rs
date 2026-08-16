@@ -7,8 +7,8 @@ use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
     async_ipc::{
-        CancellationSource, PeriodicTimer, Reactor, RunError, RunScope, TaskExecutor, TaskGroup,
-        TaskOutcome,
+        CancellationSource, DrainReport, PeriodicTimer, Reactor, RunError, RunScope, Shutdown,
+        TaskAttribution, TaskExecutor, TaskGroup, TaskOutcome, TaskRole,
     },
     blocking_ipc,
     handle::{
@@ -1162,17 +1162,20 @@ fn task_executor_probe() -> bool {
     const TASK_TIMEOUT_NS: u64 = 50_000_000;
 
     let reactor = Reactor::<8>::new();
-    let Ok(root_group) = TaskGroup::new(Deadline::INFINITE) else {
+    let Ok(root_group) = TaskGroup::root(TaskRole::Service, Deadline::INFINITE) else {
         return false;
     };
-    let Ok(cancelled_group) = TaskGroup::new(Deadline::INFINITE) else {
+    let Ok(request_parent) = root_group.child(TaskRole::Activation, Deadline::INFINITE) else {
+        return false;
+    };
+    let Ok(cancelled_group) = request_parent.child(TaskRole::Request, Deadline::INFINITE) else {
         return false;
     };
     let Ok(now) = platform::monotonic_time_ns() else {
         return false;
     };
     let timeout_deadline = Deadline::from_monotonic_ns(now.saturating_add(TASK_TIMEOUT_NS));
-    let Ok(timeout_group) = TaskGroup::new(timeout_deadline) else {
+    let Ok(timeout_group) = root_group.child(TaskRole::Background, timeout_deadline) else {
         return false;
     };
     let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
@@ -1224,7 +1227,7 @@ fn task_executor_probe() -> bool {
         if tick.expirations == 0 {
             return Err(ipc::Error::IO);
         }
-        cancelled_group.cancel()?;
+        request_parent.cancel()?;
         canceller_completed.set(true);
         Ok(())
     });
@@ -1269,13 +1272,96 @@ fn task_executor_probe() -> bool {
         && executor.outcome(cancelled_id) == Some(TaskOutcome::Cancelled)
         && executor.outcome(canceller_id) == Some(TaskOutcome::Completed(Ok(())))
         && executor.outcome(timed_out_id) == Some(TaskOutcome::TimedOut)
+        && executor.attribution(cancelled_id)
+            == Some(TaskAttribution {
+                role: TaskRole::Request,
+                group_depth: 3,
+            })
+        && executor.attribution(timed_out_id)
+            == Some(TaskAttribution {
+                role: TaskRole::Background,
+                group_depth: 2,
+            })
         && receiver_completed.get()
         && producer_completed.get()
         && canceller_completed.get()
         && cancelled_group.is_cancelled().ok() == Some(true)
+        && cancelled_group.is_locally_cancelled().ok() == Some(false)
+        && request_parent.is_locally_cancelled().ok() == Some(true)
+        && root_group.is_cancelled().ok() == Some(false)
         && timeout_group.is_cancelled().ok() == Some(false)
         && producer_timer.cancel().is_ok()
         && canceller_timer.cancel().is_ok()
+        && task_shutdown_probe()
+}
+
+fn task_shutdown_probe() -> bool {
+    const DRAIN_NS: u64 = 30_000_000;
+
+    let reactor = Reactor::<3>::new();
+    let Ok(group) = TaskGroup::root(TaskRole::Service, Deadline::INFINITE) else {
+        return false;
+    };
+    let Ok(background_group) = group.child(TaskRole::Background, Deadline::INFINITE) else {
+        return false;
+    };
+    let Ok(shutdown) = Shutdown::new() else {
+        return false;
+    };
+    let Ok(stubborn_endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let cooperative_completed = Cell::new(false);
+    let mut cooperative = core::pin::pin!(async {
+        reactor.cancelled(shutdown.token()).await?;
+        cooperative_completed.set(true);
+        Ok(())
+    });
+    let mut stubborn = core::pin::pin!(async {
+        let mut bytes = [0_u8; 1];
+        let _ = reactor
+            .receive(stubborn_endpoint.borrow(), &mut bytes)
+            .await?;
+        Err(ipc::Error::IO)
+    });
+    let Ok(mut executor) = TaskExecutor::<2, 3>::new(&reactor) else {
+        return false;
+    };
+    let Ok(cooperative_id) =
+        executor.spawn_pinned(cooperative.as_mut(), &group, Deadline::INFINITE)
+    else {
+        return false;
+    };
+    let Ok(stubborn_id) =
+        executor.spawn_pinned(stubborn.as_mut(), &background_group, Deadline::INFINITE)
+    else {
+        return false;
+    };
+    let Ok(now) = platform::monotonic_time_ns() else {
+        return false;
+    };
+    let drain_deadline = Deadline::from_monotonic_ns(now.saturating_add(DRAIN_NS));
+    let Ok(report) = executor.shutdown(&shutdown, drain_deadline) else {
+        return false;
+    };
+
+    shutdown.is_requested().ok() == Some(true)
+        && cooperative_completed.get()
+        && executor.outcome(cooperative_id) == Some(TaskOutcome::Completed(Ok(())))
+        && executor.outcome(stubborn_id) == Some(TaskOutcome::ShutdownTimedOut)
+        && executor.attribution(stubborn_id)
+            == Some(TaskAttribution {
+                role: TaskRole::Background,
+                group_depth: 2,
+            })
+        && report
+            == DrainReport {
+                completed: 1,
+                cancelled: 0,
+                timed_out: 0,
+                shutdown_timed_out: 1,
+            }
+        && report.total() == 2
 }
 
 fn capability_probe(current_process: u64) -> bool {
