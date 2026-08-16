@@ -36,9 +36,9 @@ experimentation, not production use or untrusted workloads.
   atomic rights replacement, and delegation, message endpoints, counted
   notifications, atomic paired channel creation with peer-closure readiness,
   atomic one- and bounded multi-handle endpoint move-transfer, shared byte-memory
-  objects, level-triggered endpoint, notification, job, and timer signal snapshots,
+  objects, level-triggered endpoint, notification, job, timer, and manual-reset event signal snapshots,
   absolute-deadline single- and bounded many-object waits, bounded persistent tagged wait sets,
-  bounded queued edge-event ports, one-shot monotonic timers,
+  bounded queued edge-event ports, one-shot monotonic timers, manual-reset events,
   explicit direct-child bootstrap grants,
   ownership-safe userspace handle wrappers with typed object markers, automatic close, and
   retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor for

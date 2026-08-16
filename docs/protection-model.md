@@ -8,7 +8,7 @@ ready for hostile workloads.
 ## Current status
 
 The original protection phase introduced bounded process-local capability tables,
-rights-reduced duplication and delegation, endpoints, counted notifications, shared
+rights-reduced duplication and delegation, endpoints, counted notifications, manual-reset events, shared
 byte-memory objects, scheduler-integrated endpoint waiting, and direct-child bootstrap
 grants. ABI 1.15 adds the first capability-backed job object with non-relaxable `fork`
 inheritance, independent process-exit records, and bounded whole-job termination. ABI 1.16 adds
@@ -29,6 +29,7 @@ ABI 1.26 adds atomic move-transfer and receive of up to four rights-reduced capa
 message, with duplicate-source rejection and required receive-capacity reporting.
 ABI 1.29 adds bounded one-shot monotonic timers with independently delegable wait and management
 authority.
+ABI 1.30 adds bounded manual-reset events with independently delegable signal and wait authority.
 
 Userspace now also has an initial ownership-safe layer over the unchanged raw ABI. A non-cloneable
 owned handle closes on drop, produces only lifetime-bound borrowed handles, and can be explicitly
@@ -161,6 +162,12 @@ arming and cancellation, while a rights-reduced `WAIT` capability can inspect or
 the prior arm and clears the fired level. Cancellation is idempotent and clears both pending and
 fired state. The global live-timer limit is 64, and event-port registrations retain timer identity
 under the same lifecycle rules as other targets.
+
+ABI 1.30 adds event capabilities with `DUPLICATE | TRANSFER | SIGNAL | WAIT`. `SIGNAL` authorizes
+both idempotent set and reset operations, while a rights-reduced `WAIT` capability can inspect or
+wait for `SIGNALED` without changing it. Set persists until reset; reset followed by set creates a
+fresh event-port rising edge. The global live-event limit is 64, and registrations retain event
+identity under the same lifecycle rules as other targets.
 
 ABI 1.25 adds atomic endpoint pairs. Sends target the peer's incoming queue, so `WRITABLE` reflects
 peer capacity rather than local capacity. Final peer destruction permanently asserts `PEER_CLOSED`;

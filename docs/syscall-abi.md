@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.29, and a
+The ABI is experimental, but callers can query the current version, 1.30, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -664,7 +664,7 @@ receiving process remains future work because receive authority may currently be
 
 A wait set is a transferable kernel object with `DUPLICATE | TRANSFER | WAIT | MANAGE` rights and
 space for at most 64 persistent registrations. `WAIT_SET_ADD` requires `MANAGE` on the set and
-`WAIT` on an endpoint, notification, or job target. The signal mask must be nonempty and supported
+`WAIT` on an endpoint, notification, job, timer, or event target. The signal mask must be nonempty and supported
 by the target, the key must be unique within the set, and keys are limited to `2^55 - 1`.
 Unsupported masks, duplicate keys, nested wait sets, and out-of-range keys return `EINVAL`; a full
 set returns `ENOSPC`. `WAIT_SET_REMOVE` requires `MANAGE` and returns `ENOENT` for an unknown key.
@@ -703,7 +703,7 @@ The key bound keeps bit 63 clear, so a successful event cannot overlap the negat
 
 An event port is a transferable kernel object with `DUPLICATE | TRANSFER | WAIT | MANAGE` rights.
 The system permits at most 16 live event ports, 64 registrations per port, and 64 queued events per
-port. `EVENT_PORT_ADD` requires `MANAGE` on the port and `WAIT` on an endpoint, notification, job, or timer
+port. `EVENT_PORT_ADD` requires `MANAGE` on the port and `WAIT` on an endpoint, notification, job, timer, or event
 target. Signal masks must be nonempty and supported by the target, and keys use the same unique
 `2^55 - 1` bound and packed result format as wait sets. Duplicate or nested event-port registrations,
 unsupported masks, and invalid keys return `EINVAL`; registration exhaustion returns `ENOSPC`.
@@ -751,6 +751,24 @@ event ports. Event-port delivery therefore queues one rising `TIMER_FIRED` edge 
 `CapabilityInfo.size` is one while a deadline is armed and zero while idle or fired. `TIMER_OBJECTS`
 in `SystemInfo.capabilities` advertises all three calls.
 
+## Version 1.30 manual-reset events
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 88 | `EVENT_CREATE` | none | event handle |
+| 89 | `EVENT_SET` | event | zero |
+| 90 | `EVENT_RESET` | event | zero |
+
+An event is a transferable kernel object with `DUPLICATE | TRANSFER | SIGNAL | WAIT` rights. At
+most 64 event objects may be live. `EVENT_SET` and `EVENT_RESET` require `SIGNAL`; signal inspection
+and object waiting require `WAIT`. An event supports only `SIGNALED`.
+
+Events begin reset. `EVENT_SET` persistently asserts `SIGNALED`, and `EVENT_RESET` clears it. Both
+operations are idempotent. Generic waits and persistent wait sets observe the level without
+consuming it. Event-port delivery queues one rising edge when a reset event becomes set, coalesces
+while it remains set, and rearms after reset. `CapabilityInfo.size` is one while set and zero while
+reset. `EVENT_OBJECTS` in `SystemInfo.capabilities` advertises all three calls.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -791,6 +809,7 @@ in `SystemInfo.capabilities` advertises all three calls.
 - ABI 1.27 adds bounded persistent tagged wait sets at syscalls 77 through 80.
 - ABI 1.28 adds bounded queued edge-event ports at syscalls 81 through 84.
 - ABI 1.29 adds one-shot monotonic timer objects at syscalls 85 through 87.
+- ABI 1.30 adds manual-reset event objects at syscalls 88 through 90.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

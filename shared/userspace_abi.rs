@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 29;
+pub const ABI_VERSION_MINOR: u64 = 30;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -107,6 +107,9 @@ pub mod syscall {
     pub const TIMER_CREATE: u64 = 85;
     pub const TIMER_ARM: u64 = 86;
     pub const TIMER_CANCEL: u64 = 87;
+    pub const EVENT_CREATE: u64 = 88;
+    pub const EVENT_SET: u64 = 89;
+    pub const EVENT_RESET: u64 = 90;
 }
 
 pub mod filesystem_provider {
@@ -144,6 +147,7 @@ pub mod capability {
     pub const WAIT_SETS: u64 = 1 << 25;
     pub const EVENT_PORTS: u64 = 1 << 26;
     pub const TIMER_OBJECTS: u64 = 1 << 27;
+    pub const EVENT_OBJECTS: u64 = 1 << 28;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -173,7 +177,8 @@ pub mod capability {
         | MULTI_HANDLE_MESSAGES
         | WAIT_SETS
         | EVENT_PORTS
-        | TIMER_OBJECTS;
+        | TIMER_OBJECTS
+        | EVENT_OBJECTS;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -185,6 +190,7 @@ pub mod capability {
     pub const KIND_WAIT_SET: u64 = 6;
     pub const KIND_EVENT_PORT: u64 = 7;
     pub const KIND_TIMER: u64 = 8;
+    pub const KIND_EVENT: u64 = 9;
 
     pub const RIGHT_DUPLICATE: u64 = 1 << 0;
     pub const RIGHT_TRANSFER: u64 = 1 << 1;
@@ -210,6 +216,8 @@ pub mod capability {
     pub const EVENT_PORT_RIGHTS: u64 =
         RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_WAIT | RIGHT_MANAGE;
     pub const TIMER_RIGHTS: u64 = RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_WAIT | RIGHT_MANAGE;
+    pub const EVENT_RIGHTS: u64 =
+        RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SIGNAL | RIGHT_WAIT;
 
     #[repr(C)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +228,8 @@ pub mod capability {
         /// Object-specific bounded state: queued endpoint messages, pending
         /// notification count, shared-memory byte length, early-log record capacity,
         /// active job-member count, wait-set registration count, or queued
-        /// event-port event count, or one while a timer is armed.
+        /// event-port event count, one while a timer is armed, or one while an
+        /// event is signaled.
         pub size: u64,
     }
 
@@ -633,6 +642,7 @@ pub mod limits {
     pub const MAX_WAIT_SET_OBJECTS: usize = 16;
     pub const MAX_EVENT_PORT_OBJECTS: usize = 16;
     pub const MAX_TIMER_OBJECTS: usize = 64;
+    pub const MAX_EVENT_OBJECTS: usize = 64;
     pub const MAX_JOB_PROCESSES: usize = 64;
     pub const MAX_ENDPOINT_MESSAGES: usize = 8;
     pub const MAX_IPC_MESSAGE_BYTES: usize = 256;

@@ -195,6 +195,8 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
             | abi::syscall::EVENT_PORT_ADD
             | abi::syscall::TIMER_ARM
             | abi::syscall::TIMER_CANCEL
+            | abi::syscall::EVENT_SET
+            | abi::syscall::EVENT_RESET
     ) {
         let next_stack_pointer =
             nullstar_capability_grant_syscall_dispatch(current_stack_pointer);
@@ -284,7 +286,8 @@ fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
         | CapabilityObjectData::Job(_)
         | CapabilityObjectData::WaitSet(_)
         | CapabilityObjectData::EventPort(_)
-        | CapabilityObjectData::Timer(_) => Err(abi::errno::INVALID_ARGUMENT),
+        | CapabilityObjectData::Timer(_)
+        | CapabilityObjectData::Event(_) => Err(abi::errno::INVALID_ARGUMENT),
     }
 }
 
