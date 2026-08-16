@@ -22,7 +22,7 @@ A process is removed from any previous endpoint wait before registering a new wa
 
 ## ABI discovery
 
-System information reports ABI minor version 3 and advertises the endpoint-wait feature bit. The original endpoint send and receive operations remain bounded and retain their Phase 1 behavior.
+System information reports ABI minor version 29 and advertises the endpoint-wait feature bit. The original endpoint send and receive operations remain bounded and retain their Phase 1 behavior.
 
 ## Generic object waiting
 
@@ -61,14 +61,21 @@ state deasserts. Waiting atomically removes one queued event but never consumes 
 Removal also purges a pending event for that key. The same deadline and lost-wakeup rules apply, and
 a port may be waited while empty because a separately held `MANAGE` capability can add registrations.
 
+ABI 1.29 adds one-shot monotonic timer objects. Arming replaces any prior arm, clears the fired
+level, and accepts the same absolute nanosecond domain as object-wait deadlines. A deadline at or
+before the current time fires immediately; `UINT64_MAX` is rejected because cancellation is
+explicit. Expiration disarms the timer and asserts `TIMER_FIRED` until cancellation or rearming.
+Timers work with generic waits, persistent wait sets, and event ports, so a delayed event-port wait
+uses the same lost-wakeup ordering as other object signals.
+
 ## Current boundary
 
 The original endpoint primitive removes cooperative polling from request/reply clients and remains
 the blocking foundation for existing proxies. Generic bounded object waiting now supplies timeout
 deadlines and readiness selection, and persistent wait sets remove repeated registration copying for
-larger stable sets. Queued event ports add bounded edge delivery for current endpoint, notification,
-and job signals. The current interfaces still do not provide transaction identifiers, kernel-owned
-reply slots, cancellation messages, timer or I/O completion sources, or restart-aware kernel file
+larger stable sets. Queued event ports add bounded edge delivery for endpoint, notification, job,
+and timer signals. The current interfaces still do not provide transaction identifiers, kernel-owned
+reply slots, cancellation messages, periodic timers, I/O completion sources, or restart-aware kernel file
 descriptors.
 
 Kernel service completions may arrive while a different userspace address

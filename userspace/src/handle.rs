@@ -56,6 +56,10 @@ pub enum WaitSet {}
 #[derive(Debug)]
 pub enum EventPort {}
 
+/// A one-shot absolute-monotonic timer capability.
+#[derive(Debug)]
+pub enum Timer {}
+
 impl sealed::Sealed for AnyObject {}
 impl sealed::Sealed for Endpoint {}
 impl sealed::Sealed for Notification {}
@@ -64,6 +68,7 @@ impl sealed::Sealed for KernelEarlyLogReader {}
 impl sealed::Sealed for Job {}
 impl sealed::Sealed for WaitSet {}
 impl sealed::Sealed for EventPort {}
+impl sealed::Sealed for Timer {}
 
 impl ObjectType for AnyObject {}
 impl ObjectType for Endpoint {}
@@ -73,6 +78,7 @@ impl ObjectType for KernelEarlyLogReader {}
 impl ObjectType for Job {}
 impl ObjectType for WaitSet {}
 impl ObjectType for EventPort {}
+impl ObjectType for Timer {}
 
 impl KnownObjectType for Endpoint {
     const KIND: ObjectKind = ObjectKind::Endpoint;
@@ -100,6 +106,10 @@ impl KnownObjectType for WaitSet {
 
 impl KnownObjectType for EventPort {
     const KIND: ObjectKind = ObjectKind::EventPort;
+}
+
+impl KnownObjectType for Timer {
+    const KIND: ObjectKind = ObjectKind::Timer;
 }
 
 /// Exclusive ownership of one process-local capability-table entry.
@@ -475,6 +485,20 @@ impl OwnedHandle<EventPort> {
 
     pub fn wait_next(&self, deadline: Deadline) -> ipc::Result<EventPortEvent> {
         ipc::event_port_wait(self.as_raw(), deadline)
+    }
+}
+
+impl OwnedHandle<Timer> {
+    pub fn create() -> ipc::Result<Self> {
+        Self::adopt(ipc::timer_create()?)
+    }
+
+    pub fn arm(&self, deadline: Deadline) -> ipc::Result<()> {
+        ipc::timer_arm(self.as_raw(), deadline)
+    }
+
+    pub fn cancel(&self) -> ipc::Result<()> {
+        ipc::timer_cancel(self.as_raw())
     }
 }
 

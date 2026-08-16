@@ -6,7 +6,9 @@ use userspace::{
     args::Args,
     async_ipc::Reactor,
     blocking_ipc,
-    handle::{Endpoint, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, WaitSet},
+    handle::{
+        Endpoint, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, Timer, WaitSet,
+    },
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
@@ -93,6 +95,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || !endpoint_multi_handle_probe(process_id)
         || !wait_set_probe()
         || !event_port_probe()
+        || !timer_probe()
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -376,6 +379,107 @@ fn event_port_probe() -> bool {
     }
 
     event_port_waiter_probe()
+}
+
+fn timer_probe() -> bool {
+    const TIMER_KEY: u64 = 151;
+    const FIRE_DELAY_NS: u64 = 20_000_000;
+    const WAIT_MARGIN_NS: u64 = 500_000_000;
+
+    let Ok(timer) = OwnedHandle::<Timer>::create() else {
+        return false;
+    };
+    let Ok(wait_only) = timer.borrow().duplicate(Rights::WAIT) else {
+        return false;
+    };
+    let Ok(event_port) = OwnedHandle::<EventPort>::create() else {
+        return false;
+    };
+    if !timer.info().is_ok_and(|info| {
+        info.kind == ObjectKind::Timer && info.rights == Rights::TIMER && info.size == 0
+    }) || timer.signal_state().ok() != Some(Signals::EMPTY)
+        || timer
+            .borrow()
+            .wait(Signals::TIMER_FIRED, Deadline::IMMEDIATE)
+            .err()
+            != Some(ipc::Error::TIMED_OUT)
+        || timer.arm(Deadline::INFINITE).err() != Some(ipc::Error::INVALID_ARGUMENT)
+        || wait_only.arm(Deadline::IMMEDIATE).err() != Some(ipc::Error::PERMISSION)
+        || wait_only.cancel().err() != Some(ipc::Error::PERMISSION)
+        || event_port
+            .add(timer.borrow(), Signals::READABLE, TIMER_KEY)
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || event_port
+            .add(timer.borrow(), Signals::TIMER_FIRED, TIMER_KEY)
+            .is_err()
+    {
+        return false;
+    }
+
+    let Ok(start) = platform::monotonic_time_ns() else {
+        return false;
+    };
+    let fire_at = start.saturating_add(FIRE_DELAY_NS);
+    if timer.arm(Deadline::from_monotonic_ns(fire_at)).is_err()
+        || timer.info().ok().map(|info| info.size) != Some(1)
+        || event_port
+            .wait_next(Deadline::from_monotonic_ns(
+                fire_at.saturating_add(WAIT_MARGIN_NS),
+            ))
+            .ok()
+            != Some(ipc::EventPortEvent {
+                key: TIMER_KEY,
+                signals: Signals::TIMER_FIRED,
+            })
+        || timer.info().ok().map(|info| info.size) != Some(0)
+        || timer.signal_state().ok() != Some(Signals::TIMER_FIRED)
+        || wait_only
+            .borrow()
+            .wait(Signals::TIMER_FIRED, Deadline::IMMEDIATE)
+            .ok()
+            != Some(Signals::TIMER_FIRED)
+        || event_port.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || timer.arm(Deadline::IMMEDIATE).is_err()
+        || event_port.wait_next(Deadline::IMMEDIATE).ok()
+            != Some(ipc::EventPortEvent {
+                key: TIMER_KEY,
+                signals: Signals::TIMER_FIRED,
+            })
+    {
+        return false;
+    }
+
+    let Ok(cancel_start) = platform::monotonic_time_ns() else {
+        return false;
+    };
+    let canceled_fire_at = cancel_start.saturating_add(FIRE_DELAY_NS);
+    if timer
+        .arm(Deadline::from_monotonic_ns(canceled_fire_at))
+        .is_err()
+        || timer.signal_state().ok() != Some(Signals::EMPTY)
+        || timer.cancel().is_err()
+        || timer.info().ok().map(|info| info.size) != Some(0)
+        || event_port
+            .wait_next(Deadline::from_monotonic_ns(
+                canceled_fire_at.saturating_add(FIRE_DELAY_NS),
+            ))
+            .err()
+            != Some(ipc::Error::TIMED_OUT)
+        || timer.signal_state().ok() != Some(Signals::EMPTY)
+        || timer.arm(Deadline::IMMEDIATE).is_err()
+        || event_port.wait_next(Deadline::IMMEDIATE).ok()
+            != Some(ipc::EventPortEvent {
+                key: TIMER_KEY,
+                signals: Signals::TIMER_FIRED,
+            })
+        || timer.cancel().is_err()
+        || timer.signal_state().ok() != Some(Signals::EMPTY)
+    {
+        return false;
+    }
+
+    true
 }
 
 fn event_port_waiter_probe() -> bool {

@@ -81,6 +81,7 @@ impl Rights {
     pub const JOB: Self = Self(abi_capability::JOB_RIGHTS);
     pub const WAIT_SET: Self = Self(abi_capability::WAIT_SET_RIGHTS);
     pub const EVENT_PORT: Self = Self(abi_capability::EVENT_PORT_RIGHTS);
+    pub const TIMER: Self = Self(abi_capability::TIMER_RIGHTS);
 
     pub const fn from_bits(bits: u64) -> Option<Self> {
         let all = abi_capability::ENDPOINT_RIGHTS
@@ -88,7 +89,8 @@ impl Rights {
             | abi_capability::SHARED_MEMORY_RIGHTS
             | abi_capability::JOB_RIGHTS
             | abi_capability::WAIT_SET_RIGHTS
-            | abi_capability::EVENT_PORT_RIGHTS;
+            | abi_capability::EVENT_PORT_RIGHTS
+            | abi_capability::TIMER_RIGHTS;
         if bits & !all == 0 {
             Some(Self(bits))
         } else {
@@ -217,6 +219,7 @@ pub enum ObjectKind {
     Job,
     WaitSet,
     EventPort,
+    Timer,
 }
 
 impl ObjectKind {
@@ -229,6 +232,7 @@ impl ObjectKind {
             abi_capability::KIND_JOB => Some(Self::Job),
             abi_capability::KIND_WAIT_SET => Some(Self::WaitSet),
             abi_capability::KIND_EVENT_PORT => Some(Self::EventPort),
+            abi_capability::KIND_TIMER => Some(Self::Timer),
             _ => None,
         }
     }
@@ -555,6 +559,35 @@ pub fn event_port_wait(event_port: CapabilityHandle, deadline: Deadline) -> Resu
         key: crate::abi::event_port::event_key(event),
         signals,
     })
+}
+
+pub fn timer_create() -> Result<CapabilityHandle> {
+    let mut result = syscall::TIMER_CREATE;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result)
+}
+
+pub fn timer_arm(timer: CapabilityHandle, deadline: Deadline) -> Result<()> {
+    let mut result = syscall::TIMER_ARM;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") timer,
+            in("rsi") deadline.as_monotonic_ns(),
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn timer_cancel(timer: CapabilityHandle) -> Result<()> {
+    let mut result = syscall::TIMER_CANCEL;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result, in("rdi") timer);
+    }
+    decode(result).map(|_| ())
 }
 
 pub fn wait_for_handle(handle: CapabilityHandle) -> Result<CapabilityInfo> {
@@ -1117,6 +1150,10 @@ mod tests {
             ObjectKind::from_raw(capability::KIND_EVENT_PORT),
             Some(ObjectKind::EventPort)
         );
+        assert_eq!(
+            ObjectKind::from_raw(capability::KIND_TIMER),
+            Some(ObjectKind::Timer)
+        );
         assert_eq!(ObjectKind::from_raw(99), None);
     }
 
@@ -1149,6 +1186,9 @@ mod tests {
         assert_eq!(syscall::EVENT_PORT_ADD, 82);
         assert_eq!(syscall::EVENT_PORT_REMOVE, 83);
         assert_eq!(syscall::EVENT_PORT_WAIT, 84);
+        assert_eq!(syscall::TIMER_CREATE, 85);
+        assert_eq!(syscall::TIMER_ARM, 86);
+        assert_eq!(syscall::TIMER_CANCEL, 87);
         assert_eq!(core::mem::size_of::<capability::EndpointPair>(), 16);
         assert_eq!(core::mem::align_of::<capability::EndpointPair>(), 8);
         assert_eq!(core::mem::size_of::<capability::HandleDisposition>(), 16);
@@ -1158,6 +1198,7 @@ mod tests {
         assert_eq!(capability::MULTI_HANDLE_MESSAGES, 1 << 24);
         assert_eq!(capability::WAIT_SETS, 1 << 25);
         assert_eq!(capability::EVENT_PORTS, 1 << 26);
+        assert_eq!(capability::TIMER_OBJECTS, 1 << 27);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,

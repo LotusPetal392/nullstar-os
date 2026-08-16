@@ -193,6 +193,8 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
             | abi::syscall::NOTIFICATION_TRY_WAIT
             | abi::syscall::CAPABILITY_CLOSE
             | abi::syscall::EVENT_PORT_ADD
+            | abi::syscall::TIMER_ARM
+            | abi::syscall::TIMER_CANCEL
     ) {
         let next_stack_pointer =
             nullstar_capability_grant_syscall_dispatch(current_stack_pointer);
@@ -281,7 +283,8 @@ fn endpoint_has_message(object: CapabilityObjectRef) -> Result<bool, i64> {
         | CapabilityObjectData::KernelEarlyLogReader(_)
         | CapabilityObjectData::Job(_)
         | CapabilityObjectData::WaitSet(_)
-        | CapabilityObjectData::EventPort(_) => Err(abi::errno::INVALID_ARGUMENT),
+        | CapabilityObjectData::EventPort(_)
+        | CapabilityObjectData::Timer(_) => Err(abi::errno::INVALID_ARGUMENT),
     }
 }
 
@@ -710,6 +713,9 @@ fn wake_satisfied_object_waiters() {
 }
 
 pub fn service_object_wait_deadlines(now_ns: u64) {
+    if advance_timers(now_ns) {
+        wake_satisfied_object_waiters();
+    }
     let mut waiters = OBJECT_WAITERS.lock();
     let mut wakeups = Vec::new();
     let mut index = 0usize;

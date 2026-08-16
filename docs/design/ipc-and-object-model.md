@@ -201,7 +201,8 @@ ABI 1.28 adds a separate queued event port with up to 64 retained registrations 
 event per key. Existing requested state produces an initial event; later events contain rising signal
 bits, coalesce with an already pending event for the same key, and rearm only after deassertion.
 Waiting removes the queued event without consuming target state. Event ports expose `READABLE` to
-generic waits and wait sets, but cannot register another event port. Later timer, socket, file,
+generic waits and wait sets, but cannot register another event port. ABI 1.29 adds one-shot
+absolute-monotonic timers as `TIMER_FIRED` sources. Later periodic timer, socket, file,
 display, device, and media sources should feed this common port rather than inventing separate
 polling APIs.
 
@@ -211,7 +212,8 @@ An event is a basic waitable signal object. Manual-reset behavior should be the 
 primitive; auto-reset behavior may be added only with precisely documented wake and
 fairness semantics.
 
-Timers use monotonic deadlines. Periodic timers must define overrun and coalescing
+One-shot timers use absolute monotonic deadlines, remain fired until canceled or rearmed, and feed
+the common object-wait and event-port paths. Periodic timers must define overrun and coalescing
 behavior rather than silently enqueueing an unbounded number of expirations.
 
 ## Channels
@@ -529,8 +531,8 @@ endpoint waiting, and direct-child bootstrap grants. The intended evolution is:
    lifetime, rights, signals, close, duplicate, replace, and inspection semantics;
 2. migrate one-ended endpoint consumers onto the implemented channel pairs and extend
    atomic move-transfer from one handle to bounded handle vectors;
-3. extend the implemented general object waiting, persistent tagged wait sets, and queued event
-   ports with timer, file, network, display, device, and media sources;
+3. extend the implemented general object waiting, persistent tagged wait sets, queued event ports,
+   and one-shot timers with file, network, display, device, and media sources;
 4. add mapped shared-memory objects, per-mapping protection, sealing, accounting, and
    explicit W^X integration;
 5. add cancellation and an optimized synchronous call/reply path with bounded priority

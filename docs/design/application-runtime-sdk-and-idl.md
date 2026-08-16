@@ -1000,7 +1000,8 @@ up to four heterogeneous handles, return every source on failed enqueue, report 
 capacity without dequeue, and expose the same operations as scoped futures. ABI 1.27 adds bounded
 persistent wait-set registrations, caller-defined readiness tags, typed ownership, and cross-process
 blocking coverage. ABI 1.28 adds bounded queued rising-edge delivery, per-key coalescing and rearming,
-typed event-port ownership, and cross-process blocking coverage. Timer and I/O completion sources,
+typed event-port ownership, and cross-process blocking coverage. ABI 1.29 adds typed one-shot timers,
+absolute monotonic arming, cancellation, and interrupt-driven event-port delivery. Periodic timers and I/O completion sources,
 independently scheduled tasks, sender-side receiver-slot reservation, and service migration remain
 Phase 2 work.
 
@@ -1028,7 +1029,7 @@ A test-only protocol should exercise handle transfer.
 
 - evolve the scoped reactor into event-port executor integration;
 - add task groups and structured cancellation;
-- add timers and deadline propagation;
+- add periodic timers and deadline propagation over the implemented one-shot timer primitive;
 - add a bounded blocking pool;
 - integrate application and service shutdown;
 - expose role-specific runtime contexts.

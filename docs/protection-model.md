@@ -27,11 +27,14 @@ many-object waits with deterministic lowest-index selection. ABI 1.25 adds atomi
 bidirectional endpoints whose non-owning peer links expose final-reference and process-exit closure.
 ABI 1.26 adds atomic move-transfer and receive of up to four rights-reduced capabilities in one
 message, with duplicate-source rejection and required receive-capacity reporting.
+ABI 1.29 adds bounded one-shot monotonic timers with independently delegable wait and management
+authority.
 
 Userspace now also has an initial ownership-safe layer over the unchanged raw ABI. A non-cloneable
 owned handle closes on drop, produces only lifetime-bound borrowed handles, and can be explicitly
 duplicated, rights-replaced, closed, or transferred back to raw ownership. Sealed marker types retain
-validated endpoint, notification, shared-memory, early-log reader, and job kinds. The typed endpoint
+validated endpoint, notification, shared-memory, early-log reader, job, wait-set, event-port, and
+timer kinds. The typed endpoint
 receive path adopts an attached capability immediately so ignored or rejected attachments are closed
 by ordinary ownership cleanup. Typed move send consumes its source handle on success and returns the
 still-owned source with the syscall error on any failed enqueue, preserving the kernel's atomic retry
@@ -151,6 +154,13 @@ only `WAIT` may consume queued events without receiving any target handle. Regis
 their targets, keys are unique, and nested event ports are rejected to keep observation and object
 lifetime graphs acyclic. Removing a registration purges its queued event and releases the retained
 target when no other legitimate reference remains.
+
+ABI 1.29 adds timer capabilities with `DUPLICATE | TRANSFER | WAIT | MANAGE`. `MANAGE` authorizes
+arming and cancellation, while a rights-reduced `WAIT` capability can inspect or wait for
+`TIMER_FIRED` without changing the deadline. Arming is one-shot and absolute-monotonic; it replaces
+the prior arm and clears the fired level. Cancellation is idempotent and clears both pending and
+fired state. The global live-timer limit is 64, and event-port registrations retain timer identity
+under the same lifecycle rules as other targets.
 
 ABI 1.25 adds atomic endpoint pairs. Sends target the peer's incoming queue, so `WRITABLE` reflects
 peer capacity rather than local capacity. Final peer destruction permanently asserts `PEER_CLOSED`;
@@ -398,7 +408,7 @@ Future work should preserve the current rules while adding:
 
 - typed MMIO, IRQ, DMA, and device-ownership capabilities;
 - direct shared-memory mappings with explicit cache and protection semantics;
-- cancellation, additional timer and I/O event sources, and service migration onto paired channels;
+- cancellation, periodic timers, additional I/O event sources, and service migration onto paired channels;
 - replacement of the temporary PID 1 route and generation owner with a named, policy-backed,
   restartable service-manager broker that owns the sequence and receives its current state;
 - broader job-level resource accounting and limits plus service, session, and application

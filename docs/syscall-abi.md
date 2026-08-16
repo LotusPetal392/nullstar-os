@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.28, and a
+The ABI is experimental, but callers can query the current version, 1.29, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -703,7 +703,7 @@ The key bound keeps bit 63 clear, so a successful event cannot overlap the negat
 
 An event port is a transferable kernel object with `DUPLICATE | TRANSFER | WAIT | MANAGE` rights.
 The system permits at most 16 live event ports, 64 registrations per port, and 64 queued events per
-port. `EVENT_PORT_ADD` requires `MANAGE` on the port and `WAIT` on an endpoint, notification, or job
+port. `EVENT_PORT_ADD` requires `MANAGE` on the port and `WAIT` on an endpoint, notification, job, or timer
 target. Signal masks must be nonempty and supported by the target, and keys use the same unique
 `2^55 - 1` bound and packed result format as wait sets. Duplicate or nested event-port registrations,
 unsupported masks, and invalid keys return `EINVAL`; registration exhaustion returns `ENOSPC`.
@@ -726,6 +726,30 @@ Registrations retain target object identity. A rights-reduced `WAIT` capability 
 consumption of the queued observations without delegating the registered target handles or
 registration management. `CapabilityInfo.size` reports queued event count. `EVENT_PORTS` in
 `SystemInfo.capabilities` advertises the object and all four calls.
+
+## Version 1.29 one-shot monotonic timers
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 85 | `TIMER_CREATE` | none | timer handle |
+| 86 | `TIMER_ARM` | timer, absolute monotonic deadline | zero |
+| 87 | `TIMER_CANCEL` | timer | zero |
+
+A timer is a transferable kernel object with `DUPLICATE | TRANSFER | WAIT | MANAGE` rights. At most
+64 timer objects may be live. `TIMER_ARM` and `TIMER_CANCEL` require `MANAGE`; signal inspection and
+object waiting require `WAIT`. A timer supports only `TIMER_FIRED`.
+
+`TIMER_ARM` replaces any prior arm and clears an asserted fired level before installing the new
+one-shot deadline. Deadlines use the absolute nanosecond domain returned by `MONOTONIC_TIME`. A
+deadline at or before the current time fires immediately. `UINT64_MAX` returns `EINVAL`; callers use
+`TIMER_CANCEL` to disarm. Expiration removes the pending arm and asserts `TIMER_FIRED` until an
+idempotent cancellation or a subsequent arm clears it. No periodic or overrun counter semantics are
+implied by this version.
+
+Timers can participate in `OBJECT_WAIT_ONE`, `OBJECT_WAIT_MANY`, persistent wait sets, and queued
+event ports. Event-port delivery therefore queues one rising `TIMER_FIRED` edge per rearm cycle.
+`CapabilityInfo.size` is one while a deadline is armed and zero while idle or fired. `TIMER_OBJECTS`
+in `SystemInfo.capabilities` advertises all three calls.
 
 ## Compatibility rules
 
@@ -766,6 +790,7 @@ registration management. `CapabilityInfo.size` reports queued event count. `EVEN
 - ABI 1.26 adds atomic move and receive of up to four message handles at syscalls 75 and 76.
 - ABI 1.27 adds bounded persistent tagged wait sets at syscalls 77 through 80.
 - ABI 1.28 adds bounded queued edge-event ports at syscalls 81 through 84.
+- ABI 1.29 adds one-shot monotonic timer objects at syscalls 85 through 87.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are
