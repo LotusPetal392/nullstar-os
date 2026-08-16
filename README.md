@@ -41,9 +41,11 @@ experimentation, not production use or untrusted workloads.
   bounded queued edge-event ports, one-shot monotonic timers, manual-reset events,
   explicit direct-child bootstrap grants,
   ownership-safe userspace handle wrappers with typed object markers, automatic close, and
-  retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor for
+  retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor and
+  queued-event-port task executor for
   asynchronous endpoint send, receive, and single- or multi-handle move-send operations with
-  propagated deadlines, structured cancellation, and coalescing periodic timers,
+  independently scheduled task groups, propagated deadlines, structured cancellation, and
+  coalescing periodic timers,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and

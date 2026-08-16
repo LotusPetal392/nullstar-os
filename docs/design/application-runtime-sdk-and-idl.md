@@ -1004,9 +1004,9 @@ typed event-port ownership, and cross-process blocking coverage. ABI 1.29 adds t
 absolute monotonic arming, cancellation, and interrupt-driven event-port delivery. ABI 1.30 adds
 typed manual-reset events with separated signal/wait authority and level/edge integration. The scoped
 runtime now adds one-way cancellation sources and clonable tokens, nested absolute-deadline clamping,
-and periodic one-shot rearming with explicit missed-expiration coalescing. I/O completion sources,
-independently scheduled tasks, sender-side receiver-slot reservation, and service migration remain
-Phase 2 work.
+periodic one-shot rearming with explicit missed-expiration coalescing, and fixed-capacity independent
+task scheduling over queued event ports. I/O completion sources, sender-side receiver-slot reservation,
+and service migration remain Phase 2 work.
 
 ### Phase 3: Hand-written protocol runtime
 
@@ -1030,18 +1030,22 @@ A test-only protocol should exercise handle transfer.
 
 ### Phase 4: Asynchronous execution
 
-- evolve the scoped reactor into event-port executor integration;
-- extend structured cancellation into independently scheduled task groups;
-- carry the implemented periodic schedules and deadline propagation into those task groups;
+- extend the bounded event-port executor beyond reactor-backed object waits;
+- extend bounded task groups into nested role-specific task hierarchies;
+- carry task attribution and lifecycle policy into generated service bindings;
 - add a bounded blocking pool;
 - integrate application and service shutdown;
 - expose role-specific runtime contexts.
 
-The first Phase 4 control slice is implemented without introducing an unbounded executor: `RunScope`
-propagates one absolute deadline and optional cancellation token through the existing bounded reactor,
-manual-reset events separate cancellation signal and observation authority, and `PeriodicTimer`
-rearms one kernel one-shot timer while returning a bounded coalesced expiration count. Independent
-task groups, event-port executor integration, blocking pools, and shutdown draining remain future work.
+The initial Phase 4 runtime is implemented without introducing an unbounded executor. `RunScope`
+propagates one absolute deadline and optional cancellation token, manual-reset events separate
+cancellation signal and observation authority, and `PeriodicTimer` rearms one kernel one-shot timer
+while returning a bounded coalesced expiration count. `TaskExecutor` adds fixed task and aggregate-wait
+capacities, generation-tagged event-port registrations, queued wakeup draining, independent ready-task
+selection, terminal outcome retention, and safe slot reaping. Every task belongs to a `TaskGroup` and
+inherits its cancellation token and deadline; a task may shorten but never extend that deadline.
+Nested role-specific group hierarchies, blocking pools, shutdown draining, and broader completion
+sources remain future work.
 
 ### Phase 5: NSIDL compiler MVP
 

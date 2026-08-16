@@ -350,6 +350,14 @@ but never mutation authority. Cancellation is one-way and stops the scoped futur
 distinct runtime result. Protocol cancellation messages, transaction cleanup, and rollback remain
 separate higher-level responsibilities.
 
+The fixed-capacity `TaskExecutor` carries that contract across independently scheduled futures. Every
+task is borrowed under a `TaskGroup`, inherits the group's cancellation token and deadline, and may
+only shorten that deadline. Reactor registrations are rebound to one queued event port using keys that
+include task-slot generations; unknown or late keys are discarded, completed slots retain explicit
+application, cancellation, or timeout outcomes until reaped, and reuse advances the generation. The
+executor rejects pending futures that register no waitable object and bounds both task slots and total
+reactor waits at compile time.
+
 ### Scheduling integration
 
 Bounded synchronous IPC should support limited priority inheritance or donation so a

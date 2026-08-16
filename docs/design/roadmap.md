@@ -17,7 +17,9 @@ kind-validated handles with automatic close and retry-safe ownership-consuming m
 bounded allocation-free scoped reactor also provides asynchronous endpoint send, receive, and move
 send over the existing many-object wait ABI. It now propagates nested absolute deadlines, separates
 signal-only cancellation sources from clonable wait-only tokens, and supplies coalescing periodic
-schedules over one-shot timers. The next architecture stages are:
+schedules over one-shot timers. A fixed-capacity task executor maps generation-tagged reactor waits
+onto queued event ports, schedules only ready task slots, and retains group cancellation, inherited
+deadlines, and terminal outcomes without heap allocation. The next architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
    inspection authorization around the implemented close, duplicate, atomic replace, inspection,
@@ -33,9 +35,8 @@ schedules over one-shot timers. The next architecture stages are:
    late-reply cleanup, protocol cancellation, and priority donation;
 6. extend the implemented queued event ports beyond one-shot timers and manual-reset events to process-exit, file and network completion,
    display, device, and media event sources;
-7. evolve the scoped asynchronous IPC reactor beyond propagated deadlines, cancellation, and periodic
-   scheduling into independent task scheduling, typed service
-   bindings, tracing, and protocol conformance tests;
+7. evolve the implemented bounded independent task scheduling into nested role-specific groups,
+   typed service bindings, tracing, shutdown draining, and protocol conformance tests;
 8. introduce an IDL only after stable wire and lifecycle conventions have survived real
    services.
 
