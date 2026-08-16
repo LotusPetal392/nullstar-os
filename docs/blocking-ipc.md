@@ -42,6 +42,11 @@ asserted alongside it while already queued messages are drained. A compatibility
 wakes when the peer closes so the receive loop can observe `EPIPE`. Async send, receive, and move-send
 registrations wait on peer closure as well as ordinary readiness.
 
+ABI 1.26 adds multi-handle send and receive to the same wake paths. A successful atomic send of up
+to four moved handles wakes endpoint and generic-object waiters only after the complete message is
+queued. A successful receive wakes writers only after every destination table slot is reserved and
+the message is dequeued; insufficient byte or handle capacity leaves readiness asserted.
+
 ## Current boundary
 
 The original endpoint primitive removes cooperative polling from request/reply clients and remains

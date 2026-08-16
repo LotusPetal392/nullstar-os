@@ -151,7 +151,9 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
 
     if matches!(
         syscall_number,
-        abi::syscall::ENDPOINT_SEND | abi::syscall::ENDPOINT_SEND_MOVE
+        abi::syscall::ENDPOINT_SEND
+            | abi::syscall::ENDPOINT_SEND_MOVE
+            | abi::syscall::ENDPOINT_SEND_MOVE_MANY
     ) {
         let endpoint_object = scheduler::current_process_id().and_then(|process_id| {
             let endpoint_handle = unsafe { (*registers_pointer).rdi };
@@ -174,7 +176,9 @@ pub extern "C" fn nullstar_blocking_ipc_syscall_dispatch(
 
     if matches!(
         syscall_number,
-        abi::syscall::ENDPOINT_RECEIVE | abi::syscall::NOTIFICATION_SIGNAL
+        abi::syscall::ENDPOINT_RECEIVE
+            | abi::syscall::ENDPOINT_RECEIVE_MANY
+            | abi::syscall::NOTIFICATION_SIGNAL
     ) {
         let next_stack_pointer =
             nullstar_capability_grant_syscall_dispatch(current_stack_pointer);

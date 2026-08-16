@@ -8,7 +8,7 @@ documents remain authoritative for behavior that exists today.
 
 The current system already has bounded process-local capability tables, rights-reduced
 copying and atomic replacement, diagnostic object identity, endpoints, counted notifications,
-atomic one-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
+atomic one- and bounded multi-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
 job signal snapshots, absolute-deadline single- and bounded many-object waiting, endpoint waiting,
 atomic channel pairs with final-reference peer closure,
 direct-child bootstrap grants, and an initial userspace layer of non-cloneable owned, borrowed, and
@@ -22,8 +22,8 @@ send over the existing many-object wait ABI. The next architecture stages are:
 2. evolve the implemented process and immutable hierarchical-job containment into distinct thread
    and address-space abstractions plus broader hierarchy-scoped resource policy beyond the
    implemented process-count ceiling;
-3. evolve the implemented channel pairs, peer closure, and atomic one-handle move-transfer with
-   multiple rights-reduced handles and explicit per-job backpressure accounting;
+3. evolve the implemented channel pairs, peer closure, and atomic multi-handle move-transfer with
+   sender-side receiver-capacity reservation and explicit per-job backpressure accounting;
 4. evolve shared-memory objects from bounded copies to mapped pages with protection,
    sealing, W^X integration, and job accounting;
 5. add cancellation and a bounded synchronous call/reply path with priority donation;

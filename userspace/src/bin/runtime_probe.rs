@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     async_ipc::Reactor,
     blocking_ipc,
-    handle::{Endpoint, Notification, OwnedHandle},
+    handle::{Endpoint, MoveHandle, Notification, OwnedHandle, SharedMemory},
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
@@ -90,6 +90,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
     if !capability_probe(process_id)
         || !owned_handle_probe()
         || !channel_pair_probe(process_id)
+        || !endpoint_multi_handle_probe(process_id)
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -932,6 +933,149 @@ fn endpoint_move_transfer_probe(current_process: u64) -> bool {
     drop(received);
     drop(endpoint);
     moved && endpoint_move_waiter_probe(current_process)
+}
+
+fn endpoint_multi_handle_probe(current_process: u64) -> bool {
+    const MESSAGE: &[u8] = b"multi-handle";
+
+    let Ok((sender, receiver)) = OwnedHandle::<Endpoint>::create_pair() else {
+        return false;
+    };
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
+        return false;
+    };
+    let Ok(memory) = OwnedHandle::<SharedMemory>::create(16) else {
+        return false;
+    };
+    if notification.signal(1).ok() != Some(1) || memory.write(0, b"bulk").ok() != Some(4) {
+        return false;
+    }
+    let Ok(notification_info) = notification.info() else {
+        return false;
+    };
+    let Ok(memory_info) = memory.info() else {
+        return false;
+    };
+
+    for _ in 0..limits::MAX_ENDPOINT_MESSAGES {
+        if sender.send(&[]).is_err() {
+            return false;
+        }
+    }
+    let failed = sender
+        .send_move_many(
+            MESSAGE,
+            [
+                MoveHandle::new(notification, Rights::WAIT),
+                MoveHandle::new(memory, Rights::READ),
+            ],
+        )
+        .unwrap_err();
+    if failed.error() != ipc::Error::TRY_AGAIN {
+        return false;
+    }
+    let handles = failed.into_handles();
+    if handles[0].handle().info().ok() != Some(notification_info)
+        || handles[1].handle().info().ok() != Some(memory_info)
+    {
+        return false;
+    }
+    let mut empty = [];
+    for _ in 0..limits::MAX_ENDPOINT_MESSAGES {
+        if receiver.try_receive(&mut empty).is_err() {
+            return false;
+        }
+    }
+
+    let source_handles = [handles[0].handle().as_raw(), handles[1].handle().as_raw()];
+    if sender.send_move_many(MESSAGE, handles).is_err()
+        || source_handles
+            .iter()
+            .any(|handle| ipc::info(*handle).err() != Some(ipc::Error::BAD_FILE_DESCRIPTOR))
+    {
+        return false;
+    }
+    let mut bytes = [0_u8; MESSAGE.len()];
+    if receiver.try_receive(&mut bytes).err() != Some(ipc::Error::RANGE) {
+        return false;
+    }
+    let mut too_small = [None; 1];
+    let insufficient =
+        ipc::try_receive_many(receiver.as_raw(), &mut bytes, &mut too_small).unwrap_err();
+    if insufficient.error() != ipc::Error::RANGE
+        || insufficient.required_bytes() != MESSAGE.len()
+        || insufficient.required_capabilities() != 2
+        || too_small != [None]
+        || receiver.signal_state().ok() != Some(Signals::READABLE | Signals::WRITABLE)
+    {
+        return false;
+    }
+
+    let Ok(message) = receiver.try_receive_many::<2>(&mut bytes) else {
+        return false;
+    };
+    let [Some(notification), Some(memory)] = message.capabilities else {
+        return false;
+    };
+    let notification_rights = notification.rights;
+    let memory_rights = memory.rights;
+    let Ok(notification) = notification.handle.try_cast::<Notification>() else {
+        return false;
+    };
+    let Ok(memory) = memory.handle.try_cast::<SharedMemory>() else {
+        return false;
+    };
+    let mut bulk = [0_u8; 4];
+    let delivered = message.sender_process_id == current_process
+        && message.bytes == MESSAGE.len()
+        && message.capability_count == 2
+        && bytes == MESSAGE
+        && notification_rights == Rights::WAIT
+        && memory_rights == Rights::READ
+        && notification.info().is_ok_and(|info| {
+            info.object_id == notification_info.object_id && info.rights == Rights::WAIT
+        })
+        && memory.info().is_ok_and(|info| {
+            info.object_id == memory_info.object_id && info.rights == Rights::READ
+        })
+        && notification.try_wait().ok() == Some(0)
+        && memory.read(0, &mut bulk).ok() == Some(4)
+        && bulk == *b"bulk";
+
+    drop(notification);
+    drop(memory);
+    drop(receiver);
+    drop(sender);
+    delivered && endpoint_multi_handle_duplicate_probe()
+}
+
+fn endpoint_multi_handle_duplicate_probe() -> bool {
+    let Ok((sender, receiver)) = ipc::endpoint_create_pair() else {
+        return false;
+    };
+    let Ok(notification) = ipc::notification_create() else {
+        let _ = ipc::close(sender);
+        let _ = ipc::close(receiver);
+        return false;
+    };
+    let transfers = [
+        Transfer {
+            handle: notification,
+            rights: Rights::WAIT,
+        },
+        Transfer {
+            handle: notification,
+            rights: Rights::WAIT,
+        },
+    ];
+    let rejected = ipc::send_move_many(sender, b"duplicate", &transfers).err()
+        == Some(ipc::Error::INVALID_ARGUMENT)
+        && ipc::info(notification).is_ok()
+        && ipc::signal_state(receiver).ok() == Some(Signals::WRITABLE);
+    let closed = ipc::close(notification).is_ok()
+        && ipc::close(receiver).is_ok()
+        && ipc::close(sender).is_ok();
+    rejected && closed
 }
 
 fn endpoint_move_waiter_probe(current_process: u64) -> bool {

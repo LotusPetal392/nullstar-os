@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 25;
+pub const ABI_VERSION_MINOR: u64 = 26;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -94,6 +94,8 @@ pub mod syscall {
     pub const OBJECT_WAIT_ONE: u64 = 72;
     pub const OBJECT_WAIT_MANY: u64 = 73;
     pub const ENDPOINT_CREATE_PAIR: u64 = 74;
+    pub const ENDPOINT_SEND_MOVE_MANY: u64 = 75;
+    pub const ENDPOINT_RECEIVE_MANY: u64 = 76;
 }
 
 pub mod filesystem_provider {
@@ -127,6 +129,7 @@ pub mod capability {
     pub const OBJECT_WAIT_ONE: u64 = 1 << 21;
     pub const OBJECT_WAIT_MANY: u64 = 1 << 22;
     pub const CHANNEL_PAIRS: u64 = 1 << 23;
+    pub const MULTI_HANDLE_MESSAGES: u64 = 1 << 24;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -152,7 +155,8 @@ pub mod capability {
         | MONOTONIC_CLOCK
         | OBJECT_WAIT_ONE
         | OBJECT_WAIT_MANY
-        | CHANNEL_PAIRS;
+        | CHANNEL_PAIRS
+        | MULTI_HANDLE_MESSAGES;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -232,6 +236,52 @@ pub mod capability {
             byte_count: 0,
             transferred_handle: INVALID_HANDLE,
             transferred_rights: 0,
+        };
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HandleDisposition {
+        pub handle: u64,
+        pub rights: u64,
+    }
+
+    impl HandleDisposition {
+        pub const EMPTY: Self = Self {
+            handle: INVALID_HANDLE,
+            rights: 0,
+        };
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReceivedHandle {
+        pub handle: u64,
+        pub rights: u64,
+    }
+
+    impl ReceivedHandle {
+        pub const EMPTY: Self = Self {
+            handle: INVALID_HANDLE,
+            rights: 0,
+        };
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MessageInfoMany {
+        pub sender_process_id: u64,
+        pub byte_count: u64,
+        pub handle_count: u64,
+        pub reserved: u64,
+    }
+
+    impl MessageInfoMany {
+        pub const EMPTY: Self = Self {
+            sender_process_id: 0,
+            byte_count: 0,
+            handle_count: 0,
+            reserved: 0,
         };
     }
 }
@@ -514,6 +564,7 @@ pub mod limits {
     pub const MAX_JOB_PROCESSES: usize = 64;
     pub const MAX_ENDPOINT_MESSAGES: usize = 8;
     pub const MAX_IPC_MESSAGE_BYTES: usize = 256;
+    pub const MAX_IPC_MESSAGE_HANDLES: usize = 4;
     pub const MAX_SHARED_MEMORY_BYTES: usize = 16 * 1024;
     pub const MAX_SHARED_MEMORY_TOTAL_BYTES: usize = 256 * 1024;
     pub const MAX_OBJECT_WAIT_ITEMS: usize = 16;

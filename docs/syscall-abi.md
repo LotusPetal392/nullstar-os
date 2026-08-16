@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.25, and a
+The ABI is experimental, but callers can query the current version, 1.26, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -76,7 +76,7 @@ only a nonempty subset of the source rights.
 Endpoint send and receive are non-blocking data-movement calls. A full send
 queue or an empty receive queue returns `EAGAIN`. Receiving into a buffer smaller
 than the front message returns `ERANGE` without consuming the message. One
-message may carry one rights-reduced capability. The `userspace::ipc::receive`
+message may carry one rights-reduced capability through these compatibility calls. The `userspace::ipc::receive`
 helper yields and retries on `EAGAIN`. `endpoint_wait` is the scheduler-integrated
 readiness wait for code that wants to block until an endpoint receives a message.
 
@@ -602,6 +602,57 @@ and publishes any resulting closure. The older `ENDPOINT_CREATE` call remains a 
 one-ended loopback mailbox: its sends target its own queue and it never asserts `PEER_CLOSED`.
 `CHANNEL_PAIRS` in `SystemInfo.capabilities` advertises the operation.
 
+## Version 1.26 bounded multi-handle messages
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 75 | `ENDPOINT_SEND_MOVE_MANY` | endpoint, byte address, byte count, disposition address, disposition count | zero |
+| 76 | `ENDPOINT_RECEIVE_MANY` | endpoint, buffer address, byte capacity, handle-output address, handle capacity, message-info address | received byte count |
+
+The new calls use these fixed-width records:
+
+```rust
+#[repr(C)]
+pub struct HandleDisposition {
+    pub handle: u64,
+    pub rights: u64,
+}
+
+#[repr(C)]
+pub struct ReceivedHandle {
+    pub handle: u64,
+    pub rights: u64,
+}
+
+#[repr(C)]
+pub struct MessageInfoMany {
+    pub sender_process_id: u64,
+    pub byte_count: u64,
+    pub handle_count: u64,
+    pub reserved: u64,
+}
+```
+
+`ENDPOINT_SEND_MOVE_MANY` accepts one through four distinct source handles. Every source must carry
+`TRANSFER`, and each requested nonempty rights mask must be a subset of both its source rights and
+the rights valid for that object kind. The kernel copies and validates the entire disposition array,
+resolves the destination, and checks queue capacity before removing any source. Duplicate sources
+return `EINVAL`; an empty array returns `EINVAL`; more than four entries returns `E2BIG`. Any failed
+validation or full-queue `EAGAIN` leaves all source handles, bytes, and queue state unchanged.
+
+`ENDPOINT_RECEIVE_MANY` accepts capacity for zero through four output handles. It always validates
+the output ranges before inspecting the front message. When the byte or handle capacity is too
+small, it writes canonical required counts to `MessageInfoMany` and returns `ERANGE` without
+dequeueing or installing any handle. On success the kernel reserves all required process-local
+handle-table slots before dequeue, then publishes the bytes, ordered `{handle, rights}` records, and
+message metadata together. Table exhaustion returns `ENOSPC` with the message still queued.
+
+The ABI 1.2 receive call returns `ERANGE` without consuming a message containing more than one
+attachment, allowing old callers to leave it for a multi-handle-aware receiver. Existing zero- and
+one-handle messages are accepted by `ENDPOINT_RECEIVE_MANY`. `MULTI_HANDLE_MESSAGES` in
+`SystemInfo.capabilities` advertises both calls. Sender-side reservation against the eventual
+receiving process remains future work because receive authority may currently be shared.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -638,6 +689,7 @@ one-ended loopback mailbox: its sends target its own queue and it never asserts 
   71 and 72.
 - ABI 1.24 adds bounded absolute-deadline many-object waiting at syscall 73.
 - ABI 1.25 adds atomic channel-pair creation and level-triggered peer closure at syscall 74.
+- ABI 1.26 adds atomic move and receive of up to four message handles at syscalls 75 and 76.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

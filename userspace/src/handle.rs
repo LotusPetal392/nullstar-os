@@ -111,6 +111,43 @@ pub struct ReceivedMessage {
     pub capability: Option<ReceivedCapability>,
 }
 
+/// One ownership-consuming attachment for a multi-handle endpoint send.
+#[derive(Debug)]
+pub struct MoveHandle {
+    handle: OwnedHandle<AnyObject>,
+    rights: Rights,
+}
+
+impl MoveHandle {
+    pub fn new<T: ObjectType>(handle: OwnedHandle<T>, rights: Rights) -> Self {
+        Self {
+            handle: handle.erase(),
+            rights,
+        }
+    }
+
+    pub fn handle(&self) -> &OwnedHandle<AnyObject> {
+        &self.handle
+    }
+
+    pub const fn rights(&self) -> Rights {
+        self.rights
+    }
+
+    pub fn into_handle(self) -> OwnedHandle<AnyObject> {
+        self.handle
+    }
+}
+
+/// Typed metadata and owned attachments from one multi-handle receive.
+#[derive(Debug)]
+pub struct ReceivedMessageMany<const N: usize> {
+    pub sender_process_id: u64,
+    pub bytes: usize,
+    pub capabilities: [Option<ReceivedCapability>; N],
+    pub capability_count: usize,
+}
+
 /// A failed ownership-consuming endpoint send.
 ///
 /// The kernel leaves a moved capability installed when enqueueing fails, so this
@@ -119,6 +156,31 @@ pub struct ReceivedMessage {
 pub struct SendMoveError<T: ObjectType> {
     error: ipc::Error,
     handle: OwnedHandle<T>,
+}
+
+/// A failed ownership-consuming multi-handle endpoint send.
+#[derive(Debug)]
+pub struct SendMoveManyError<const N: usize> {
+    error: ipc::Error,
+    handles: [MoveHandle; N],
+}
+
+impl<const N: usize> SendMoveManyError<N> {
+    pub(crate) fn new(error: ipc::Error, handles: [MoveHandle; N]) -> Self {
+        Self { error, handles }
+    }
+
+    pub const fn error(&self) -> ipc::Error {
+        self.error
+    }
+
+    pub fn into_handles(self) -> [MoveHandle; N] {
+        self.handles
+    }
+
+    pub fn into_parts(self) -> (ipc::Error, [MoveHandle; N]) {
+        (self.error, self.handles)
+    }
 }
 
 impl<T: ObjectType> SendMoveError<T> {
@@ -285,8 +347,27 @@ impl OwnedHandle<Endpoint> {
         self.borrow().send_move(bytes, handle, rights)
     }
 
+    /// Atomically sends a message and moves every supplied handle.
+    ///
+    /// Success consumes all sources. Failure returns every source in its
+    /// original order inside [`SendMoveManyError`].
+    pub fn send_move_many<const N: usize>(
+        &self,
+        bytes: &[u8],
+        handles: [MoveHandle; N],
+    ) -> Result<(), SendMoveManyError<N>> {
+        self.borrow().send_move_many(bytes, handles)
+    }
+
     pub fn try_receive(&self, output: &mut [u8]) -> ipc::Result<ReceivedMessage> {
         self.borrow().try_receive(output)
+    }
+
+    pub fn try_receive_many<const N: usize>(
+        &self,
+        output: &mut [u8],
+    ) -> Result<ReceivedMessageMany<N>, ipc::ReceiveManyError> {
+        self.borrow().try_receive_many(output)
     }
 }
 
@@ -372,6 +453,14 @@ impl BorrowedHandle<'_, Endpoint> {
         send_move_with(self.as_raw(), bytes, handle, rights, ipc::send_move)
     }
 
+    pub fn send_move_many<const N: usize>(
+        self,
+        bytes: &[u8],
+        handles: [MoveHandle; N],
+    ) -> Result<(), SendMoveManyError<N>> {
+        send_move_many_with(self.as_raw(), bytes, handles, ipc::send_move_many)
+    }
+
     pub fn try_receive(self, output: &mut [u8]) -> ipc::Result<ReceivedMessage> {
         let message = ipc::try_receive(self.as_raw(), output)?;
         let capability = match message.capability {
@@ -385,6 +474,42 @@ impl BorrowedHandle<'_, Endpoint> {
             sender_process_id: message.sender_process_id,
             bytes: message.bytes,
             capability,
+        })
+    }
+
+    pub fn try_receive_many<const N: usize>(
+        self,
+        output: &mut [u8],
+    ) -> Result<ReceivedMessageMany<N>, ipc::ReceiveManyError> {
+        let mut raw: [Option<ipc::ReceivedCapability>; N] = core::array::from_fn(|_| None);
+        let message = ipc::try_receive_many(self.as_raw(), output, &mut raw)?;
+        let mut capabilities: [Option<ReceivedCapability>; N] = core::array::from_fn(|_| None);
+        for index in 0..message.capabilities {
+            let Some(capability) = raw[index].take() else {
+                for capability in raw.into_iter().flatten() {
+                    let _ = ipc::close(capability.handle);
+                }
+                return Err(ipc::ReceiveManyError::from_error(ipc::Error::IO));
+            };
+            let handle = match OwnedHandle::adopt(capability.handle) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    for capability in raw.into_iter().flatten() {
+                        let _ = ipc::close(capability.handle);
+                    }
+                    return Err(ipc::ReceiveManyError::from_error(ipc::Error::IO));
+                }
+            };
+            capabilities[index] = Some(ReceivedCapability {
+                handle,
+                rights: capability.rights,
+            });
+        }
+        Ok(ReceivedMessageMany {
+            sender_process_id: message.sender_process_id,
+            bytes: message.bytes,
+            capabilities,
+            capability_count: message.capabilities,
         })
     }
 }
@@ -415,6 +540,30 @@ where
     }
 }
 
+fn send_move_many_with<const N: usize, F>(
+    endpoint: CapabilityHandle,
+    bytes: &[u8],
+    handles: [MoveHandle; N],
+    send: F,
+) -> Result<(), SendMoveManyError<N>>
+where
+    F: FnOnce(CapabilityHandle, &[u8], &[ipc::Transfer]) -> ipc::Result<()>,
+{
+    let transfers: [ipc::Transfer; N] = core::array::from_fn(|index| ipc::Transfer {
+        handle: handles[index].handle.as_raw(),
+        rights: handles[index].rights,
+    });
+    match send(endpoint, bytes, &transfers) {
+        Ok(()) => {
+            for handle in handles {
+                let _ = handle.handle.into_raw();
+            }
+            Ok(())
+        }
+        Err(error) => Err(SendMoveManyError { error, handles }),
+    }
+}
+
 impl<T: ObjectType> Drop for OwnedHandle<T> {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
@@ -438,7 +587,7 @@ fn close_raw(raw: CapabilityHandle) -> ipc::Result<()> {
 mod tests {
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-    use super::{AnyObject, OwnedHandle, send_move_with};
+    use super::{AnyObject, MoveHandle, OwnedHandle, send_move_many_with, send_move_with};
     use crate::ipc::{self, Rights};
 
     static CLOSED_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -508,5 +657,56 @@ mod tests {
             unsafe { OwnedHandle::<AnyObject>::from_raw(0) }.unwrap_err(),
             ipc::Error::INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn multi_handle_move_is_all_or_nothing_for_ownership() {
+        reset_closes();
+        let first = unsafe { OwnedHandle::<AnyObject>::from_raw(51) }.unwrap();
+        let second = unsafe { OwnedHandle::<AnyObject>::from_raw(52) }.unwrap();
+        let failed = send_move_many_with(
+            9,
+            b"retry-many",
+            [
+                MoveHandle::new(first, Rights::WAIT),
+                MoveHandle::new(second, Rights::READ),
+            ],
+            |endpoint, bytes, transfers| {
+                assert_eq!(endpoint, 9);
+                assert_eq!(bytes, b"retry-many");
+                assert_eq!(transfers.len(), 2);
+                assert_eq!(transfers[0].handle, 51);
+                assert_eq!(transfers[0].rights, Rights::WAIT);
+                assert_eq!(transfers[1].handle, 52);
+                assert_eq!(transfers[1].rights, Rights::READ);
+                Err(ipc::Error::TRY_AGAIN)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failed.error(), ipc::Error::TRY_AGAIN);
+        let handles = failed.into_handles();
+        assert_eq!(handles[0].handle().as_raw(), 51);
+        assert_eq!(handles[1].handle().as_raw(), 52);
+        drop(handles);
+        assert_eq!(CLOSED_COUNT.load(Ordering::SeqCst), 2);
+
+        let first = unsafe { OwnedHandle::<AnyObject>::from_raw(53) }.unwrap();
+        let second = unsafe { OwnedHandle::<AnyObject>::from_raw(54) }.unwrap();
+        assert!(
+            send_move_many_with(
+                9,
+                b"sent-many",
+                [
+                    MoveHandle::new(first, Rights::WAIT),
+                    MoveHandle::new(second, Rights::READ),
+                ],
+                |_, _, transfers| {
+                    assert_eq!(transfers.len(), 2);
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(CLOSED_COUNT.load(Ordering::SeqCst), 2);
     }
 }

@@ -35,12 +35,12 @@ experimentation, not production use or untrusted workloads.
 - bounded per-process capability tables with rights-reduced duplication,
   atomic rights replacement, and delegation, message endpoints, counted
   notifications, atomic paired channel creation with peer-closure readiness,
-  atomic one-handle endpoint move-transfer, shared byte-memory
+  atomic one- and bounded multi-handle endpoint move-transfer, shared byte-memory
   objects, level-triggered endpoint, notification, and job signal snapshots,
   absolute-deadline single- and bounded many-object waits, explicit direct-child bootstrap grants,
   ownership-safe userspace handle wrappers with typed object markers, automatic close, and
   retry-safe ownership-consuming move transfer, plus a bounded allocation-free reactor for
-  asynchronous endpoint send, receive, and move-send operations,
+  asynchronous endpoint send, receive, and single- or multi-handle move-send operations,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and

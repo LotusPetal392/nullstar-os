@@ -28,7 +28,7 @@ struct TransferredCapability {
 struct EndpointMessage {
     sender_process_id: u64,
     bytes: Vec<u8>,
-    capability: Option<TransferredCapability>,
+    capabilities: Vec<TransferredCapability>,
 }
 
 #[derive(Debug)]
@@ -173,6 +173,72 @@ impl CapabilityRegistry {
         };
         self.tables[table_index].entries.remove(entry_index);
         true
+    }
+
+    fn remove_entries(&mut self, process_id: u64, handles: &[u64]) -> bool {
+        let Some(table_index) = self.table_index(process_id) else {
+            return false;
+        };
+        if handles.iter().enumerate().any(|(index, handle)| {
+            handles[..index].contains(handle)
+                || !self.tables[table_index]
+                    .entries
+                    .iter()
+                    .any(|entry| entry.handle == *handle)
+        }) {
+            return false;
+        }
+        self.tables[table_index]
+            .entries
+            .retain(|entry| !handles.contains(&entry.handle));
+        true
+    }
+
+    fn insert_entries(
+        &mut self,
+        process_id: u64,
+        capabilities: &[TransferredCapability],
+    ) -> Result<Vec<u64>, i64> {
+        for capability in capabilities {
+            if capability.rights == 0
+                || capability.rights & !capability_allowed_rights(capability.object.kind) != 0
+            {
+                return Err(abi::errno::INVALID_ARGUMENT);
+            }
+            if self.object_index(capability.object).is_none() {
+                return Err(abi::errno::NO_ENTRY);
+            }
+        }
+
+        let table_index = self.ensure_table(process_id)?;
+        if self.tables[table_index]
+            .entries
+            .len()
+            .saturating_add(capabilities.len())
+            > abi::limits::MAX_CAPABILITIES_PER_PROCESS
+        {
+            return Err(abi::errno::NO_SPACE);
+        }
+        let handles = (1..=abi::limits::MAX_CAPABILITIES_PER_PROCESS as u64)
+            .filter(|candidate| {
+                !self.tables[table_index]
+                    .entries
+                    .iter()
+                    .any(|entry| entry.handle == *candidate)
+            })
+            .take(capabilities.len())
+            .collect::<Vec<_>>();
+        if handles.len() != capabilities.len() {
+            return Err(abi::errno::NO_SPACE);
+        }
+        for (handle, capability) in handles.iter().copied().zip(capabilities.iter().copied()) {
+            self.tables[table_index].entries.push(CapabilityEntry {
+                handle,
+                object: capability.object,
+                rights: capability.rights,
+            });
+        }
+        Ok(handles)
     }
 
     fn object_index(&self, reference: CapabilityObjectRef) -> Option<usize> {
@@ -328,8 +394,11 @@ impl CapabilityRegistry {
                         endpoint
                             .queue
                             .iter()
-                            .filter_map(|message| {
-                                message.capability.map(|capability| capability.object)
+                            .flat_map(|message| {
+                                message
+                                    .capabilities
+                                    .iter()
+                                    .map(|capability| capability.object)
                             })
                             .collect::<Vec<_>>(),
                     ),
@@ -665,7 +734,9 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::ENDPOINT_CREATE_PAIR
             | abi::syscall::ENDPOINT_SEND
             | abi::syscall::ENDPOINT_SEND_MOVE
+            | abi::syscall::ENDPOINT_SEND_MOVE_MANY
             | abi::syscall::ENDPOINT_RECEIVE
+            | abi::syscall::ENDPOINT_RECEIVE_MANY
             | abi::syscall::NOTIFICATION_CREATE
             | abi::syscall::NOTIFICATION_SIGNAL
             | abi::syscall::NOTIFICATION_TRY_WAIT
@@ -742,12 +813,29 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
             registers.r10,
             registers.r8,
         ),
+        abi::syscall::ENDPOINT_SEND_MOVE_MANY => endpoint_send_move_many(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            registers.r10,
+            registers.r8,
+        ),
         abi::syscall::ENDPOINT_RECEIVE => endpoint_receive(
             process_id,
             registers.rdi,
             registers.rsi,
             registers.rdx,
             registers.r10,
+        ),
+        abi::syscall::ENDPOINT_RECEIVE_MANY => endpoint_receive_many(
+            process_id,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            registers.r10,
+            registers.r8,
+            registers.r9,
         ),
         abi::syscall::NOTIFICATION_CREATE => notification_create(process_id),
         abi::syscall::NOTIFICATION_SIGNAL => {
@@ -1087,6 +1175,106 @@ fn endpoint_send_move(
     )
 }
 
+fn endpoint_send_move_many(
+    process_id: u64,
+    endpoint_handle: u64,
+    address: u64,
+    length: u64,
+    dispositions_address: u64,
+    disposition_count: u64,
+) -> u64 {
+    let bytes = match capability_read_message(process_id, address, length) {
+        Ok(bytes) => bytes,
+        Err(error) => return error_return(error),
+    };
+    let disposition_count =
+        match capability_user_length(disposition_count, abi::limits::MAX_IPC_MESSAGE_HANDLES) {
+            Ok(0) => return error_return(abi::errno::INVALID_ARGUMENT),
+            Ok(count) => count,
+            Err(error) => return error_return(error),
+        };
+    let disposition_bytes = match disposition_count
+        .checked_mul(size_of::<abi::capability::HandleDisposition>())
+    {
+        Some(bytes) => bytes,
+        None => return error_return(abi::errno::RANGE),
+    };
+    if !capability_user_range(process_id, dispositions_address, disposition_bytes, false) {
+        return error_return(abi::errno::BAD_ADDRESS);
+    }
+    let dispositions = (0..disposition_count)
+        .map(|index| unsafe {
+            ptr::read_unaligned(
+                (dispositions_address as *const abi::capability::HandleDisposition).add(index),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(endpoint_entry) = registry.entry(process_id, endpoint_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(endpoint_entry, abi::capability::RIGHT_SEND) {
+        return error_return(error);
+    }
+    if endpoint_entry.object.kind != abi::capability::KIND_ENDPOINT {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+
+    let mut source_handles = Vec::with_capacity(disposition_count);
+    let mut transfers = Vec::with_capacity(disposition_count);
+    for disposition in dispositions {
+        if disposition.handle == abi::capability::INVALID_HANDLE
+            || source_handles.contains(&disposition.handle)
+        {
+            return error_return(abi::errno::INVALID_ARGUMENT);
+        }
+        let Some(source) = registry.entry(process_id, disposition.handle) else {
+            return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+        };
+        if let Err(error) = capability_has_right(source, abi::capability::RIGHT_TRANSFER) {
+            return error_return(error);
+        }
+        if disposition.rights == 0
+            || disposition.rights & !source.rights != 0
+            || disposition.rights & !capability_allowed_rights(source.object.kind) != 0
+        {
+            return error_return(abi::errno::PERMISSION);
+        }
+        source_handles.push(disposition.handle);
+        transfers.push(TransferredCapability {
+            object: source.object,
+            rights: disposition.rights,
+        });
+    }
+
+    let destination = match endpoint_destination(&registry, endpoint_entry.object) {
+        Ok(destination) => destination,
+        Err(error) => return error_return(error),
+    };
+    let Some(object_index) = registry.object_index(destination) else {
+        return error_return(abi::errno::IO);
+    };
+    let CapabilityObjectData::Endpoint(endpoint) = &registry.objects[object_index].data else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    if endpoint.queue.len() >= abi::limits::MAX_ENDPOINT_MESSAGES {
+        return error_return(abi::errno::TRY_AGAIN);
+    }
+    if !registry.remove_entries(process_id, &source_handles) {
+        return error_return(abi::errno::IO);
+    }
+    let CapabilityObjectData::Endpoint(endpoint) = &mut registry.objects[object_index].data else {
+        return error_return(abi::errno::IO);
+    };
+    endpoint.queue.push_back(EndpointMessage {
+        sender_process_id: process_id,
+        bytes,
+        capabilities: transfers,
+    });
+    0
+}
+
 fn endpoint_send_with_disposition(
     process_id: u64,
     endpoint_handle: u64,
@@ -1157,7 +1345,7 @@ fn endpoint_send_with_disposition(
     endpoint.queue.push_back(EndpointMessage {
         sender_process_id: process_id,
         bytes,
-        capability: transfer,
+        capabilities: transfer.into_iter().collect(),
     });
     0
 }
@@ -1201,7 +1389,10 @@ fn endpoint_receive(
 
     let (message_length, transfer) = match &registry.objects[object_index].data {
         CapabilityObjectData::Endpoint(endpoint) => match endpoint.queue.front() {
-            Some(message) => (message.bytes.len(), message.capability),
+            Some(message) if message.capabilities.len() <= 1 => {
+                (message.bytes.len(), message.capabilities.first().copied())
+            }
+            Some(_) => return error_return(abi::errno::RANGE),
             None => {
                 if let EndpointPeer::Connected(peer) = endpoint.peer
                     && registry.object_index(peer).is_none()
@@ -1222,15 +1413,15 @@ fn endpoint_receive(
         return error_return(abi::errno::RANGE);
     }
 
-    let transferred_handle = match transfer {
-        Some(capability) => {
-            match registry.insert_entry(process_id, capability.object, capability.rights) {
-                Ok(handle) => handle,
-                Err(error) => return error_return(error),
-            }
-        }
-        None => abi::capability::INVALID_HANDLE,
+    let transfers = transfer.into_iter().collect::<Vec<_>>();
+    let transferred_handles = match registry.insert_entries(process_id, &transfers) {
+        Ok(handles) => handles,
+        Err(error) => return error_return(error),
     };
+    let transferred_handle = transferred_handles
+        .first()
+        .copied()
+        .unwrap_or(abi::capability::INVALID_HANDLE);
 
     let message = match &mut registry.objects[object_index].data {
         CapabilityObjectData::Endpoint(endpoint) => endpoint
@@ -1258,11 +1449,144 @@ fn endpoint_receive(
         byte_count: message.bytes.len() as u64,
         transferred_handle,
         transferred_rights: message
-            .capability
+            .capabilities
+            .first()
+            .copied()
             .map(|capability| capability.rights)
             .unwrap_or(0),
     };
     unsafe { ptr::write_unaligned(info_address as *mut abi::capability::MessageInfo, info) };
+    registry.collect_garbage();
+    message.bytes.len() as u64
+}
+
+fn endpoint_receive_many(
+    process_id: u64,
+    endpoint_handle: u64,
+    buffer_address: u64,
+    buffer_length: u64,
+    handles_address: u64,
+    handle_capacity: u64,
+    info_address: u64,
+) -> u64 {
+    let buffer_length =
+        match capability_user_length(buffer_length, abi::limits::MAX_IPC_MESSAGE_BYTES) {
+            Ok(length) => length,
+            Err(error) => return error_return(error),
+        };
+    let handle_capacity =
+        match capability_user_length(handle_capacity, abi::limits::MAX_IPC_MESSAGE_HANDLES) {
+            Ok(capacity) => capacity,
+            Err(error) => return error_return(error),
+        };
+    let handles_length = match handle_capacity
+        .checked_mul(size_of::<abi::capability::ReceivedHandle>())
+    {
+        Some(length) => length,
+        None => return error_return(abi::errno::RANGE),
+    };
+    if !capability_user_range(process_id, buffer_address, buffer_length, true)
+        || !capability_user_range(process_id, handles_address, handles_length, true)
+        || !user_range_allows(
+            process_id,
+            info_address,
+            size_of::<abi::capability::MessageInfoMany>(),
+            true,
+        )
+    {
+        return error_return(abi::errno::BAD_ADDRESS);
+    }
+
+    let mut registry = CAPABILITY_REGISTRY.lock();
+    let Some(endpoint_entry) = registry.entry(process_id, endpoint_handle) else {
+        return error_return(abi::errno::BAD_FILE_DESCRIPTOR);
+    };
+    if let Err(error) = capability_has_right(endpoint_entry, abi::capability::RIGHT_RECEIVE) {
+        return error_return(error);
+    }
+    if endpoint_entry.object.kind != abi::capability::KIND_ENDPOINT {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let Some(object_index) = registry.object_index(endpoint_entry.object) else {
+        return error_return(abi::errno::IO);
+    };
+
+    let (message_length, transfers, sender_process_id) =
+        match &registry.objects[object_index].data {
+            CapabilityObjectData::Endpoint(endpoint) => match endpoint.queue.front() {
+                Some(message) => (
+                    message.bytes.len(),
+                    message.capabilities.clone(),
+                    message.sender_process_id,
+                ),
+                None => {
+                    if let EndpointPeer::Connected(peer) = endpoint.peer
+                        && registry.object_index(peer).is_none()
+                    {
+                        return error_return(abi::errno::BROKEN_PIPE);
+                    }
+                    return error_return(abi::errno::TRY_AGAIN);
+                }
+            },
+            CapabilityObjectData::Notification(_)
+            | CapabilityObjectData::SharedMemory(_)
+            | CapabilityObjectData::KernelEarlyLogReader(_)
+            | CapabilityObjectData::Job(_) => {
+                return error_return(abi::errno::INVALID_ARGUMENT);
+            }
+        };
+    let info = abi::capability::MessageInfoMany {
+        sender_process_id,
+        byte_count: message_length as u64,
+        handle_count: transfers.len() as u64,
+        reserved: 0,
+    };
+    unsafe { ptr::write_unaligned(info_address as *mut abi::capability::MessageInfoMany, info) };
+    if message_length > buffer_length || transfers.len() > handle_capacity {
+        return error_return(abi::errno::RANGE);
+    }
+
+    let transferred_handles = match registry.insert_entries(process_id, &transfers) {
+        Ok(handles) => handles,
+        Err(error) => return error_return(error),
+    };
+    let message = match &mut registry.objects[object_index].data {
+        CapabilityObjectData::Endpoint(endpoint) => endpoint
+            .queue
+            .pop_front()
+            .expect("endpoint message disappeared during receive-many"),
+        CapabilityObjectData::Notification(_)
+        | CapabilityObjectData::SharedMemory(_)
+        | CapabilityObjectData::KernelEarlyLogReader(_)
+        | CapabilityObjectData::Job(_) => {
+            return error_return(abi::errno::IO);
+        }
+    };
+    if !message.bytes.is_empty() {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                message.bytes.as_ptr(),
+                buffer_address as *mut u8,
+                message.bytes.len(),
+            )
+        };
+    }
+    for (index, (handle, capability)) in transferred_handles
+        .iter()
+        .copied()
+        .zip(message.capabilities.iter().copied())
+        .enumerate()
+    {
+        unsafe {
+            ptr::write_unaligned(
+                (handles_address as *mut abi::capability::ReceivedHandle).add(index),
+                abi::capability::ReceivedHandle {
+                    handle,
+                    rights: capability.rights,
+                },
+            )
+        };
+    }
     registry.collect_garbage();
     message.bytes.len() as u64
 }
