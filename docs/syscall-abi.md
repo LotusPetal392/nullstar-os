@@ -653,6 +653,45 @@ one-handle messages are accepted by `ENDPOINT_RECEIVE_MANY`. `MULTI_HANDLE_MESSA
 `SystemInfo.capabilities` advertises both calls. Sender-side reservation against the eventual
 receiving process remains future work because receive authority may currently be shared.
 
+## Version 1.27 bounded persistent wait sets
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 77 | `WAIT_SET_CREATE` | none | wait-set handle |
+| 78 | `WAIT_SET_ADD` | wait set, target, requested signals, key | zero |
+| 79 | `WAIT_SET_REMOVE` | wait set, key | zero |
+| 80 | `WAIT_SET_WAIT` | wait set, absolute deadline | packed readiness event |
+
+A wait set is a transferable kernel object with `DUPLICATE | TRANSFER | WAIT | MANAGE` rights and
+space for at most 64 persistent registrations. `WAIT_SET_ADD` requires `MANAGE` on the set and
+`WAIT` on an endpoint, notification, or job target. The signal mask must be nonempty and supported
+by the target, the key must be unique within the set, and keys are limited to `2^55 - 1`.
+Unsupported masks, duplicate keys, nested wait sets, and out-of-range keys return `EINVAL`; a full
+set returns `ENOSPC`. `WAIT_SET_REMOVE` requires `MANAGE` and returns `ENOENT` for an unknown key.
+
+Each registration retains the target object even if its original handle is closed. Consequently a
+wait-set handle reduced to `WAIT` intentionally delegates observation of every registered target
+without delegating their individual handles. Removing the registration or destroying the final
+wait-set reference releases that retained object identity.
+
+`WAIT_SET_WAIT` requires `WAIT` on a nonempty set and uses the same absolute monotonic deadlines as
+the object-wait calls: zero polls, `UINT64_MAX` waits indefinitely, and an expired finite deadline
+returns `ETIMEDOUT`. The kernel snapshots the current registrations before state inspection and
+scheduler blocking, so add/remove operations affect the next wait while target signal transitions
+continue to wake the in-flight snapshot. Ready registrations are selected in insertion order.
+Readiness is level-triggered and does not consume the underlying object state.
+
+A successful result packs the caller key and asserted signals into one nonnegative `u64`:
+
+```text
+event = (key << 8) | asserted_signals
+key = event >> 8
+asserted_signals = event & 0xff
+```
+
+The key bound keeps bit 63 clear, so a successful event cannot overlap the negative errno encoding.
+`WAIT_SETS` in `SystemInfo.capabilities` advertises the object and all four calls.
+
 ## Compatibility rules
 
 - Existing syscall numbers 1 through 34 are unchanged.
@@ -690,6 +729,7 @@ receiving process remains future work because receive authority may currently be
 - ABI 1.24 adds bounded absolute-deadline many-object waiting at syscall 73.
 - ABI 1.25 adds atomic channel-pair creation and level-triggered peer closure at syscall 74.
 - ABI 1.26 adds atomic move and receive of up to four message handles at syscalls 75 and 76.
+- ABI 1.27 adds bounded persistent tagged wait sets at syscalls 77 through 80.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

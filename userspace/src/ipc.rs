@@ -79,12 +79,14 @@ impl Rights {
     pub const SHARED_MEMORY: Self = Self(abi_capability::SHARED_MEMORY_RIGHTS);
     pub const KERNEL_EARLY_LOG_READER: Self = Self(abi_capability::KERNEL_EARLY_LOG_READER_RIGHTS);
     pub const JOB: Self = Self(abi_capability::JOB_RIGHTS);
+    pub const WAIT_SET: Self = Self(abi_capability::WAIT_SET_RIGHTS);
 
     pub const fn from_bits(bits: u64) -> Option<Self> {
         let all = abi_capability::ENDPOINT_RIGHTS
             | abi_capability::NOTIFICATION_RIGHTS
             | abi_capability::SHARED_MEMORY_RIGHTS
-            | abi_capability::JOB_RIGHTS;
+            | abi_capability::JOB_RIGHTS
+            | abi_capability::WAIT_SET_RIGHTS;
         if bits & !all == 0 {
             Some(Self(bits))
         } else {
@@ -175,6 +177,12 @@ pub struct WaitItem {
     requested_signals: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitSetEvent {
+    pub key: u64,
+    pub signals: Signals,
+}
+
 impl WaitItem {
     pub const fn new(handle: CapabilityHandle, requested: Signals) -> Self {
         Self {
@@ -199,6 +207,7 @@ pub enum ObjectKind {
     SharedMemory,
     KernelEarlyLogReader,
     Job,
+    WaitSet,
 }
 
 impl ObjectKind {
@@ -209,6 +218,7 @@ impl ObjectKind {
             abi_capability::KIND_SHARED_MEMORY => Some(Self::SharedMemory),
             abi_capability::KIND_KERNEL_EARLY_LOG_READER => Some(Self::KernelEarlyLogReader),
             abi_capability::KIND_JOB => Some(Self::Job),
+            abi_capability::KIND_WAIT_SET => Some(Self::WaitSet),
             _ => None,
         }
     }
@@ -413,6 +423,67 @@ pub fn wait_many(items: &[WaitItem], deadline: Deadline) -> Result<usize> {
     } else {
         Err(Error::IO)
     }
+}
+
+pub fn wait_set_create() -> Result<CapabilityHandle> {
+    let mut result = syscall::WAIT_SET_CREATE;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result)
+}
+
+pub fn wait_set_add(
+    wait_set: CapabilityHandle,
+    target: CapabilityHandle,
+    requested: Signals,
+    key: u64,
+) -> Result<()> {
+    let mut result = syscall::WAIT_SET_ADD;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") wait_set,
+            in("rsi") target,
+            in("rdx") requested.bits(),
+            in("r10") key,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn wait_set_remove(wait_set: CapabilityHandle, key: u64) -> Result<()> {
+    let mut result = syscall::WAIT_SET_REMOVE;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") wait_set,
+            in("rsi") key,
+        );
+    }
+    decode(result).map(|_| ())
+}
+
+pub fn wait_set_wait(wait_set: CapabilityHandle, deadline: Deadline) -> Result<WaitSetEvent> {
+    let mut result = syscall::WAIT_SET_WAIT;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") wait_set,
+            in("rsi") deadline.as_monotonic_ns(),
+        );
+    }
+    let event = decode(result)?;
+    let signals = Signals::from_bits(crate::abi::wait_set::event_signals(event))
+        .filter(|signals| signals.bits() != 0)
+        .ok_or(Error::IO)?;
+    Ok(WaitSetEvent {
+        key: crate::abi::wait_set::event_key(event),
+        signals,
+    })
 }
 
 pub fn wait_for_handle(handle: CapabilityHandle) -> Result<CapabilityInfo> {
@@ -967,6 +1038,10 @@ mod tests {
             ObjectKind::from_raw(capability::KIND_JOB),
             Some(ObjectKind::Job)
         );
+        assert_eq!(
+            ObjectKind::from_raw(capability::KIND_WAIT_SET),
+            Some(ObjectKind::WaitSet)
+        );
         assert_eq!(ObjectKind::from_raw(99), None);
     }
 
@@ -991,6 +1066,10 @@ mod tests {
         assert_eq!(syscall::ENDPOINT_CREATE_PAIR, 74);
         assert_eq!(syscall::ENDPOINT_SEND_MOVE_MANY, 75);
         assert_eq!(syscall::ENDPOINT_RECEIVE_MANY, 76);
+        assert_eq!(syscall::WAIT_SET_CREATE, 77);
+        assert_eq!(syscall::WAIT_SET_ADD, 78);
+        assert_eq!(syscall::WAIT_SET_REMOVE, 79);
+        assert_eq!(syscall::WAIT_SET_WAIT, 80);
         assert_eq!(core::mem::size_of::<capability::EndpointPair>(), 16);
         assert_eq!(core::mem::align_of::<capability::EndpointPair>(), 8);
         assert_eq!(core::mem::size_of::<capability::HandleDisposition>(), 16);
@@ -998,12 +1077,35 @@ mod tests {
         assert_eq!(core::mem::size_of::<capability::MessageInfoMany>(), 32);
         assert_eq!(capability::CHANNEL_PAIRS, 1 << 23);
         assert_eq!(capability::MULTI_HANDLE_MESSAGES, 1 << 24);
+        assert_eq!(capability::WAIT_SETS, 1 << 25);
         assert_eq!(
             crate::syscall::ChildStatus::from_raw(
                 crate::abi::child_status::SIGNAL_BASE + crate::abi::signal::KILL,
             )
             .signal(),
             Some(crate::abi::signal::KILL)
+        );
+    }
+
+    #[test]
+    fn wait_set_events_pack_tags_without_overlapping_errno_values() {
+        let event = crate::abi::wait_set::pack_event(
+            crate::abi::wait_set::MAX_KEY,
+            crate::abi::object_signal::READABLE | crate::abi::object_signal::PEER_CLOSED,
+        )
+        .unwrap();
+        assert!(event <= i64::MAX as u64);
+        assert_eq!(
+            crate::abi::wait_set::event_key(event),
+            crate::abi::wait_set::MAX_KEY
+        );
+        assert_eq!(
+            crate::abi::wait_set::event_signals(event),
+            crate::abi::object_signal::READABLE | crate::abi::object_signal::PEER_CLOSED
+        );
+        assert_eq!(
+            crate::abi::wait_set::pack_event(crate::abi::wait_set::MAX_KEY + 1, 1),
+            None
         );
     }
 

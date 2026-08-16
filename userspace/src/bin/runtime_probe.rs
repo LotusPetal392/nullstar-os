@@ -6,7 +6,7 @@ use userspace::{
     args::Args,
     async_ipc::Reactor,
     blocking_ipc,
-    handle::{Endpoint, MoveHandle, Notification, OwnedHandle, SharedMemory},
+    handle::{Endpoint, MoveHandle, Notification, OwnedHandle, SharedMemory, WaitSet},
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
@@ -91,6 +91,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || !owned_handle_probe()
         || !channel_pair_probe(process_id)
         || !endpoint_multi_handle_probe(process_id)
+        || !wait_set_probe()
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -167,6 +168,150 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         return false;
     }
     true
+}
+
+fn wait_set_probe() -> bool {
+    const NOTIFICATION_KEY: u64 = 41;
+
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
+        return false;
+    };
+    let Ok(wait_set) = OwnedHandle::<WaitSet>::create() else {
+        return false;
+    };
+    if !wait_set.info().is_ok_and(|info| {
+        info.kind == ObjectKind::WaitSet && info.rights == Rights::WAIT_SET && info.size == 0
+    }) || wait_set.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::INVALID_ARGUMENT)
+        || wait_set
+            .add(
+                notification.borrow(),
+                Signals::SIGNALED,
+                userspace::abi::wait_set::MAX_KEY + 1,
+            )
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || wait_set
+            .add(notification.borrow(), Signals::READABLE, NOTIFICATION_KEY)
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || wait_set
+            .add(notification.borrow(), Signals::SIGNALED, NOTIFICATION_KEY)
+            .is_err()
+        || wait_set
+            .add(notification.borrow(), Signals::SIGNALED, NOTIFICATION_KEY)
+            .err()
+            != Some(ipc::Error::INVALID_ARGUMENT)
+        || wait_set.info().ok().map(|info| info.size) != Some(1)
+        || wait_set.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || notification.signal(1).ok() != Some(1)
+    {
+        return false;
+    }
+
+    let first = wait_set.wait_next(Deadline::IMMEDIATE).ok();
+    let repeated = wait_set.wait_next(Deadline::IMMEDIATE).ok();
+    if first != repeated
+        || first
+            != Some(ipc::WaitSetEvent {
+                key: NOTIFICATION_KEY,
+                signals: Signals::SIGNALED,
+            })
+        || notification.try_wait().ok() != Some(0)
+        || wait_set.wait_next(Deadline::IMMEDIATE).err() != Some(ipc::Error::TIMED_OUT)
+        || wait_set.remove(NOTIFICATION_KEY).is_err()
+        || wait_set.remove(NOTIFICATION_KEY).err() != Some(ipc::Error::NO_ENTRY)
+        || wait_set.info().ok().map(|info| info.size) != Some(0)
+    {
+        return false;
+    }
+
+    wait_set_waiter_probe()
+}
+
+fn wait_set_waiter_probe() -> bool {
+    const CHILD_WAIT_SET_HANDLE: ipc::CapabilityHandle = 1;
+    const NOTIFICATION_KEY: u64 = 73;
+
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
+        return false;
+    };
+    let Ok(wait_set) = OwnedHandle::<WaitSet>::create() else {
+        return false;
+    };
+    if wait_set
+        .add(notification.borrow(), Signals::SIGNALED, NOTIFICATION_KEY)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return false;
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return false;
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.reader);
+        if !ipc::wait_for_handle(CHILD_WAIT_SET_HANDLE)
+            .is_ok_and(|info| info.kind == ObjectKind::WaitSet && info.rights == Rights::WAIT)
+            || syscall::write_all(barrier.writer, &[1]).is_err()
+            || syscall::close(barrier.writer).is_err()
+        {
+            syscall::exit(76);
+        }
+        let woke = ipc::wait_set_wait(CHILD_WAIT_SET_HANDLE, Deadline::INFINITE).ok()
+            == Some(ipc::WaitSetEvent {
+                key: NOTIFICATION_KEY,
+                signals: Signals::SIGNALED,
+            });
+        let closed = ipc::close(CHILD_WAIT_SET_HANDLE).is_ok();
+        syscall::exit(if woke && closed { 0 } else { 77 });
+    }
+
+    let setup = syscall::close(barrier.writer).is_ok()
+        && ipc::grant_child(
+            child,
+            wait_set.as_raw(),
+            Rights::WAIT,
+            CHILD_WAIT_SET_HANDLE,
+        )
+        .ok()
+            == Some(CHILD_WAIT_SET_HANDLE);
+    let mut ready = [0_u8; 1];
+    let synchronized = setup
+        && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
+        && ready[0] == 1
+        && syscall::close(barrier.reader).is_ok();
+    if synchronized {
+        for _ in 0..4 {
+            let _ = syscall::yield_now();
+        }
+    }
+    let signaled = synchronized && notification.signal(1).ok() == Some(1);
+    let mut child_succeeded = false;
+    if signaled {
+        for _ in 0..JOB_WAIT_YIELDS {
+            match syscall::try_wait_child(child) {
+                Ok(status) => {
+                    child_succeeded = status.success();
+                    break;
+                }
+                Err(error) if error == syscall::Errno::TRY_AGAIN => {
+                    let _ = syscall::yield_now();
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if !child_succeeded {
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+    }
+    let _ = syscall::close(barrier.reader);
+    let _ = syscall::close(barrier.writer);
+    signaled && child_succeeded
 }
 
 fn supplementary_probes_enabled(argument: &[u8]) -> bool {

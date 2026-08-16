@@ -4,8 +4,8 @@
 //! non-blocking operation first, register level-triggered readiness on
 //! [`crate::ipc::Error::TRY_AGAIN`], and let the runner sleep in the kernel's
 //! bounded `wait_many` syscall. This is the initial single-threaded runtime
-//! layer; persistent event ports and independently spawned task scheduling
-//! remain future work.
+//! layer; migration onto persistent wait sets, queued event ports, and
+//! independently spawned task scheduling remain future work.
 
 use core::{
     array,

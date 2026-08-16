@@ -192,10 +192,12 @@ Absolute deadlines compose across nested service calls without resetting the tim
 each layer. Zero represents an immediate poll and `UINT64_MAX` represents an infinite deadline.
 The many-object operation is bounded at 16 entries and returns the lowest ready array index.
 
-A later event port or persistent wait set should aggregate large numbers of registered
-objects and deliver tagged readiness records. It should cover channels, timers, process
-exit, sockets, file completion, display events, device events, and media events rather
-than forcing every subsystem to invent a separate polling API.
+ABI 1.27 adds the first persistent wait set: up to 64 wait-authorized endpoint, notification, or job
+registrations are retained under caller-defined tags and checked in insertion order with the same
+absolute deadlines and level-triggered signals. A registration retains its target object, and a
+wait snapshots the current set. Later queued event-port semantics should extend this foundation to
+timers, sockets, file completion, display events, device events, and media events rather than forcing
+every subsystem to invent a separate polling API.
 
 ### Events and timers
 
@@ -521,8 +523,8 @@ endpoint waiting, and direct-child bootstrap grants. The intended evolution is:
    lifetime, rights, signals, close, duplicate, replace, and inspection semantics;
 2. migrate one-ended endpoint consumers onto the implemented channel pairs and extend
    atomic move-transfer from one handle to bounded handle vectors;
-3. add general object waiting with monotonic deadlines, followed by persistent wait sets
-   or event ports;
+3. extend the implemented general object waiting and persistent tagged wait sets with queued event
+   ports and additional timer, file, network, display, device, and media sources;
 4. add mapped shared-memory objects, per-mapping protection, sealing, accounting, and
    explicit W^X integration;
 5. add cancellation and an optimized synchronous call/reply path with bounded priority

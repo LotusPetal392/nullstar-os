@@ -7,7 +7,9 @@
 
 use core::{marker::PhantomData, num::NonZeroU64};
 
-use crate::ipc::{self, CapabilityHandle, CapabilityInfo, Deadline, ObjectKind, Rights, Signals};
+use crate::ipc::{
+    self, CapabilityHandle, CapabilityInfo, Deadline, ObjectKind, Rights, Signals, WaitSetEvent,
+};
 
 mod sealed {
     pub trait Sealed {}
@@ -45,12 +47,17 @@ pub enum KernelEarlyLogReader {}
 #[derive(Debug)]
 pub enum Job {}
 
+/// A bounded persistent set of tagged object-signal registrations.
+#[derive(Debug)]
+pub enum WaitSet {}
+
 impl sealed::Sealed for AnyObject {}
 impl sealed::Sealed for Endpoint {}
 impl sealed::Sealed for Notification {}
 impl sealed::Sealed for SharedMemory {}
 impl sealed::Sealed for KernelEarlyLogReader {}
 impl sealed::Sealed for Job {}
+impl sealed::Sealed for WaitSet {}
 
 impl ObjectType for AnyObject {}
 impl ObjectType for Endpoint {}
@@ -58,6 +65,7 @@ impl ObjectType for Notification {}
 impl ObjectType for SharedMemory {}
 impl ObjectType for KernelEarlyLogReader {}
 impl ObjectType for Job {}
+impl ObjectType for WaitSet {}
 
 impl KnownObjectType for Endpoint {
     const KIND: ObjectKind = ObjectKind::Endpoint;
@@ -77,6 +85,10 @@ impl KnownObjectType for KernelEarlyLogReader {
 
 impl KnownObjectType for Job {
     const KIND: ObjectKind = ObjectKind::Job;
+}
+
+impl KnownObjectType for WaitSet {
+    const KIND: ObjectKind = ObjectKind::WaitSet;
 }
 
 /// Exclusive ownership of one process-local capability-table entry.
@@ -406,6 +418,29 @@ impl OwnedHandle<Job> {
 
     pub fn create_child(&self) -> ipc::Result<Self> {
         Self::adopt(ipc::job_create_child(self.as_raw())?)
+    }
+}
+
+impl OwnedHandle<WaitSet> {
+    pub fn create() -> ipc::Result<Self> {
+        Self::adopt(ipc::wait_set_create()?)
+    }
+
+    pub fn add<T: ObjectType>(
+        &self,
+        target: BorrowedHandle<'_, T>,
+        requested: Signals,
+        key: u64,
+    ) -> ipc::Result<()> {
+        ipc::wait_set_add(self.as_raw(), target.as_raw(), requested, key)
+    }
+
+    pub fn remove(&self, key: u64) -> ipc::Result<()> {
+        ipc::wait_set_remove(self.as_raw(), key)
+    }
+
+    pub fn wait_next(&self, deadline: Deadline) -> ipc::Result<WaitSetEvent> {
+        ipc::wait_set_wait(self.as_raw(), deadline)
     }
 }
 

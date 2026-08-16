@@ -997,9 +997,10 @@ real cross-process readiness wakeup plus local async send, receive, and capabili
 creation, bidirectional delivery, final-reference and process-exit peer closure, and queued-message
 drainage are covered by the QEMU runtime probe. ABI 1.26 and the typed runtime now atomically move
 up to four heterogeneous handles, return every source on failed enqueue, report insufficient receive
-capacity without dequeue, and expose the same operations as scoped futures. Persistent registrations,
-independently scheduled tasks, sender-side receiver-slot reservation, and service migration remain
-Phase 2 work.
+capacity without dequeue, and expose the same operations as scoped futures. ABI 1.27 adds bounded
+persistent wait-set registrations, caller-defined readiness tags, typed ownership, and cross-process
+blocking coverage. Queued event delivery, independently scheduled tasks, sender-side receiver-slot
+reservation, and service migration remain Phase 2 work.
 
 ### Phase 3: Hand-written protocol runtime
 

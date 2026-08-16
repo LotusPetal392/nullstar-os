@@ -9,7 +9,8 @@ documents remain authoritative for behavior that exists today.
 The current system already has bounded process-local capability tables, rights-reduced
 copying and atomic replacement, diagnostic object identity, endpoints, counted notifications,
 atomic one- and bounded multi-handle move-transfer, copied shared memory, level-triggered endpoint, notification, and
-job signal snapshots, absolute-deadline single- and bounded many-object waiting, endpoint waiting,
+job signal snapshots, absolute-deadline single- and bounded many-object waiting, bounded persistent
+tagged wait sets, endpoint waiting,
 atomic channel pairs with final-reference peer closure,
 direct-child bootstrap grants, and an initial userspace layer of non-cloneable owned, borrowed, and
 kind-validated handles with automatic close and retry-safe ownership-consuming move transfer. A
@@ -27,8 +28,8 @@ send over the existing many-object wait ABI. The next architecture stages are:
 4. evolve shared-memory objects from bounded copies to mapped pages with protection,
    sealing, W^X integration, and job accounting;
 5. add cancellation and a bounded synchronous call/reply path with priority donation;
-6. add persistent event ports or wait sets for IPC, timers, process exit, file and
-   network completion, display, device, and media events;
+6. evolve the implemented persistent wait sets into queued event ports covering timers, process
+   exit, file and network completion, display, device, and media events;
 7. evolve the scoped asynchronous IPC reactor into independent task scheduling, typed service
    bindings, tracing, and protocol conformance tests;
 8. introduce an IDL only after stable wire and lifecycle conventions have survived real

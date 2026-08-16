@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 26;
+pub const ABI_VERSION_MINOR: u64 = 27;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -96,6 +96,10 @@ pub mod syscall {
     pub const ENDPOINT_CREATE_PAIR: u64 = 74;
     pub const ENDPOINT_SEND_MOVE_MANY: u64 = 75;
     pub const ENDPOINT_RECEIVE_MANY: u64 = 76;
+    pub const WAIT_SET_CREATE: u64 = 77;
+    pub const WAIT_SET_ADD: u64 = 78;
+    pub const WAIT_SET_REMOVE: u64 = 79;
+    pub const WAIT_SET_WAIT: u64 = 80;
 }
 
 pub mod filesystem_provider {
@@ -130,6 +134,7 @@ pub mod capability {
     pub const OBJECT_WAIT_MANY: u64 = 1 << 22;
     pub const CHANNEL_PAIRS: u64 = 1 << 23;
     pub const MULTI_HANDLE_MESSAGES: u64 = 1 << 24;
+    pub const WAIT_SETS: u64 = 1 << 25;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -156,7 +161,8 @@ pub mod capability {
         | OBJECT_WAIT_ONE
         | OBJECT_WAIT_MANY
         | CHANNEL_PAIRS
-        | MULTI_HANDLE_MESSAGES;
+        | MULTI_HANDLE_MESSAGES
+        | WAIT_SETS;
 
     pub const INVALID_HANDLE: u64 = 0;
 
@@ -165,6 +171,7 @@ pub mod capability {
     pub const KIND_SHARED_MEMORY: u64 = 3;
     pub const KIND_KERNEL_EARLY_LOG_READER: u64 = 4;
     pub const KIND_JOB: u64 = 5;
+    pub const KIND_WAIT_SET: u64 = 6;
 
     pub const RIGHT_DUPLICATE: u64 = 1 << 0;
     pub const RIGHT_TRANSFER: u64 = 1 << 1;
@@ -185,6 +192,8 @@ pub mod capability {
     pub const KERNEL_EARLY_LOG_READER_RIGHTS: u64 = RIGHT_TRANSFER | RIGHT_READ;
     pub const JOB_RIGHTS: u64 =
         RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_SIGNAL | RIGHT_WAIT | RIGHT_MANAGE;
+    pub const WAIT_SET_RIGHTS: u64 =
+        RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_WAIT | RIGHT_MANAGE;
 
     #[repr(C)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +203,7 @@ pub mod capability {
         pub rights: u64,
         /// Object-specific bounded state: queued endpoint messages, pending
         /// notification count, shared-memory byte length, early-log record capacity,
-        /// or active job-member count.
+        /// active job-member count, or wait-set registration count.
         pub size: u64,
     }
 
@@ -310,6 +319,30 @@ pub mod deadline {
 pub struct ObjectWaitItem {
     pub handle: u64,
     pub requested_signals: u64,
+}
+
+pub mod wait_set {
+    /// Ready signal bits occupy the low byte of a successful `WAIT_SET_WAIT` result.
+    pub const SIGNAL_BITS: u32 = 8;
+    pub const SIGNAL_MASK: u64 = (1 << SIGNAL_BITS) - 1;
+    /// Keys are bounded so packed successful results never overlap negative errno values.
+    pub const MAX_KEY: u64 = (i64::MAX as u64) >> SIGNAL_BITS;
+
+    pub const fn pack_event(key: u64, signals: u64) -> Option<u64> {
+        if key > MAX_KEY || signals == 0 || signals & !SIGNAL_MASK != 0 {
+            None
+        } else {
+            Some((key << SIGNAL_BITS) | signals)
+        }
+    }
+
+    pub const fn event_key(event: u64) -> u64 {
+        event >> SIGNAL_BITS
+    }
+
+    pub const fn event_signals(event: u64) -> u64 {
+        event & SIGNAL_MASK
+    }
 }
 
 pub mod job {
@@ -561,6 +594,7 @@ pub mod limits {
     pub const MAX_NOTIFICATION_OBJECTS: usize = 32;
     pub const MAX_SHARED_MEMORY_OBJECTS: usize = 16;
     pub const MAX_JOB_OBJECTS: usize = 32;
+    pub const MAX_WAIT_SET_OBJECTS: usize = 16;
     pub const MAX_JOB_PROCESSES: usize = 64;
     pub const MAX_ENDPOINT_MESSAGES: usize = 8;
     pub const MAX_IPC_MESSAGE_BYTES: usize = 256;
@@ -568,6 +602,7 @@ pub mod limits {
     pub const MAX_SHARED_MEMORY_BYTES: usize = 16 * 1024;
     pub const MAX_SHARED_MEMORY_TOTAL_BYTES: usize = 256 * 1024;
     pub const MAX_OBJECT_WAIT_ITEMS: usize = 16;
+    pub const MAX_WAIT_SET_REGISTRATIONS: usize = 64;
 }
 
 pub mod errno {

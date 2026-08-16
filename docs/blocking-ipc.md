@@ -47,12 +47,19 @@ to four moved handles wakes endpoint and generic-object waiters only after the c
 queued. A successful receive wakes writers only after every destination table slot is reserved and
 the message is dequeued; insufficient byte or handle capacity leaves readiness asserted.
 
+ABI 1.27 adds persistent wait sets with up to 64 insertion-ordered registrations. A wait snapshots
+the registered targets and returns the first ready caller-defined tag plus its asserted signal bits.
+The same immediate, finite absolute-deadline, infinite, lost-wakeup, and one-outstanding-wait-per-
+process rules apply. Registration changes affect the next wait rather than mutating an in-flight
+snapshot.
+
 ## Current boundary
 
 The original endpoint primitive removes cooperative polling from request/reply clients and remains
 the blocking foundation for existing proxies. Generic bounded object waiting now supplies timeout
-deadlines and readiness selection, but neither interface provides transaction identifiers,
-kernel-owned reply slots, cancellation messages, persistent wait sets, or restart-aware kernel file
+deadlines and readiness selection, and persistent wait sets remove repeated registration copying for
+larger stable sets. The current interfaces still do not provide transaction identifiers,
+kernel-owned reply slots, cancellation messages, queued edge events, or restart-aware kernel file
 descriptors.
 
 Kernel service completions may arrive while a different userspace address
