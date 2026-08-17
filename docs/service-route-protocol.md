@@ -164,20 +164,15 @@ still behind the launch barrier. PID 1 retains exact `SIGNAL | WAIT`, uses the j
 and drains all exits to `ECHILD` before closing route sources or starting a replacement. The current
 contract provides no durable cross-boot persistence.
 
-PID 1 creates a private bootstrap endpoint, grants the logging-service child a handle with exactly
-`RECEIVE` rights, and sends exactly one 16-byte `NSGN` v1 record with no capability attachment:
-
-| Byte range | Size | Field | Encoding and constraint |
-| --- | ---: | --- | --- |
-| `0..4` | 4 | magic | ASCII `NSGN` (`4e 53 47 4e`) |
-| `4..6` | 2 | version | little-endian `u16`, exactly `1` |
-| `6..8` | 2 | reserved | all zero |
-| `8..16` | 8 | provider generation | little-endian nonzero `u64` |
-
-The service requires exact `RECEIVE` rights on its bootstrap handle, a kernel-stamped sender PID of
-`1`, an exact canonical record, and no transferred capability. It closes the bootstrap handle after
-this one receive attempt. The accepted generation identifies the collector, binds `NSLS` sessions
-and NSWP negotiation, and is the generation PID 1 publishes on both logging routes.
+PID 1 creates one private managed-start channel and grants the logging-service child its exact
+receive-only endpoint as bootstrap handle 1, with no other initial capability. It sends a role-tagged
+`NSPC` envelope containing the readiness, producer, observer, and moved kernel early-log authorities,
+then the required `NSPD` sections and canonical `NSPX` end record. The shared receiver pins the
+kernel-stamped sender as PID 1, validates service identity and arguments, adopts authorities by role,
+and obtains the nonzero provider generation from authenticated launch data. The accepted generation
+identifies the collector, binds `NSLS` sessions and NSWP negotiation, and is the generation PID 1
+publishes on both logging routes. PID 1 reacquires the transfer-only early-log reader for every
+replacement generation.
 
 This remains an integration step, not the intended permanent service manager, policy engine, or
 global service namespace. PID 1 delegates only selected stable role grants. A restartable service

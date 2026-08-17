@@ -69,15 +69,17 @@ environment, and launch plus namespace-profile metadata. Receiver-owned fixed st
 section to span the 256-byte IPC message bound while rejecting fragment gaps, duplicates, reordering,
 unknown required sections, missing mandatory sections, and an invalid final section count.
 
-The definition-backed service, tmpfs, and VFS are live transport users. PID 1 keeps each child behind
+The definition-backed service, logging, NullFS, tmpfs, and VFS are live transport users. PID 1 keeps each child behind
 its launch barrier, grants one receive-only endpoint at bootstrap handle 1, queues an `NSPC` envelope
 with moved role-tagged capabilities, sends the required `NSPD` sections and canonical `NSPX` end
-record, closes its bootstrap references, and only then releases the child. The shared tmpfs/VFS
+record, closes its bootstrap references, and only then releases the child. The shared logging/NullFS/tmpfs/VFS
 receiver requires that bootstrap endpoint to be the only initial capability, pins PID 1, validates
 identity and structured arguments against the legacy stack, and adopts readiness and request
-endpoints by policy rather than handle number. Their manager generation is authenticated descriptive
+endpoints plus logging's producer, observer, and kernel early-log authorities and NullFS's writable
+block-device authority by policy rather than handle number. PID 1 moves each transfer-only authority
+and reacquires a fresh endpoint for every replacement generation. Their manager generation is authenticated descriptive
 data in `NSPD`, so the former one-use generation endpoint is gone. This still uses the transitional
-fork/exec barrier and direct-child grant; migrating logging, NullFS, and the general process loader is
+fork/exec barrier and direct-child grant; migrating the general process loader is
 future work.
 
 ## Service discovery

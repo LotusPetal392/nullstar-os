@@ -351,6 +351,12 @@ Read-only and writable access are distinct endpoint objects and generations, bot
 delegated through ordinary endpoint `SEND` rights. Paths, discovery, provider
 registration, and UID cannot manufacture write authority.
 
+PID 1 acquires a fresh writable endpoint for each NullFS service startup attempt, moves the
+transfer-only authority into that generation's role-tagged `NSPC` envelope, and retains only its
+non-authoritative object ID for provider-loss diagnostics. The service adopts it through the shared
+managed-start receiver after authenticating PID 1 and obtains its generation from `NSPD` launch data;
+there is no fixed block-device handle or separate `NSGN` endpoint.
+
 Read-only `INFO` advertises `READ` plus `READ_ONLY`. Writable `INFO` advertises
 `READ | WRITE | FLUSH` without `READ_ONLY`, and the userspace NullFS block-device adapter
 rejects writable metadata unless both `WRITE` and `FLUSH` are present. Writes are bounded
@@ -446,7 +452,7 @@ each run because the mutation may have reached durable storage before failure be
 
 ### Service-backed mutation crash and dirty remount — implemented
 
-The dedicated crash-recovery image starts NullFS with one private receive-only capability that is not
+The dedicated crash-recovery image starts NullFS with one private role-tagged receive-only capability that is not
 part of public filesystem version 1, `NFLC`, or `NSVC`. PID 1 sends an exact 32-byte `NFCR` version 1
 `ARM` frame bound to the current service generation and a nonzero nonce. After the next successful
 nonempty `WRITE` has completed its core transaction but before the service queues the filesystem

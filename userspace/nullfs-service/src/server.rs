@@ -12,8 +12,6 @@ use userspace::{
     syscall,
 };
 
-use crate::REQUEST_HANDLE;
-
 const CRASH_TEST_FAILURE_EXIT: u64 = 38;
 
 pub struct CrashTestHook {
@@ -54,7 +52,7 @@ impl CrashTestHook {
         }
     }
 
-    fn mutation_reached(&mut self, generation: u64, request_id: u64) {
+    fn mutation_reached(&mut self, readiness: u64, generation: u64, request_id: u64) {
         let Some(nonce) = self.armed_nonce.take() else {
             return;
         };
@@ -65,7 +63,7 @@ impl CrashTestHook {
             request_id,
         )
         .unwrap_or_else(|| fail_crash_test_control());
-        if ipc::send(crate::READY_HANDLE, &message.encode(), None).is_err() {
+        if ipc::send(readiness, &message.encode(), None).is_err() {
             fail_crash_test_control();
         }
         fail(37, b"nullfs: injected crash after durable mutation\n")
@@ -76,6 +74,8 @@ pub fn serve<D: BlockDevice>(
     filesystem: Filesystem<D>,
     generation: u64,
     root_attributes: CoreNodeAttributes,
+    readiness: u64,
+    request: u64,
     crash_test: Option<CrashTestHook>,
 ) -> ! {
     let root = root_attributes.node;
@@ -98,9 +98,11 @@ pub fn serve<D: BlockDevice>(
         sessions: SessionTable::new(),
         nodes,
         opens: OpenTable::new(),
+        readiness,
+        request,
         crash_test,
     };
-    if ipc::send(crate::READY_HANDLE, crate::READY_MESSAGE, None).is_err() {
+    if ipc::send(readiness, crate::READY_MESSAGE, None).is_err() {
         fail(30, b"nullfs: readiness send failed\n");
     }
     server.run()
@@ -118,6 +120,8 @@ struct FilesystemServer<D> {
     sessions: SessionTable,
     nodes: NodeMap,
     opens: OpenTable,
+    readiness: u64,
+    request: u64,
     crash_test: Option<CrashTestHook>,
 }
 
@@ -128,7 +132,7 @@ impl<D: BlockDevice> FilesystemServer<D> {
         loop {
             self.poll_crash_test();
             let message = if self.crash_test.is_some() {
-                match ipc::try_receive(REQUEST_HANDLE, &mut request_bytes) {
+                match ipc::try_receive(self.request, &mut request_bytes) {
                     Ok(message) => message,
                     Err(error) if error == ipc::Error::TRY_AGAIN => {
                         if syscall::yield_now().is_err() {
@@ -139,7 +143,7 @@ impl<D: BlockDevice> FilesystemServer<D> {
                     Err(_) => fail(31, b"nullfs: request receive failed\n"),
                 }
             } else {
-                match ipc::receive(REQUEST_HANDLE, &mut request_bytes) {
+                match ipc::receive(self.request, &mut request_bytes) {
                     Ok(message) => message,
                     Err(_) => fail(31, b"nullfs: request receive failed\n"),
                 }
@@ -232,7 +236,7 @@ impl<D: BlockDevice> FilesystemServer<D> {
     fn send_lifecycle(&self, kind: u16, transition_id: u64) {
         let message = protocol::lifecycle::Message::new(kind, self.generation, transition_id)
             .unwrap_or_else(|| fail(36, b"nullfs: invalid lifecycle response\n"));
-        if ipc::send(crate::READY_HANDLE, &message.encode(), None).is_err() {
+        if ipc::send(self.readiness, &message.encode(), None).is_err() {
             fail(36, b"nullfs: lifecycle response failed\n");
         }
     }
@@ -243,7 +247,7 @@ impl<D: BlockDevice> FilesystemServer<D> {
             self.generation,
             transition_id,
         ) {
-            let _ = ipc::send(crate::READY_HANDLE, &message.encode(), None);
+            let _ = ipc::send(self.readiness, &message.encode(), None);
         }
         fail(36, b"nullfs: lifecycle transition failed\n")
     }
@@ -430,7 +434,7 @@ impl<D: BlockDevice> FilesystemServer<D> {
             && reply.status == protocol::status::OK
             && let Some(crash_test) = self.crash_test.as_mut()
         {
-            crash_test.mutation_reached(self.generation, request.request_id);
+            crash_test.mutation_reached(self.readiness, self.generation, request.request_id);
         }
         send_value(reply_endpoint, &reply);
         if fail_stop {
