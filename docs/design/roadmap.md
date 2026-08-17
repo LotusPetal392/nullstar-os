@@ -21,7 +21,11 @@ schedules over one-shot timers. A fixed-capacity task executor maps generation-t
 onto queued event ports, schedules only ready task slots, and retains fixed-depth role attribution,
 ancestor cancellation, inherited deadlines, bounded shutdown draining, and distinct terminal outcomes
 without heap allocation. A bounded lifecycle trace now retains sequence-ordered task transitions with
-overwrite accounting. Role-specific process contexts own explicitly supplied capabilities, validate
+overwrite accounting. Typed generic readiness, counted-notification consumption, and hierarchical
+job-exit futures feed the same registration machinery. A fixed-capacity blocking-work coordinator adds
+FIFO admission, logical worker bounds, task-group attribution, pre-dispatch cancellation and deadline
+checks, shutdown conversion, retained outcomes, and bounded tracing; actual parallel/preemptible workers
+still depend on thread/address-space support. Role-specific process contexts own explicitly supplied capabilities, validate
 typed claims, tighten rights, and construct client/server-typed bindings from bounded protocol
 descriptors whose common transport invariants have host and QEMU conformance coverage. The next
 architecture stages are:
@@ -38,8 +42,8 @@ architecture stages are:
    sealing, W^X integration, and job accounting;
 5. extend the implemented scoped cancellation foundation into bounded synchronous call/reply,
    late-reply cleanup, protocol cancellation, and priority donation;
-6. extend the implemented queued event ports beyond one-shot timers and manual-reset events to process-exit, file and network completion,
-   display, device, and media event sources;
+6. extend the implemented queued event ports and typed job-exit completion beyond current object signals
+   to file and network completion, display, device, and media event sources;
 7. integrate the implemented typed service bindings, bounded tracing, capability-bearing process
    contexts, and protocol conformance checks with the eventual startup message, generated bindings,
    privacy metadata, and real service migrations;

@@ -80,8 +80,10 @@ The original endpoint primitive removes cooperative polling from request/reply c
 the blocking foundation for existing proxies. Generic bounded object waiting now supplies timeout
 deadlines and readiness selection, and persistent wait sets remove repeated registration copying for
 larger stable sets. Queued event ports add bounded edge delivery for endpoint, notification, job,
-timer, and manual-reset event signals. The current interfaces still do not provide transaction identifiers, kernel-owned
-reply slots, cancellation messages, periodic timers, I/O completion sources, or restart-aware kernel file
+timer, and manual-reset event signals. The userspace reactor now turns generic object signals, counted
+notifications, and hierarchical job exits into typed futures over those bounded waits and event ports.
+The current kernel interfaces still do not provide transaction identifiers, kernel-owned reply slots,
+cancellation messages, periodic timers, file/network completion tokens, or restart-aware kernel file
 descriptors.
 
 Kernel service completions may arrive while a different userspace address

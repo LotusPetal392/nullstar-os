@@ -5,6 +5,7 @@ pub mod args;
 pub mod async_ipc;
 pub mod block_device;
 pub mod blocking_ipc;
+pub mod blocking_pool;
 pub mod early_log;
 pub mod endpoint_transport;
 pub mod environment;

@@ -3,13 +3,14 @@
 //! [`Reactor`] drives scoped futures. Endpoint futures attempt their
 //! non-blocking operation first, register level-triggered readiness on
 //! [`crate::ipc::Error::TRY_AGAIN`], and let the runner sleep in the kernel's
-//! bounded `wait_many` syscall. [`RunScope`] propagates one absolute deadline
-//! and a bounded set of [`CancellationToken`]s through every wait. [`PeriodicTimer`]
-//! builds explicit coalescing periodic behavior over the kernel's one-shot
-//! timer primitive. [`TaskExecutor`] drives independently ready tasks through a
-//! queued event port, while [`TaskGroup`] supplies nested role attribution,
-//! cancellation, deadline inheritance, and bounded shutdown draining without
-//! heap allocation.
+//! bounded `wait_many` syscall. Counted notifications, hierarchical job exits,
+//! and generic object readiness use the same registration path. [`RunScope`]
+//! propagates one absolute deadline and a bounded set of [`CancellationToken`]s
+//! through every wait. [`PeriodicTimer`] builds explicit coalescing periodic
+//! behavior over the kernel's one-shot timer primitive. [`TaskExecutor`] drives
+//! independently ready tasks through a queued event port, while [`TaskGroup`]
+//! supplies nested role attribution, cancellation, deadline inheritance, and
+//! bounded shutdown draining without heap allocation.
 
 use core::{
     array,
@@ -24,10 +25,10 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{
     handle::{
-        BorrowedHandle, Endpoint, Event, EventPort, MoveHandle, ObjectType, OwnedHandle,
-        ReceivedMessage, ReceivedMessageMany, SendMoveError, SendMoveManyError, Timer,
+        BorrowedHandle, Endpoint, Event, EventPort, Job, MoveHandle, Notification, ObjectType,
+        OwnedHandle, ReceivedMessage, ReceivedMessageMany, SendMoveError, SendMoveManyError, Timer,
     },
-    ipc::{self, CapabilityHandle, Deadline, EventPortEvent, Rights, Signals, WaitItem},
+    ipc::{self, CapabilityHandle, Deadline, EventPortEvent, JobExit, Rights, Signals, WaitItem},
 };
 
 /// Failure from the scoped reactor itself rather than from the driven future.
@@ -705,6 +706,44 @@ impl<const N: usize> Reactor<N> {
         }
     }
 
+    /// A future that completes when any requested signal is asserted.
+    pub fn ready<'reactor, 'handle, T: ObjectType>(
+        &'reactor self,
+        handle: BorrowedHandle<'handle, T>,
+        requested: Signals,
+    ) -> Ready<'reactor, 'handle, T, N> {
+        Ready {
+            reactor: self,
+            handle,
+            requested,
+            complete: false,
+        }
+    }
+
+    /// Consumes one notification and returns the remaining asserted count.
+    pub fn notification_completion<'reactor, 'handle>(
+        &'reactor self,
+        notification: BorrowedHandle<'handle, Notification>,
+    ) -> NotificationCompletion<'reactor, 'handle, N> {
+        NotificationCompletion {
+            reactor: self,
+            notification,
+            complete: false,
+        }
+    }
+
+    /// Consumes the next process exit retained by a hierarchical job.
+    pub fn job_exit<'reactor, 'handle>(
+        &'reactor self,
+        job: BorrowedHandle<'handle, Job>,
+    ) -> JobCompletion<'reactor, 'handle, N> {
+        JobCompletion {
+            reactor: self,
+            job,
+            complete: false,
+        }
+    }
+
     fn register(&self, item: WaitItem, waker: &Waker) -> ipc::Result<()> {
         if item.handle() == 0 || item.requested() == Signals::EMPTY {
             return Err(ipc::Error::INVALID_ARGUMENT);
@@ -839,6 +878,131 @@ struct RunningGuard<'a>(&'a Cell<bool>);
 impl Drop for RunningGuard<'_> {
     fn drop(&mut self) {
         self.0.set(false);
+    }
+}
+
+/// A future for level-triggered readiness on any typed kernel object.
+pub struct Ready<'reactor, 'handle, T: ObjectType, const N: usize> {
+    reactor: &'reactor Reactor<N>,
+    handle: BorrowedHandle<'handle, T>,
+    requested: Signals,
+    complete: bool,
+}
+
+impl<T: ObjectType, const N: usize> Future for Ready<'_, '_, T, N> {
+    type Output = ipc::Result<Signals>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(!self.complete, "readiness future polled after completion");
+        if self.requested == Signals::EMPTY {
+            self.complete = true;
+            return Poll::Ready(Err(ipc::Error::INVALID_ARGUMENT));
+        }
+        match self.handle.signal_state() {
+            Ok(asserted) => {
+                let matching = Signals::from_bits(asserted.bits() & self.requested.bits())
+                    .expect("an intersection of valid signals is valid");
+                if matching != Signals::EMPTY {
+                    self.complete = true;
+                    Poll::Ready(Ok(matching))
+                } else {
+                    match self
+                        .reactor
+                        .register(self.handle.wait_item(self.requested), context.waker())
+                    {
+                        Ok(()) => Poll::Pending,
+                        Err(error) => {
+                            self.complete = true;
+                            Poll::Ready(Err(error))
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                self.complete = true;
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+}
+
+/// A future that consumes one notification and returns its remaining count.
+pub struct NotificationCompletion<'reactor, 'handle, const N: usize> {
+    reactor: &'reactor Reactor<N>,
+    notification: BorrowedHandle<'handle, Notification>,
+    complete: bool,
+}
+
+impl<const N: usize> Future for NotificationCompletion<'_, '_, N> {
+    type Output = ipc::Result<u64>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(
+            !self.complete,
+            "notification completion future polled after completion"
+        );
+        match ipc::notification_try_wait(self.notification.as_raw()) {
+            Ok(count) => {
+                self.complete = true;
+                Poll::Ready(Ok(count))
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {
+                match self.reactor.register(
+                    self.notification.wait_item(Signals::SIGNALED),
+                    context.waker(),
+                ) {
+                    Ok(()) => Poll::Pending,
+                    Err(error) => {
+                        self.complete = true;
+                        Poll::Ready(Err(error))
+                    }
+                }
+            }
+            Err(error) => {
+                self.complete = true;
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+}
+
+/// A future that consumes one process-exit record from a hierarchical job.
+pub struct JobCompletion<'reactor, 'handle, const N: usize> {
+    reactor: &'reactor Reactor<N>,
+    job: BorrowedHandle<'handle, Job>,
+    complete: bool,
+}
+
+impl<const N: usize> Future for JobCompletion<'_, '_, N> {
+    type Output = ipc::Result<JobExit>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(
+            !self.complete,
+            "job completion future polled after completion"
+        );
+        match ipc::job_try_wait(self.job.as_raw()) {
+            Ok(exit) => {
+                self.complete = true;
+                Poll::Ready(Ok(exit))
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {
+                match self.reactor.register(
+                    self.job.wait_item(Signals::READABLE | Signals::TERMINATED),
+                    context.waker(),
+                ) {
+                    Ok(()) => Poll::Pending,
+                    Err(error) => {
+                        self.complete = true;
+                        Poll::Ready(Err(error))
+                    }
+                }
+            }
+            Err(error) => {
+                self.complete = true;
+                Poll::Ready(Err(error))
+            }
+        }
     }
 }
 
