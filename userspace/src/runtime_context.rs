@@ -40,6 +40,7 @@ impl CapabilityRole {
     pub const JOB: Self = Self(7);
     pub const READINESS: Self = Self(8);
     pub const SERVICE_GENERATION: Self = Self(9);
+    pub const SERVICE_REQUEST: Self = Self(10);
 
     pub const fn new(value: u32) -> Option<Self> {
         if value == 0 { None } else { Some(Self(value)) }

@@ -30,9 +30,11 @@ typed claims, tighten rights, and construct client/server-typed bindings from bo
 descriptors whose common transport invariants have host and QEMU conformance coverage. Canonical
 fragmented process-start data frames now add bounded typed identity, arguments, compatibility
 environment, and launch metadata without treating any descriptive field as authority. The
-definition-backed service is the first live one-channel pilot: PID 1 queues its `NSPC` generation
-and readiness capabilities, required `NSPD` sections, and `NSPX` end record before launch-barrier
-release. General loader integration and broad service migration remain future work. The next
+definition-backed service, tmpfs, and VFS now use the live one-channel path: PID 1 queues their
+role-tagged `NSPC` capabilities, required `NSPD` sections, and `NSPX` end record before
+launch-barrier release. Tmpfs and VFS additionally use a shared fail-closed receiver and carry
+manager generation in PID 1-authenticated launch data instead of a separate endpoint. Logging,
+NullFS, and general loader integration remain future work. The next
 architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
@@ -72,8 +74,8 @@ The detailed contract is in
    replacement. NullFS preserves exact quiesce, clean-unmount, and final-exit evidence before clean
    drainage; forced dirty recovery terminates and drains the complete job. PID 1 service generations
    remain flat roots; session and application hierarchy integration remains future work.
-2. expand the implemented definition-service bootstrap-channel pilot, versioned startup message,
-   and explicit handles to the general loader and remaining managed services;
+2. expand the implemented definition-service, tmpfs, and VFS bootstrap-channel path to logging,
+   NullFS, the general loader, and remaining managed processes;
 3. define stable service identity, service generation, lifecycle state, readiness,
    control, and failure protocols;
 4. keep PID 1 as a minimal bootstrap and recovery supervisor while moving ordinary

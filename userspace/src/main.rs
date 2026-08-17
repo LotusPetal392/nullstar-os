@@ -14,6 +14,10 @@ use userspace::{
     definition_service_probe, early_log,
     filesystem::{crash_test, protocol as filesystem_protocol},
     ipc::{self, CapabilityHandle, ObjectKind, Rights, Transfer},
+    managed_startup::{
+        ManagedServiceIdentity, SYSTEM_NAMESPACE_PROFILE_ID, SYSTEM_PACKAGE_GENERATION,
+        SYSTEM_PACKAGE_ID, numeric_service_id,
+    },
     nullfs_primary_volume, platform,
     process_start::{
         PROCESS_START_BOOTSTRAP_HANDLE, StartupIdentity, StartupLaunch, StartupLaunchReason,
@@ -264,6 +268,8 @@ const NULLFS_TEST_QUIESCE_GRACE_YIELDS: u32 = 8;
 const NULLFS_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
+const TMPFS_EXECUTABLE_ID: u64 = 3;
+const VFS_EXECUTABLE_ID: u64 = 4;
 
 const LOGGING_SERVICE: ServiceSpec = ServiceSpec {
     name: b"logging",
@@ -335,6 +341,13 @@ struct BootstrapCapability {
 }
 
 #[derive(Clone, Copy)]
+struct ManagedStartupCapability {
+    source_handle: CapabilityHandle,
+    rights: Rights,
+    role: CapabilityRole,
+}
+
+#[derive(Clone, Copy)]
 struct ServiceContainment {
     service: CleanupService,
     drained_message: &'static [u8],
@@ -353,9 +366,164 @@ const VFS_CONTAINMENT: ServiceContainment = ServiceContainment {
     drained_message: VFS_SERVICE_JOB_DRAINED,
 };
 
+fn managed_containment_identity(containment: ServiceContainment) -> Option<ManagedServiceIdentity> {
+    let (executable, service) = match containment.service {
+        CleanupService::Tmpfs => (TMPFS_EXECUTABLE_ID, TMPFS_SERVICE_ID),
+        CleanupService::Vfs => (VFS_EXECUTABLE_ID, VFS_SERVICE_ID),
+        _ => return None,
+    };
+    Some(ManagedServiceIdentity::new(
+        executable,
+        numeric_service_id(service.into_bytes()),
+        executable,
+    ))
+}
+
+fn send_managed_service_process_start(
+    sender: CapabilityHandle,
+    command: &[u8],
+    process_id: ProcessId,
+    generation: ProviderGeneration,
+    restart_count: u32,
+    identity: ManagedServiceIdentity,
+    capabilities: &[ManagedStartupCapability],
+) -> bool {
+    if capabilities.is_empty()
+        || capabilities.len() > userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES
+    {
+        return false;
+    }
+    let mut resources = [None; userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES];
+    let mut transfers = [Transfer {
+        handle: 0,
+        rights: Rights::EMPTY,
+    }; userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES];
+    let mut duplicates = [0; userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES];
+    for (index, capability) in capabilities.iter().enumerate() {
+        let duplicate = match ipc::duplicate(
+            capability.source_handle,
+            capability.rights | Rights::TRANSFER,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                for handle in duplicates[..index].iter().copied() {
+                    let _ = ipc::close(handle);
+                }
+                return false;
+            }
+        };
+        duplicates[index] = duplicate;
+        resources[index] = Some(StartupResource {
+            role: capability.role,
+            required: true,
+        });
+        transfers[index] = Transfer {
+            handle: duplicate,
+            rights: capability.rights,
+        };
+    }
+    let message = match StartupMessage::new(StartupRuntimeRole::Service, resources) {
+        Ok(message) => message,
+        Err(_) => {
+            for handle in duplicates[..capabilities.len()].iter().copied() {
+                let _ = ipc::close(handle);
+            }
+            return false;
+        }
+    };
+    if send_startup_message(sender, &message, &transfers[..capabilities.len()]).is_err() {
+        for handle in duplicates[..capabilities.len()].iter().copied() {
+            let _ = ipc::close(handle);
+        }
+        return false;
+    }
+
+    let mut arguments = [&[][..]; userspace::abi::limits::MAX_ARGUMENTS];
+    let mut argument_count = 0;
+    for argument in command
+        .split(u8::is_ascii_whitespace)
+        .filter(|argument| !argument.is_empty())
+    {
+        if argument_count == arguments.len() {
+            return false;
+        }
+        arguments[argument_count] = argument;
+        argument_count += 1;
+    }
+    if argument_count == 0 {
+        return false;
+    }
+    let mut argument_bytes = [0; userspace::abi::limits::MAX_ARGUMENT_BYTES];
+    let argument_length =
+        match encode_startup_arguments(&arguments[..argument_count], &mut argument_bytes) {
+            Ok(length) => length,
+            Err(_) => return false,
+        };
+    let mut environment_bytes = [0; 4];
+    let environment_length = match encode_startup_environment(&[], &mut environment_bytes) {
+        Ok(length) => length,
+        Err(_) => return false,
+    };
+    let monotonic_start_ns = match platform::monotonic_time_ns() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let identity_bytes = StartupIdentity {
+        process: process_id,
+        package: SYSTEM_PACKAGE_ID,
+        package_generation: SYSTEM_PACKAGE_GENERATION,
+        executable: identity.executable,
+        application: 0,
+        service: identity.service,
+        component: identity.component,
+        user: 0,
+        session: 0,
+    }
+    .encode();
+    let launch_bytes = StartupLaunch {
+        launch: generation.get(),
+        manager_generation: generation.get(),
+        namespace_profile: SYSTEM_NAMESPACE_PROFILE_ID,
+        monotonic_start_ns,
+        attempt: restart_count.saturating_add(1),
+        reason: if generation.get() == 1 {
+            StartupLaunchReason::Activation
+        } else {
+            StartupLaunchReason::Restart
+        },
+        flags: 0,
+    }
+    .encode();
+    let sections = [
+        StartupSectionPayload {
+            id: StartupSectionId::IDENTITY,
+            required: true,
+            bytes: &identity_bytes,
+        },
+        StartupSectionPayload {
+            id: StartupSectionId::ARGUMENTS,
+            required: true,
+            bytes: &argument_bytes[..argument_length],
+        },
+        StartupSectionPayload {
+            id: StartupSectionId::ENVIRONMENT,
+            required: true,
+            bytes: &environment_bytes[..environment_length],
+        },
+        StartupSectionPayload {
+            id: StartupSectionId::LAUNCH,
+            required: true,
+            bytes: &launch_bytes,
+        },
+    ];
+    send_process_start_data(sender, &sections).is_ok()
+}
+
 struct ContainedServiceActivationAttempt {
     containment: ServiceContainment,
     generation_handoff_source: Option<CapabilityHandle>,
+    bootstrap_sender: Option<CapabilityHandle>,
+    bootstrap_receiver_source: Option<CapabilityHandle>,
     barrier: Option<syscall::LaunchBarrier>,
     process_id: Option<ProcessId>,
     process_group_id: Option<ProcessId>,
@@ -370,6 +538,8 @@ impl ContainedServiceActivationAttempt {
         Self {
             containment,
             generation_handoff_source: None,
+            bootstrap_sender: None,
+            bootstrap_receiver_source: None,
             barrier: None,
             process_id: None,
             process_group_id: None,
@@ -392,8 +562,14 @@ impl ContainedServiceActivationAttempt {
         let mut generation_handoff_source = self.generation_handoff_source.take();
         let generation_closed = self.close_capability(&mut generation_handoff_source);
         self.generation_handoff_source = generation_handoff_source;
+        let mut bootstrap_sender = self.bootstrap_sender.take();
+        let sender_closed = self.close_capability(&mut bootstrap_sender);
+        self.bootstrap_sender = bootstrap_sender;
+        let mut bootstrap_receiver_source = self.bootstrap_receiver_source.take();
+        let receiver_closed = self.close_capability(&mut bootstrap_receiver_source);
+        self.bootstrap_receiver_source = bootstrap_receiver_source;
         let barrier_released = release_cleanup_barrier(self.containment.service, &mut self.barrier);
-        generation_closed && barrier_released
+        generation_closed && sender_closed && receiver_closed && barrier_released
     }
 
     fn abort(&mut self) -> bool {
@@ -450,12 +626,27 @@ impl ContainedServiceActivationAttempt {
         } else {
             false
         };
+        let bootstrap_closed = if process_clean {
+            let mut sender = self.bootstrap_sender.take();
+            let sender_closed = self.close_capability(&mut sender);
+            self.bootstrap_sender = sender;
+            let mut receiver = self.bootstrap_receiver_source.take();
+            let receiver_closed = self.close_capability(&mut receiver);
+            self.bootstrap_receiver_source = receiver;
+            sender_closed && receiver_closed
+        } else {
+            false
+        };
         let barrier_released = if process_clean {
             release_cleanup_barrier(self.containment.service, &mut self.barrier)
         } else {
             false
         };
-        process_clean && management_closed && generation_closed && barrier_released
+        process_clean
+            && management_closed
+            && generation_closed
+            && bootstrap_closed
+            && barrier_released
     }
 
     fn finish_reaped(&mut self) -> bool {
@@ -5742,6 +5933,7 @@ fn start_contained_service(
 ) -> (ProviderGeneration, ContainedServiceJob) {
     'attempt: loop {
         let spec = service.spec();
+        let managed_identity = managed_containment_identity(containment);
         let generation = generations
             .next_generation()
             .unwrap_or_else(|_| fail(messages.bootstrap_failed));
@@ -5770,13 +5962,22 @@ fn start_contained_service(
             fail_contained_activation(attempt, messages, messages.bootstrap_failed);
         }
 
-        let generation_handoff_source = match ipc::endpoint_create() {
-            Ok(handle) => handle,
-            Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
-        };
-        attempt.generation_handoff_source = Some(generation_handoff_source);
-        if queue_service_generation(generation_handoff_source, generation).is_err() {
-            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        if managed_identity.is_some() {
+            let (sender, receiver) = match ipc::endpoint_create_pair() {
+                Ok(pair) => pair,
+                Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
+            };
+            attempt.bootstrap_sender = Some(sender);
+            attempt.bootstrap_receiver_source = Some(receiver);
+        } else {
+            let generation_handoff_source = match ipc::endpoint_create() {
+                Ok(handle) => handle,
+                Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
+            };
+            attempt.generation_handoff_source = Some(generation_handoff_source);
+            if queue_service_generation(generation_handoff_source, generation).is_err() {
+                fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+            }
         }
         let _ = syscall::write_all(STDOUT, messages.starting);
         let barrier = match syscall::LaunchBarrier::new() {
@@ -5825,36 +6026,78 @@ fn start_contained_service(
         }
         attempt.job_management = management;
 
-        if ipc::grant_child(process_id, *readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
-            != Some(READY_HANDLE)
-            || ipc::grant_child(
-                process_id,
-                *request_endpoint,
-                Rights::RECEIVE,
-                REQUEST_HANDLE,
-            )
-            .ok()
-                != Some(REQUEST_HANDLE)
-            || ipc::grant_child(
-                process_id,
-                generation_handoff_source,
-                Rights::RECEIVE,
-                GENERATION_HANDOFF_HANDLE,
-            )
-            .ok()
-                != Some(GENERATION_HANDOFF_HANDLE)
-            || additional_capabilities.iter().copied().any(|capability| {
-                ipc::grant_child(
-                    process_id,
-                    capability.source_handle,
-                    capability.rights,
-                    capability.target_handle,
-                )
-                .ok()
-                    != Some(capability.target_handle)
-            })
-            || !attempt.release_child()
-        {
+        let bootstrap_ready = match managed_identity {
+            Some(identity) => {
+                let capabilities = [
+                    ManagedStartupCapability {
+                        source_handle: *readiness_endpoint,
+                        rights: Rights::SEND,
+                        role: CapabilityRole::READINESS,
+                    },
+                    ManagedStartupCapability {
+                        source_handle: *request_endpoint,
+                        rights: Rights::RECEIVE,
+                        role: CapabilityRole::SERVICE_REQUEST,
+                    },
+                ];
+                additional_capabilities.is_empty()
+                    && attempt.bootstrap_receiver_source.is_some_and(|receiver| {
+                        ipc::grant_child(
+                            process_id,
+                            receiver,
+                            Rights::RECEIVE,
+                            PROCESS_START_BOOTSTRAP_HANDLE,
+                        )
+                        .ok()
+                            == Some(PROCESS_START_BOOTSTRAP_HANDLE)
+                    })
+                    && attempt.bootstrap_sender.is_some_and(|sender| {
+                        send_managed_service_process_start(
+                            sender,
+                            spec.command,
+                            process_id,
+                            generation,
+                            service.restart_count(),
+                            identity,
+                            &capabilities,
+                        )
+                    })
+            }
+            None => {
+                let generation_handoff_source = attempt
+                    .generation_handoff_source
+                    .expect("legacy contained activation owns generation handoff");
+                ipc::grant_child(process_id, *readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
+                    == Some(READY_HANDLE)
+                    && ipc::grant_child(
+                        process_id,
+                        *request_endpoint,
+                        Rights::RECEIVE,
+                        REQUEST_HANDLE,
+                    )
+                    .ok()
+                        == Some(REQUEST_HANDLE)
+                    && ipc::grant_child(
+                        process_id,
+                        generation_handoff_source,
+                        Rights::RECEIVE,
+                        GENERATION_HANDOFF_HANDLE,
+                    )
+                    .ok()
+                        == Some(GENERATION_HANDOFF_HANDLE)
+                    && !additional_capabilities.iter().copied().any(|capability| {
+                        ipc::grant_child(
+                            process_id,
+                            capability.source_handle,
+                            capability.rights,
+                            capability.target_handle,
+                        )
+                        .ok()
+                            != Some(capability.target_handle)
+                    })
+            }
+        };
+        if !bootstrap_ready || !attempt.release_child() {
             fail_contained_activation(attempt, messages, messages.bootstrap_failed);
         }
         service.note_spawned(process_id);

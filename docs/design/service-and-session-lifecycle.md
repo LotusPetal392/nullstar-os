@@ -215,9 +215,10 @@ nonzero role ID. A role matters because one service can expose independently aut
 the logging producer and observer are separate routes under one service ID. The current PID 1 pilot
 owns allocation-free monotonic provider-generation sequences for logging, NullFS, tmpfs, and VFS,
 and every startup attempt consumes a generation independent of process IDs. PID 1 hands it to the
-service in a strict one-use `NSGN` v1 record over a private receive-only bootstrap endpoint; the
-service validates PID 1, exact rights, no capability attachment, and canonical encoding before
-closing the handle and declaring readiness. The generation binds filesystem sessions and proxy
+logging and NullFS services in a strict one-use `NSGN` v1 record over a private receive-only
+bootstrap endpoint. Tmpfs and VFS receive the same manager-owned value in the launch section of
+their complete PID 1-authenticated `NSPD` stream and no longer need a separate generation endpoint.
+The generation binds filesystem sessions and proxy
 registrations, while logging also binds its collector, `NSLS`, NSWP, and route publications. For a
 filesystem replacement, the kernel preserves the exact old generation as an offline tombstone and
 accepts registration only under a strictly newer generation with a fresh endpoint object. A

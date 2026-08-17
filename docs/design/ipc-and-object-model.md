@@ -475,10 +475,10 @@ the current integration.
 
 PID 1 is the temporary generation authority and owns separate allocation-free monotonic sequences for
 logging, NullFS, tmpfs, and VFS. Every startup attempt consumes a generation independent of process
-IDs. PID 1 sends it once in an exact 16-byte `NSGN` v1 record with no capability over a private
-endpoint granted to the service with exact `RECEIVE` rights. The service validates those rights,
-kernel-stamped sender PID 1, and canonical encoding, closes the bootstrap handle, and accepts the
-generation before readiness. NullFS and tmpfs bind filesystem sessions to it; PID 1 registers the
+IDs. Logging and NullFS receive it once in an exact 16-byte `NSGN` v1 record with no capability over
+a private endpoint granted with exact `RECEIVE` rights. Tmpfs and VFS receive it in the launch
+section of their complete single-channel startup stream after validating the kernel-stamped PID 1
+sender, and therefore need no separate generation endpoint. NullFS and tmpfs bind filesystem sessions to it; PID 1 registers the
 matching generation with kernel proxies; logging also binds its collector, `NSLS`, NSWP, and routes.
 A restartable service manager must eventually own the sequences and receive their state across
 replacement. The current contract provides no durable cross-boot persistence.
