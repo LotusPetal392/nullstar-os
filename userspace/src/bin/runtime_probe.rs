@@ -25,6 +25,11 @@ use userspace::{
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
+    process_start::{
+        ProcessStartData, StartupIdentity, StartupLaunch, StartupLaunchReason,
+        StartupSectionFrames, StartupSectionId, ValidatedProcessStart, encode_startup_arguments,
+        encode_startup_environment,
+    },
     runtime_context::{
         self, BindingEndpointSide, BindingTraceEvent, BindingTraceKind, CapabilityRole, Client,
         ContextError, ProcessContext, ServiceBinding, ServiceProcess, ServiceProtocol,
@@ -176,6 +181,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || !timer_probe()
         || !event_probe()
         || !runtime_context_probe()
+        || !process_start_data_probe()
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -391,6 +397,88 @@ fn runtime_context_probe() -> bool {
         && events[1].privacy == MessagePrivacy::Secret
         && events[1].trace_correlated
         && events[1].trace_id == [0; 16]
+}
+
+fn process_start_data_probe() -> bool {
+    const SUPPORTED: [StartupSectionId; 4] = [
+        StartupSectionId::IDENTITY,
+        StartupSectionId::ARGUMENTS,
+        StartupSectionId::ENVIRONMENT,
+        StartupSectionId::LAUNCH,
+    ];
+
+    let identity = StartupIdentity {
+        process: 17,
+        package: 23,
+        package_generation: 3,
+        executable: 29,
+        application: 0,
+        service: 31,
+        component: 37,
+        user: 0,
+        session: 0,
+    };
+    let launch = StartupLaunch {
+        launch: 41,
+        manager_generation: 5,
+        namespace_profile: 43,
+        monotonic_start_ns: 47,
+        attempt: 2,
+        reason: StartupLaunchReason::Restart,
+        flags: 1,
+    };
+    let mut argument_bytes = [0; 64];
+    let Ok(argument_length) =
+        encode_startup_arguments(&[b"runtime-probe", b"managed"], &mut argument_bytes)
+    else {
+        return false;
+    };
+    let mut environment_bytes = [0; 64];
+    let Ok(environment_length) = encode_startup_environment(
+        &[(b"LANG", b"C.UTF-8"), (b"MODE", b"probe")],
+        &mut environment_bytes,
+    ) else {
+        return false;
+    };
+
+    let mut data = ProcessStartData::<256, 4>::new();
+    let mut frame = [0; limits::MAX_IPC_MESSAGE_BYTES];
+    for (section, payload) in [
+        (StartupSectionId::IDENTITY, &identity.encode()[..]),
+        (
+            StartupSectionId::ARGUMENTS,
+            &argument_bytes[..argument_length],
+        ),
+        (
+            StartupSectionId::ENVIRONMENT,
+            &environment_bytes[..environment_length],
+        ),
+        (StartupSectionId::LAUNCH, &launch.encode()[..]),
+    ] {
+        let Ok(mut frames) = StartupSectionFrames::new(section, true, payload) else {
+            return false;
+        };
+        loop {
+            let length = match frames.next_frame(&mut frame) {
+                Ok(Some(length)) => length,
+                Ok(None) => break,
+                Err(_) => return false,
+            };
+            if data.push_frame(&frame[..length], &SUPPORTED).is_err() {
+                return false;
+            }
+        }
+    }
+
+    let Ok(decoded) = ValidatedProcessStart::from_data(&data) else {
+        return false;
+    };
+    decoded.identity == identity
+        && decoded.arguments.get(0) == Some(&b"runtime-probe"[..])
+        && decoded.arguments.get(1) == Some(&b"managed"[..])
+        && decoded.environment.find(b"LANG") == Some(&b"C.UTF-8"[..])
+        && decoded.environment.find(b"MODE") == Some(&b"probe"[..])
+        && decoded.launch == launch
 }
 
 fn wait_set_probe() -> bool {

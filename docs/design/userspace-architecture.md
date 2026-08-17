@@ -63,6 +63,20 @@ Native child processes do not inherit every parent handle implicitly. The curren
 direct-child grant and deterministic child handle are transitional bootstrap mechanisms,
 not the final process-start contract.
 
+The userspace runtime implements the descriptive half of that contract as `NSPD` version 1.
+Strictly ordered frames carry typed identity, structured arguments, a validated compatibility
+environment, and launch plus namespace-profile metadata. Receiver-owned fixed storage permits a
+section to span the 256-byte IPC message bound while rejecting fragment gaps, duplicates, reordering,
+unknown required sections, missing mandatory sections, and an invalid final section count.
+
+The definition-backed service is the first live transport pilot. PID 1 keeps the child behind its
+launch barrier, grants one receive-only endpoint at bootstrap handle 1, queues an `NSPC` envelope
+with moved generation and readiness capabilities, sends the required `NSPD` sections and canonical
+`NSPX` end record, closes its bootstrap references, and only then releases the child. The child pins
+PID 1 as sender and validates both capability policy and descriptive data before service logic. This
+still uses the transitional fork/exec barrier and direct-child grant; migrating the general process
+loader and the remaining services is future work.
+
 ## Service discovery
 
 Applications and services discover stable protocols through a restricted namespace or

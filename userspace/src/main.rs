@@ -13,8 +13,16 @@ use userspace::{
     abi::{INIT_PROCESS_ID, file, signal},
     definition_service_probe, early_log,
     filesystem::{crash_test, protocol as filesystem_protocol},
-    ipc::{self, CapabilityHandle, ObjectKind, Rights},
+    ipc::{self, CapabilityHandle, ObjectKind, Rights, Transfer},
     nullfs_primary_volume, platform,
+    process_start::{
+        PROCESS_START_BOOTSTRAP_HANDLE, StartupIdentity, StartupLaunch, StartupLaunchReason,
+        StartupSectionId, StartupSectionPayload, encode_startup_arguments,
+        encode_startup_environment, send_process_start_data,
+    },
+    runtime_context::{
+        CapabilityRole, StartupMessage, StartupResource, StartupRuntimeRole, send_startup_message,
+    },
     service_cleanup::{
         self, Action as CleanupAction, Diagnostic as CleanupDiagnostic,
         JobWaitResult as CleanupJobWaitResult, LeaderResult as CleanupLeaderResult,
@@ -2506,7 +2514,9 @@ fn load_definition_service<'a>(
     if definition.service_id().as_bytes() != &definition_service_probe::SERVICE_ID_BYTES
         || definition.name() != definition_service_probe::SERVICE_NAME
         || definition.executable().as_bytes() != definition_service_probe::EXECUTABLE_PATH
-        || definition.arguments().len() != 0
+        || definition.arguments().len() != 1
+        || definition.arguments().next().map(str::as_bytes)
+            != Some(definition_service_probe::MANAGED_ARGUMENT)
         || definition.readiness() != Readiness::Notify
         || definition.ready_message().map(str::as_bytes)
             != Some(definition_service_probe::READY_MESSAGE)
@@ -2904,6 +2914,8 @@ fn clear_definition_service_process(
 struct DefinitionActivationAttempt {
     generation_source: Option<CapabilityHandle>,
     readiness_endpoint: Option<CapabilityHandle>,
+    bootstrap_sender: Option<CapabilityHandle>,
+    bootstrap_receiver_source: Option<CapabilityHandle>,
     barrier: Option<syscall::LaunchBarrier>,
     process_id: Option<ProcessId>,
     process_group_id: Option<ProcessId>,
@@ -2918,6 +2930,8 @@ impl DefinitionActivationAttempt {
         Self {
             generation_source: None,
             readiness_endpoint: None,
+            bootstrap_sender: None,
+            bootstrap_receiver_source: None,
             barrier: None,
             process_id: None,
             process_group_id: None,
@@ -2956,15 +2970,31 @@ impl DefinitionActivationAttempt {
         )
     }
 
+    fn close_bootstrap(&mut self) -> bool {
+        let sender_closed = close_cleanup_capability(
+            CleanupService::Definition,
+            CleanupPhase::ResourceRelease,
+            &mut self.bootstrap_sender,
+        );
+        let receiver_closed = close_cleanup_capability(
+            CleanupService::Definition,
+            CleanupPhase::ResourceRelease,
+            &mut self.bootstrap_receiver_source,
+        );
+        sender_closed && receiver_closed
+    }
+
     fn release_child(&mut self) -> bool {
         let generation_closed = self.close_generation_source();
+        let bootstrap_closed = self.close_bootstrap();
         let barrier_released = self.release_barrier();
-        generation_closed && barrier_released
+        generation_closed && bootstrap_closed && barrier_released
     }
 
     fn abort(&mut self) -> bool {
         let generation_closed = self.close_generation_source();
         let readiness_closed = self.close_readiness();
+        let bootstrap_closed = self.close_bootstrap();
         let process_clean = if self.job_assigned {
             let clean = terminate_and_drain_service_job(
                 CleanupService::Definition,
@@ -3014,6 +3044,7 @@ impl DefinitionActivationAttempt {
         };
         generation_closed
             && readiness_closed
+            && bootstrap_closed
             && process_clean
             && management_closed
             && barrier_released
@@ -3023,6 +3054,151 @@ impl DefinitionActivationAttempt {
         self.process_id = None;
         self.abort()
     }
+}
+
+fn send_definition_process_start(
+    attempt: &mut DefinitionActivationAttempt,
+    runtime: &DefinitionServiceRuntime<'_>,
+    process_id: ProcessId,
+    generation: ProviderGeneration,
+) -> bool {
+    let Some(sender) = attempt.bootstrap_sender else {
+        return false;
+    };
+    let Some(generation_source) = attempt.generation_source else {
+        return false;
+    };
+    let generation_transfer =
+        match ipc::duplicate(generation_source, Rights::RECEIVE | Rights::TRANSFER) {
+            Ok(handle) => handle,
+            Err(_) => return false,
+        };
+    let readiness_transfer = match attempt.readiness_endpoint {
+        Some(readiness) => match ipc::duplicate(readiness, Rights::SEND | Rights::TRANSFER) {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                let _ = ipc::close(generation_transfer);
+                return false;
+            }
+        },
+        None => None,
+    };
+
+    let message = match StartupMessage::new(
+        StartupRuntimeRole::Service,
+        [
+            Some(StartupResource {
+                role: CapabilityRole::SERVICE_GENERATION,
+                required: true,
+            }),
+            readiness_transfer.map(|_| StartupResource {
+                role: CapabilityRole::READINESS,
+                required: true,
+            }),
+        ],
+    ) {
+        Ok(message) => message,
+        Err(_) => {
+            let _ = ipc::close(generation_transfer);
+            if let Some(handle) = readiness_transfer {
+                let _ = ipc::close(handle);
+            }
+            return false;
+        }
+    };
+    let transfers = [
+        Transfer {
+            handle: generation_transfer,
+            rights: Rights::RECEIVE,
+        },
+        Transfer {
+            handle: readiness_transfer.unwrap_or(0),
+            rights: Rights::SEND,
+        },
+    ];
+    let transfer_count = if readiness_transfer.is_some() { 2 } else { 1 };
+    if send_startup_message(sender, &message, &transfers[..transfer_count]).is_err() {
+        let _ = ipc::close(generation_transfer);
+        if let Some(handle) = readiness_transfer {
+            let _ = ipc::close(handle);
+        }
+        return false;
+    }
+
+    let mut arguments = [&[][..]; userspace::abi::limits::MAX_ARGUMENTS];
+    arguments[0] = runtime.definition.executable().as_bytes();
+    let mut argument_count = 1;
+    for argument in runtime.definition.arguments() {
+        if argument_count == arguments.len() {
+            return false;
+        }
+        arguments[argument_count] = argument.as_bytes();
+        argument_count += 1;
+    }
+    let mut argument_bytes = [0; userspace::abi::limits::MAX_ARGUMENT_BYTES];
+    let argument_length =
+        match encode_startup_arguments(&arguments[..argument_count], &mut argument_bytes) {
+            Ok(length) => length,
+            Err(_) => return false,
+        };
+    let mut environment_bytes = [0; 4];
+    let environment_length = match encode_startup_environment(&[], &mut environment_bytes) {
+        Ok(length) => length,
+        Err(_) => return false,
+    };
+    let monotonic_start_ns = match platform::monotonic_time_ns() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let identity = StartupIdentity {
+        process: process_id,
+        package: definition_service_probe::SYSTEM_PACKAGE_ID,
+        package_generation: generation.get(),
+        executable: definition_service_probe::EXECUTABLE_ID,
+        application: 0,
+        service: definition_service_probe::SERVICE_NUMERIC_ID,
+        component: definition_service_probe::COMPONENT_ID,
+        user: 0,
+        session: 0,
+    }
+    .encode();
+    let launch = StartupLaunch {
+        launch: generation.get(),
+        manager_generation: generation.get(),
+        namespace_profile: definition_service_probe::NAMESPACE_PROFILE_ID,
+        monotonic_start_ns,
+        attempt: runtime.restart_count.saturating_add(1),
+        reason: if runtime.restart_count == 0 {
+            StartupLaunchReason::Activation
+        } else {
+            StartupLaunchReason::Restart
+        },
+        flags: 0,
+    }
+    .encode();
+    let sections = [
+        StartupSectionPayload {
+            id: StartupSectionId::IDENTITY,
+            required: true,
+            bytes: &identity,
+        },
+        StartupSectionPayload {
+            id: StartupSectionId::ARGUMENTS,
+            required: true,
+            bytes: &argument_bytes[..argument_length],
+        },
+        StartupSectionPayload {
+            id: StartupSectionId::ENVIRONMENT,
+            required: true,
+            bytes: &environment_bytes[..environment_length],
+        },
+        StartupSectionPayload {
+            id: StartupSectionId::LAUNCH,
+            required: true,
+            bytes: &launch,
+        },
+    ];
+    send_process_start_data(sender, &sections).is_ok()
 }
 
 fn cleanup_definition_attempt(
@@ -3100,6 +3276,15 @@ fn start_definition_service(
         };
         attempt.readiness_endpoint = Some(readiness_endpoint);
     }
+    let (bootstrap_sender, bootstrap_receiver_source) = match ipc::endpoint_create_pair() {
+        Ok(pair) => pair,
+        Err(_) => {
+            cleanup_definition_attempt(runtime, attempt, false)?;
+            return Err(DefinitionServiceError::Activation);
+        }
+    };
+    attempt.bootstrap_sender = Some(bootstrap_sender);
+    attempt.bootstrap_receiver_source = Some(bootstrap_receiver_source);
     let barrier = match syscall::LaunchBarrier::new() {
         Ok(barrier) => barrier,
         Err(_) => {
@@ -3145,19 +3330,19 @@ fn start_definition_service(
         cleanup_definition_attempt(runtime, attempt, false)?;
         return Err(DefinitionServiceError::Activation);
     }
-    let readiness_granted = attempt.readiness_endpoint.is_none_or(|endpoint| {
-        ipc::grant_child(process_id, endpoint, Rights::SEND, READY_HANDLE).ok()
-            == Some(READY_HANDLE)
+    let bootstrap_granted = attempt.bootstrap_receiver_source.is_some_and(|endpoint| {
+        ipc::grant_child(
+            process_id,
+            endpoint,
+            Rights::RECEIVE,
+            PROCESS_START_BOOTSTRAP_HANDLE,
+        )
+        .ok()
+            == Some(PROCESS_START_BOOTSTRAP_HANDLE)
     });
-    let generation_granted = ipc::grant_child(
-        process_id,
-        generation_source,
-        Rights::RECEIVE,
-        GENERATION_HANDOFF_HANDLE,
-    )
-    .ok()
-        == Some(GENERATION_HANDOFF_HANDLE);
-    if !readiness_granted || !generation_granted || !attempt.release_child() {
+    let startup_sent = bootstrap_granted
+        && send_definition_process_start(&mut attempt, runtime, process_id, generation);
+    if !startup_sent || !attempt.release_child() {
         cleanup_definition_attempt(runtime, attempt, false)?;
         return Err(DefinitionServiceError::Activation);
     }

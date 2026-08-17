@@ -461,8 +461,13 @@ fn build_nullfs_fixture(exec_target_path: &Path, definition_service_path: &Path)
     );
     assert_eq!(
         definition.arguments().len(),
-        0,
-        "activation pilot does not support definition arguments"
+        1,
+        "activation pilot must contain its bootstrap-transport argument"
+    );
+    assert_eq!(
+        definition.arguments().next().map(str::as_bytes),
+        Some(definition_service_probe::MANAGED_ARGUMENT),
+        "embedded service definition argument drifted"
     );
     assert_eq!(
         definition.readiness(),
