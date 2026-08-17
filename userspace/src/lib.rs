@@ -16,6 +16,7 @@ pub mod heap;
 pub mod ipc;
 pub mod logctl;
 pub mod logging_session;
+pub mod managed_startup;
 pub mod platform;
 pub mod process_start;
 pub mod runtime_context;

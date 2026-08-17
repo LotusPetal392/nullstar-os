@@ -4,13 +4,15 @@
 use core::{mem::size_of, slice};
 
 use userspace::{
-    abi::INIT_PROCESS_ID,
     args::Args,
     filesystem::protocol as filesystem_protocol,
     filesystem_service::{Error as SessionError, NodeReference, NodeReferenceError, SessionTable},
+    handle::Endpoint,
     ipc::{self, ObjectKind, ReceivedCapability, Rights},
+    managed_startup::{ManagedServiceIdentity, numeric_service_id, receive_managed_service_start},
     platform,
-    service_route::receive_service_generation,
+    runtime_context::{CapabilityRole, StartupCapabilityPolicy},
+    service_control::TMPFS_SERVICE_ID,
     syscall,
     tmpfs::protocol,
 };
@@ -18,9 +20,12 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const READY_HANDLE: u64 = 1;
-const REQUEST_HANDLE: u64 = 2;
-const GENERATION_HANDOFF_HANDLE: u64 = 5;
+const EXECUTABLE_ID: u64 = 3;
+const SERVICE_IDENTITY: ManagedServiceIdentity = ManagedServiceIdentity::new(
+    EXECUTABLE_ID,
+    numeric_service_id(TMPFS_SERVICE_ID.into_bytes()),
+    EXECUTABLE_ID,
+);
 const READY_MESSAGE: &[u8] = b"service-ready: tmpfs";
 const CONTAINMENT_TEST_ARGUMENT: &[u8] = b"--containment-test";
 const CONTAINMENT_DESCENDANT_MARKER: &[u8] =
@@ -112,25 +117,42 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         syscall::exit(1);
     }
 
-    let _ = syscall::write_all(syscall::STDERR, b"tmpfs: validating readiness handle\n");
-    if !valid_bootstrap(READY_HANDLE, ObjectKind::Endpoint, Rights::SEND) {
-        let _ = syscall::write_all(syscall::STDERR, b"tmpfs: invalid readiness handle\n");
-        syscall::exit(2);
-    }
-
-    let _ = syscall::write_all(syscall::STDERR, b"tmpfs: validating request handle\n");
-    if !valid_bootstrap(REQUEST_HANDLE, ObjectKind::Endpoint, Rights::RECEIVE) {
-        let _ = syscall::write_all(syscall::STDERR, b"tmpfs: invalid request handle\n");
-        syscall::exit(3);
-    }
-
-    let generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
-        Ok(generation) => generation.get(),
-        Err(_) => {
-            let _ = syscall::write_all(syscall::STDERR, b"tmpfs: generation handoff failed\n");
-            syscall::exit(4);
-        }
+    let policies = [
+        StartupCapabilityPolicy {
+            role: CapabilityRole::READINESS,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::SEND,
+            maximum_rights: Rights::SEND,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::SERVICE_REQUEST,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::RECEIVE,
+            maximum_rights: Rights::RECEIVE,
+            required: true,
+        },
+    ];
+    let mut start = match receive_managed_service_start::<2>(arguments, &policies, SERVICE_IDENTITY)
+    {
+        Ok(start) => start,
+        Err(_) => syscall::exit(2),
     };
+    let readiness = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::READINESS, Rights::SEND)
+    {
+        Ok(handle) => handle.into_raw(),
+        Err(_) => syscall::exit(3),
+    };
+    let request = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::SERVICE_REQUEST, Rights::RECEIVE)
+    {
+        Ok(handle) if start.context.is_empty() => handle.into_raw(),
+        _ => syscall::exit(3),
+    };
+    let generation = start.generation;
     let legacy_generation = match u32::try_from(generation) {
         Ok(generation) => generation,
         Err(_) => syscall::exit(4),
@@ -140,7 +162,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
 
     let _ = syscall::write_all(syscall::STDERR, b"tmpfs: sending readiness message\n");
-    if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err() {
+    if ipc::send(readiness, READY_MESSAGE, None).is_err() || ipc::close(readiness).is_err() {
         let _ = syscall::write_all(syscall::STDERR, b"tmpfs: readiness send failed\n");
         syscall::exit(5);
     }
@@ -150,7 +172,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let mut sessions = SessionTable::new();
     let mut request_bytes = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
     loop {
-        let message = match ipc::receive(REQUEST_HANDLE, &mut request_bytes) {
+        let message = match ipc::receive(request, &mut request_bytes) {
             Ok(message) => message,
             Err(_) => syscall::exit(6),
         };
@@ -961,10 +983,6 @@ fn send_value<T>(endpoint: u64, value: &T) {
 
 fn value_bytes<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
-}
-
-fn valid_bootstrap(handle: u64, kind: ObjectKind, rights: Rights) -> bool {
-    ipc::wait_for_handle(handle).is_ok_and(|info| info.kind == kind && info.rights == rights)
 }
 
 fn dispatch(

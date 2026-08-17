@@ -4,11 +4,13 @@
 use core::{mem::size_of, slice};
 
 use userspace::{
-    abi::INIT_PROCESS_ID,
     args::Args,
+    handle::Endpoint,
     ipc::{self, ObjectKind, Rights},
+    managed_startup::{ManagedServiceIdentity, numeric_service_id, receive_managed_service_start},
     nullfs_primary_volume, platform,
-    service_route::receive_service_generation,
+    runtime_context::{CapabilityRole, StartupCapabilityPolicy},
+    service_control::VFS_SERVICE_ID,
     syscall,
     vfs::protocol,
 };
@@ -16,9 +18,12 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const READY_HANDLE: u64 = 1;
-const REQUEST_HANDLE: u64 = 2;
-const GENERATION_HANDOFF_HANDLE: u64 = 5;
+const EXECUTABLE_ID: u64 = 4;
+const SERVICE_IDENTITY: ManagedServiceIdentity = ManagedServiceIdentity::new(
+    EXECUTABLE_ID,
+    numeric_service_id(VFS_SERVICE_ID.into_bytes()),
+    EXECUTABLE_ID,
+);
 const READY_MESSAGE: &[u8] = b"service-ready: vfs";
 const CONTAINMENT_TEST_ARGUMENT: &[u8] = b"--containment-test";
 const CONTAINMENT_DESCENDANT_MARKER: &[u8] =
@@ -172,25 +177,52 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         syscall::exit(1);
     }
 
-    if !valid_bootstrap(READY_HANDLE, ObjectKind::Endpoint, Rights::SEND)
-        || !valid_bootstrap(REQUEST_HANDLE, ObjectKind::Endpoint, Rights::RECEIVE)
+    let policies = [
+        StartupCapabilityPolicy {
+            role: CapabilityRole::READINESS,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::SEND,
+            maximum_rights: Rights::SEND,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::SERVICE_REQUEST,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::RECEIVE,
+            maximum_rights: Rights::RECEIVE,
+            required: true,
+        },
+    ];
+    let mut start = match receive_managed_service_start::<2>(arguments, &policies, SERVICE_IDENTITY)
     {
-        syscall::exit(2);
-    }
-    let generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
-        Ok(generation) => generation.get(),
+        Ok(start) => start,
+        Err(_) => syscall::exit(2),
+    };
+    let readiness = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::READINESS, Rights::SEND)
+    {
+        Ok(handle) => handle.into_raw(),
         Err(_) => syscall::exit(3),
     };
+    let request = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::SERVICE_REQUEST, Rights::RECEIVE)
+    {
+        Ok(handle) if start.context.is_empty() => handle.into_raw(),
+        _ => syscall::exit(3),
+    };
+    let generation = start.generation;
     if containment_test && generation == 1 {
         spawn_containment_descendant();
     }
-    if ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err() {
+    if ipc::send(readiness, READY_MESSAGE, None).is_err() || ipc::close(readiness).is_err() {
         syscall::exit(4);
     }
 
     let mut bytes = [0_u8; userspace::abi::limits::MAX_IPC_MESSAGE_BYTES];
     loop {
-        let message = match ipc::receive(REQUEST_HANDLE, &mut bytes) {
+        let message = match ipc::receive(request, &mut bytes) {
             Ok(message) => message,
             Err(_) => syscall::exit(5),
         };
@@ -264,8 +296,4 @@ fn resolve(request: &protocol::Request) -> protocol::Reply {
     }
     reply.status = protocol::status::NOT_FOUND;
     reply
-}
-
-fn valid_bootstrap(handle: u64, kind: ObjectKind, rights: Rights) -> bool {
-    matches!(ipc::wait_for_handle(handle), Ok(info) if info.kind == kind && info.rights == rights)
 }

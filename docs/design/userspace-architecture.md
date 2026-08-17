@@ -69,13 +69,16 @@ environment, and launch plus namespace-profile metadata. Receiver-owned fixed st
 section to span the 256-byte IPC message bound while rejecting fragment gaps, duplicates, reordering,
 unknown required sections, missing mandatory sections, and an invalid final section count.
 
-The definition-backed service is the first live transport pilot. PID 1 keeps the child behind its
-launch barrier, grants one receive-only endpoint at bootstrap handle 1, queues an `NSPC` envelope
-with moved generation and readiness capabilities, sends the required `NSPD` sections and canonical
-`NSPX` end record, closes its bootstrap references, and only then releases the child. The child pins
-PID 1 as sender and validates both capability policy and descriptive data before service logic. This
-still uses the transitional fork/exec barrier and direct-child grant; migrating the general process
-loader and the remaining services is future work.
+The definition-backed service, tmpfs, and VFS are live transport users. PID 1 keeps each child behind
+its launch barrier, grants one receive-only endpoint at bootstrap handle 1, queues an `NSPC` envelope
+with moved role-tagged capabilities, sends the required `NSPD` sections and canonical `NSPX` end
+record, closes its bootstrap references, and only then releases the child. The shared tmpfs/VFS
+receiver requires that bootstrap endpoint to be the only initial capability, pins PID 1, validates
+identity and structured arguments against the legacy stack, and adopts readiness and request
+endpoints by policy rather than handle number. Their manager generation is authenticated descriptive
+data in `NSPD`, so the former one-use generation endpoint is gone. This still uses the transitional
+fork/exec barrier and direct-child grant; migrating logging, NullFS, and the general process loader is
+future work.
 
 ## Service discovery
 

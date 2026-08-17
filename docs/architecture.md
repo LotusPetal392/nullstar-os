@@ -143,12 +143,14 @@ companion codec fragments descriptive process-start identity, structured argumen
 environment, and launch metadata across bounded messages, assembles them into caller-owned fixed
 storage, and rejects gaps, reordering, malformed sections, and unsupported required extensions. Its
 namespace-profile and executable identities are data rather than authority; validated `NSPC`
-capabilities remain the authority boundary. The definition-backed service is the first live
-bootstrap-channel pilot: PID 1 moves its generation and readiness endpoints in `NSPC`, follows with
+capabilities remain the authority boundary. The definition-backed service, tmpfs, and VFS now use
+the live bootstrap-channel path. PID 1 moves their role-tagged capabilities in `NSPC`, follows with
 the required `NSPD` sections and `NSPX` end record, and releases the launch barrier only after the
-complete stream is queued. General loader integration, additional I/O event sources, sender-side
-receiver-slot reservation, generated bindings, parallel isolated blocking workers, and broad service
-migration remain future runtime work.
+complete stream is queued. A shared service receiver requires bootstrap handle 1 to be the only
+initial capability, pins PID 1, validates identity and legacy-stack argument agreement, and adopts
+capabilities by semantic role. Logging, NullFS, the general loader, additional I/O event sources,
+sender-side receiver-slot reservation, generated bindings, and parallel isolated blocking workers
+remain future migration work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh
@@ -190,10 +192,10 @@ clients send directly to the resolved service ingress.
 
 PID 1 owns allocation-free monotonic provider-generation sequences scoped to the stable identities of
 logging, NullFS, tmpfs, and VFS. Every startup attempt consumes a generation independently of process
-IDs. PID 1 sends that value in a one-use exact 16-byte `NSGN` v1 record over a private bootstrap
-endpoint granted to the service with exact `RECEIVE` rights. Each service requires sender PID 1,
-exact rights, no attached capability, and a canonical record, then closes the bootstrap handle before
-readiness. NullFS and tmpfs use the value in filesystem sessions, PID 1 uses the same value for kernel
+IDs. Logging and NullFS still receive that value in a one-use exact 16-byte `NSGN` v1 record over a
+private bootstrap endpoint. Tmpfs and VFS instead obtain it from the manager-generation field of the
+complete `NSPD` stream after pinning PID 1 on their single bootstrap channel; they no longer receive
+a generation endpoint. NullFS and tmpfs use the value in filesystem sessions, PID 1 uses the same value for kernel
 proxy registration, and logging uses it consistently for its collector, `NSLS`, NSWP, and route
 publications. The current contract provides no durable cross-boot persistence; a restartable service
 manager must eventually own and receive each sequence's state.
