@@ -667,6 +667,16 @@ The dispatcher owns:
 Service implementations should not manipulate transaction identifiers or raw attached
 handles manually.
 
+The hand-written runtime contract already represents each method's request and response privacy
+classification in `MethodDescriptor`. A typed `ServiceBinding` can be attached to a `TaskGroup` to
+form a lifecycle-managed binding that exposes the group's inherited cancellation scope, absolute
+deadline, and task attribution. Each managed binding retains at most 64 sequence-paged structural
+events. The tracing API accepts encoded body size, handle count, method ordinal, timing, transition kind,
+and an optional correlation identifier, but never accepts payload bytes. `secret` and `opaque`
+messages suppress the correlation identifier; overwritten events are reported to readers as an
+explicit gap. Generated bindings should drive this contract at validated request, response, one-way,
+and cancellation boundaries.
+
 ## Connection concurrency
 
 The server runtime should support:
@@ -1065,11 +1075,15 @@ role-specific `ProcessContext` under a trusted type-and-rights policy, including
 cleanup and pre-entry-point required-role validation. `ServiceProtocol` now consumes the same NSWP
 runtime descriptor emitted or returned by a binding instead of duplicating provisional version and
 transport metadata; conformance checks cover its protocol profiles, transport bounds, outstanding-call
-limit, and endpoint rights. Host tests cover canonical startup encoding and descriptor validation, while
-the QEMU probe checks startup adoption and rights tightening against real kernel objects. Remaining work
-includes the non-capability `ProcessStart` sections, privacy-aware tracing, blocking pools, and broader
-completion sources; the NSIDL compiler still needs to generate the descriptors and binding code now
-accepted by this runtime layer.
+limit, endpoint rights, and per-direction privacy classification. A binding can now borrow a `TaskGroup`
+to carry inherited lifecycle scope and attribution while retaining a fixed 64-event, payload-free trace;
+secret and opaque transitions suppress correlation identifiers, and sequence-paged reads report
+overwritten gaps. Host tests cover canonical startup encoding, descriptor validation, trace admission,
+redaction, and bounded overwrite behavior, while the QEMU probe checks startup adoption, rights
+tightening, lifecycle attribution, and privacy-aware tracing against real kernel objects. Remaining work
+includes the non-capability `ProcessStart` sections, blocking pools, and broader completion sources; the
+NSIDL compiler still needs to generate the descriptors and binding code now accepted by this runtime
+layer.
 
 ### Phase 5: NSIDL compiler MVP
 

@@ -12,8 +12,9 @@ use nswp_core::{
     validate_body,
 };
 use nswp_runtime::{
-    BodyBuf, Client, ClientEvent, DeadlinePolicy, HANDLE_FREE_ENDPOINT_LIMITS, MethodDescriptor,
-    MethodKind, ProtocolDescriptor, RequestToken, RuntimeError, Server, TryTransport,
+    BodyBuf, Client, ClientEvent, DeadlinePolicy, HANDLE_FREE_ENDPOINT_LIMITS, MessagePrivacy,
+    MethodDescriptor, MethodKind, ProtocolDescriptor, RequestToken, RuntimeError, Server,
+    TryTransport,
 };
 use service_route::{RoleId, ServiceId};
 
@@ -1552,6 +1553,8 @@ static LOGGING_METHODS: [MethodDescriptor; 3] = [
         ordinal: LOGGING_EMIT_ORDINAL,
         kind: MethodKind::OneWay,
         deadline: DeadlinePolicy::Forbidden,
+        request_privacy: MessagePrivacy::Opaque,
+        response_privacy: MessagePrivacy::Opaque,
         validate_request: validate_log_record,
         validate_response: validate_log_record,
     },
@@ -1561,6 +1564,8 @@ static LOGGING_METHODS: [MethodDescriptor; 3] = [
         deadline: DeadlinePolicy::Required {
             max_duration_ns: None,
         },
+        request_privacy: MessagePrivacy::Sensitive,
+        response_privacy: MessagePrivacy::Sensitive,
         validate_request: validate_collector_stats_request,
         validate_response: validate_collector_stats_response,
     },
@@ -1570,6 +1575,8 @@ static LOGGING_METHODS: [MethodDescriptor; 3] = [
         deadline: DeadlinePolicy::Required {
             max_duration_ns: None,
         },
+        request_privacy: MessagePrivacy::Sensitive,
+        response_privacy: MessagePrivacy::Opaque,
         validate_request: validate_history_read_request,
         validate_response: validate_history_read_response,
     },
