@@ -162,11 +162,34 @@ pub enum MethodKind {
     OneWay,
 }
 
+/// Maximum disclosure permitted for one encoded message in diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessagePrivacy {
+    /// Structural metadata and correlation identifiers may be retained.
+    Public,
+    /// Payload remains private to the owning user or application boundary.
+    Private,
+    /// Payload requires privileged diagnostic access.
+    Sensitive,
+    /// Payload never enters logs or traces; correlation is also suppressed.
+    Secret,
+    /// Payload may expose encoded size and timing, but never content.
+    Opaque,
+}
+
+impl MessagePrivacy {
+    pub const fn exposes_correlation(self) -> bool {
+        matches!(self, Self::Public | Self::Private | Self::Sensitive)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct MethodDescriptor {
     pub ordinal: u32,
     pub kind: MethodKind,
     pub deadline: DeadlinePolicy,
+    pub request_privacy: MessagePrivacy,
+    pub response_privacy: MessagePrivacy,
     pub validate_request: BodyValidator,
     pub validate_response: BodyValidator,
 }

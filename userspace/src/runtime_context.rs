@@ -8,10 +8,12 @@
 
 use core::{array, marker::PhantomData};
 
-use nswp_runtime::ProtocolDescriptor;
+use nswp_core::ProtocolId;
+use nswp_runtime::{MessagePrivacy, MethodKind, ProtocolDescriptor};
 
 use crate::{
     abi::limits,
+    async_ipc::{RunScope, TaskAttribution, TaskGroup},
     handle::{AnyObject, BorrowedHandle, Endpoint, KnownObjectType, ObjectType, OwnedHandle},
     ipc::{self, ObjectKind, Rights},
 };
@@ -821,18 +823,138 @@ pub enum Server {}
 
 /// Compile-time endpoint side for a service binding.
 pub trait BindingSide: private::Sealed {
+    const SIDE: BindingEndpointSide;
+
     fn required_rights<P: ServiceProtocol>() -> Rights;
 }
 
 impl BindingSide for Client {
+    const SIDE: BindingEndpointSide = BindingEndpointSide::Client;
+
     fn required_rights<P: ServiceProtocol>() -> Rights {
         P::CLIENT_RIGHTS
     }
 }
 
 impl BindingSide for Server {
+    const SIDE: BindingEndpointSide = BindingEndpointSide::Server;
+
     fn required_rights<P: ServiceProtocol>() -> Rights {
         P::SERVER_RIGHTS
+    }
+}
+
+/// Endpoint side retained in binding trace metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingEndpointSide {
+    Client,
+    Server,
+}
+
+/// Protocol transition represented by one structural binding trace event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingTraceKind {
+    Request,
+    Response,
+    OneWay,
+    Cancellation,
+}
+
+/// Why a binding transition could not be admitted to its trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingTraceError {
+    InvalidMessage(ConformanceError),
+    UnknownMethod,
+    WrongMethodKind,
+    InvalidCancellationShape,
+}
+
+/// Maximum structural events retained by one managed service binding.
+pub const MAX_BINDING_TRACE_EVENTS: usize = 64;
+
+/// Payload-free binding trace metadata retained independently of endpoint I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingTraceEvent {
+    pub sequence: u64,
+    pub monotonic_ns: u64,
+    pub protocol_id: ProtocolId,
+    pub endpoint_side: BindingEndpointSide,
+    pub kind: BindingTraceKind,
+    pub ordinal: u32,
+    pub body_bytes: u32,
+    pub handles: u16,
+    pub attribution: TaskAttribution,
+    pub group_deadline_ns: u64,
+    pub privacy: MessagePrivacy,
+    pub trace_correlated: bool,
+    pub trace_id: [u8; 16],
+}
+
+/// Result of copying a sequence-paged binding trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingTraceRead {
+    pub events: usize,
+    pub next_cursor: u64,
+    pub missed: u64,
+}
+
+struct BindingTraceBuffer {
+    events: [Option<BindingTraceEvent>; MAX_BINDING_TRACE_EVENTS],
+    next_sequence: u64,
+    len: usize,
+}
+
+impl BindingTraceBuffer {
+    fn new() -> Self {
+        Self {
+            events: array::from_fn(|_| None),
+            next_sequence: 1,
+            len: 0,
+        }
+    }
+
+    fn record(&mut self, mut event: BindingTraceEvent) {
+        event.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let index = usize::try_from(event.sequence.saturating_sub(1)).unwrap_or(usize::MAX)
+            % MAX_BINDING_TRACE_EVENTS;
+        self.events[index] = Some(event);
+        self.len = self.len.saturating_add(1).min(MAX_BINDING_TRACE_EVENTS);
+    }
+
+    fn read(&self, after: u64, output: &mut [BindingTraceEvent]) -> BindingTraceRead {
+        if output.is_empty() || self.len == 0 {
+            return BindingTraceRead {
+                events: 0,
+                next_cursor: after,
+                missed: 0,
+            };
+        }
+        let oldest = self.next_sequence.saturating_sub(self.len as u64);
+        let requested = after.saturating_add(1);
+        let start = requested.max(oldest);
+        let missed = start.saturating_sub(requested);
+        let mut copied = 0;
+        let mut cursor = after;
+        let newest = self.next_sequence.saturating_sub(1);
+        for sequence in start..=newest {
+            if copied == output.len() {
+                break;
+            }
+            let index = usize::try_from(sequence.saturating_sub(1)).unwrap_or(usize::MAX)
+                % MAX_BINDING_TRACE_EVENTS;
+            let Some(event) = self.events[index].filter(|event| event.sequence == sequence) else {
+                continue;
+            };
+            output[copied] = event;
+            copied += 1;
+            cursor = sequence;
+        }
+        BindingTraceRead {
+            events: copied,
+            next_cursor: cursor,
+            missed,
+        }
     }
 }
 
@@ -929,12 +1051,130 @@ impl<P: ServiceProtocol, S: BindingSide> ServiceBinding<P, S> {
     pub fn into_endpoint(self) -> OwnedHandle<Endpoint> {
         self.endpoint
     }
+
+    /// Attaches this endpoint to one structured lifecycle owner and a fresh,
+    /// fixed-capacity structural trace.
+    pub fn with_task_group<'group>(
+        self,
+        group: &'group TaskGroup,
+    ) -> ManagedServiceBinding<'group, P, S> {
+        ManagedServiceBinding {
+            binding: self,
+            group,
+            trace: BindingTraceBuffer::new(),
+        }
+    }
+}
+
+/// Typed endpoint bound to structured cancellation, deadline, attribution, and
+/// privacy-aware structural tracing.
+pub struct ManagedServiceBinding<'group, P: ServiceProtocol, S: BindingSide> {
+    binding: ServiceBinding<P, S>,
+    group: &'group TaskGroup,
+    trace: BindingTraceBuffer,
+}
+
+impl<P: ServiceProtocol, S: BindingSide> ManagedServiceBinding<'_, P, S> {
+    pub const fn attribution(&self) -> TaskAttribution {
+        self.group.attribution()
+    }
+
+    pub fn scope(&self) -> RunScope<'_> {
+        self.group.scope()
+    }
+
+    pub fn is_cancelled(&self) -> ipc::Result<bool> {
+        self.group.is_cancelled()
+    }
+
+    pub fn endpoint(&self) -> BorrowedHandle<'_, Endpoint> {
+        self.binding.endpoint()
+    }
+
+    pub fn descriptor(&self) -> ProtocolDescriptor<'static> {
+        self.binding.descriptor()
+    }
+
+    /// Retains only structural metadata for one validated protocol transition.
+    /// Message payload bytes are never accepted by this API. Secret and opaque
+    /// methods additionally suppress the correlation identifier while retaining
+    /// whether correlation existed.
+    pub fn trace_message(
+        &mut self,
+        monotonic_ns: u64,
+        kind: BindingTraceKind,
+        ordinal: u32,
+        body_bytes: usize,
+        handles: usize,
+        trace_id: [u8; 16],
+    ) -> Result<(), BindingTraceError> {
+        validate_message_shape::<P>(body_bytes, handles)
+            .map_err(BindingTraceError::InvalidMessage)?;
+        if kind == BindingTraceKind::Cancellation && (body_bytes != 0 || handles != 0) {
+            return Err(BindingTraceError::InvalidCancellationShape);
+        }
+        let descriptor = P::descriptor();
+        let method = descriptor
+            .method(ordinal)
+            .ok_or(BindingTraceError::UnknownMethod)?;
+        let privacy = match kind {
+            BindingTraceKind::Request | BindingTraceKind::Cancellation => {
+                if method.kind != MethodKind::RequestResponse {
+                    return Err(BindingTraceError::WrongMethodKind);
+                }
+                method.request_privacy
+            }
+            BindingTraceKind::Response => {
+                if method.kind != MethodKind::RequestResponse {
+                    return Err(BindingTraceError::WrongMethodKind);
+                }
+                method.response_privacy
+            }
+            BindingTraceKind::OneWay => {
+                if method.kind != MethodKind::OneWay {
+                    return Err(BindingTraceError::WrongMethodKind);
+                }
+                method.request_privacy
+            }
+        };
+        let trace_correlated = trace_id != [0; 16];
+        self.trace.record(BindingTraceEvent {
+            sequence: 0,
+            monotonic_ns,
+            protocol_id: descriptor.protocol_id,
+            endpoint_side: S::SIDE,
+            kind,
+            ordinal,
+            body_bytes: body_bytes as u32,
+            handles: handles as u16,
+            attribution: self.group.attribution(),
+            group_deadline_ns: self.group.deadline().as_monotonic_ns(),
+            privacy,
+            trace_correlated,
+            trace_id: if privacy.exposes_correlation() {
+                trace_id
+            } else {
+                [0; 16]
+            },
+        });
+        Ok(())
+    }
+
+    pub fn read_trace(&self, after: u64, output: &mut [BindingTraceEvent]) -> BindingTraceRead {
+        self.trace.read(after, output)
+    }
+
+    pub fn into_binding(self) -> ServiceBinding<P, S> {
+        self.binding
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nswp_core::{ConnectionLimits, MinorVersionProfile, ProtocolId};
+    use crate::{async_ipc::TaskRole, ipc::Deadline};
+    use nswp_core::{BodyError, BoundProtocol, ConnectionLimits, MinorVersionProfile, ProtocolId};
+    use nswp_runtime::{DeadlinePolicy, MethodDescriptor};
 
     const TEST_PROTOCOL_ID: ProtocolId = match ProtocolId::from_bytes([
         0x10, 0x61, 0xa2, 0x41, 0xb6, 0x42, 0x4d, 0x58, 0x80, 0x55, 0x61, 0xf2, 0x8d, 0xec, 0x93,
@@ -948,6 +1188,32 @@ mod tests {
         minimum_body_bytes: 1,
         minimum_handles: 0,
     }];
+    static TEST_METHODS: [MethodDescriptor; 2] = [
+        MethodDescriptor {
+            ordinal: 1,
+            kind: MethodKind::RequestResponse,
+            deadline: DeadlinePolicy::Optional {
+                max_duration_ns: None,
+            },
+            request_privacy: MessagePrivacy::Public,
+            response_privacy: MessagePrivacy::Secret,
+            validate_request: validate_test_body,
+            validate_response: validate_test_body,
+        },
+        MethodDescriptor {
+            ordinal: 2,
+            kind: MethodKind::OneWay,
+            deadline: DeadlinePolicy::Forbidden,
+            request_privacy: MessagePrivacy::Opaque,
+            response_privacy: MessagePrivacy::Opaque,
+            validate_request: validate_test_body,
+            validate_response: validate_test_body,
+        },
+    ];
+
+    fn validate_test_body(_body: &[u8], _bound: &BoundProtocol<'_>) -> Result<(), BodyError> {
+        Ok(())
+    }
 
     struct Conforming;
 
@@ -971,7 +1237,7 @@ mod tests {
                 available_features: &[],
                 versions: &TEST_VERSIONS,
                 feature_set_fits: nswp_runtime::no_features_fit,
-                methods: &[],
+                methods: &TEST_METHODS,
             }
         }
     }
@@ -1060,6 +1326,137 @@ mod tests {
             StartupMessage::<1>::decode(&bytes),
             Err(StartupError::MalformedMessage)
         );
+    }
+
+    #[test]
+    fn managed_binding_carries_lifecycle_and_redacts_restricted_trace_metadata() {
+        let group = TaskGroup::root(TaskRole::Request, Deadline::from_monotonic_ns(500)).unwrap();
+        let endpoint = unsafe { OwnedHandle::<Endpoint>::from_raw(103) }.unwrap();
+        let binding = ServiceBinding::<Conforming, Client> {
+            endpoint,
+            protocol: PhantomData,
+        };
+        let mut binding = binding.with_task_group(&group);
+        let trace_id = [0x5a; 16];
+        binding
+            .trace_message(100, BindingTraceKind::Request, 1, 8, 0, trace_id)
+            .unwrap();
+        binding
+            .trace_message(110, BindingTraceKind::Response, 1, 8, 0, trace_id)
+            .unwrap();
+        binding
+            .trace_message(120, BindingTraceKind::OneWay, 2, 4, 0, trace_id)
+            .unwrap();
+
+        let placeholder = BindingTraceEvent {
+            sequence: 0,
+            monotonic_ns: 0,
+            protocol_id: TEST_PROTOCOL_ID,
+            endpoint_side: BindingEndpointSide::Client,
+            kind: BindingTraceKind::Request,
+            ordinal: 0,
+            body_bytes: 0,
+            handles: 0,
+            attribution: group.attribution(),
+            group_deadline_ns: 0,
+            privacy: MessagePrivacy::Public,
+            trace_correlated: false,
+            trace_id: [0; 16],
+        };
+        let mut events = [placeholder; 3];
+        let read = binding.read_trace(0, &mut events);
+        assert_eq!(read.events, 3);
+        assert_eq!(events[0].attribution, group.attribution());
+        assert_eq!(events[0].group_deadline_ns, 500);
+        assert_eq!(events[0].trace_id, trace_id);
+        assert_eq!(events[1].privacy, MessagePrivacy::Secret);
+        assert!(events[1].trace_correlated);
+        assert_eq!(events[1].trace_id, [0; 16]);
+        assert_eq!(events[2].privacy, MessagePrivacy::Opaque);
+        assert_eq!(events[2].trace_id, [0; 16]);
+        assert_eq!(binding.scope().deadline(), Deadline::from_monotonic_ns(500));
+    }
+
+    #[test]
+    fn managed_binding_trace_reports_overwrite_gaps_in_sequence_order() {
+        let group = TaskGroup::root(TaskRole::Service, Deadline::INFINITE).unwrap();
+        let endpoint = unsafe { OwnedHandle::<Endpoint>::from_raw(104) }.unwrap();
+        let binding = ServiceBinding::<Conforming, Client> {
+            endpoint,
+            protocol: PhantomData,
+        };
+        let mut binding = binding.with_task_group(&group);
+        for monotonic_ns in 0..(MAX_BINDING_TRACE_EVENTS as u64 + 2) {
+            binding
+                .trace_message(monotonic_ns, BindingTraceKind::Request, 1, 8, 0, [0; 16])
+                .unwrap();
+        }
+
+        let placeholder = BindingTraceEvent {
+            sequence: 0,
+            monotonic_ns: 0,
+            protocol_id: TEST_PROTOCOL_ID,
+            endpoint_side: BindingEndpointSide::Client,
+            kind: BindingTraceKind::Request,
+            ordinal: 0,
+            body_bytes: 0,
+            handles: 0,
+            attribution: group.attribution(),
+            group_deadline_ns: 0,
+            privacy: MessagePrivacy::Public,
+            trace_correlated: false,
+            trace_id: [0; 16],
+        };
+        let mut retained = [placeholder; MAX_BINDING_TRACE_EVENTS];
+        let read = binding.read_trace(0, &mut retained);
+        assert_eq!(read.events, MAX_BINDING_TRACE_EVENTS);
+        assert_eq!(read.missed, 2);
+        assert_eq!(retained[0].sequence, 3);
+        assert!(
+            retained
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+    }
+
+    #[test]
+    fn managed_binding_rejects_invalid_protocol_transitions_without_tracing_them() {
+        let group = TaskGroup::root(TaskRole::Request, Deadline::INFINITE).unwrap();
+        let endpoint = unsafe { OwnedHandle::<Endpoint>::from_raw(105) }.unwrap();
+        let binding = ServiceBinding::<Conforming, Client> {
+            endpoint,
+            protocol: PhantomData,
+        };
+        let mut binding = binding.with_task_group(&group);
+        assert_eq!(
+            binding.trace_message(1, BindingTraceKind::Request, 99, 0, 0, [0; 16]),
+            Err(BindingTraceError::UnknownMethod)
+        );
+        assert_eq!(
+            binding.trace_message(2, BindingTraceKind::OneWay, 1, 0, 0, [0; 16]),
+            Err(BindingTraceError::WrongMethodKind)
+        );
+        assert_eq!(
+            binding.trace_message(3, BindingTraceKind::Cancellation, 1, 1, 0, [0; 16]),
+            Err(BindingTraceError::InvalidCancellationShape)
+        );
+
+        let mut output = [BindingTraceEvent {
+            sequence: 0,
+            monotonic_ns: 0,
+            protocol_id: TEST_PROTOCOL_ID,
+            endpoint_side: BindingEndpointSide::Client,
+            kind: BindingTraceKind::Request,
+            ordinal: 0,
+            body_bytes: 0,
+            handles: 0,
+            attribution: group.attribution(),
+            group_deadline_ns: 0,
+            privacy: MessagePrivacy::Public,
+            trace_correlated: false,
+            trace_id: [0; 16],
+        }];
+        assert_eq!(binding.read_trace(0, &mut output).events, 0);
     }
 
     #[test]

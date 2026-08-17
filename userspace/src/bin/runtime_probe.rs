@@ -3,8 +3,10 @@
 
 use core::cell::Cell;
 
-use nswp_core::{ConnectionLimits, MinorVersionProfile, ProtocolId};
-use nswp_runtime::ProtocolDescriptor;
+use nswp_core::{BodyError, BoundProtocol, ConnectionLimits, MinorVersionProfile, ProtocolId};
+use nswp_runtime::{
+    DeadlinePolicy, MessagePrivacy, MethodDescriptor, MethodKind, ProtocolDescriptor,
+};
 
 use userspace::{
     abi::{capability, file, limits, signal},
@@ -23,9 +25,9 @@ use userspace::{
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
     runtime_context::{
-        self, CapabilityRole, Client, ContextError, ProcessContext, ServiceBinding, ServiceProcess,
-        ServiceProtocol, StartupCapabilityPolicy, StartupMessage, StartupResource,
-        StartupRuntimeRole,
+        self, BindingEndpointSide, BindingTraceEvent, BindingTraceKind, CapabilityRole, Client,
+        ContextError, ProcessContext, ServiceBinding, ServiceProcess, ServiceProtocol,
+        StartupCapabilityPolicy, StartupMessage, StartupResource, StartupRuntimeRole,
     },
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
@@ -56,6 +58,21 @@ static RUNTIME_PROBE_VERSIONS: [MinorVersionProfile; 1] = [MinorVersionProfile {
     minimum_body_bytes: 1,
     minimum_handles: 0,
 }];
+static RUNTIME_PROBE_METHODS: [MethodDescriptor; 1] = [MethodDescriptor {
+    ordinal: 1,
+    kind: MethodKind::RequestResponse,
+    deadline: DeadlinePolicy::Optional {
+        max_duration_ns: None,
+    },
+    request_privacy: MessagePrivacy::Public,
+    response_privacy: MessagePrivacy::Secret,
+    validate_request: validate_runtime_probe_body,
+    validate_response: validate_runtime_probe_body,
+}];
+
+fn validate_runtime_probe_body(_body: &[u8], _bound: &BoundProtocol<'_>) -> Result<(), BodyError> {
+    Ok(())
+}
 
 impl ServiceProtocol for RuntimeProbeProtocol {
     const NAME: &'static str = "test.runtime-context";
@@ -77,7 +94,7 @@ impl ServiceProtocol for RuntimeProbeProtocol {
             available_features: &[],
             versions: &RUNTIME_PROBE_VERSIONS,
             feature_set_fits: nswp_runtime::no_features_fit,
-            methods: &[],
+            methods: &RUNTIME_PROBE_METHODS,
         }
     }
 }
@@ -318,14 +335,61 @@ fn runtime_context_probe() -> bool {
         return false;
     };
     let descriptor = binding.descriptor();
-    descriptor.protocol_id == RUNTIME_PROBE_PROTOCOL_ID
-        && descriptor.limits.max_body_bytes == 32
-        && binding
+    if descriptor.protocol_id != RUNTIME_PROBE_PROTOCOL_ID
+        || descriptor.limits.max_body_bytes != 32
+        || !binding
             .endpoint()
             .info()
             .is_ok_and(|info| info.rights == PROBE_CLIENT_RIGHTS)
-        && context.len() == 1
-        && context.contains(CapabilityRole::CONFIGURATION)
+        || context.len() != 1
+        || !context.contains(CapabilityRole::CONFIGURATION)
+    {
+        return false;
+    }
+
+    let Ok(group) = TaskGroup::root(TaskRole::Request, Deadline::from_monotonic_ns(500)) else {
+        return false;
+    };
+    let attribution = group.attribution();
+    let mut binding = binding.with_task_group(&group);
+    let trace_id = [0x5a; 16];
+    if binding
+        .trace_message(100, BindingTraceKind::Request, 1, 8, 0, trace_id)
+        .is_err()
+        || binding
+            .trace_message(110, BindingTraceKind::Response, 1, 8, 0, trace_id)
+            .is_err()
+    {
+        return false;
+    }
+    let placeholder = BindingTraceEvent {
+        sequence: 0,
+        monotonic_ns: 0,
+        protocol_id: RUNTIME_PROBE_PROTOCOL_ID,
+        endpoint_side: BindingEndpointSide::Client,
+        kind: BindingTraceKind::Request,
+        ordinal: 0,
+        body_bytes: 0,
+        handles: 0,
+        attribution,
+        group_deadline_ns: 0,
+        privacy: MessagePrivacy::Public,
+        trace_correlated: false,
+        trace_id: [0; 16],
+    };
+    let mut events = [placeholder; 2];
+    let read = binding.read_trace(0, &mut events);
+    read.events == 2
+        && read.next_cursor == 2
+        && read.missed == 0
+        && events[0].endpoint_side == BindingEndpointSide::Client
+        && events[0].attribution == attribution
+        && events[0].group_deadline_ns == 500
+        && events[0].privacy == MessagePrivacy::Public
+        && events[0].trace_id == trace_id
+        && events[1].privacy == MessagePrivacy::Secret
+        && events[1].trace_correlated
+        && events[1].trace_id == [0; 16]
 }
 
 fn wait_set_probe() -> bool {

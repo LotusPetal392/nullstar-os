@@ -56,6 +56,8 @@ static DEADLINE_METHODS: [MethodDescriptor; 2] = [
         deadline: DeadlinePolicy::Required {
             max_duration_ns: Some(100),
         },
+        request_privacy: nswp_runtime::MessagePrivacy::Public,
+        response_privacy: nswp_runtime::MessagePrivacy::Public,
         validate_request: validate_empty_body,
         validate_response: validate_empty_body,
     },
@@ -65,6 +67,8 @@ static DEADLINE_METHODS: [MethodDescriptor; 2] = [
         deadline: DeadlinePolicy::Optional {
             max_duration_ns: Some(100),
         },
+        request_privacy: nswp_runtime::MessagePrivacy::Public,
+        response_privacy: nswp_runtime::MessagePrivacy::Public,
         validate_request: validate_empty_body,
         validate_response: validate_empty_body,
     },
