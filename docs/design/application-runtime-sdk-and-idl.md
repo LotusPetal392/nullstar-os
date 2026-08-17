@@ -300,15 +300,14 @@ monotonic-start metadata. Sections may span the kernel's 256-byte message bound,
 be contiguous and canonical. Receiver-supplied storage bounds assembly, unknown optional sections are
 discarded, and unknown required or missing mandatory sections fail before entry-point dispatch.
 These values remain descriptive data: namespace and other authority still require validated `NSPC`
-capabilities. The definition-backed service, tmpfs, and VFS are live PID 1 transports: while each
+capabilities. The definition-backed service, logging, NullFS, tmpfs, and VFS are live PID 1 transports: while each
 child is held behind the existing launch barrier, PID 1 grants one receive-only bootstrap endpoint,
 queues an `NSPC` envelope with moved role-tagged capabilities, sends the four mandatory `NSPD`
-sections and canonical `NSPX` end record, then releases the child. The shared tmpfs/VFS receiver pins
+sections and canonical `NSPX` end record, then releases the child. The shared logging/NullFS/tmpfs/VFS receiver pins
 PID 1, requires no other initial capability, validates identity and argument agreement, and adopts
-readiness and request endpoints by policy. Their manager generation is carried in authenticated
+role-tagged endpoints plus logging's kernel early-log and NullFS's writable block-device authorities by policy. Their manager generation is carried in authenticated
 launch data rather than a redundant one-use generation capability. This migration still depends on
-the transitional fork/exec barrier and direct-child grant; logging, NullFS, and the general process
-loader have not migrated.
+the transitional fork/exec barrier and direct-child grant; the general process loader has not migrated.
 
 ## Role-specific entry points
 
@@ -1119,10 +1118,10 @@ lifecycle transitions. The coordinator deliberately supplies no threads and cann
 callbacks; parallel isolated workers and execution-time resource accounting require the later
 thread/address-space and job-policy milestones. The `NSPD` companion codec now supplies canonical,
 fragmentable typed identity, argument, environment, and launch sections with bounded receiver-owned
-assembly and host validation. The definition-backed service, tmpfs, and VFS now provide QEMU coverage
-for live `NSPC` plus `NSPD` bootstrap streams; the lifecycle gate also proves tmpfs and VFS
+assembly and host validation. The definition-backed service, logging, NullFS, tmpfs, and VFS now provide QEMU coverage
+for live `NSPC` plus `NSPD` bootstrap streams; the lifecycle gates also prove logging, NullFS, tmpfs, and VFS
 replacement generations revalidate the contract after complete job drainage. Remaining work includes
-migrating logging, NullFS, and the general process loader, replacing the transitional launch/grant mechanics, and adding
+migrating the general process loader, replacing the transitional launch/grant mechanics, and adding
 file, network, display, device, and media completion sources; the NSIDL compiler still needs to
 generate the descriptors and binding code now accepted by this runtime layer.
 

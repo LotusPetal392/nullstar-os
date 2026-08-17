@@ -9,27 +9,30 @@ use nswp_logging::{
 };
 use nswp_runtime::{Server, ServerEvent};
 use userspace::{
-    abi::{INIT_PROCESS_ID, signal},
+    abi::signal,
     args::Args,
     early_log,
+    handle::{Endpoint, KernelEarlyLogReader},
     ipc::{self, ObjectKind, Rights},
     logging_session::{
         AcceptError, InboundPacket, MAX_LOGGING_SESSIONS, PendingConnect, ServerIngress,
         ServerIngressEvent, ServerTransport, SessionRole, admission_rejection,
     },
+    managed_startup::{ManagedServiceIdentity, numeric_service_id, receive_managed_service_start},
     platform,
-    service_route::receive_service_generation,
+    runtime_context::{CapabilityRole, StartupCapabilityPolicy},
     syscall::{self, SignalAction},
 };
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const READY_HANDLE: u64 = 1;
-const PRODUCER_INGRESS_HANDLE: u64 = 2;
-const OBSERVER_INGRESS_HANDLE: u64 = 3;
-const EARLY_LOG_HANDLE: u64 = 4;
-const GENERATION_HANDOFF_HANDLE: u64 = 5;
+const LOGGING_EXECUTABLE_ID: u64 = 1;
+const SERVICE_IDENTITY: ManagedServiceIdentity = ManagedServiceIdentity::new(
+    LOGGING_EXECUTABLE_ID,
+    numeric_service_id(nswp_logging::LOGGING_SERVICE_ID.into_bytes()),
+    LOGGING_EXECUTABLE_ID,
+);
 const READY_MESSAGE: &[u8] = b"service-ready: logging";
 const STARTED_MARKER: &[u8] = b"logging-service: bounded session collector ready\n";
 const KERNEL_IMPORT_MARKER: &[u8] = b"logging-service: kernel early log imported\n";
@@ -299,38 +302,93 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     {
         syscall::exit(1);
     }
-    if !matches!(
-        ipc::info(READY_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) {
+    let policies = [
+        StartupCapabilityPolicy {
+            role: CapabilityRole::READINESS,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::SEND,
+            maximum_rights: Rights::SEND,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::LOGGING_PRODUCER_INGRESS,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::RECEIVE,
+            maximum_rights: Rights::RECEIVE,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::LOGGING_OBSERVER_INGRESS,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::RECEIVE,
+            maximum_rights: Rights::RECEIVE,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::KERNEL_EARLY_LOG,
+            kind: ObjectKind::KernelEarlyLogReader,
+            minimum_rights: Rights::READ,
+            maximum_rights: Rights::READ,
+            required: true,
+        },
+    ];
+    let mut start = match receive_managed_service_start::<4>(arguments, &policies, SERVICE_IDENTITY)
+    {
+        Ok(start) => start,
+        Err(_) => syscall::exit(2),
+    };
+    let readiness = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::READINESS, Rights::SEND)
+    {
+        Ok(handle) => handle.into_raw(),
+        Err(_) => syscall::exit(3),
+    };
+    let producer = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::LOGGING_PRODUCER_INGRESS, Rights::RECEIVE)
+    {
+        Ok(handle) => handle.into_raw(),
+        Err(_) => syscall::exit(3),
+    };
+    let observer = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::LOGGING_OBSERVER_INGRESS, Rights::RECEIVE)
+    {
+        Ok(handle) => handle.into_raw(),
+        Err(_) => syscall::exit(3),
+    };
+    let early_log_reader = match start
+        .context
+        .take::<KernelEarlyLogReader>(CapabilityRole::KERNEL_EARLY_LOG, Rights::READ)
+    {
+        Ok(handle) if start.context.is_empty() => handle.into_raw(),
+        _ => syscall::exit(3),
+    };
+    let generation = start.generation;
+    if generation == 0 {
         syscall::exit(2);
     }
-    let mut producer_ingress =
-        match ServerIngress::new(SessionRole::Producer, PRODUCER_INGRESS_HANDLE) {
-            Ok(ingress) => ingress,
-            Err(_) => syscall::exit(3),
-        };
-    let mut observer_ingress =
-        match ServerIngress::new(SessionRole::Observer, OBSERVER_INGRESS_HANDLE) {
-            Ok(ingress) => ingress,
-            Err(_) => syscall::exit(3),
-        };
-    let generation = match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
-        Ok(generation) => generation.get(),
-        Err(_) => syscall::exit(4),
+    let mut producer_ingress = match ServerIngress::new(SessionRole::Producer, producer) {
+        Ok(ingress) => ingress,
+        Err(_) => syscall::exit(3),
+    };
+    let mut observer_ingress = match ServerIngress::new(SessionRole::Observer, observer) {
+        Ok(ingress) => ingress,
+        Err(_) => syscall::exit(3),
     };
     let mut collector = match FixedLoggingCollector::<COLLECTOR_CAPACITY>::new(generation) {
         Ok(collector) => collector,
         Err(_) => syscall::exit(5),
     };
     if !matches!(
-        ipc::info(EARLY_LOG_HANDLE),
+        ipc::info(early_log_reader),
         Ok(info) if info.kind == ObjectKind::KernelEarlyLogReader && info.rights == Rights::READ
     ) || early_log::open_reader() != Err(early_log::Error::PERMISSION)
     {
         syscall::exit(6);
     }
-    if import_kernel_history(&mut collector).is_err() {
+    if import_kernel_history(early_log_reader, &mut collector).is_err() {
         syscall::exit(early_log::IMPORT_FAILURE_EXIT_STATUS);
     }
     if syscall::write_all(syscall::STDOUT, KERNEL_IMPORT_MARKER).is_err() {
@@ -340,7 +398,8 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         spawn_containment_descendant();
     }
     let mut sessions = SessionManager::new();
-    if (!suppress_readiness && ipc::send(READY_HANDLE, READY_MESSAGE, None).is_err())
+    if (!suppress_readiness && ipc::send(readiness, READY_MESSAGE, None).is_err())
+        || ipc::close(readiness).is_err()
         || syscall::write_all(syscall::STDOUT, STARTED_MARKER).is_err()
     {
         syscall::exit(8);
@@ -365,10 +424,11 @@ fn poll_ingress(ingress: &mut ServerIngress, sessions: &mut SessionManager, gene
 }
 
 fn import_kernel_history(
+    early_log_reader: u64,
     collector: &mut FixedLoggingCollector<COLLECTOR_CAPACITY>,
 ) -> Result<(), ()> {
     let mut storage = early_log::ResponseStorage::new();
-    let first = read_kernel_after(None, &mut storage)?;
+    let first = read_kernel_after(early_log_reader, None, &mut storage)?;
     if first.stats.retained_records == 0 || first.stats.retained_records > COLLECTOR_CAPACITY as u64
     {
         return Err(());
@@ -392,17 +452,18 @@ fn import_kernel_history(
             return Ok(());
         }
 
-        let read = read_kernel_after(Some(record.sequence), &mut storage)?;
+        let read = read_kernel_after(early_log_reader, Some(record.sequence), &mut storage)?;
         record = read.record.ok_or(())?;
     }
 }
 
 fn read_kernel_after(
+    early_log_reader: u64,
     after: Option<KernelSequence>,
     storage: &mut early_log::ResponseStorage,
 ) -> Result<early_log::ReadResult, ()> {
     loop {
-        match early_log::read_after(EARLY_LOG_HANDLE, after, storage) {
+        match early_log::read_after(early_log_reader, after, storage) {
             Ok(read) => return Ok(read),
             Err(error) if error == early_log::Error::TRY_AGAIN => {
                 syscall::yield_now().map_err(|_| ())?;

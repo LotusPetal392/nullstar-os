@@ -7,8 +7,8 @@ volatile filesystem state and old client assumptions must not silently continue.
 
 ## Mount handshake
 
-Before readiness, tmpfs accepts one manager-issued nonzero generation from PID 1 through the strict
-`NSGN` bootstrap handoff. A client then sends the versioned `MOUNT` operation, and the running service
+Before readiness, tmpfs accepts one manager-issued nonzero generation from the launch section of its
+complete PID 1-authenticated managed-start stream. A client then sends the versioned `MOUNT` operation, and the running service
 returns that generation rather than deriving lifecycle identity from its process ID. The client stores
 the value in a typed `tmpfs::Mount` and includes it in every subsequent request.
 

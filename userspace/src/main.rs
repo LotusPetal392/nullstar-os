@@ -248,11 +248,6 @@ const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
 const SV_OBSERVATION_HANDLE: u64 = 1;
 const SV_MUTATION_HANDLE: u64 = 2;
-const NULLFS_BLOCK_HANDLE: u64 = 3;
-const NULLFS_CRASH_TEST_HANDLE: u64 = 4;
-const LOGGING_OBSERVER_INGRESS_HANDLE: u64 = 3;
-const LOGGING_EARLY_LOG_HANDLE: u64 = 4;
-const GENERATION_HANDOFF_HANDLE: u64 = 5;
 const SHELL_SERVICE_CONTROL_HANDLE: u64 = 2;
 const SHELL_SERVICE_CONTROL_MUTATION_HANDLE: u64 = 3;
 const MAX_BOOTSTRAP_ROUTES: usize = 2;
@@ -268,6 +263,8 @@ const NULLFS_TEST_QUIESCE_GRACE_YIELDS: u32 = 8;
 const NULLFS_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
 const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
 const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
+const LOGGING_EXECUTABLE_ID: u64 = 1;
+const NULLFS_EXECUTABLE_ID: u64 = 2;
 const TMPFS_EXECUTABLE_ID: u64 = 3;
 const VFS_EXECUTABLE_ID: u64 = 4;
 
@@ -334,17 +331,32 @@ struct ServiceMessages {
 }
 
 #[derive(Clone, Copy)]
-struct BootstrapCapability {
-    source_handle: CapabilityHandle,
-    rights: Rights,
-    target_handle: CapabilityHandle,
-}
-
-#[derive(Clone, Copy)]
 struct ManagedStartupCapability {
     source_handle: CapabilityHandle,
     rights: Rights,
     role: CapabilityRole,
+}
+
+struct ManagedStartupCapabilities<'a> {
+    duplicated: &'a [ManagedStartupCapability],
+    moved: Option<ManagedStartupCapability>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedProcessStartSend {
+    FailedBeforeCapabilities,
+    FailedAfterCapabilities,
+    Complete,
+}
+
+impl ManagedProcessStartSend {
+    const fn capabilities_moved(self) -> bool {
+        !matches!(self, Self::FailedBeforeCapabilities)
+    }
+
+    const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -366,17 +378,18 @@ const VFS_CONTAINMENT: ServiceContainment = ServiceContainment {
     drained_message: VFS_SERVICE_JOB_DRAINED,
 };
 
-fn managed_containment_identity(containment: ServiceContainment) -> Option<ManagedServiceIdentity> {
+fn managed_containment_identity(containment: ServiceContainment) -> ManagedServiceIdentity {
     let (executable, service) = match containment.service {
+        CleanupService::Nullfs => (NULLFS_EXECUTABLE_ID, NULLFS_SERVICE_ID),
         CleanupService::Tmpfs => (TMPFS_EXECUTABLE_ID, TMPFS_SERVICE_ID),
         CleanupService::Vfs => (VFS_EXECUTABLE_ID, VFS_SERVICE_ID),
-        _ => return None,
+        _ => unreachable!("only contained core services use the managed startup helper"),
     };
-    Some(ManagedServiceIdentity::new(
+    ManagedServiceIdentity::new(
         executable,
         numeric_service_id(service.into_bytes()),
         executable,
-    ))
+    )
 }
 
 fn send_managed_service_process_start(
@@ -386,12 +399,12 @@ fn send_managed_service_process_start(
     generation: ProviderGeneration,
     restart_count: u32,
     identity: ManagedServiceIdentity,
-    capabilities: &[ManagedStartupCapability],
-) -> bool {
-    if capabilities.is_empty()
-        || capabilities.len() > userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES
-    {
-        return false;
+    capabilities: ManagedStartupCapabilities<'_>,
+) -> ManagedProcessStartSend {
+    let capability_count =
+        capabilities.duplicated.len() + usize::from(capabilities.moved.is_some());
+    if capability_count == 0 || capability_count > userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES {
+        return ManagedProcessStartSend::FailedBeforeCapabilities;
     }
     let mut resources = [None; userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES];
     let mut transfers = [Transfer {
@@ -399,7 +412,7 @@ fn send_managed_service_process_start(
         rights: Rights::EMPTY,
     }; userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES];
     let mut duplicates = [0; userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES];
-    for (index, capability) in capabilities.iter().enumerate() {
+    for (index, capability) in capabilities.duplicated.iter().enumerate() {
         let duplicate = match ipc::duplicate(
             capability.source_handle,
             capability.rights | Rights::TRANSFER,
@@ -409,7 +422,7 @@ fn send_managed_service_process_start(
                 for handle in duplicates[..index].iter().copied() {
                     let _ = ipc::close(handle);
                 }
-                return false;
+                return ManagedProcessStartSend::FailedBeforeCapabilities;
             }
         };
         duplicates[index] = duplicate;
@@ -422,20 +435,31 @@ fn send_managed_service_process_start(
             rights: capability.rights,
         };
     }
+    if let Some(capability) = capabilities.moved {
+        let index = capabilities.duplicated.len();
+        resources[index] = Some(StartupResource {
+            role: capability.role,
+            required: true,
+        });
+        transfers[index] = Transfer {
+            handle: capability.source_handle,
+            rights: capability.rights,
+        };
+    }
     let message = match StartupMessage::new(StartupRuntimeRole::Service, resources) {
         Ok(message) => message,
         Err(_) => {
-            for handle in duplicates[..capabilities.len()].iter().copied() {
+            for handle in duplicates[..capabilities.duplicated.len()].iter().copied() {
                 let _ = ipc::close(handle);
             }
-            return false;
+            return ManagedProcessStartSend::FailedBeforeCapabilities;
         }
     };
-    if send_startup_message(sender, &message, &transfers[..capabilities.len()]).is_err() {
-        for handle in duplicates[..capabilities.len()].iter().copied() {
+    if send_startup_message(sender, &message, &transfers[..capability_count]).is_err() {
+        for handle in duplicates[..capabilities.duplicated.len()].iter().copied() {
             let _ = ipc::close(handle);
         }
-        return false;
+        return ManagedProcessStartSend::FailedBeforeCapabilities;
     }
 
     let mut arguments = [&[][..]; userspace::abi::limits::MAX_ARGUMENTS];
@@ -445,28 +469,28 @@ fn send_managed_service_process_start(
         .filter(|argument| !argument.is_empty())
     {
         if argument_count == arguments.len() {
-            return false;
+            return ManagedProcessStartSend::FailedAfterCapabilities;
         }
         arguments[argument_count] = argument;
         argument_count += 1;
     }
     if argument_count == 0 {
-        return false;
+        return ManagedProcessStartSend::FailedAfterCapabilities;
     }
     let mut argument_bytes = [0; userspace::abi::limits::MAX_ARGUMENT_BYTES];
     let argument_length =
         match encode_startup_arguments(&arguments[..argument_count], &mut argument_bytes) {
             Ok(length) => length,
-            Err(_) => return false,
+            Err(_) => return ManagedProcessStartSend::FailedAfterCapabilities,
         };
     let mut environment_bytes = [0; 4];
     let environment_length = match encode_startup_environment(&[], &mut environment_bytes) {
         Ok(length) => length,
-        Err(_) => return false,
+        Err(_) => return ManagedProcessStartSend::FailedAfterCapabilities,
     };
     let monotonic_start_ns = match platform::monotonic_time_ns() {
         Ok(value) => value,
-        Err(_) => return false,
+        Err(_) => return ManagedProcessStartSend::FailedAfterCapabilities,
     };
     let identity_bytes = StartupIdentity {
         process: process_id,
@@ -516,14 +540,19 @@ fn send_managed_service_process_start(
             bytes: &launch_bytes,
         },
     ];
-    send_process_start_data(sender, &sections).is_ok()
+    if send_process_start_data(sender, &sections).is_ok() {
+        ManagedProcessStartSend::Complete
+    } else {
+        ManagedProcessStartSend::FailedAfterCapabilities
+    }
 }
 
 struct ContainedServiceActivationAttempt {
     containment: ServiceContainment,
-    generation_handoff_source: Option<CapabilityHandle>,
     bootstrap_sender: Option<CapabilityHandle>,
     bootstrap_receiver_source: Option<CapabilityHandle>,
+    moved_startup_source: Option<CapabilityHandle>,
+    moved_startup_object_id: Option<u64>,
     barrier: Option<syscall::LaunchBarrier>,
     process_id: Option<ProcessId>,
     process_group_id: Option<ProcessId>,
@@ -537,9 +566,10 @@ impl ContainedServiceActivationAttempt {
     const fn new(containment: ServiceContainment) -> Self {
         Self {
             containment,
-            generation_handoff_source: None,
             bootstrap_sender: None,
             bootstrap_receiver_source: None,
+            moved_startup_source: None,
+            moved_startup_object_id: None,
             barrier: None,
             process_id: None,
             process_group_id: None,
@@ -559,9 +589,6 @@ impl ContainedServiceActivationAttempt {
     }
 
     fn release_child(&mut self) -> bool {
-        let mut generation_handoff_source = self.generation_handoff_source.take();
-        let generation_closed = self.close_capability(&mut generation_handoff_source);
-        self.generation_handoff_source = generation_handoff_source;
         let mut bootstrap_sender = self.bootstrap_sender.take();
         let sender_closed = self.close_capability(&mut bootstrap_sender);
         self.bootstrap_sender = bootstrap_sender;
@@ -569,7 +596,7 @@ impl ContainedServiceActivationAttempt {
         let receiver_closed = self.close_capability(&mut bootstrap_receiver_source);
         self.bootstrap_receiver_source = bootstrap_receiver_source;
         let barrier_released = release_cleanup_barrier(self.containment.service, &mut self.barrier);
-        generation_closed && sender_closed && receiver_closed && barrier_released
+        sender_closed && receiver_closed && barrier_released
     }
 
     fn abort(&mut self) -> bool {
@@ -618,10 +645,10 @@ impl ContainedServiceActivationAttempt {
         } else {
             false
         };
-        let generation_closed = if process_clean {
-            let mut handle = self.generation_handoff_source.take();
+        let moved_startup_closed = if process_clean {
+            let mut handle = self.moved_startup_source.take();
             let closed = self.close_capability(&mut handle);
-            self.generation_handoff_source = handle;
+            self.moved_startup_source = handle;
             closed
         } else {
             false
@@ -644,7 +671,7 @@ impl ContainedServiceActivationAttempt {
         };
         process_clean
             && management_closed
-            && generation_closed
+            && moved_startup_closed
             && bootstrap_closed
             && barrier_released
     }
@@ -660,7 +687,9 @@ impl ContainedServiceActivationAttempt {
             || self.process_group_id.is_none()
             || self.job.is_none()
             || self.job_management.is_some()
-            || self.generation_handoff_source.is_some()
+            || self.bootstrap_sender.is_some()
+            || self.bootstrap_receiver_source.is_some()
+            || self.moved_startup_source.is_some()
             || self.barrier.is_some()
         {
             fail(messages.protocol_failed);
@@ -668,6 +697,7 @@ impl ContainedServiceActivationAttempt {
         ContainedServiceJob {
             containment: self.containment,
             job: self.job.take(),
+            moved_startup_object_id: self.moved_startup_object_id,
             cleanup_budget_reported: false,
         }
     }
@@ -676,6 +706,7 @@ impl ContainedServiceActivationAttempt {
 struct ContainedServiceJob {
     containment: ServiceContainment,
     job: Option<CapabilityHandle>,
+    moved_startup_object_id: Option<u64>,
     cleanup_budget_reported: bool,
 }
 
@@ -686,6 +717,10 @@ struct NullfsGenerationResources<'a> {
 }
 
 impl ContainedServiceJob {
+    const fn moved_startup_object_id(&self) -> Option<u64> {
+        self.moved_startup_object_id
+    }
+
     fn request_termination(&mut self) -> bool {
         let Some(handle) = self.job else {
             report_service_cleanup_diagnostic(
@@ -1748,7 +1783,9 @@ fn pump_route_ingress(
 }
 
 struct LoggingActivationAttempt {
-    generation_handoff_source: Option<CapabilityHandle>,
+    bootstrap_sender: Option<CapabilityHandle>,
+    bootstrap_receiver_source: Option<CapabilityHandle>,
+    early_log_reader: Option<CapabilityHandle>,
     readiness_source: Option<CapabilityHandle>,
     producer_source: Option<CapabilityHandle>,
     observer_source: Option<CapabilityHandle>,
@@ -1764,7 +1801,9 @@ struct LoggingActivationAttempt {
 impl LoggingActivationAttempt {
     const fn new() -> Self {
         Self {
-            generation_handoff_source: None,
+            bootstrap_sender: None,
+            bootstrap_receiver_source: None,
+            early_log_reader: None,
             readiness_source: None,
             producer_source: None,
             observer_source: None,
@@ -1791,9 +1830,10 @@ impl LoggingActivationAttempt {
     }
 
     fn release_child(&mut self) -> bool {
-        let generation_closed = Self::close_capability(&mut self.generation_handoff_source);
+        let sender_closed = Self::close_capability(&mut self.bootstrap_sender);
+        let receiver_closed = Self::close_capability(&mut self.bootstrap_receiver_source);
         let barrier_released = self.release_barrier();
-        generation_closed && barrier_released
+        sender_closed && receiver_closed && barrier_released
     }
 
     fn abort(&mut self) -> bool {
@@ -1839,13 +1879,20 @@ impl LoggingActivationAttempt {
         } else {
             false
         };
-        let generation_closed = if process_clean {
-            Self::close_capability(&mut self.generation_handoff_source)
+        let bootstrap_closed = if process_clean {
+            let sender_closed = Self::close_capability(&mut self.bootstrap_sender);
+            let receiver_closed = Self::close_capability(&mut self.bootstrap_receiver_source);
+            sender_closed && receiver_closed
         } else {
             false
         };
         let readiness_closed = if process_clean {
             Self::close_capability(&mut self.readiness_source)
+        } else {
+            false
+        };
+        let early_log_closed = if process_clean {
+            Self::close_capability(&mut self.early_log_reader)
         } else {
             false
         };
@@ -1866,7 +1913,8 @@ impl LoggingActivationAttempt {
         };
         process_clean
             && management_closed
-            && generation_closed
+            && bootstrap_closed
+            && early_log_closed
             && readiness_closed
             && producer_closed
             && observer_closed
@@ -3774,30 +3822,18 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     }
 
     let mut route_broker = RouteBrokerState::new();
-    let logging_early_log_reader =
-        early_log::open_reader().unwrap_or_else(|_| fail(LOGGING_SERVICE_BOOTSTRAP_FAILED));
-    if !matches!(
-        ipc::info(logging_early_log_reader),
-        Ok(info)
-            if info.kind == ObjectKind::KernelEarlyLogReader
-                && info.rights == Rights::KERNEL_EARLY_LOG_READER
-    ) {
-        fail(LOGGING_SERVICE_BOOTSTRAP_FAILED);
-    }
     let mut logging_service = ServiceRuntime::new(LOGGING_SERVICE);
     let mut logging_generations = ProviderGenerationSequence::new();
     let mut logging_generation = start_logging_generation(
         &mut logging_service,
         &mut route_broker,
         &mut logging_generations,
-        logging_early_log_reader,
     );
     if nullfs_restart_test {
         logging_generation = run_logging_collector_restart_test(
             &mut logging_service,
             &mut route_broker,
             &mut logging_generations,
-            logging_early_log_reader,
             logging_generation,
         );
     } else {
@@ -3882,18 +3918,6 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             .unwrap_or_else(|_| fail(BLOCK_DEVICE_BOOTSTRAP_FAILED));
     }
 
-    let nullfs_service_block_endpoint = platform::open_writable_nullfs_block_device_endpoint(
-        &nullfs_primary_volume::FILESYSTEM_UUID,
-    )
-    .unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
-    if !matches!(
-        ipc::info(nullfs_service_block_endpoint),
-        Ok(info)
-            if info.kind == ipc::ObjectKind::Endpoint
-                && info.rights == (Rights::SEND | Rights::TRANSFER)
-    ) {
-        fail(NULLFS_SERVICE_BOOTSTRAP_FAILED);
-    }
     let mut nullfs_readiness_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_SERVICE_BOOTSTRAP_FAILED));
     let mut nullfs_request_endpoint =
@@ -3912,21 +3936,16 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     };
     let mut nullfs_service = ServiceRuntime::new(nullfs_spec);
     let mut nullfs_generations = ProviderGenerationSequence::new();
-    let nullfs_block_capability = BootstrapCapability {
-        source_handle: nullfs_service_block_endpoint,
-        rights: Rights::SEND,
-        target_handle: NULLFS_BLOCK_HANDLE,
-    };
-    let nullfs_crash_capability = BootstrapCapability {
+    let nullfs_crash_capability = ManagedStartupCapability {
         source_handle: nullfs_crash_hook_endpoint.unwrap_or(0),
         rights: Rights::RECEIVE,
-        target_handle: NULLFS_CRASH_TEST_HANDLE,
+        role: CapabilityRole::NULLFS_CRASH_TEST_CONTROL,
     };
-    let nullfs_capabilities = [nullfs_block_capability, nullfs_crash_capability];
+    let nullfs_capabilities = [nullfs_crash_capability];
     let nullfs_capabilities = if nullfs_crash_recovery_test {
         &nullfs_capabilities[..]
     } else {
-        &nullfs_capabilities[..1]
+        &nullfs_capabilities[..0]
     };
     let (mut nullfs_generation, mut nullfs_job) = start_contained_service(
         &mut nullfs_service,
@@ -4021,7 +4040,6 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
                 job: &mut nullfs_job,
             },
             vfs_request_endpoint,
-            nullfs_block_capability,
         );
         let _ = syscall::write_all(STDOUT, NULLFS_RESTART_PROBE_PASSED);
         run_service_control_probe(
@@ -4040,12 +4058,15 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             },
         );
     } else if nullfs_block_device_loss_test {
+        let nullfs_block_object_id = nullfs_job
+            .moved_startup_object_id()
+            .unwrap_or_else(|| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
         run_nullfs_block_device_loss_probe(
             &nullfs_service,
             nullfs_generation,
             &mut nullfs_job,
             vfs_request_endpoint,
-            nullfs_service_block_endpoint,
+            nullfs_block_object_id,
         );
     } else if nullfs_crash_recovery_test {
         nullfs_generation = run_nullfs_crash_recovery_probe(
@@ -4181,7 +4202,6 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
             &mut logging_lifecycle,
             &mut route_broker,
             &mut logging_generations,
-            logging_early_log_reader,
             logging_lifecycle_test,
         );
         service_control.pump_observation(ServiceRegistryView {
@@ -4582,7 +4602,7 @@ fn run_nullfs_crash_recovery_probe(
     old_generation: ProviderGeneration,
     generations: &mut ProviderGenerationSequence,
     resources: NullfsGenerationResources<'_>,
-    bootstrap_capabilities: &[BootstrapCapability],
+    bootstrap_capabilities: &[ManagedStartupCapability],
     crash_hook_endpoint: CapabilityHandle,
 ) -> ProviderGeneration {
     const NONCE: u64 = 0x4352_4153_4800_0001;
@@ -4775,14 +4795,11 @@ fn run_nullfs_block_device_loss_probe(
     nullfs_generation: ProviderGeneration,
     job: &mut ContainedServiceJob,
     vfs_request_endpoint: CapabilityHandle,
-    block_endpoint: CapabilityHandle,
+    block_generation: u64,
 ) {
     let service_process_id = nullfs_service
         .process_id()
         .unwrap_or_else(|| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
-    let block_generation = ipc::info(block_endpoint)
-        .map(|info| info.object_id)
-        .unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
     if block_generation == 0 {
         fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
     }
@@ -4946,7 +4963,6 @@ fn run_nullfs_restart_probe(
     generations: &mut ProviderGenerationSequence,
     resources: NullfsGenerationResources<'_>,
     vfs_request_endpoint: CapabilityHandle,
-    block_capability: BootstrapCapability,
 ) -> ProviderGeneration {
     let ready_endpoint =
         ipc::endpoint_create().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
@@ -5115,7 +5131,7 @@ fn run_nullfs_restart_probe(
         generations,
         resources.readiness_endpoint,
         &mut replacement_request_endpoint,
-        &[block_capability],
+        &[],
         &NULLFS_MESSAGES,
         NULLFS_CONTAINMENT,
     );
@@ -5298,7 +5314,7 @@ fn run_nullfs_restart_probe(
         generations,
         resources.readiness_endpoint,
         &mut forced_replacement_endpoint,
-        &[block_capability],
+        &[],
         &NULLFS_MESSAGES,
         NULLFS_CONTAINMENT,
     );
@@ -5404,7 +5420,6 @@ fn fail_logging_activation(mut attempt: LoggingActivationAttempt, message: &[u8]
 fn launch_logging_generation(
     service: &mut ServiceRuntime,
     generations: &mut ProviderGenerationSequence,
-    early_log_reader: CapabilityHandle,
     lifecycle_test: bool,
 ) -> (ProcessId, LoggingGeneration) {
     let generation = generations
@@ -5448,12 +5463,23 @@ fn launch_logging_generation(
         fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
 
-    let generation_handoff_source = match ipc::endpoint_create() {
+    let (bootstrap_sender, bootstrap_receiver_source) = match ipc::endpoint_create_pair() {
+        Ok(pair) => pair,
+        Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
+    };
+    attempt.bootstrap_sender = Some(bootstrap_sender);
+    attempt.bootstrap_receiver_source = Some(bootstrap_receiver_source);
+    let early_log_reader = match early_log::open_reader() {
         Ok(handle) => handle,
         Err(_) => fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED),
     };
-    attempt.generation_handoff_source = Some(generation_handoff_source);
-    if queue_service_generation(generation_handoff_source, generation).is_err() {
+    attempt.early_log_reader = Some(early_log_reader);
+    if !matches!(
+        ipc::info(early_log_reader),
+        Ok(info)
+            if info.kind == ObjectKind::KernelEarlyLogReader
+                && info.rights == Rights::KERNEL_EARLY_LOG_READER
+    ) {
         fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
     let readiness_source = match ipc::endpoint_create() {
@@ -5524,36 +5550,60 @@ fn launch_logging_generation(
         fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
 
-    if ipc::grant_child(process_id, readiness_source, Rights::SEND, READY_HANDLE).ok()
-        != Some(READY_HANDLE)
-        || ipc::grant_child(process_id, producer_source, Rights::RECEIVE, REQUEST_HANDLE).ok()
-            != Some(REQUEST_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            observer_source,
-            Rights::RECEIVE,
-            LOGGING_OBSERVER_INGRESS_HANDLE,
-        )
-        .ok()
-            != Some(LOGGING_OBSERVER_INGRESS_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            early_log_reader,
-            Rights::READ,
-            LOGGING_EARLY_LOG_HANDLE,
-        )
-        .ok()
-            != Some(LOGGING_EARLY_LOG_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            generation_handoff_source,
-            Rights::RECEIVE,
-            GENERATION_HANDOFF_HANDLE,
-        )
-        .ok()
-            != Some(GENERATION_HANDOFF_HANDLE)
-        || !attempt.release_child()
+    let capabilities = [
+        ManagedStartupCapability {
+            source_handle: readiness_source,
+            rights: Rights::SEND,
+            role: CapabilityRole::READINESS,
+        },
+        ManagedStartupCapability {
+            source_handle: producer_source,
+            rights: Rights::RECEIVE,
+            role: CapabilityRole::LOGGING_PRODUCER_INGRESS,
+        },
+        ManagedStartupCapability {
+            source_handle: observer_source,
+            rights: Rights::RECEIVE,
+            role: CapabilityRole::LOGGING_OBSERVER_INGRESS,
+        },
+    ];
+    let moved_early_log = ManagedStartupCapability {
+        source_handle: early_log_reader,
+        rights: Rights::READ,
+        role: CapabilityRole::KERNEL_EARLY_LOG,
+    };
+    let identity = ManagedServiceIdentity::new(
+        LOGGING_EXECUTABLE_ID,
+        numeric_service_id(LOGGING_SERVICE_ID.into_bytes()),
+        LOGGING_EXECUTABLE_ID,
+    );
+    if ipc::grant_child(
+        process_id,
+        bootstrap_receiver_source,
+        Rights::RECEIVE,
+        PROCESS_START_BOOTSTRAP_HANDLE,
+    )
+    .ok()
+        != Some(PROCESS_START_BOOTSTRAP_HANDLE)
     {
+        fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
+    }
+    let send = send_managed_service_process_start(
+        bootstrap_sender,
+        command,
+        process_id,
+        generation,
+        service.restart_count(),
+        identity,
+        ManagedStartupCapabilities {
+            duplicated: &capabilities,
+            moved: Some(moved_early_log),
+        },
+    );
+    if send.capabilities_moved() {
+        attempt.early_log_reader = None;
+    }
+    if !send.is_complete() || !attempt.release_child() {
         fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
 
@@ -5592,12 +5642,11 @@ fn start_logging_generation(
     service: &mut ServiceRuntime,
     route_broker: &mut RouteBrokerState,
     generations: &mut ProviderGenerationSequence,
-    early_log_reader: CapabilityHandle,
 ) -> LoggingGeneration {
     'attempt: loop {
         let spec = service.spec();
         let (process_id, mut logging_generation) =
-            launch_logging_generation(service, generations, early_log_reader, false);
+            launch_logging_generation(service, generations, false);
         let generation = logging_generation.generation;
         let readiness_source = logging_generation.readiness_source;
         let producer_source = logging_generation.producer_source;
@@ -5701,10 +5750,9 @@ fn start_logging_generation(
 fn begin_logging_generation(
     service: &mut ServiceRuntime,
     generations: &mut ProviderGenerationSequence,
-    early_log_reader: CapabilityHandle,
     lifecycle_test: bool,
 ) -> LoggingGeneration {
-    launch_logging_generation(service, generations, early_log_reader, lifecycle_test).1
+    launch_logging_generation(service, generations, lifecycle_test).1
 }
 
 fn poll_logging_child(
@@ -5821,7 +5869,6 @@ fn advance_logging_lifecycle(
     lifecycle: &mut LoggingLifecycle,
     route_broker: &mut RouteBrokerState,
     generations: &mut ProviderGenerationSequence,
-    early_log_reader: CapabilityHandle,
     lifecycle_test: bool,
 ) {
     if lifecycle.current.is_none() {
@@ -5830,8 +5877,7 @@ fn advance_logging_lifecycle(
             return;
         }
         if service.should_start() || service.state() == ServiceState::Backoff {
-            let generation =
-                begin_logging_generation(service, generations, early_log_reader, lifecycle_test);
+            let generation = begin_logging_generation(service, generations, lifecycle_test);
             lifecycle.install(generation);
         }
         return;
@@ -5927,7 +5973,7 @@ fn start_contained_service(
     generations: &mut ProviderGenerationSequence,
     readiness_endpoint: &mut CapabilityHandle,
     request_endpoint: &mut CapabilityHandle,
-    additional_capabilities: &[BootstrapCapability],
+    additional_capabilities: &[ManagedStartupCapability],
     messages: &ServiceMessages,
     containment: ServiceContainment,
 ) -> (ProviderGeneration, ContainedServiceJob) {
@@ -5962,22 +6008,32 @@ fn start_contained_service(
             fail_contained_activation(attempt, messages, messages.bootstrap_failed);
         }
 
-        if managed_identity.is_some() {
-            let (sender, receiver) = match ipc::endpoint_create_pair() {
-                Ok(pair) => pair,
-                Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
-            };
-            attempt.bootstrap_sender = Some(sender);
-            attempt.bootstrap_receiver_source = Some(receiver);
-        } else {
-            let generation_handoff_source = match ipc::endpoint_create() {
+        let (sender, receiver) = match ipc::endpoint_create_pair() {
+            Ok(pair) => pair,
+            Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
+        };
+        attempt.bootstrap_sender = Some(sender);
+        attempt.bootstrap_receiver_source = Some(receiver);
+        if matches!(containment.service, CleanupService::Nullfs) {
+            let block = match platform::open_writable_nullfs_block_device_endpoint(
+                &nullfs_primary_volume::FILESYSTEM_UUID,
+            ) {
                 Ok(handle) => handle,
                 Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
             };
-            attempt.generation_handoff_source = Some(generation_handoff_source);
-            if queue_service_generation(generation_handoff_source, generation).is_err() {
+            let info = match ipc::info(block) {
+                Ok(info) => info,
+                Err(_) => fail_contained_activation(attempt, messages, messages.bootstrap_failed),
+            };
+            if info.kind != ObjectKind::Endpoint
+                || info.rights != (Rights::SEND | Rights::TRANSFER)
+                || info.object_id == 0
+            {
+                attempt.moved_startup_source = Some(block);
                 fail_contained_activation(attempt, messages, messages.bootstrap_failed);
             }
+            attempt.moved_startup_source = Some(block);
+            attempt.moved_startup_object_id = Some(info.object_id);
         }
         let _ = syscall::write_all(STDOUT, messages.starting);
         let barrier = match syscall::LaunchBarrier::new() {
@@ -6026,78 +6082,72 @@ fn start_contained_service(
         }
         attempt.job_management = management;
 
-        let bootstrap_ready = match managed_identity {
-            Some(identity) => {
-                let capabilities = [
-                    ManagedStartupCapability {
-                        source_handle: *readiness_endpoint,
-                        rights: Rights::SEND,
-                        role: CapabilityRole::READINESS,
-                    },
-                    ManagedStartupCapability {
-                        source_handle: *request_endpoint,
-                        rights: Rights::RECEIVE,
-                        role: CapabilityRole::SERVICE_REQUEST,
-                    },
-                ];
-                additional_capabilities.is_empty()
-                    && attempt.bootstrap_receiver_source.is_some_and(|receiver| {
-                        ipc::grant_child(
-                            process_id,
-                            receiver,
-                            Rights::RECEIVE,
-                            PROCESS_START_BOOTSTRAP_HANDLE,
-                        )
-                        .ok()
-                            == Some(PROCESS_START_BOOTSTRAP_HANDLE)
-                    })
-                    && attempt.bootstrap_sender.is_some_and(|sender| {
-                        send_managed_service_process_start(
-                            sender,
-                            spec.command,
-                            process_id,
-                            generation,
-                            service.restart_count(),
-                            identity,
-                            &capabilities,
-                        )
-                    })
-            }
-            None => {
-                let generation_handoff_source = attempt
-                    .generation_handoff_source
-                    .expect("legacy contained activation owns generation handoff");
-                ipc::grant_child(process_id, *readiness_endpoint, Rights::SEND, READY_HANDLE).ok()
-                    == Some(READY_HANDLE)
-                    && ipc::grant_child(
-                        process_id,
-                        *request_endpoint,
-                        Rights::RECEIVE,
-                        REQUEST_HANDLE,
-                    )
-                    .ok()
-                        == Some(REQUEST_HANDLE)
-                    && ipc::grant_child(
-                        process_id,
-                        generation_handoff_source,
-                        Rights::RECEIVE,
-                        GENERATION_HANDOFF_HANDLE,
-                    )
-                    .ok()
-                        == Some(GENERATION_HANDOFF_HANDLE)
-                    && !additional_capabilities.iter().copied().any(|capability| {
-                        ipc::grant_child(
-                            process_id,
-                            capability.source_handle,
-                            capability.rights,
-                            capability.target_handle,
-                        )
-                        .ok()
-                            != Some(capability.target_handle)
-                    })
-            }
+        if additional_capabilities.len() > 1
+            || (!matches!(containment.service, CleanupService::Nullfs)
+                && !additional_capabilities.is_empty())
+        {
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+        let mut capabilities = [ManagedStartupCapability {
+            source_handle: 0,
+            rights: Rights::EMPTY,
+            role: CapabilityRole::BOOTSTRAP,
+        }; userspace::abi::limits::MAX_IPC_MESSAGE_HANDLES];
+        capabilities[0] = ManagedStartupCapability {
+            source_handle: *readiness_endpoint,
+            rights: Rights::SEND,
+            role: CapabilityRole::READINESS,
         };
-        if !bootstrap_ready || !attempt.release_child() {
+        capabilities[1] = ManagedStartupCapability {
+            source_handle: *request_endpoint,
+            rights: Rights::RECEIVE,
+            role: CapabilityRole::SERVICE_REQUEST,
+        };
+        for (index, capability) in additional_capabilities.iter().copied().enumerate() {
+            capabilities[index + 2] = capability;
+        }
+        let capability_count = additional_capabilities.len() + 2;
+        let moved_capability =
+            attempt
+                .moved_startup_source
+                .map(|source_handle| ManagedStartupCapability {
+                    source_handle,
+                    rights: Rights::SEND,
+                    role: CapabilityRole::BLOCK_DEVICE,
+                });
+        let receiver = attempt
+            .bootstrap_receiver_source
+            .expect("contained activation owns bootstrap receiver");
+        if ipc::grant_child(
+            process_id,
+            receiver,
+            Rights::RECEIVE,
+            PROCESS_START_BOOTSTRAP_HANDLE,
+        )
+        .ok()
+            != Some(PROCESS_START_BOOTSTRAP_HANDLE)
+        {
+            fail_contained_activation(attempt, messages, messages.bootstrap_failed);
+        }
+        let sender = attempt
+            .bootstrap_sender
+            .expect("contained activation owns bootstrap sender");
+        let send = send_managed_service_process_start(
+            sender,
+            spec.command,
+            process_id,
+            generation,
+            service.restart_count(),
+            managed_identity,
+            ManagedStartupCapabilities {
+                duplicated: &capabilities[..capability_count],
+                moved: moved_capability,
+            },
+        );
+        if moved_capability.is_some() && send.capabilities_moved() {
+            attempt.moved_startup_source = None;
+        }
+        if !send.is_complete() || !attempt.release_child() {
             fail_contained_activation(attempt, messages, messages.bootstrap_failed);
         }
         service.note_spawned(process_id);
@@ -6238,7 +6288,6 @@ fn run_logging_collector_restart_test(
     service: &mut ServiceRuntime,
     route_broker: &mut RouteBrokerState,
     generations: &mut ProviderGenerationSequence,
-    early_log_reader: CapabilityHandle,
     mut generation: LoggingGeneration,
 ) -> LoggingGeneration {
     let status_endpoint = ipc::endpoint_create().unwrap_or_else(|_| fail(LOGGING_PROBE_FAILED));
@@ -6341,8 +6390,7 @@ fn run_logging_collector_restart_test(
     generation.close();
     let _ = syscall::write_all(STDOUT, LOGGING_SERVICE_RESTARTING);
     backoff(backoff_yields);
-    let replacement =
-        start_logging_generation(service, route_broker, generations, early_log_reader);
+    let replacement = start_logging_generation(service, route_broker, generations);
     if service.process_id() == Some(old_service_process_id)
         || service.restart_count() != 1
         || replacement.generation.get() <= old_generation.get()

@@ -214,10 +214,9 @@ The implemented route substrate represents a stable identity as a UUIDv4 `Servic
 nonzero role ID. A role matters because one service can expose independently authorized authorities;
 the logging producer and observer are separate routes under one service ID. The current PID 1 pilot
 owns allocation-free monotonic provider-generation sequences for logging, NullFS, tmpfs, and VFS,
-and every startup attempt consumes a generation independent of process IDs. PID 1 hands it to the
-logging and NullFS services in a strict one-use `NSGN` v1 record over a private receive-only
-bootstrap endpoint. Tmpfs and VFS receive the same manager-owned value in the launch section of
-their complete PID 1-authenticated `NSPD` stream and no longer need a separate generation endpoint.
+and every startup attempt consumes a generation independent of process IDs. Logging, NullFS, tmpfs,
+and VFS receive the manager-owned value in the launch section of their complete PID 1-authenticated
+`NSPD` stream and no longer need a separate generation endpoint.
 The generation binds filesystem sessions and proxy
 registrations, while logging also binds its collector, `NSLS`, NSWP, and route publications. For a
 filesystem replacement, the kernel preserves the exact old generation as an offline tombstone and
@@ -634,7 +633,8 @@ The accepted model can be introduced incrementally:
    before replacement. NullFS clean replacement preserves the exact quiesce and clean-unmount
    proof before drainage; forced dirty recovery terminates and drains the complete job. Hierarchy
    remains future work.
-2. introduce the one-bootstrap-channel startup contract and explicit startup handles;
+2. expand the implemented one-bootstrap-channel startup contract from the definition service,
+   logging, NullFS, tmpfs, and VFS to the general loader and remaining managed processes;
 3. define stable service identity, generation, lifecycle state, readiness, and control
    protocols;
 4. extract dependency, restart, and resource policy into a separate system service

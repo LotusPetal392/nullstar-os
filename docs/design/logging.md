@@ -191,11 +191,11 @@ packets and is not on the logging data path after resolution.
 
 PID 1 owns an allocation-free monotonic logging provider-generation sequence independent of process
 IDs. Every `/logging-service` startup attempt consumes a nonzero generation, including an attempt
-that fails before readiness. PID 1 sends it in one exact 16-byte `NSGN` v1 record, with no capability
-attachment, over a private bootstrap endpoint granted to the child with exact `RECEIVE` rights. The
-service requires that exact handle authority, kernel-stamped sender PID 1, `NSGN` magic, version 1,
-zero reserved bytes, a nonzero generation, and no trailing data. It closes the bootstrap handle after
-the one receive attempt. PID 1 also creates a fresh flat job for every startup attempt, assigns the
+that fails before readiness. PID 1 sends it as authenticated descriptive data in the launch section
+of the complete `NSPD` stream over the service's single bootstrap endpoint. The shared managed-service
+receiver requires that endpoint to be the child's only initial capability, pins the kernel-stamped
+sender as PID 1, validates the logging identity, and rejects a zero generation. PID 1 also creates a
+fresh flat job for every startup attempt, assigns the
 blocked child before launch-barrier release, and drops the full management handle after retaining
 exactly `SIGNAL | WAIT`. Cooperative shutdown still begins with process-group `SIGTERM`; forced
 termination and readiness expiry target the whole job. PID 1 independently consumes the leader's

@@ -14,22 +14,24 @@ use nullfs_core::Filesystem;
 use nullfs_format::NodeKind;
 use nullfs_userspace_blockdev::SessionBlockDevice;
 use userspace::{
-    abi::INIT_PROCESS_ID,
     args::Args,
     block_device::{self, protocol},
+    handle::Endpoint,
     ipc::{self, ObjectKind, Rights},
+    managed_startup::{ManagedServiceIdentity, numeric_service_id, receive_managed_service_start},
     nullfs_primary_volume, platform,
-    service_route::receive_service_generation,
+    runtime_context::{CapabilityRole, StartupCapabilityPolicy},
     syscall,
 };
 
 userspace::entry!(rust_main);
 
-const READY_HANDLE: u64 = 1;
-const REQUEST_HANDLE: u64 = 2;
-const BLOCK_HANDLE: u64 = 3;
-const CRASH_TEST_HANDLE: u64 = 4;
-const GENERATION_HANDOFF_HANDLE: u64 = 5;
+const NULLFS_EXECUTABLE_ID: u64 = 2;
+const SERVICE_IDENTITY: ManagedServiceIdentity = ManagedServiceIdentity::new(
+    NULLFS_EXECUTABLE_ID,
+    numeric_service_id(userspace::service_control::NULLFS_SERVICE_ID.into_bytes()),
+    NULLFS_EXECUTABLE_ID,
+);
 const READY_MESSAGE: &[u8] = b"service-ready: nullfs";
 const CRASH_TEST_ARGUMENT: &[u8] = b"--crash-test";
 const CONTAINMENT_TEST_ARGUMENT: &[u8] = b"--containment-test";
@@ -110,45 +112,87 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         }
     }
 
-    require_handle(
-        READY_HANDLE,
-        Rights::SEND,
-        10,
-        b"nullfs: handle 1 must be Endpoint SEND\n",
-    );
-    require_handle(
-        REQUEST_HANDLE,
-        Rights::RECEIVE,
-        11,
-        b"nullfs: handle 2 must be Endpoint RECEIVE\n",
-    );
-    require_handle(
-        BLOCK_HANDLE,
-        Rights::SEND,
-        12,
-        b"nullfs: handle 3 must be Endpoint SEND\n",
-    );
+    let policies = [
+        StartupCapabilityPolicy {
+            role: CapabilityRole::READINESS,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::SEND,
+            maximum_rights: Rights::SEND,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::SERVICE_REQUEST,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::RECEIVE,
+            maximum_rights: Rights::RECEIVE,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::BLOCK_DEVICE,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::SEND,
+            maximum_rights: Rights::SEND,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::NULLFS_CRASH_TEST_CONTROL,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::RECEIVE,
+            maximum_rights: Rights::RECEIVE,
+            required: crash_test,
+        },
+    ];
+    let policies = if crash_test {
+        &policies[..]
+    } else {
+        &policies[..3]
+    };
+    let mut start = match receive_managed_service_start::<4>(arguments, policies, SERVICE_IDENTITY)
+    {
+        Ok(start) => start,
+        Err(_) => fail(10, b"nullfs: managed startup validation failed\n"),
+    };
+    let readiness = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::READINESS, Rights::SEND)
+    {
+        Ok(handle) => handle.into_raw(),
+        Err(_) => fail(11, b"nullfs: readiness authority missing\n"),
+    };
+    let request = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::SERVICE_REQUEST, Rights::RECEIVE)
+    {
+        Ok(handle) => handle.into_raw(),
+        Err(_) => fail(11, b"nullfs: request authority missing\n"),
+    };
+    let block = match start
+        .context
+        .take::<Endpoint>(CapabilityRole::BLOCK_DEVICE, Rights::SEND)
+    {
+        Ok(handle) => handle.into_raw(),
+        Err(_) => fail(12, b"nullfs: block-device authority missing\n"),
+    };
     let crash_test_hook = if crash_test {
-        require_handle(
-            CRASH_TEST_HANDLE,
-            Rights::RECEIVE,
-            14,
-            b"nullfs: handle 4 must be Endpoint RECEIVE in crash-test mode\n",
-        );
-        Some(server::CrashTestHook::new(CRASH_TEST_HANDLE))
+        match start
+            .context
+            .take::<Endpoint>(CapabilityRole::NULLFS_CRASH_TEST_CONTROL, Rights::RECEIVE)
+        {
+            Ok(handle) => Some(server::CrashTestHook::new(handle.into_raw())),
+            Err(_) => fail(14, b"nullfs: crash-test authority missing\n"),
+        }
     } else {
         None
     };
-    let service_generation =
-        match receive_service_generation(GENERATION_HANDOFF_HANDLE, INIT_PROCESS_ID) {
-            Ok(generation) => generation.get(),
-            Err(_) => fail(13, b"nullfs: generation handoff failed\n"),
-        };
+    if !start.context.is_empty() {
+        fail(10, b"nullfs: unexpected startup authority\n");
+    }
+    let service_generation = start.generation;
     if containment_test {
         spawn_containment_descendant();
     }
 
-    let mut session = match block_device::connect_service(BLOCK_HANDLE, 1) {
+    let mut session = match block_device::connect_service(block, 1) {
         Ok(session) => session,
         Err(_) => fail(20, b"nullfs: block-device connect failed\n"),
     };
@@ -205,17 +249,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         filesystem,
         service_generation,
         root_attributes,
+        readiness,
+        request,
         crash_test_hook,
     )
-}
-
-fn require_handle(handle: u64, rights: Rights, exit_code: u64, message: &[u8]) {
-    if !matches!(
-        ipc::wait_for_handle(handle),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == rights
-    ) {
-        fail(exit_code, message);
-    }
 }
 
 fn fail(code: u64, message: &[u8]) -> ! {

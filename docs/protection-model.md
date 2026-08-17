@@ -258,10 +258,11 @@ kernel has no general revocation operation, and an endpoint object remains reach
 or queued transfer refers to it.
 
 PID 1 owns separate allocation-free monotonic provider-generation sequences for logging, NullFS,
-tmpfs, and VFS, and every startup attempt consumes a value independently of process IDs. It sends one
-exact 16-byte `NSGN` v1 record with no capability over a private endpoint granted to the service with
-exact `RECEIVE` rights. Each service accepts only the canonical record from kernel-stamped sender PID
-1 on that exact-rights handle and closes the handle after the one receive attempt. NullFS and tmpfs
+tmpfs, and VFS, and every startup attempt consumes a value independently of process IDs. It sends the
+value in authenticated `NSPD` launch data over each service's single managed-start channel. Each
+service requires that receive-only bootstrap endpoint to be its only initial capability, pins the
+kernel-stamped sender as PID 1, validates its identity, and adopts `NSPC` authorities by semantic role.
+NullFS and tmpfs
 bind filesystem sessions to the value, PID 1 registers matching generations with the kernel proxies,
 and logging also uses it for its collector, `NSLS`, NSWP, and route publications. The current
 contract provides no durable cross-boot sequence persistence.

@@ -41,6 +41,11 @@ impl CapabilityRole {
     pub const READINESS: Self = Self(8);
     pub const SERVICE_GENERATION: Self = Self(9);
     pub const SERVICE_REQUEST: Self = Self(10);
+    pub const LOGGING_PRODUCER_INGRESS: Self = Self(11);
+    pub const LOGGING_OBSERVER_INGRESS: Self = Self(12);
+    pub const KERNEL_EARLY_LOG: Self = Self(13);
+    pub const BLOCK_DEVICE: Self = Self(14);
+    pub const NULLFS_CRASH_TEST_CONTROL: Self = Self(15);
 
     pub const fn new(value: u32) -> Option<Self> {
         if value == 0 { None } else { Some(Self(value)) }
