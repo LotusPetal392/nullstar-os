@@ -3,6 +3,9 @@
 
 use core::cell::Cell;
 
+use nswp_core::{ConnectionLimits, MinorVersionProfile, ProtocolId};
+use nswp_runtime::ProtocolDescriptor;
+
 use userspace::{
     abi::{capability, file, limits, signal},
     args::Args,
@@ -20,8 +23,9 @@ use userspace::{
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
     platform::{self, DirectoryEntry},
     runtime_context::{
-        self, CapabilityRole, Client, ContextCapability, ContextError, ProcessContext,
-        ProtocolDescriptor, ServiceBinding, ServiceProcess, ServiceProtocol,
+        self, CapabilityRole, Client, ContextError, ProcessContext, ServiceBinding, ServiceProcess,
+        ServiceProtocol, StartupCapabilityPolicy, StartupMessage, StartupResource,
+        StartupRuntimeRole,
     },
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
@@ -41,16 +45,41 @@ const PROBE_CLIENT_RIGHTS: Rights =
 
 struct RuntimeProbeProtocol;
 
+const RUNTIME_PROBE_PROTOCOL_ID: ProtocolId = match ProtocolId::from_bytes([
+    0x7f, 0xc6, 0xb1, 0xc3, 0xcb, 0xd1, 0x49, 0x21, 0x92, 0xbd, 0xe1, 0xcc, 0xbc, 0xb7, 0x4f, 0x56,
+]) {
+    Ok(protocol_id) => protocol_id,
+    Err(_) => panic!("runtime probe protocol id must be canonical"),
+};
+static RUNTIME_PROBE_VERSIONS: [MinorVersionProfile; 1] = [MinorVersionProfile {
+    minor: 0,
+    minimum_body_bytes: 1,
+    minimum_handles: 0,
+}];
+
 impl ServiceProtocol for RuntimeProbeProtocol {
-    const DESCRIPTOR: ProtocolDescriptor = ProtocolDescriptor {
-        name: "test.runtime-context",
-        major: 1,
-        minor: 0,
-        max_message_bytes: 32,
-        max_handles: 1,
-    };
+    const NAME: &'static str = "test.runtime-context";
     const CLIENT_RIGHTS: Rights = PROBE_CLIENT_RIGHTS;
     const SERVER_RIGHTS: Rights = Rights::RECEIVE;
+
+    fn descriptor() -> ProtocolDescriptor<'static> {
+        ProtocolDescriptor {
+            protocol_id: RUNTIME_PROBE_PROTOCOL_ID,
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+            limits: ConnectionLimits {
+                max_body_bytes: 32,
+                max_handles: 0,
+                max_outstanding: 2,
+            },
+            requested_features: &[],
+            available_features: &[],
+            versions: &RUNTIME_PROBE_VERSIONS,
+            feature_set_fits: nswp_runtime::no_features_fit,
+            methods: &[],
+        }
+    }
 }
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
@@ -217,25 +246,56 @@ fn runtime_context_probe() -> bool {
     if restricted.replace_rights(Rights::SEND).is_err() {
         return false;
     }
-    let capabilities = [
-        Some(ContextCapability::new(
-            CapabilityRole::SERVICE_NAMESPACE,
-            endpoint,
-        )),
-        Some(ContextCapability::new(
-            CapabilityRole::CONFIGURATION,
-            restricted,
-        )),
+    let startup = match StartupMessage::new(
+        StartupRuntimeRole::Service,
+        [
+            Some(StartupResource {
+                role: CapabilityRole::SERVICE_NAMESPACE,
+                required: true,
+            }),
+            Some(StartupResource {
+                role: CapabilityRole::CONFIGURATION,
+                required: false,
+            }),
+        ],
+    ) {
+        Ok(startup) => startup,
+        Err(_) => return false,
+    };
+    let mut startup_bytes = [0; 32];
+    let Ok(startup_length) = startup.encode(&mut startup_bytes) else {
+        return false;
+    };
+    let policies = [
+        StartupCapabilityPolicy {
+            role: CapabilityRole::SERVICE_NAMESPACE,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: PROBE_CLIENT_RIGHTS,
+            maximum_rights: PROBE_CLIENT_RIGHTS,
+            required: true,
+        },
+        StartupCapabilityPolicy {
+            role: CapabilityRole::CONFIGURATION,
+            kind: ObjectKind::Endpoint,
+            minimum_rights: Rights::SEND,
+            maximum_rights: Rights::SEND,
+            required: false,
+        },
     ];
-    let Ok(mut context) = ProcessContext::<ServiceProcess, 2>::new(capabilities) else {
+    let handles = [Some(endpoint.erase()), Some(restricted.erase())];
+    let Ok(mut context) = ProcessContext::<ServiceProcess, 2>::from_startup(
+        &startup_bytes[..startup_length],
+        handles,
+        &policies,
+    ) else {
         return false;
     };
     if context.runtime_role() != "service"
         || !context.contains(CapabilityRole::SERVICE_NAMESPACE)
         || context.len() != 2
         || runtime_context::validate_protocol::<RuntimeProbeProtocol>().is_err()
-        || runtime_context::validate_message_shape::<RuntimeProbeProtocol>(32, 1).is_err()
-        || runtime_context::validate_message_shape::<RuntimeProbeProtocol>(33, 1).is_ok()
+        || runtime_context::validate_message_shape::<RuntimeProbeProtocol>(32, 0).is_err()
+        || runtime_context::validate_message_shape::<RuntimeProbeProtocol>(33, 0).is_ok()
     {
         return false;
     }
@@ -257,7 +317,9 @@ fn runtime_context_probe() -> bool {
     ) else {
         return false;
     };
-    binding.descriptor() == RuntimeProbeProtocol::DESCRIPTOR
+    let descriptor = binding.descriptor();
+    descriptor.protocol_id == RUNTIME_PROBE_PROTOCOL_ID
+        && descriptor.limits.max_body_bytes == 32
         && binding
             .endpoint()
             .info()

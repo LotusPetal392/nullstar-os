@@ -283,6 +283,17 @@ The runtime should:
 The runtime must not infer trust from executable path, parent process, display name,
 working directory, or environment variables.
 
+The first capability-bearing startup record is implemented as the allocation-free `NSPC`
+version-1 envelope. Its canonical little-endian header identifies the runtime role and the
+number and fixed width of positional resource entries. Each entry carries only a stable semantic
+role and whether an unknown receiver must reject it; object kind and rights are deliberately not
+trusted from the wire. A role-specific receiver policy supplies the expected object kind, minimum
+usable rights, maximum authority ceiling, and required roles. `ProcessContext::from_startup`
+validates the complete record and every attachment before adoption, closes unknown optional
+attachments, and reduces known handles to the intersection of their delivered rights and policy
+ceiling. The record is bounded by the kernel's per-message handle limit. Identity, arguments,
+environment, and other non-capability fields remain separate future sections of `ProcessStart`.
+
 ## Role-specific entry points
 
 The SDK should provide source-level entry helpers such as:
@@ -1049,9 +1060,16 @@ spawn, poll, wait, wake, terminal, and reap transitions and reports overwritten 
 adds fixed-capacity role-specific ownership for explicit capabilities, rejects duplicate semantic roles,
 validates claimed object kinds, preserves ownership on failure, and rights-reduces successful claims.
 Bounded protocol descriptors and client/server `ServiceBinding` types provide the first pre-generated
-binding and conformance layer; host tests check identity and transport bounds, while the QEMU probe
-checks real capability adoption and rights tightening. The eventual startup message, generated binding
-integration, privacy-aware tracing, blocking pools, and broader completion sources remain future work.
+binding and conformance layer. The version-1 capability-bearing startup envelope now constructs a
+role-specific `ProcessContext` under a trusted type-and-rights policy, including unknown-optional
+cleanup and pre-entry-point required-role validation. `ServiceProtocol` now consumes the same NSWP
+runtime descriptor emitted or returned by a binding instead of duplicating provisional version and
+transport metadata; conformance checks cover its protocol profiles, transport bounds, outstanding-call
+limit, and endpoint rights. Host tests cover canonical startup encoding and descriptor validation, while
+the QEMU probe checks startup adoption and rights tightening against real kernel objects. Remaining work
+includes the non-capability `ProcessStart` sections, privacy-aware tracing, blocking pools, and broader
+completion sources; the NSIDL compiler still needs to generate the descriptors and binding code now
+accepted by this runtime layer.
 
 ### Phase 5: NSIDL compiler MVP
 
