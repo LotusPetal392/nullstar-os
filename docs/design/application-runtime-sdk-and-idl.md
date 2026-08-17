@@ -472,7 +472,10 @@ Ready tasks
 ```
 
 The kernel reports object events and completion tokens. It does not understand Rust
-futures.
+futures. The implemented reactor exposes typed futures for generic level-triggered
+readiness, counted-notification consumption, and hierarchical job-exit records in
+addition to endpoint and timer operations. These futures share the executor's bounded,
+generation-tagged event-port registration path.
 
 ### Registration identity
 
@@ -521,6 +524,14 @@ asynchronous. It must have:
 
 Audio and other deadline-sensitive work should use dedicated budgeted workers rather
 than the general async executor.
+
+The initial `BlockingPool` coordinator implements fixed FIFO admission, policy-bounded
+execution-context identifiers, structured task-group attribution, inherited deadline and
+cancellation checks before dispatch, queued cancellation, shutdown rejection, retained
+terminal outcomes, and a bounded sequence-paged trace without heap allocation. It does
+not create threads or claim preemptive cancellation of a callback that has already begun.
+Actual parallel workers, resource charging during execution, and isolation for stuck
+compatibility code depend on the future thread/address-space and broader job-policy work.
 
 ### Deadline propagation
 
@@ -1026,7 +1037,9 @@ absolute monotonic arming, cancellation, and interrupt-driven event-port deliver
 typed manual-reset events with separated signal/wait authority and level/edge integration. The scoped
 runtime now adds one-way cancellation sources and clonable tokens, nested absolute-deadline clamping,
 periodic one-shot rearming with explicit missed-expiration coalescing, and fixed-capacity independent
-task scheduling over queued event ports. I/O completion sources, sender-side receiver-slot reservation,
+task scheduling over queued event ports. Generic typed readiness, counted-notification completion, and
+hierarchical job-exit futures now reuse that bounded registration path. File/network and other I/O
+completion sources, sender-side receiver-slot reservation,
 and service migration remain Phase 2 work.
 
 ### Phase 3: Hand-written protocol runtime
@@ -1080,8 +1093,16 @@ to carry inherited lifecycle scope and attribution while retaining a fixed 64-ev
 secret and opaque transitions suppress correlation identifiers, and sequence-paged reads report
 overwritten gaps. Host tests cover canonical startup encoding, descriptor validation, trace admission,
 redaction, and bounded overwrite behavior, while the QEMU probe checks startup adoption, rights
-tightening, lifecycle attribution, and privacy-aware tracing against real kernel objects. Remaining work
-includes the non-capability `ProcessStart` sections, blocking pools, and broader completion sources; the
+tightening, lifecycle attribution, and privacy-aware tracing against real kernel objects. The runtime
+now also includes a fixed-capacity `BlockingPool` coordinator with FIFO admission, logical worker
+bounds, task-group attribution, inherited pre-dispatch cancellation and deadlines, explicit queued
+cancellation, shutdown conversion, retained outcomes, and a sequence-paged trace. The reactor adds
+generic typed readiness plus counted-notification and hierarchical job-exit completion futures; the
+QEMU runtime probe covers their real cross-process wake and exit paths as well as blocking-work
+lifecycle transitions. The coordinator deliberately supplies no threads and cannot preempt executing
+callbacks; parallel isolated workers and execution-time resource accounting require the later
+thread/address-space and job-policy milestones. Remaining work includes the non-capability
+`ProcessStart` sections and file, network, display, device, and media completion sources; the
 NSIDL compiler still needs to generate the descriptors and binding code now accepted by this runtime
 layer.
 

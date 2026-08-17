@@ -17,9 +17,10 @@ use userspace::{
         TaskTraceEvent, TaskTraceKind,
     },
     blocking_ipc,
+    blocking_pool::{BlockingOutcome, BlockingPool, BlockingTraceKind},
     handle::{
-        Endpoint, Event, EventPort, MoveHandle, Notification, OwnedHandle, SharedMemory, Timer,
-        WaitSet,
+        Endpoint, Event, EventPort, Job, MoveHandle, Notification, OwnedHandle, SharedMemory,
+        Timer, WaitSet,
     },
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
@@ -1120,11 +1121,17 @@ fn channel_pair_process_exit_probe() -> bool {
 
 fn async_ipc_probe(current_process: u64) -> bool {
     const CHILD_ENDPOINT_HANDLE: ipc::CapabilityHandle = 1;
+    const CHILD_NOTIFICATION_HANDLE: ipc::CapabilityHandle = 2;
+    const NOTIFICATION_COUNT: u64 = 3;
+    const EXPECTED_NOTIFICATION_REMAINING: u64 = NOTIFICATION_COUNT - 1;
     const CHILD_MESSAGE: &[u8] = b"async-wakeup";
     const LOCAL_MESSAGE: &[u8] = b"async-send";
     const MOVE_MESSAGE: &[u8] = b"async-move";
 
     let Ok(endpoint) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(notification) = OwnedHandle::<Notification>::create() else {
         return false;
     };
     let Ok(barrier) = syscall::pipe_pair() else {
@@ -1139,6 +1146,9 @@ fn async_ipc_probe(current_process: u64) -> bool {
         let _ = syscall::close(barrier.reader);
         let ready = ipc::wait_for_handle(CHILD_ENDPOINT_HANDLE)
             .is_ok_and(|info| info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND)
+            && ipc::wait_for_handle(CHILD_NOTIFICATION_HANDLE).is_ok_and(|info| {
+                info.kind == ObjectKind::Notification && info.rights == Rights::SIGNAL
+            })
             && syscall::write_all(barrier.writer, &[1]).is_ok()
             && syscall::close(barrier.writer).is_ok();
         if ready {
@@ -1147,7 +1157,10 @@ fn async_ipc_probe(current_process: u64) -> bool {
             }
         }
         let sent = ready
+            && ipc::notification_signal(CHILD_NOTIFICATION_HANDLE, NOTIFICATION_COUNT).ok()
+                == Some(NOTIFICATION_COUNT)
             && ipc::send(CHILD_ENDPOINT_HANDLE, CHILD_MESSAGE, None).is_ok()
+            && ipc::close(CHILD_NOTIFICATION_HANDLE).is_ok()
             && ipc::close(CHILD_ENDPOINT_HANDLE).is_ok();
         syscall::exit(if sent { 0 } else { 80 });
     }
@@ -1160,7 +1173,15 @@ fn async_ipc_probe(current_process: u64) -> bool {
             CHILD_ENDPOINT_HANDLE,
         )
         .ok()
-            == Some(CHILD_ENDPOINT_HANDLE);
+            == Some(CHILD_ENDPOINT_HANDLE)
+        && ipc::grant_child(
+            child,
+            notification.as_raw(),
+            Rights::SIGNAL,
+            CHILD_NOTIFICATION_HANDLE,
+        )
+        .ok()
+            == Some(CHILD_NOTIFICATION_HANDLE);
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
@@ -1168,6 +1189,21 @@ fn async_ipc_probe(current_process: u64) -> bool {
         && syscall::close(barrier.reader).is_ok();
 
     let reactor = Reactor::<2>::new();
+    let notification_ready = if synchronized {
+        let mut ready = reactor.ready(notification.borrow(), Signals::SIGNALED);
+        matches!(reactor.run(&mut ready), Ok(Ok(Signals::SIGNALED)))
+    } else {
+        false
+    };
+    let notification_count = if notification_ready {
+        let mut completion = reactor.notification_completion(notification.borrow());
+        match reactor.run(&mut completion) {
+            Ok(Ok(count)) => Some(count),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut buffer = [0_u8; 16];
     let child_message = if synchronized {
         let mut receive = reactor.receive(endpoint.borrow(), &mut buffer);
@@ -1257,11 +1293,65 @@ fn async_ipc_probe(current_process: u64) -> bool {
     }
     let _ = syscall::close(barrier.reader);
     let _ = syscall::close(barrier.writer);
-    child_received
-        && local_received
-        && move_received
-        && child_succeeded
-        && async_control_probe(&reactor)
+    if notification_count != Some(EXPECTED_NOTIFICATION_REMAINING) {
+        return false;
+    }
+    if !child_received || !local_received || !move_received || !child_succeeded {
+        return false;
+    }
+    if !async_control_probe(&reactor) {
+        return false;
+    }
+    if !async_job_completion_probe(&reactor) {
+        return false;
+    }
+    true
+}
+
+fn async_job_completion_probe(reactor: &Reactor<2>) -> bool {
+    const EXIT_STATUS: u64 = 61;
+
+    let Ok(job) = OwnedHandle::<Job>::create() else {
+        return false;
+    };
+    let Ok(barrier) = syscall::pipe_pair() else {
+        return false;
+    };
+    let Ok(child) = syscall::fork() else {
+        let _ = syscall::close(barrier.reader);
+        let _ = syscall::close(barrier.writer);
+        return false;
+    };
+    if child == 0 {
+        let _ = syscall::close(barrier.writer);
+        let mut byte = [0_u8; 1];
+        let released = syscall::read(barrier.reader, &mut byte).ok() == Some(0)
+            && syscall::close(barrier.reader).is_ok();
+        syscall::exit(if released { EXIT_STATUS } else { 81 });
+    }
+
+    let setup = syscall::close(barrier.reader).is_ok()
+        && ipc::job_assign(job.as_raw(), child).ok() == Some(child)
+        && syscall::close(barrier.writer).is_ok();
+    let exit = if setup {
+        let mut completion = reactor.job_exit(job.borrow());
+        match reactor.run(&mut completion) {
+            Ok(Ok(exit)) => Some(exit),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let reaped = syscall::wait_child(child).ok();
+    if exit.is_none() || reaped.is_none() {
+        let _ = ipc::job_terminate(job.as_raw());
+        let _ = platform::kill(child, signal::KILL);
+        let _ = syscall::wait_child(child);
+    }
+    let _ = syscall::close(barrier.reader);
+    let _ = syscall::close(barrier.writer);
+    exit.is_some_and(|exit| exit.process_id == child && exit.status.raw() == EXIT_STATUS)
+        && reaped.is_some_and(|status| status.raw() == EXIT_STATUS)
 }
 
 fn async_control_probe(reactor: &Reactor<2>) -> bool {
@@ -1598,6 +1688,85 @@ fn task_shutdown_probe() -> bool {
                 shutdown_timed_out: 1,
             }
         && report.total() == 2
+        && blocking_pool_probe()
+}
+
+fn blocking_pool_probe() -> bool {
+    let Ok(group) = TaskGroup::root(TaskRole::Background, Deadline::INFINITE) else {
+        return false;
+    };
+    let calls = Cell::new(0_u32);
+    let mut completed = || {
+        calls.set(calls.get().saturating_add(1));
+        Ok(())
+    };
+    let mut cancelled = || {
+        calls.set(calls.get().saturating_add(10));
+        Ok(())
+    };
+    let mut timed_out = || {
+        calls.set(calls.get().saturating_add(100));
+        Ok(())
+    };
+    let mut shutdown_work = || {
+        calls.set(calls.get().saturating_add(1_000));
+        Ok(())
+    };
+    let Ok(mut pool) = BlockingPool::<2, 4>::new() else {
+        return false;
+    };
+    let Ok(completed_id) = pool.submit(&mut completed, &group, Deadline::INFINITE) else {
+        return false;
+    };
+    let Ok(cancelled_id) = pool.submit(&mut cancelled, &group, Deadline::INFINITE) else {
+        return false;
+    };
+    let Ok(timed_out_id) = pool.submit(&mut timed_out, &group, Deadline::IMMEDIATE) else {
+        return false;
+    };
+    let Ok(shutdown_id) = pool.submit(&mut shutdown_work, &group, Deadline::INFINITE) else {
+        return false;
+    };
+    if pool.cancel(cancelled_id).is_err() {
+        return false;
+    }
+    let Ok(now) = platform::monotonic_time_ns().map(Deadline::from_monotonic_ns) else {
+        return false;
+    };
+    if pool.run_next(1, now).ok().flatten().map(|run| run.outcome)
+        != Some(BlockingOutcome::Completed(Ok(())))
+        || pool.run_next(0, now).ok().flatten().map(|run| run.outcome)
+            != Some(BlockingOutcome::TimedOut)
+        || pool.shutdown().cancelled_queued != 1
+        || calls.get() != 1
+        || pool.outcome(completed_id) != Some(BlockingOutcome::Completed(Ok(())))
+        || pool.outcome(cancelled_id) != Some(BlockingOutcome::Cancelled)
+        || pool.outcome(timed_out_id) != Some(BlockingOutcome::TimedOut)
+        || pool.outcome(shutdown_id) != Some(BlockingOutcome::Shutdown)
+        || pool.attribution(completed_id) != Some(group.attribution())
+    {
+        return false;
+    }
+
+    let mut trace = [None; 16];
+    let read = pool.read_trace(0, &mut trace);
+    read.missed == 0
+        && read.events >= 9
+        && trace[..read.events].iter().flatten().any(|event| {
+            event.job == completed_id && event.kind == BlockingTraceKind::Started { worker: 1 }
+        })
+        && trace[..read.events]
+            .iter()
+            .flatten()
+            .any(|event| event.job == cancelled_id && event.kind == BlockingTraceKind::Cancelled)
+        && trace[..read.events]
+            .iter()
+            .flatten()
+            .any(|event| event.job == timed_out_id && event.kind == BlockingTraceKind::TimedOut)
+        && trace[..read.events]
+            .iter()
+            .flatten()
+            .any(|event| event.job == shutdown_id && event.kind == BlockingTraceKind::Shutdown)
 }
 
 fn capability_probe(current_process: u64) -> bool {

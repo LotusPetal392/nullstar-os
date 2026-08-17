@@ -127,14 +127,19 @@ tasks, polls only selected task slots, and gives every task fixed-depth role att
 ancestor cancellation and deadlines. A distinct cooperative shutdown signal lets the executor drain
 until one absolute deadline and records any remaining task as a shutdown timeout. A fixed 64-record
 lifecycle ring traces spawn, poll, wait, wake, terminal, and reap transitions with sequence cursors and
-explicit overwrite counts. Role-specific process contexts own explicit capabilities, reject duplicate
+explicit overwrite counts. Generic typed readiness, counted-notification consumption, and hierarchical
+job-exit futures now use the same bounded reactor and event-port route. An allocation-free blocking-work
+coordinator provides fixed FIFO admission, logical worker bounds, inherited task-group cancellation and
+deadline checks before execution, queued cancellation, shutdown conversion, retained outcomes, and a
+bounded trace. It does not create threads or preempt callbacks that have begun; those guarantees require
+the future thread/address-space and job-resource-policy substrate. Role-specific process contexts own explicit capabilities, reject duplicate
 roles, validate claimed object kinds, and irreversibly tighten authority to the consumer's requested
 rights. Provisional protocol descriptors bound names, versions, message sizes, and handle counts;
 client/server service bindings pair those declarations with typed endpoint ownership. The runtime probe
-checks these rules, process-exit cleanup, real cross-process wakeups, interrupt-driven timer delivery,
+checks these rules, typed notification and job-exit completions, process-exit cleanup, real cross-process wakeups, interrupt-driven timer delivery,
 periodic rearming, ancestor cancellation isolation, deadline termination, trace ordering, rights
-tightening, and bounded shutdown against kernel handles. Startup-message integration, additional I/O
-event sources, sender-side receiver-slot reservation, generated bindings, blocking workers, and broad
+tightening, blocking-work lifecycle policy, and bounded shutdown against kernel handles. Startup-message integration, additional I/O
+event sources, sender-side receiver-slot reservation, generated bindings, parallel isolated blocking workers, and broad
 service migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
