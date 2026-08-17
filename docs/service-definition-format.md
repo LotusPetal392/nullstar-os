@@ -6,16 +6,21 @@ Version 1 of the bounded service-definition file format and its allocation-free 
 implemented by `crates/service-definition`. PID 1 now contains one bounded migration pilot:
 it reads the policy-pinned `/System/services/definition-probe.service` through the canonical
 VFS/NullFS path, validates it, launches its NullFS-only `/System/bin` executable with
-manager-owned generation and readiness handles, and applies its bounded `on-failure`
-restart policy. The first generation deliberately fails before readiness and the second
-must become ready, including after the controlled NullFS replacement test.
+one receive-only bootstrap channel, and applies its bounded `on-failure` restart policy.
+PID 1 queues an `NSPC` capability envelope containing manager-owned generation and readiness
+endpoints, followed by the four required `NSPD` identity, structured-argument, environment,
+and launch sections plus the canonical end record, before releasing the launch barrier. The
+service validates and consumes that stream before its entry logic. The first generation
+deliberately fails before readiness and the second must become ready, including after the
+controlled NullFS replacement test.
 
-This is not general definition discovery or a system service manager. The pilot supports
-no definition arguments because the current launch ABI accepts a command line rather than
-a structured argument vector. It grants no definition-selected capabilities, is absent
-from `NSVC`, and runs one fixed executable that does not fork descendants. Enablement,
-dependencies, activation queues, job-backed descendant containment, resource policy, and arbitrary
-packaged services remain later milestones.
+This is not general definition discovery or a system service manager. The pilot definition's
+`--managed-bootstrap` argument is delivered only in the `NSPD` structured argument vector; the
+transitional kernel exec stack still contains only the executable path. The pilot grants no
+definition-selected capabilities, is absent from `NSVC`, and runs one fixed executable. Its first
+generation creates an escaped process-group descendant so whole-job termination and drainage are
+also exercised. General suspended process construction, enablement, dependencies, activation queues,
+resource policy, and arbitrary packaged services remain later milestones.
 
 Packaged machine-service definitions belong below `/System/services`. Machine enablement
 and local policy remain separate data below `/System/config/services`; a packaged

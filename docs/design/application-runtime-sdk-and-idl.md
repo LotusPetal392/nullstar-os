@@ -291,8 +291,22 @@ trusted from the wire. A role-specific receiver policy supplies the expected obj
 usable rights, maximum authority ceiling, and required roles. `ProcessContext::from_startup`
 validates the complete record and every attachment before adoption, closes unknown optional
 attachments, and reduces known handles to the intersection of their delivered rights and policy
-ceiling. The record is bounded by the kernel's per-message handle limit. Identity, arguments,
-environment, and other non-capability fields remain separate future sections of `ProcessStart`.
+ceiling. The record is bounded by the kernel's per-message handle limit. The allocation-free `NSPD`
+version-1 companion format now carries the descriptive portion of `ProcessStart` as strictly ordered,
+bounded frames. Its typed sections cover process, package-generation, executable, application,
+service, component, user, and session identities; a structured argument vector; a validated
+compatibility environment; and launch, manager-generation, namespace-profile, attempt, reason, and
+monotonic-start metadata. Sections may span the kernel's 256-byte message bound, but fragments must
+be contiguous and canonical. Receiver-supplied storage bounds assembly, unknown optional sections are
+discarded, and unknown required or missing mandatory sections fail before entry-point dispatch.
+These values remain descriptive data: namespace and other authority still require validated `NSPC`
+capabilities. The definition-backed service is the first live PID 1 transport: while its child is
+held behind the existing launch barrier, PID 1 grants one receive-only bootstrap endpoint, queues an
+`NSPC` envelope with moved service-generation and readiness capabilities, sends the four mandatory
+`NSPD` sections and canonical `NSPX` end record, then releases the child. The receiver pins PID 1 as
+sender and validates both streams before service entry logic. This pilot still depends on the
+transitional fork/exec barrier and direct-child grant; the general process loader and other managed
+services have not migrated.
 
 ## Role-specific entry points
 
@@ -1101,10 +1115,14 @@ generic typed readiness plus counted-notification and hierarchical job-exit comp
 QEMU runtime probe covers their real cross-process wake and exit paths as well as blocking-work
 lifecycle transitions. The coordinator deliberately supplies no threads and cannot preempt executing
 callbacks; parallel isolated workers and execution-time resource accounting require the later
-thread/address-space and job-policy milestones. Remaining work includes the non-capability
-`ProcessStart` sections and file, network, display, device, and media completion sources; the
-NSIDL compiler still needs to generate the descriptors and binding code now accepted by this runtime
-layer.
+thread/address-space and job-policy milestones. The `NSPD` companion codec now supplies canonical,
+fragmentable typed identity, argument, environment, and launch sections with bounded receiver-owned
+assembly and host validation. The definition-backed service now provides QEMU coverage for the first
+live `NSPC` plus `NSPD` bootstrap stream, including moved generation/readiness capabilities and an
+argument absent from the legacy exec stack. Remaining work includes migrating the general process
+loader and other managed services, replacing the transitional launch/grant mechanics, and adding
+file, network, display, device, and media completion sources; the NSIDL compiler still needs to
+generate the descriptors and binding code now accepted by this runtime layer.
 
 ### Phase 5: NSIDL compiler MVP
 

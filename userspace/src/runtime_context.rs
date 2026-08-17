@@ -15,7 +15,7 @@ use crate::{
     abi::limits,
     async_ipc::{RunScope, TaskAttribution, TaskGroup},
     handle::{AnyObject, BorrowedHandle, Endpoint, KnownObjectType, ObjectType, OwnedHandle},
-    ipc::{self, ObjectKind, Rights},
+    ipc::{self, ObjectKind, Rights, Transfer},
 };
 
 const STARTUP_MAGIC: [u8; 4] = *b"NSPC";
@@ -38,6 +38,8 @@ impl CapabilityRole {
     pub const SERVICE_NAMESPACE: Self = Self(5);
     pub const PRIVATE_STORAGE: Self = Self(6);
     pub const JOB: Self = Self(7);
+    pub const READINESS: Self = Self(8);
+    pub const SERVICE_GENERATION: Self = Self(9);
 
     pub const fn new(value: u32) -> Option<Self> {
         if value == 0 { None } else { Some(Self(value)) }
@@ -247,6 +249,44 @@ impl<const N: usize> StartupMessage<N> {
     }
 }
 
+/// Sends one canonical `NSPC` envelope and atomically moves its attachments.
+///
+/// On an IPC failure the raw transfer handles remain owned by the caller.
+pub fn send_startup_message<const N: usize>(
+    endpoint: u64,
+    message: &StartupMessage<N>,
+    transfers: &[Transfer],
+) -> Result<(), StartupSendError> {
+    if endpoint == 0 || transfers.len() != message.resource_count() {
+        return Err(StartupSendError::AttachmentCount);
+    }
+    let mut bytes = [0; limits::MAX_IPC_MESSAGE_BYTES];
+    let length = message
+        .encode(&mut bytes)
+        .map_err(StartupSendError::Encode)?;
+    if transfers.is_empty() {
+        ipc::send(endpoint, &bytes[..length], None).map_err(StartupSendError::Ipc)
+    } else {
+        ipc::send_move_many(endpoint, &bytes[..length], transfers).map_err(StartupSendError::Ipc)
+    }
+}
+
+/// Why an `NSPC` sender could not publish a complete envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupSendError {
+    Encode(StartupError),
+    AttachmentCount,
+    Ipc(ipc::Error),
+}
+
+/// Why a process rejected its capability-bearing startup envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupReceiveError {
+    Ipc(ipc::Error),
+    WrongSender,
+    Startup(StartupError),
+}
+
 /// Trusted receiver policy for one semantic startup capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupCapabilityPolicy {
@@ -367,6 +407,37 @@ impl<R: RuntimeRole, const N: usize> ProcessContext<R, N> {
             capabilities,
             role: PhantomData,
         })
+    }
+
+    /// Receives and adopts one capability-bearing startup envelope from the
+    /// trusted process manager.
+    pub fn receive_startup(
+        endpoint: &OwnedHandle<Endpoint>,
+        expected_sender: u64,
+        policy: &[StartupCapabilityPolicy],
+    ) -> Result<Self, StartupReceiveError> {
+        if expected_sender == 0 {
+            return Err(StartupReceiveError::WrongSender);
+        }
+        let mut bytes = [0; limits::MAX_IPC_MESSAGE_BYTES];
+        let message = loop {
+            match endpoint.try_receive_many::<N>(&mut bytes) {
+                Ok(message) => break message,
+                Err(error) if error.error() == ipc::Error::TRY_AGAIN => {
+                    crate::syscall::yield_now()
+                        .map_err(|_| StartupReceiveError::Ipc(ipc::Error::IO))?;
+                }
+                Err(error) => return Err(StartupReceiveError::Ipc(error.error())),
+            }
+        };
+        if message.sender_process_id != expected_sender {
+            return Err(StartupReceiveError::WrongSender);
+        }
+        let handles = message
+            .capabilities
+            .map(|capability| capability.map(|capability| capability.handle));
+        Self::from_startup(&bytes[..message.bytes], handles, policy)
+            .map_err(|error| StartupReceiveError::Startup(error.error()))
     }
 
     /// Adopts the positional capabilities attached to one startup record.

@@ -138,9 +138,17 @@ rights. Provisional protocol descriptors bound names, versions, message sizes, a
 client/server service bindings pair those declarations with typed endpoint ownership. The runtime probe
 checks these rules, typed notification and job-exit completions, process-exit cleanup, real cross-process wakeups, interrupt-driven timer delivery,
 periodic rearming, ancestor cancellation isolation, deadline termination, trace ordering, rights
-tightening, blocking-work lifecycle policy, and bounded shutdown against kernel handles. Startup-message integration, additional I/O
-event sources, sender-side receiver-slot reservation, generated bindings, parallel isolated blocking workers, and broad
-service migration remain future runtime work.
+tightening, blocking-work lifecycle policy, and bounded shutdown against kernel handles. An `NSPD`
+companion codec fragments descriptive process-start identity, structured arguments, compatibility
+environment, and launch metadata across bounded messages, assembles them into caller-owned fixed
+storage, and rejects gaps, reordering, malformed sections, and unsupported required extensions. Its
+namespace-profile and executable identities are data rather than authority; validated `NSPC`
+capabilities remain the authority boundary. The definition-backed service is the first live
+bootstrap-channel pilot: PID 1 moves its generation and readiness endpoints in `NSPC`, follows with
+the required `NSPD` sections and `NSPX` end record, and releases the launch barrier only after the
+complete stream is queued. General loader integration, additional I/O event sources, sender-side
+receiver-slot reservation, generated bindings, parallel isolated blocking workers, and broad service
+migration remain future runtime work.
 
 PID 1 remains outside the interactive process group, launches `/ush` as a foreground
 child group, waits for shell state changes, restores a stopped shell, and starts a fresh

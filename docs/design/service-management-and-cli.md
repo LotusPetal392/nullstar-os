@@ -79,9 +79,12 @@ failure, and authorization semantics are defined.
 
 The implemented version 1 format intentionally covers only identity, description,
 executable and structured arguments, readiness notification, and bounded restart fields. The
-current migration pilot accepts no definition arguments because the launch ABI is still
-command-line based, grants no definition-selected capabilities, and treats its exact definition
-path as fixed enablement policy. A later definition version should eventually include:
+current migration pilot carries its definition argument through an `NSPD` structured argument
+section while the transitional exec stack contains only the executable. PID 1 queues that section
+and the remaining required descriptive sections after an `NSPC` envelope containing the exact
+generation and readiness endpoints on one receive-only bootstrap channel before launch-barrier
+release. The pilot grants no definition-selected capabilities and treats its exact definition path
+as fixed enablement policy. A later definition version should eventually include:
 
 - stable canonical service identity and service class;
 - executable identity, argument vector, environment data, and working-directory
@@ -462,7 +465,8 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    in-memory `start`/`stop`, and NullFS restart has exact-generation quiesce, clean unmount, forced
    dirty-recovery fallback, and provider replacement; filesystem live `start`/`stop` and cross-reboot
    desired state remain future work.
-3. Introduce the one-bootstrap-channel startup contract and stable service generations.
+3. Expand the definition-service one-bootstrap-channel pilot and stable service generations to the
+   general process loader and remaining managed services.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.
 5. Add definitions, dependency validation, readiness, channel activation, restart
