@@ -35,7 +35,13 @@ role-tagged `NSPC` capabilities, required `NSPD` sections, and `NSPX` end record
 launch-barrier release. Logging, NullFS, tmpfs, and VFS additionally use a shared fail-closed receiver and carry
 manager generation in PID 1-authenticated launch data instead of a separate endpoint. PID 1 also moves
 generation-local transfer-only authorities for logging and NullFS, reacquiring them for replacements.
-General loader integration remains future work. The next
+The ordinary shell loader now applies the same capability-empty contract to single commands and every
+pipeline stage, using a private internal barrier before the existing process-group barrier. Converted
+tool entry points pin their parent and validate canonical identity, arguments, environment, and an
+otherwise empty initial capability table. The external `exec` tool and the environment- and
+signal-lifecycle probes carry the managed stream through image replacement as a same-PID handoff;
+the remaining relative-path retry and capability-bearing fork/VFS `execve` callers plus PID 1's
+capability-bearing probe launchers retain transitional startup paths. The next
 architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
@@ -75,8 +81,9 @@ The detailed contract is in
    replacement. NullFS preserves exact quiesce, clean-unmount, and final-exit evidence before clean
    drainage; forced dirty recovery terminates and drains the complete job. PID 1 service generations
    remain flat roots; session and application hierarchy integration remains future work.
-2. expand the implemented definition-service, logging, NullFS, tmpfs, and VFS bootstrap-channel path to
-   the general loader and remaining managed processes;
+2. complete the partially migrated general-loader path by covering the remaining relative-path and
+   capability-bearing `execve` callers, PID 1's capability-bearing probes, and other managed
+   processes, then remove the kernel-direct compatibility fallback;
 3. define stable service identity, service generation, lifecycle state, readiness,
    control, and failure protocols;
 4. keep PID 1 as a minimal bootstrap and recovery supervisor while moving ordinary

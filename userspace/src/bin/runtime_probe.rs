@@ -24,6 +24,7 @@ use userspace::{
     },
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
+    managed_startup::{ManagedToolStartMode, managed_tool_start_mode},
     platform::{self, DirectoryEntry},
     process_start::{
         ProcessStartData, StartupIdentity, StartupLaunch, StartupLaunchReason,
@@ -38,7 +39,7 @@ use userspace::{
     syscall::{self, OpenFlags, STDERR, STDIN, STDOUT, SignalAction, SignalMask, SpawnFlags},
 };
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 const SUCCESS: &[u8] = b"userspace Rust runtime probe passed\n";
@@ -112,6 +113,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     };
     if arguments.len() != 2 || argument.is_empty() {
         syscall::exit(64);
+    }
+    if argument == b"manual-argv" && managed_tool_start_mode() != ManagedToolStartMode::Managed {
+        syscall::exit(65);
     }
 
     let mut heap = BumpHeap::<4096>::new();

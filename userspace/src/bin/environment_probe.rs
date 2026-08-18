@@ -1,13 +1,14 @@
 #![no_std]
 #![no_main]
 
-use userspace::{environment::Environment, syscall};
+use userspace::{environment::Environment, managed_startup::ManagedToolCommand, syscall};
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 const CHILD_COMMAND: &[u8] = b"/environment-target child";
 const PARENT_COMMAND: &[u8] = b"/environment-target parent";
+const EXEC_ENVIRONMENT: &[(&[u8], &[u8])] = &[(b"BASE", b"changed"), (b"ADDED", b"ready")];
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let environment = unsafe { Environment::from_stack(initial_stack) };
@@ -32,7 +33,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         Err(_) => syscall::exit(5),
     };
     if child == 0 {
-        if syscall::execve(CHILD_COMMAND).is_err() {
+        if syscall::exec_managed_command(ManagedToolCommand::new(CHILD_COMMAND, EXEC_ENVIRONMENT))
+            .is_err()
+        {
             syscall::exit(6);
         }
         syscall::exit(7);
@@ -41,7 +44,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         Ok(status) if status.raw() == 31 => {}
         _ => syscall::exit(8),
     }
-    if syscall::execve(PARENT_COMMAND).is_err() {
+    if syscall::exec_managed_command(ManagedToolCommand::new(PARENT_COMMAND, EXEC_ENVIRONMENT))
+        .is_err()
+    {
         syscall::exit(9);
     }
     syscall::exit(10)

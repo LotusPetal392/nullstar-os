@@ -465,8 +465,9 @@ The name `ush` should not silently imply complete POSIX shell behavior.
    in-memory `start`/`stop`, and NullFS restart has exact-generation quiesce, clean unmount, forced
    dirty-recovery fallback, and provider replacement; filesystem live `start`/`stop` and cross-reboot
    desired state remain future work.
-3. Expand the implemented definition-service, logging, NullFS, tmpfs, and VFS one-bootstrap-channel path
-   and stable service generations to the general process loader and remaining managed
+3. Complete the partially implemented general-loader migration beyond managed shell commands,
+   pipelines, external `exec` replacement, and the compatible direct exec probes by covering the
+   remaining relative-path and capability-bearing `execve` callers, PID 1 probes, and other managed
    processes.
 4. Extract ordinary service policy into a separately restartable system service manager
    while PID 1 retains bootstrap and recovery supervision.

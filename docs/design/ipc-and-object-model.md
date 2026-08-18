@@ -562,8 +562,11 @@ endpoint waiting, and direct-child bootstrap grants. The intended evolution is:
    explicit W^X integration;
 5. add cancellation and an optimized synchronous call/reply path with bounded priority
    donation;
-6. introduce the one-bootstrap-channel process-startup contract and remove ambient
-   native handle inheritance;
+6. **Partially implemented:** extend the one-bootstrap-channel process-startup contract from managed
+   services, shell-launched tools, the external `exec` replacement path, and the compatible direct
+   exec probes to the remaining relative-path and capability-bearing `execve` callers, PID 1 probe
+   launchers, and all native processes, then remove the kernel-direct compatibility fallback and
+   ambient handle inheritance;
 7. build the userspace IPC runtime, typed service bindings, tracing, and protocol
    conformance tests;
 8. add an IDL compiler only after the wire and lifecycle rules have survived real

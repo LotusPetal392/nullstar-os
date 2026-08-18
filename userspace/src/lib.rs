@@ -85,6 +85,26 @@ macro_rules! entry {
     };
 }
 
+/// Defines a raw ELF entry point that validates an optional managed-tool
+/// startup stream before invoking the program entry function.
+///
+/// Kernel-direct compatibility launches may omit the bootstrap handle. If the
+/// handle is present, malformed authority or descriptive data terminates the
+/// process before program code runs.
+#[macro_export]
+macro_rules! managed_tool_entry {
+    ($entry:path) => {
+        extern "C" fn __nullstar_managed_tool_entry(initial_stack: *const usize) -> ! {
+            if $crate::managed_startup::initialize_managed_tool_start(initial_stack).is_err() {
+                $crate::syscall::exit(125);
+            }
+            $entry(initial_stack)
+        }
+
+        $crate::entry!(__nullstar_managed_tool_entry);
+    };
+}
+
 /// Installs a minimal panic handler that terminates the current process.
 #[macro_export]
 macro_rules! panic_handler {

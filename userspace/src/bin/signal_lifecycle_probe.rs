@@ -3,6 +3,7 @@
 
 use userspace::{
     abi::signal,
+    managed_startup::ManagedToolCommand,
     syscall::{self, SignalAction, SignalActionFlags, SignalFrame, SignalMask, SignalMaskHow},
 };
 
@@ -47,7 +48,12 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         {
             syscall::exit(5);
         }
-        if syscall::execve(b"/signal-lifecycle-target inherited").is_err() {
+        if syscall::exec_managed_command(ManagedToolCommand::new(
+            b"/signal-lifecycle-target inherited",
+            &[],
+        ))
+        .is_err()
+        {
             syscall::exit(6);
         }
         syscall::exit(7)

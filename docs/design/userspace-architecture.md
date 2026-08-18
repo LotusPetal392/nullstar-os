@@ -79,8 +79,16 @@ endpoints plus logging's producer, observer, and kernel early-log authorities an
 block-device authority by policy rather than handle number. PID 1 moves each transfer-only authority
 and reacquires a fresh endpoint for every replacement generation. Their manager generation is authenticated descriptive
 data in `NSPD`, so the former one-use generation endpoint is gone. This still uses the transitional
-fork/exec barrier and direct-child grant; migrating the general process loader is
-future work.
+fork/exec barrier and direct-child grant. The ordinary shell launcher now creates a second private
+barrier for managed startup, grants only bootstrap handle 1, and sends a capability-empty tool stream
+for single commands and every pipeline stage before releasing that barrier. Converted tool entry
+points validate the parent-stamped sender, canonical executable identity, argument and environment
+agreement, and the absence of any other initial capability. Kernel-direct launches without a
+bootstrap handle remain a compatibility path. The external `exec` tool stages a fresh receive-only
+handle 1 and complete stream before replacement; its target accepts the self-issued stream only when
+the exec launch flag agrees. The environment- and signal-lifecycle probes use the same handoff. The
+relative-path retry and capability-bearing fork/VFS `execve` probes plus remaining PID 1 probe
+launchers have not migrated.
 
 ## Service discovery
 

@@ -829,7 +829,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     let userspace_rust_runtime_verified = runtime_probe_result.exit_code() == Some(0)
         && runtime_probe_result.path == "/runtime-probe"
-        && runtime_probe_result.syscall_count == 109
+        && runtime_probe_result.syscall_count == 107
         && runtime_probe_result.write_count == 1
         && runtime_probe_result.bytes_written == USERSPACE_RUNTIME_PROBE_BYTES;
     if !userspace_rust_runtime_verified {
@@ -1665,7 +1665,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let userspace_pipeline_before = userspace_runtime.pipe_snapshot();
     if let Err(error) =
-        userspace_runtime.inject_terminal_line("pipe-producer | upper | pipe-consumer")
+        userspace_runtime.inject_terminal_line("pipe-producer managed | upper | pipe-consumer")
     {
         serial_println!("userspace multi-stage pipeline command injection failed: {error}");
         hlt_loop();
@@ -2121,13 +2121,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && shell_consumer.pipe_read_count >= 2
         && shell_consumer.pipe_bytes_read == PIPE_TEST_BYTES
         && shell_consumer.blocked_pipe_read_count >= 1
-        && userspace_shell_result.pipe_pair_count == 8
-        && userspace_shell_result.pipe_descriptor_close_count == 16
+        && userspace_shell_result.pipe_pair_count
+            == userspace_shell_result.child_spawn_count.saturating_add(8)
+        && userspace_shell_result.pipe_descriptor_close_count
+            == userspace_shell_result
+                .child_spawn_count
+                .saturating_mul(2)
+                .saturating_add(16)
         && userspace_shell_result.pipe_descriptor_inherit_count == 0
-        && created_pipe_delta == 3
-        && destroyed_pipe_delta == 3
-        && reader_retain_delta == 11
-        && writer_retain_delta == 11
+        && created_pipe_delta == 6
+        && destroyed_pipe_delta == 6
+        && reader_retain_delta == 14
+        && writer_retain_delta == 14
         && pipe_bytes_read_delta == PIPE_TEST_BYTES.saturating_mul(2)
         && pipe_bytes_written_delta == PIPE_TEST_BYTES.saturating_mul(2)
         && userspace_pipeline_after.active_pipes == 0;
@@ -2284,8 +2289,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .any(|result| result.path == "/pipe-consumer")
         && terminal_after_interrupt.interrupts
             == terminal_before_interrupt.interrupts.saturating_add(1)
-        && signal_pipe_created == 3
-        && signal_pipe_destroyed == 3
+        && signal_pipe_created == 8
+        && signal_pipe_destroyed == 8
         && userspace_signal_pipe_after.active_pipes == 0;
     let background_signal_verified = background_signal_group.process_ids.len() == 1
         && background_signal_results.len() == 1

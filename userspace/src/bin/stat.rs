@@ -8,7 +8,7 @@ use userspace::{
     syscall::{self, STDERR, STDOUT},
 };
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 const USAGE: &[u8] = b"usage: stat PATH\n";
