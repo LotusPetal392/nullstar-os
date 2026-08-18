@@ -3,7 +3,7 @@
 
 use userspace::syscall::{self, STDOUT};
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 // Keep the probe alive across prompt recovery without making the smoke test slow.

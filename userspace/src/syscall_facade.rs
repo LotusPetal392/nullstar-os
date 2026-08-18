@@ -6,7 +6,13 @@
 //! process-group setup. Bundled userspace no longer calls the legacy atomic
 //! spawn syscall; syscall 7 remains a kernel ABI compatibility entry point.
 
-use crate::{abi::signal, platform};
+use crate::{
+    abi::signal,
+    ipc::{self, Rights},
+    managed_startup::{self, ManagedToolCommand, ManagedToolStartOrigin},
+    platform,
+    process_start::PROCESS_START_BOOTSTRAP_HANDLE,
+};
 
 pub use crate::syscall_legacy::{
     ChildStatus, DescriptorFlags, Errno, FileDescriptor, OpenFlags, PipePair, ProcessGroupId,
@@ -108,6 +114,25 @@ pub fn spawn_command(
         LaunchDescriptors::new(stdin_descriptor, stdout_descriptor, stderr_descriptor),
         process_group,
         None,
+        None,
+    )
+}
+
+pub fn spawn_managed_command(
+    command: ManagedToolCommand<'_>,
+    flags: SpawnFlags,
+    stdin_descriptor: Option<FileDescriptor>,
+    stdout_descriptor: Option<FileDescriptor>,
+    stderr_descriptor: Option<FileDescriptor>,
+    process_group: Option<ProcessGroupId>,
+) -> Result<ProcessId> {
+    spawn_command_inner(
+        command.command(),
+        flags,
+        LaunchDescriptors::new(stdin_descriptor, stdout_descriptor, stderr_descriptor),
+        process_group,
+        None,
+        Some(command),
     )
 }
 
@@ -126,7 +151,63 @@ pub fn spawn_command_with_barrier(
         LaunchDescriptors::new(stdin_descriptor, stdout_descriptor, stderr_descriptor),
         process_group,
         Some(barrier.pair),
+        None,
     )
+}
+
+pub fn spawn_managed_command_with_barrier(
+    command: ManagedToolCommand<'_>,
+    flags: SpawnFlags,
+    stdin_descriptor: Option<FileDescriptor>,
+    stdout_descriptor: Option<FileDescriptor>,
+    stderr_descriptor: Option<FileDescriptor>,
+    process_group: Option<ProcessGroupId>,
+    barrier: &LaunchBarrier,
+) -> Result<ProcessId> {
+    spawn_command_inner(
+        command.command(),
+        flags,
+        LaunchDescriptors::new(stdin_descriptor, stdout_descriptor, stderr_descriptor),
+        process_group,
+        Some(barrier.pair),
+        Some(command),
+    )
+}
+
+/// Replaces the current image after staging a capability-empty managed startup
+/// stream on bootstrap handle 1. A failed replacement removes the staged
+/// endpoint so the caller retains transactional exec semantics.
+pub fn exec_managed_command(command: ManagedToolCommand<'_>) -> Result<()> {
+    let process_id = getpid()?;
+    if ipc::info(PROCESS_START_BOOTSTRAP_HANDLE).is_ok() {
+        return Err(Errno::INVALID_ARGUMENT);
+    }
+    let (receiver, sender) = ipc::endpoint_create_pair().map_err(|_| Errno::IO)?;
+    let receiver_ready = receiver == PROCESS_START_BOOTSTRAP_HANDLE
+        && ipc::replace(receiver, Rights::RECEIVE).ok() == Some(receiver);
+    let sent = receiver_ready
+        && managed_startup::send_managed_tool_start(
+            sender,
+            process_id,
+            command,
+            ManagedToolStartOrigin::Exec,
+        )
+        .is_ok();
+    let sender_closed = ipc::close(sender).is_ok();
+    if !receiver_ready || !sent || !sender_closed {
+        let _ = ipc::close(receiver);
+        if !sender_closed {
+            let _ = ipc::close(sender);
+        }
+        return Err(Errno::IO);
+    }
+    match execve(command.command()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = ipc::close(receiver);
+            Err(error)
+        }
+    }
 }
 
 fn spawn_command_inner(
@@ -135,6 +216,7 @@ fn spawn_command_inner(
     descriptors: LaunchDescriptors,
     process_group: Option<ProcessGroupId>,
     barrier: Option<PipePair>,
+    managed_command: Option<ManagedToolCommand<'_>>,
 ) -> Result<ProcessId> {
     if !generic_spawn_supported(
         command,
@@ -146,14 +228,35 @@ fn spawn_command_inner(
         return Err(Errno::INVALID_ARGUMENT);
     }
 
+    let mut startup_barrier = if managed_command.is_some() {
+        Some(LaunchBarrier::new()?)
+    } else {
+        None
+    };
     let foreground = flags.contains(SpawnFlags::FOREGROUND);
     let child_process_id = fork()?;
     if child_process_id == 0 {
-        launch_child(command, foreground, descriptors, process_group, barrier)
+        launch_child(
+            command,
+            foreground,
+            descriptors,
+            process_group,
+            startup_barrier.as_ref().map(|barrier| barrier.pair),
+            barrier,
+        )
     }
 
     let target_group = process_group.unwrap_or(child_process_id);
     if platform::set_process_group(child_process_id, target_group).is_err() {
+        terminate_and_reap(child_process_id);
+        return Err(Errno::IO);
+    }
+    if let Some(managed_command) = managed_command
+        && (!install_managed_tool_start(child_process_id, managed_command)
+            || startup_barrier
+                .as_mut()
+                .is_none_or(|barrier| barrier.release_in_place().is_err()))
+    {
         terminate_and_reap(child_process_id);
         return Err(Errno::IO);
     }
@@ -190,6 +293,7 @@ fn launch_child(
     foreground: bool,
     descriptors: LaunchDescriptors,
     process_group: Option<ProcessGroupId>,
+    startup_barrier: Option<PipePair>,
     barrier: Option<PipePair>,
 ) -> ! {
     let process_id = match getpid() {
@@ -198,6 +302,11 @@ fn launch_child(
     };
     let expected_group = process_group.unwrap_or(process_id);
 
+    if let Some(pair) = startup_barrier
+        && close(pair.writer).is_err()
+    {
+        launch_failure();
+    }
     if let Some(pair) = barrier
         && close(pair.writer).is_err()
     {
@@ -208,6 +317,9 @@ fn launch_child(
     }
     close_descriptor_sources(descriptors);
 
+    if let Some(pair) = startup_barrier {
+        wait_for_barrier(pair.reader);
+    }
     if let Some(pair) = barrier {
         wait_for_barrier(pair.reader);
         if platform::get_process_group(0).ok() != Some(expected_group) {
@@ -224,6 +336,32 @@ fn launch_child(
         launch_failure();
     }
     exit(127)
+}
+
+fn install_managed_tool_start(process_id: ProcessId, command: ManagedToolCommand<'_>) -> bool {
+    let (sender, receiver) = match ipc::endpoint_create_pair() {
+        Ok(pair) => pair,
+        Err(_) => return false,
+    };
+    let granted = ipc::grant_child(
+        process_id,
+        receiver,
+        Rights::RECEIVE,
+        PROCESS_START_BOOTSTRAP_HANDLE,
+    )
+    .ok()
+        == Some(PROCESS_START_BOOTSTRAP_HANDLE);
+    let sent = granted
+        && managed_startup::send_managed_tool_start(
+            sender,
+            process_id,
+            command,
+            ManagedToolStartOrigin::Parent,
+        )
+        .is_ok();
+    let sender_closed = ipc::close(sender).is_ok();
+    let receiver_closed = ipc::close(receiver).is_ok();
+    granted && sent && sender_closed && receiver_closed
 }
 
 fn install_descriptors(descriptors: LaunchDescriptors) -> bool {

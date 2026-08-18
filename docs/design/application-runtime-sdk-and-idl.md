@@ -307,7 +307,13 @@ sections and canonical `NSPX` end record, then releases the child. The shared lo
 PID 1, requires no other initial capability, validates identity and argument agreement, and adopts
 role-tagged endpoints plus logging's kernel early-log and NullFS's writable block-device authorities by policy. Their manager generation is carried in authenticated
 launch data rather than a redundant one-use generation capability. This migration still depends on
-the transitional fork/exec barrier and direct-child grant; the general process loader has not migrated.
+the transitional fork/exec barrier and direct-child grant. The ordinary shell loader now uses a
+capability-empty tool stream for single commands and pipeline stages, and converted tool entry points
+validate parent identity plus canonical arguments and environment before program code. The external
+`exec` launcher stages the same contract for its replacement image with an authenticated same-PID
+flag, and the environment- and signal-lifecycle probes exercise that handoff directly. The remaining
+relative-path retry and capability-bearing fork/VFS `execve` callers, PID 1 probes, and removal of
+the kernel-direct compatibility fallback remain.
 
 ## Role-specific entry points
 
@@ -1120,8 +1126,12 @@ thread/address-space and job-policy milestones. The `NSPD` companion codec now s
 fragmentable typed identity, argument, environment, and launch sections with bounded receiver-owned
 assembly and host validation. The definition-backed service, logging, NullFS, tmpfs, and VFS now provide QEMU coverage
 for live `NSPC` plus `NSPD` bootstrap streams; the lifecycle gates also prove logging, NullFS, tmpfs, and VFS
-replacement generations revalidate the contract after complete job drainage. Remaining work includes
-migrating the general process loader, replacing the transitional launch/grant mechanics, and adding
+replacement generations revalidate the contract after complete job drainage. The smoke gate also
+proves managed single-command environment agreement, managed pipeline startup, and same-PID managed
+replacement through the external `exec` launcher plus the environment- and signal-lifecycle probes.
+Remaining work includes migrating the relative-path retry and capability-bearing fork/VFS `execve`
+callers and PID 1 probes, replacing the
+transitional launch/grant mechanics, and adding
 file, network, display, device, and media completion sources; the NSIDL compiler still needs to
 generate the descriptors and binding code now accepted by this runtime layer.
 

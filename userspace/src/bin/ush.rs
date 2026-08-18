@@ -6,7 +6,9 @@ use userspace::{
     abi::{limits, signal},
     environment::Environment,
     ipc::{self, Rights},
-    logctl, platform, sv,
+    logctl,
+    managed_startup::ManagedToolCommand,
+    platform, sv,
     syscall::{
         self, ChildStatus, DescriptorFlags, FileDescriptor, LaunchBarrier, OpenFlags, PipePair,
         ProcessGroupId, ProcessId, STDERR, STDIN, STDOUT, SpawnFlags,
@@ -570,6 +572,22 @@ impl Shell {
         }
     }
 
+    fn exported_environment<'a>(
+        &'a self,
+        output: &mut [(&'a [u8], &'a [u8]); MAX_VARIABLES],
+    ) -> usize {
+        let mut count = 0;
+        for variable in self
+            .variables
+            .iter()
+            .filter(|variable| variable.is_active() && variable.exported)
+        {
+            output[count] = (variable.name.as_slice(), variable.value.as_slice());
+            count += 1;
+        }
+        count
+    }
+
     fn variable_index(&self, name: &[u8]) -> Option<usize> {
         self.variables
             .iter()
@@ -804,8 +822,10 @@ impl Shell {
         if d.uses_descriptors() {
             flags |= SpawnFlags::USE_DESCRIPTORS;
         }
-        let spawned = syscall::spawn_command(
-            stage.command.as_slice(),
+        let mut environment = [(&[][..], &[][..]); MAX_VARIABLES];
+        let environment_count = self.exported_environment(&mut environment);
+        let spawned = syscall::spawn_managed_command(
+            ManagedToolCommand::new(stage.command.as_slice(), &environment[..environment_count]),
             flags,
             d.stdin,
             d.stdout,
@@ -895,8 +915,13 @@ impl Shell {
                 flags |= SpawnFlags::JOIN_PROCESS_GROUP;
                 leader
             };
-            let spawned = syscall::spawn_command_with_barrier(
-                stage.command.as_slice(),
+            let mut environment = [(&[][..], &[][..]); MAX_VARIABLES];
+            let environment_count = self.exported_environment(&mut environment);
+            let spawned = syscall::spawn_managed_command_with_barrier(
+                ManagedToolCommand::new(
+                    stage.command.as_slice(),
+                    &environment[..environment_count],
+                ),
                 flags,
                 d.stdin,
                 d.stdout,

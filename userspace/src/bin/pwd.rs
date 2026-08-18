@@ -7,7 +7,7 @@ use userspace::{
     syscall::{self, STDOUT},
 };
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {

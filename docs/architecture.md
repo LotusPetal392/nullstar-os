@@ -150,7 +150,17 @@ complete stream is queued. A shared service receiver requires bootstrap handle 1
 initial capability, pins PID 1, validates identity and legacy-stack argument agreement, and adopts
 capabilities by semantic role for logging, NullFS, tmpfs, and VFS. Logging's transfer-only kernel early-log
 reader and NullFS's transfer-only writable block-device endpoint are moved into each startup envelope
-and reacquired by PID 1 for every later generation. The general loader, additional I/O event sources,
+and reacquired by PID 1 for every later generation. The ordinary shell launcher now gives each
+single-command and pipeline child a private internal barrier, installs one receive-only bootstrap
+handle, and queues a capability-empty tool `NSPC` plus complete `NSPD`/`NSPX` stream before release.
+Converted bundled tools authenticate their parent and validate canonical executable identity,
+arguments, compatibility environment, and the absence of ambient capabilities before program entry.
+The external `exec` launcher also stages the stream on its own receive-only handle 1 before image
+replacement; the replacement accepts the same PID only when the authenticated exec flag is present.
+The environment- and signal-lifecycle probes now exercise that path while preserving their exec
+semantics. Kernel-direct compatibility launches may still omit the bootstrap handle; the remaining
+relative-path retry and capability-bearing fork/VFS `execve` callers, PID 1's remaining probe
+launchers, additional I/O event sources,
 sender-side receiver-slot reservation, generated bindings, and parallel isolated blocking workers
 remain future migration work.
 

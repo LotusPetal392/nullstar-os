@@ -4,15 +4,19 @@
 use userspace::{
     abi::signal,
     args::Args,
+    managed_startup::{ManagedToolStartMode, managed_tool_start_mode},
     syscall::{self, SignalAction, SignalMask},
 };
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
-    if arguments.len() != 2 || arguments.get(1) != Some(b"inherited") {
+    if managed_tool_start_mode() != ManagedToolStartMode::Managed
+        || arguments.len() != 2
+        || arguments.get(1) != Some(b"inherited")
+    {
         syscall::exit(10);
     }
     let action = match syscall::query_signal_action(signal::TERMINATE) {

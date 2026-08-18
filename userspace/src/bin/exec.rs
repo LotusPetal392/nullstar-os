@@ -4,10 +4,12 @@
 use userspace::{
     abi::limits,
     args::Args,
+    environment::Environment,
+    managed_startup::ManagedToolCommand,
     syscall::{self, STDERR},
 };
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 const USAGE: &[u8] = b"usage: /exec <program> [arguments...]\n";
@@ -43,7 +45,23 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         length = end;
     }
 
-    if syscall::execve(&command[..length]).is_err() {
+    let inherited_environment = unsafe { Environment::from_stack(initial_stack) };
+    let mut environment = [(&[][..], &[][..]); limits::MAX_ENVIRONMENT_VARIABLES];
+    let mut environment_count = 0usize;
+    for entry in inherited_environment.iter() {
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            let _ = syscall::write_all(STDERR, FAILURE);
+            syscall::exit(7);
+        };
+        environment[environment_count] = (&entry[..separator], &entry[separator + 1..]);
+        environment_count += 1;
+    }
+    if syscall::exec_managed_command(ManagedToolCommand::new(
+        &command[..length],
+        &environment[..environment_count],
+    ))
+    .is_err()
+    {
         let _ = syscall::write_all(STDERR, FAILURE);
         syscall::exit(126);
     }
