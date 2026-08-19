@@ -93,6 +93,13 @@ Task-shared state uses a preemption-aware mutex. Interrupts remain enabled, but 
 switching is deferred while the current task owns the outermost guard. Preemption depth
 is global while the system is single-CPU and must become per-CPU before SMP.
 
+The kernel also exposes a bounded, architecture-neutral process/thread lifecycle model.
+Processes own parent/child hierarchy and exit state; threads own schedulable lifecycle
+state, independent identities, join/detach policy, and exit records. The model is
+host-testable and intentionally sits beneath the existing single-thread-per-process
+userspace compatibility path; scheduler context and userspace thread creation will be
+connected in the scheduling and SMP milestones.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
