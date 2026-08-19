@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -475,7 +475,7 @@ impl BootGenerationProgress {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Options {
     headless: bool,
     boot_check: bool,
@@ -748,27 +748,122 @@ fn run_kernel_smoke_test(options: &Options) -> ExitCode {
         qemu_command_for_image(options, test_image.path()),
         SmokePhase::PreparePersistentFat,
     );
-    let smoke_result = if prepare {
-        run_qemu_phase(
-            qemu_command_for_image(options, test_image.path()),
-            SmokePhase::VerifyCompleteSystem,
-        )
-    } else {
-        false
-    };
-    let restart_result = smoke_result && run_nullfs_restart_test(options);
-    let out_of_space_result = restart_result && run_nullfs_out_of_space_test(options);
-    let block_loss_result = out_of_space_result && run_nullfs_block_device_loss_test(options);
-    let crash_recovery_result = block_loss_result && run_nullfs_crash_recovery_test(options);
-    let boot_generation_result = crash_recovery_result && run_nullfs_boot_generation_test(options);
-    let logging_result = boot_generation_result && run_logging_lifecycle_test(options);
-    let recovery_result = logging_result && run_nullfs_unavailable_test(options);
-    if recovery_result {
+    if !prepare {
+        return ExitCode::FAILURE;
+    }
+
+    let complete_system_image = test_image.path().to_path_buf();
+    let checks = vec![
+        ParallelCheck::new("complete-system smoke test", move |options| {
+            run_qemu_phase(
+                qemu_command_for_image(&options, &complete_system_image),
+                SmokePhase::VerifyCompleteSystem,
+            )
+        }),
+        ParallelCheck::new("NullFS restart fault injection", |options| {
+            run_nullfs_restart_test(&options)
+        }),
+        ParallelCheck::new("NullFS out-of-space check", |options| {
+            run_nullfs_out_of_space_test(&options)
+        }),
+        ParallelCheck::new("NullFS block-device-loss check", |options| {
+            run_nullfs_block_device_loss_test(&options)
+        }),
+        ParallelCheck::new("NullFS crash-recovery check", |options| {
+            run_nullfs_crash_recovery_test(&options)
+        }),
+        ParallelCheck::new("NullFS boot-generation check", |options| {
+            run_nullfs_boot_generation_test(&options)
+        }),
+        ParallelCheck::new("logging lifecycle check", |options| {
+            run_logging_lifecycle_test(&options)
+        }),
+        ParallelCheck::new("unavailable-primary recovery check", |options| {
+            run_nullfs_unavailable_test(&options)
+        }),
+    ];
+    if run_parallel_checks(*options, checks) {
         println!("QEMU kernel smoke test passed");
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+struct ParallelCheck {
+    label: &'static str,
+    check: Box<dyn FnOnce(Options) -> bool + Send>,
+}
+
+impl ParallelCheck {
+    fn new<F>(label: &'static str, check: F) -> Self
+    where
+        F: FnOnce(Options) -> bool + Send + 'static,
+    {
+        Self {
+            label,
+            check: Box::new(check),
+        }
+    }
+}
+
+fn run_parallel_checks(options: Options, checks: Vec<ParallelCheck>) -> bool {
+    const MAX_CONCURRENT_QEMU_CHECKS: usize = 2;
+
+    let (job_sender, job_receiver) = mpsc::channel::<ParallelCheck>();
+    let (result_sender, result_receiver) = mpsc::channel::<(&'static str, bool)>();
+    let job_receiver = Arc::new(Mutex::new(job_receiver));
+    let worker_count = checks.len().min(MAX_CONCURRENT_QEMU_CHECKS);
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let job_receiver = Arc::clone(&job_receiver);
+        let result_sender = result_sender.clone();
+        workers.push(thread::spawn(move || {
+            loop {
+                let job = {
+                    let receiver = job_receiver.lock().expect("QEMU job queue poisoned");
+                    receiver.recv()
+                };
+                let Ok(job) = job else { break };
+                let label = job.label;
+                let passed = (job.check)(options);
+                let _ = result_sender.send((label, passed));
+            }
+        }));
+    }
+
+    let expected_results = checks.len();
+    for check in checks {
+        job_sender
+            .send(check)
+            .expect("QEMU workers unexpectedly stopped");
+    }
+    drop(job_sender);
+    drop(result_sender);
+
+    let mut all_passed = true;
+    for worker in workers {
+        if worker.join().is_err() {
+            eprintln!("QEMU check worker panicked");
+            all_passed = false;
+        }
+    }
+    for _ in 0..expected_results {
+        match result_receiver.recv() {
+            Ok((_label, true)) => {}
+            Ok((label, false)) => {
+                eprintln!("QEMU {label} failed");
+                all_passed = false;
+            }
+            Err(_) => {
+                eprintln!("QEMU check worker stopped before reporting its result");
+                all_passed = false;
+                break;
+            }
+        }
+    }
+    all_passed
 }
 
 fn run_nullfs_restart_check(options: &Options) -> ExitCode {
@@ -1181,6 +1276,7 @@ fn run_qemu_until(
     timeout: Duration,
     mut completion: impl FnMut(&str) -> bool + Send + 'static,
 ) -> bool {
+    let started = Instant::now();
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
     let mut child = match command.spawn() {
@@ -1222,6 +1318,10 @@ fn run_qemu_until(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader.join();
+                println!(
+                    "QEMU {label} passed in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
                 return true;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {

@@ -33,6 +33,6 @@ cargo "$toolchain" clippy --workspace --all-targets --locked -- -D warnings
 cargo "$toolchain" build --release --locked
 
 if [[ "$run_qemu" == true ]]; then
-    cargo "$toolchain" run --locked --quiet -- --boot-check
-    cargo "$toolchain" run --locked --quiet -- --test
+    cargo "$toolchain" run --release --locked --quiet -- --boot-check
+    cargo "$toolchain" run --release --locked --quiet -- --test
 fi
