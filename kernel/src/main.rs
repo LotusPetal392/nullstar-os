@@ -232,6 +232,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         interrupt_controller.timer_source,
         interrupts::timer_ticks()
     );
+    if let Some(madt) = acpi_info.as_ref().and_then(|info| info.madt.as_ref()) {
+        serial_println!(
+            "CPU topology discovered: records={}, processors={}, enabled={}, online_capable={}, boot_lapic_id={:?}",
+            madt.processors().len(),
+            madt.processor_count,
+            madt.enabled_processor_count,
+            madt.online_capable_processor_count,
+            interrupt_controller.local_apic_id
+        );
+        for processor in madt.processors() {
+            serial_println!(
+                "CPU topology entry: uid={}, lapic_id={}, enabled={}, online_capable={}",
+                processor.processor_uid,
+                processor.local_apic_id,
+                processor.enabled,
+                processor.online_capable
+            );
+        }
+    }
     record_kernel_event(
         KERNEL_INTERRUPTS_READY_EVENT_ID,
         LogSeverity::Info,

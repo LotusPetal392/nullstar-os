@@ -9,6 +9,7 @@ const MAX_RSDP_LENGTH: usize = 4096;
 const SDT_HEADER_LENGTH: usize = 36;
 const MAX_ACPI_TABLE_LENGTH: usize = 16 * 1024 * 1024;
 const MAX_RECORDED_TABLES: usize = 32;
+pub const MAX_RECORDED_PROCESSORS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpiError {
@@ -185,6 +186,14 @@ pub struct IoApicInfo {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct MadtProcessorInfo {
+    pub processor_uid: u32,
+    pub local_apic_id: u32,
+    pub enabled: bool,
+    pub online_capable: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct MadtInfo {
     pub local_apic_address: u64,
     pub supports_legacy_pic: bool,
@@ -194,9 +203,17 @@ pub struct MadtInfo {
     pub io_apic_count: u16,
     pub interrupt_override_count: u16,
     pub malformed_entry_count: u16,
+    processors: [MadtProcessorInfo; MAX_RECORDED_PROCESSORS],
+    recorded_processor_count: usize,
     pub first_io_apic: Option<IoApicInfo>,
     pub timer_route: IsaInterruptRoute,
     pub keyboard_route: IsaInterruptRoute,
+}
+
+impl MadtInfo {
+    pub fn processors(&self) -> &[MadtProcessorInfo] {
+        &self.processors[..self.recorded_processor_count]
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -544,6 +561,13 @@ fn parse_madt(table: &[u8]) -> Option<MadtInfo> {
         io_apic_count: 0,
         interrupt_override_count: 0,
         malformed_entry_count: 0,
+        processors: [MadtProcessorInfo {
+            processor_uid: 0,
+            local_apic_id: 0,
+            enabled: false,
+            online_capable: false,
+        }; MAX_RECORDED_PROCESSORS],
+        recorded_processor_count: 0,
         first_io_apic: None,
         timer_route: IsaInterruptRoute::legacy(0),
         keyboard_route: IsaInterruptRoute::legacy(1),
@@ -567,7 +591,7 @@ fn parse_madt(table: &[u8]) -> Option<MadtInfo> {
         match entry_type {
             0 if entry.len() >= 8 => {
                 let flags = read_u32(entry, 4)?;
-                record_processor(&mut info, flags);
+                record_processor(&mut info, u32::from(entry[2]), u32::from(entry[3]), flags);
             }
             1 if entry.len() >= 12 => {
                 info.io_apic_count = info.io_apic_count.saturating_add(1);
@@ -594,8 +618,10 @@ fn parse_madt(table: &[u8]) -> Option<MadtInfo> {
                 info.local_apic_address = read_u64(entry, 4)?;
             }
             9 if entry.len() >= 16 => {
+                let local_apic_id = read_u32(entry, 4)?;
                 let flags = read_u32(entry, 8)?;
-                record_processor(&mut info, flags);
+                let processor_uid = read_u32(entry, 12)?;
+                record_processor(&mut info, processor_uid, local_apic_id, flags);
             }
             0 | 1 | 2 | 5 | 9 => {
                 info.malformed_entry_count = info.malformed_entry_count.saturating_add(1);
@@ -638,13 +664,22 @@ fn parse_interrupt_override(entry: &[u8]) -> Option<IsaInterruptRoute> {
     })
 }
 
-fn record_processor(info: &mut MadtInfo, flags: u32) {
+fn record_processor(info: &mut MadtInfo, processor_uid: u32, local_apic_id: u32, flags: u32) {
     info.processor_count = info.processor_count.saturating_add(1);
     if flags & 1 != 0 {
         info.enabled_processor_count = info.enabled_processor_count.saturating_add(1);
     }
     if flags & 2 != 0 {
         info.online_capable_processor_count = info.online_capable_processor_count.saturating_add(1);
+    }
+    if info.recorded_processor_count < MAX_RECORDED_PROCESSORS {
+        info.processors[info.recorded_processor_count] = MadtProcessorInfo {
+            processor_uid,
+            local_apic_id,
+            enabled: flags & 1 != 0,
+            online_capable: flags & 2 != 0,
+        };
+        info.recorded_processor_count += 1;
     }
 }
 
