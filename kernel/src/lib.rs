@@ -12,6 +12,7 @@ pub mod nullfs_volume_selection;
 pub mod object;
 pub mod process_completion;
 pub mod process_model;
+pub mod scheduling;
 pub mod timer;
 pub mod tmpfs_abi;
 pub mod wait_set;

@@ -6,6 +6,7 @@
 //! these identities without changing the lifecycle rules.
 
 use alloc::vec::Vec;
+use core::fmt;
 
 pub const MAX_PROCESSES: usize = 64;
 pub const MAX_THREADS: usize = 128;
@@ -16,6 +17,10 @@ pub const MAX_CHILDREN_PER_PROCESS: usize = 16;
 pub struct ProcessId(u64);
 
 impl ProcessId {
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -25,6 +30,10 @@ impl ProcessId {
 pub struct ThreadId(u64);
 
 impl ThreadId {
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -45,6 +54,19 @@ pub enum ThreadState {
     Sleeping,
     Stopped,
     Exited,
+}
+
+impl fmt::Display for ThreadState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runnable => formatter.write_str("runnable"),
+            Self::Running => formatter.write_str("running"),
+            Self::Blocked => formatter.write_str("blocked"),
+            Self::Sleeping => formatter.write_str("sleeping"),
+            Self::Stopped => formatter.write_str("stopped"),
+            Self::Exited => formatter.write_str("exited"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -467,10 +489,10 @@ impl ProcessTable {
             .position(|candidate| candidate.id == process_id)
             .expect("validated process disappeared");
         self.processes.remove(index);
-        if let Some(parent_id) = parent {
-            if let Some(parent) = self.process_mut(parent_id) {
-                parent.children.retain(|child| *child != process_id);
-            }
+        if let Some(parent_id) = parent
+            && let Some(parent) = self.process_mut(parent_id)
+        {
+            parent.children.retain(|child| *child != process_id);
         }
         Ok(exit)
     }

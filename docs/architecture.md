@@ -100,6 +100,12 @@ host-testable and intentionally sits beneath the existing single-thread-per-proc
 userspace compatibility path; scheduler context and userspace thread creation will be
 connected in the scheduling and SMP milestones.
 
+The single-CPU scheduling milestone now shares that thread-state vocabulary and provides
+a bounded round-robin policy model. Timer ticks consume a configured quantum, rotate
+runnable threads, and record preemptions; explicit yield, block, wake, and removal paths
+use the same queue and preserve deterministic switch accounting. The architecture-specific
+interrupt scheduler remains responsible for register contexts and address spaces.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
