@@ -18,6 +18,7 @@ authoritative when it differs from future design.
 ## System foundations
 
 - [Kernel, IPC, and scheduling](kernel-ipc-scheduling.md)
+- [SMP and multithreading evolution](smp-and-threading.md)
 - [IPC, kernel object, and handle model](ipc-and-object-model.md)
 - [Memory management](memory-management.md)
 - [Memory hardening](memory-hardening.md)
