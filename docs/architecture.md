@@ -106,6 +106,13 @@ runnable threads, and record preemptions; explicit yield, block, wake, and remov
 use the same queue and preserve deterministic switch accounting. The architecture-specific
 interrupt scheduler remains responsible for register contexts and address spaces.
 
+The SMP foundation now retains bounded processor identities from the ACPI MADT and exposes
+an affinity-aware per-CPU round-robin policy model. `SmpRoundRobin` validates online CPU masks,
+balances unrestricted threads, and supports explicit affinity changes and migration while
+preserving deterministic queue accounting. This slice deliberately stops short of AP startup,
+per-CPU GDT/TSS and interrupt state, inter-processor interrupts, and true parallel execution;
+those hardware bring-up pieces build on this topology and placement layer in the next SMP work.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
