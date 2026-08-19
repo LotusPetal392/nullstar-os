@@ -3,15 +3,33 @@
 
 use userspace::{
     args::Args,
+    handle::Endpoint,
+    ipc::{ObjectKind, Rights},
+    managed_startup::ManagedToolStart,
+    runtime_context::{CapabilityRole, StartupCapabilityPolicy},
     sv,
     syscall::{self, STDERR},
 };
 
-userspace::entry!(rust_main);
+userspace::managed_capability_tool_entry!(rust_main, 1, &STARTUP_POLICIES);
 userspace::panic_handler!();
 
-const OBSERVATION_GRANT_HANDLE: u64 = 1;
-const MUTATION_GRANT_HANDLE: u64 = 2;
+const STARTUP_POLICIES: [StartupCapabilityPolicy; 2] = [
+    StartupCapabilityPolicy {
+        role: CapabilityRole::SERVICE_CONTROL_OBSERVATION,
+        kind: ObjectKind::Endpoint,
+        minimum_rights: Rights::SEND,
+        maximum_rights: Rights::SEND,
+        required: false,
+    },
+    StartupCapabilityPolicy {
+        role: CapabilityRole::SERVICE_CONTROL_MUTATION,
+        kind: ObjectKind::Endpoint,
+        minimum_rights: Rights::SEND,
+        maximum_rights: Rights::SEND,
+        required: false,
+    },
+];
 const USAGE: &[u8] =
     b"usage: sv list | sv status SERVICE | sv start SERVICE | sv stop SERVICE | sv restart SERVICE\n";
 const UNKNOWN_SERVICE: &[u8] = b"sv: unknown service\n";
@@ -21,33 +39,44 @@ const MUTATION_OUTCOME_UNKNOWN: &[u8] =
 const MUTATION_COMMITTED_OUTPUT_FAILED: &[u8] =
     b"sv: mutation committed, but its result could not be printed\n";
 
-extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+fn rust_main(initial_stack: *const usize, mut start: ManagedToolStart<1>) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
+    let role = match arguments.get(1) {
+        Some(b"list") | Some(b"status") => CapabilityRole::SERVICE_CONTROL_OBSERVATION,
+        Some(b"start") | Some(b"stop") | Some(b"restart") => {
+            CapabilityRole::SERVICE_CONTROL_MUTATION
+        }
+        _ => fail(USAGE, 64),
+    };
+    let authority = match start.context.take::<Endpoint>(role, Rights::SEND) {
+        Ok(authority) if start.context.is_empty() => authority,
+        _ => syscall::exit(125),
+    };
     let result = match (arguments.len(), arguments.get(1), arguments.get(2)) {
-        (2, Some(b"list"), None) => sv::list(OBSERVATION_GRANT_HANDLE),
+        (2, Some(b"list"), None) => sv::list(authority.as_raw()),
         (3, Some(b"status"), Some(name)) => {
             let Some(service) = sv::service_id(name) else {
                 fail(UNKNOWN_SERVICE, 64);
             };
-            sv::status(OBSERVATION_GRANT_HANDLE, service)
+            sv::status(authority.as_raw(), service)
         }
         (3, Some(b"start"), Some(name)) => {
             let Some(service) = sv::service_id(name) else {
                 fail(UNKNOWN_SERVICE, 64);
             };
-            sv::start(MUTATION_GRANT_HANDLE, service)
+            sv::start(authority.as_raw(), service)
         }
         (3, Some(b"stop"), Some(name)) => {
             let Some(service) = sv::service_id(name) else {
                 fail(UNKNOWN_SERVICE, 64);
             };
-            sv::stop(MUTATION_GRANT_HANDLE, service)
+            sv::stop(authority.as_raw(), service)
         }
         (3, Some(b"restart"), Some(name)) => {
             let Some(service) = sv::service_id(name) else {
                 fail(UNKNOWN_SERVICE, 64);
             };
-            sv::restart(MUTATION_GRANT_HANDLE, service)
+            sv::restart(authority.as_raw(), service)
         }
         _ => fail(USAGE, 64),
     };

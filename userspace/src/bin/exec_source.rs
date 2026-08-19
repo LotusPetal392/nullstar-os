@@ -2,6 +2,7 @@
 #![no_main]
 
 use userspace::{
+    managed_startup::ManagedToolCommand,
     platform,
     syscall::{self, DescriptorFlags, Errno, OpenFlags},
 };
@@ -13,6 +14,7 @@ const PRESERVED_PATH: &[u8] = b"/tmp/exec-preserved.txt";
 const CLOSED_PATH: &[u8] = b"/tmp/exec-closed.txt";
 const VALID_EXEC: &[u8] = b"../exec-target alpha beta";
 const INVALID_EXEC: &[u8] = b"/missing-exec";
+const TMP_ENVIRONMENT: &[(&[u8], &[u8])] = &[(b"PWD", b"/tmp")];
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     let preserved = match syscall::open(
@@ -39,7 +41,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(4);
     }
 
-    match syscall::execve(INVALID_EXEC) {
+    match syscall::exec_managed_command(ManagedToolCommand::new(INVALID_EXEC, &[])) {
         Err(error) if error == Errno::NO_ENTRY => {}
         _ => syscall::exit(5),
     }
@@ -57,7 +59,8 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(7);
     }
 
-    if syscall::execve(VALID_EXEC).is_err() {
+    if syscall::exec_managed_command(ManagedToolCommand::new(VALID_EXEC, TMP_ENVIRONMENT)).is_err()
+    {
         syscall::exit(8);
     }
     syscall::exit(9)

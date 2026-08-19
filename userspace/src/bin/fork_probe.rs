@@ -4,6 +4,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use userspace::{
     ipc::{self, ObjectKind, Rights},
+    managed_startup::ManagedToolCommand,
     syscall::{self, OpenFlags},
 };
 
@@ -68,7 +69,9 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         if syscall::write_all(descriptor, b"child-before-exec\n").is_err() {
             syscall::exit(5);
         }
-        if syscall::execve(CHILD_EXEC).is_err() {
+        if syscall::close_all_capabilities().is_err()
+            || syscall::exec_managed_command(ManagedToolCommand::new(CHILD_EXEC, &[])).is_err()
+        {
             syscall::exit(6);
         }
         syscall::exit(7)

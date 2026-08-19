@@ -15,8 +15,9 @@ use userspace::{
     filesystem::{crash_test, protocol as filesystem_protocol},
     ipc::{self, CapabilityHandle, ObjectKind, Rights, Transfer},
     managed_startup::{
-        ManagedServiceIdentity, SYSTEM_NAMESPACE_PROFILE_ID, SYSTEM_PACKAGE_GENERATION,
-        SYSTEM_PACKAGE_ID, numeric_service_id,
+        ManagedServiceIdentity, ManagedToolCapability, ManagedToolCommand, ManagedToolStartOrigin,
+        SYSTEM_NAMESPACE_PROFILE_ID, SYSTEM_PACKAGE_GENERATION, SYSTEM_PACKAGE_ID,
+        numeric_service_id, send_managed_tool_start_with_capabilities,
     },
     nullfs_primary_volume, platform,
     process_start::{
@@ -246,10 +247,6 @@ const SHELL_FOREGROUND_FAILED: &[u8] =
 
 const READY_HANDLE: u64 = 1;
 const REQUEST_HANDLE: u64 = 2;
-const SV_OBSERVATION_HANDLE: u64 = 1;
-const SV_MUTATION_HANDLE: u64 = 2;
-const SHELL_SERVICE_CONTROL_HANDLE: u64 = 2;
-const SHELL_SERVICE_CONTROL_MUTATION_HANDLE: u64 = 3;
 const MAX_BOOTSTRAP_ROUTES: usize = 2;
 const ROUTE_PUMP_BUDGET: usize = 4;
 const SERVICE_CONTROL_PUMP_BUDGET: usize = 4;
@@ -2182,7 +2179,7 @@ impl LoggingLifecycleCheck {
                 let process_id = spawn_sv_command(
                     SV_STOP_LOGGING_COMMAND,
                     control.mutation_source,
-                    SV_MUTATION_HANDLE,
+                    CapabilityRole::SERVICE_CONTROL_MUTATION,
                 );
                 self.phase = LoggingLifecycleCheckPhase::WaitStopClient(process_id);
             }
@@ -2216,7 +2213,7 @@ impl LoggingLifecycleCheck {
                 let process_id = spawn_sv_command(
                     SV_START_LOGGING_COMMAND,
                     control.mutation_source,
-                    SV_MUTATION_HANDLE,
+                    CapabilityRole::SERVICE_CONTROL_MUTATION,
                 );
                 self.phase = LoggingLifecycleCheckPhase::WaitStartClient(process_id);
             }
@@ -2255,7 +2252,7 @@ impl LoggingLifecycleCheck {
                 let process_id = spawn_sv_command(
                     SV_STATUS_LOGGING_COMMAND,
                     control.observation_source,
-                    SV_OBSERVATION_HANDLE,
+                    CapabilityRole::SERVICE_CONTROL_OBSERVATION,
                 );
                 self.phase = LoggingLifecycleCheckPhase::WaitReadyStatus(process_id);
             }
@@ -2269,7 +2266,7 @@ impl LoggingLifecycleCheck {
                 let process_id = spawn_sv_command(
                     SV_RESTART_LOGGING_COMMAND,
                     control.mutation_source,
-                    SV_MUTATION_HANDLE,
+                    CapabilityRole::SERVICE_CONTROL_MUTATION,
                 );
                 self.phase = LoggingLifecycleCheckPhase::WaitRestartPending(process_id);
             }
@@ -2404,7 +2401,7 @@ impl LoggingLifecycleCheck {
                 let process_id = spawn_sv_command(
                     SV_RESTART_TMPFS_COMMAND,
                     control.mutation_source,
-                    SV_MUTATION_HANDLE,
+                    CapabilityRole::SERVICE_CONTROL_MUTATION,
                 );
                 self.phase = LoggingLifecycleCheckPhase::WaitTmpfsRestartClient(process_id);
             }
@@ -2438,7 +2435,7 @@ impl LoggingLifecycleCheck {
                 let process_id = spawn_sv_command(
                     SV_RESTART_VFS_COMMAND,
                     control.mutation_source,
-                    SV_MUTATION_HANDLE,
+                    CapabilityRole::SERVICE_CONTROL_MUTATION,
                 );
                 self.phase = LoggingLifecycleCheckPhase::WaitVfsRestartClient(process_id);
             }
@@ -2476,7 +2473,7 @@ impl LoggingLifecycleCheck {
                 let process_id = spawn_sv_command(
                     SV_RESTART_LOGGING_COMMAND,
                     control.mutation_source,
-                    SV_MUTATION_HANDLE,
+                    CapabilityRole::SERVICE_CONTROL_MUTATION,
                 );
                 self.phase = LoggingLifecycleCheckPhase::WaitReadinessRestartClient(process_id);
             }
@@ -2593,28 +2590,48 @@ fn published_route(
 fn spawn_sv_command(
     command: &[u8],
     authority: CapabilityHandle,
-    target_handle: CapabilityHandle,
+    role: CapabilityRole,
 ) -> ProcessId {
-    let barrier =
-        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
-    let process_id = syscall::spawn_command_with_barrier(
+    spawn_managed_capability_tool(
         command,
         SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &barrier,
+        &[ManagedToolCapability::new(authority, Rights::SEND, role)],
+        LOGGING_LIFECYCLE_TEST_FAILED,
     )
-    .unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
-    if ipc::grant_child(process_id, authority, Rights::SEND, target_handle).ok()
-        != Some(target_handle)
-    {
-        fail(LOGGING_LIFECYCLE_TEST_FAILED);
+}
+
+fn spawn_managed_capability_tool<const N: usize>(
+    command: &[u8],
+    flags: SpawnFlags,
+    capabilities: &[ManagedToolCapability; N],
+    failure_message: &[u8],
+) -> ProcessId {
+    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(failure_message));
+    let process_id =
+        syscall::spawn_command_with_barrier(command, flags, None, None, None, None, &barrier)
+            .unwrap_or_else(|_| fail(failure_message));
+    let (sender, receiver) = ipc::endpoint_create_pair().unwrap_or_else(|_| fail(failure_message));
+    let bootstrap_granted = ipc::grant_child(
+        process_id,
+        receiver,
+        Rights::RECEIVE,
+        PROCESS_START_BOOTSTRAP_HANDLE,
+    )
+    .ok()
+        == Some(PROCESS_START_BOOTSTRAP_HANDLE);
+    let startup_sent = bootstrap_granted
+        && send_managed_tool_start_with_capabilities(
+            sender,
+            process_id,
+            ManagedToolCommand::new(command, &[]),
+            ManagedToolStartOrigin::Parent,
+            capabilities,
+        )
+        .is_ok();
+    let endpoints_closed = ipc::close(sender).is_ok() && ipc::close(receiver).is_ok();
+    if !startup_sent || !endpoints_closed || barrier.release().is_err() {
+        fail(failure_message);
     }
-    barrier
-        .release()
-        .unwrap_or_else(|_| fail(LOGGING_LIFECYCLE_TEST_FAILED));
     process_id
 }
 
@@ -5028,26 +5045,11 @@ fn run_nullfs_restart_probe(
     let old_endpoint_info = ipc::info(*resources.request_endpoint)
         .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
 
-    let restart_barrier =
-        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    let restart_process_id = syscall::spawn_command_with_barrier(
+    let restart_process_id = spawn_sv_command(
         SV_RESTART_NULLFS_COMMAND,
-        SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &restart_barrier,
-    )
-    .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    if ipc::grant_child(restart_process_id, control.mutation_source, Rights::SEND, 2).ok()
-        != Some(2)
-    {
-        fail(NULLFS_RESTART_PROBE_FAILED);
-    }
-    restart_barrier
-        .release()
-        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+        control.mutation_source,
+        CapabilityRole::SERVICE_CONTROL_MUTATION,
+    );
 
     let mut restart_requested = false;
     for _ in 0..256 {
@@ -5219,32 +5221,11 @@ fn run_nullfs_restart_probe(
         }
     }
 
-    let forced_barrier =
-        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    let forced_restart_process_id = syscall::spawn_command_with_barrier(
+    let forced_restart_process_id = spawn_sv_command(
         SV_RESTART_NULLFS_COMMAND,
-        SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &forced_barrier,
-    )
-    .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    if ipc::grant_child(
-        forced_restart_process_id,
         control.mutation_source,
-        Rights::SEND,
-        2,
-    )
-    .ok()
-        != Some(2)
-    {
-        fail(NULLFS_RESTART_PROBE_FAILED);
-    }
-    forced_barrier
-        .release()
-        .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
+        CapabilityRole::SERVICE_CONTROL_MUTATION,
+    );
     let mut forced_requested = false;
     for _ in 0..256 {
         control.pump_mutation(
@@ -6240,29 +6221,16 @@ fn run_logging_probe(
 }
 
 fn run_logctl_show(service: &ServiceRuntime, route_broker: &mut RouteBrokerState) {
-    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(LOGCTL_FAILED));
-    let process_id = syscall::spawn_command_with_barrier(
+    let process_id = spawn_managed_capability_tool(
         LOGCTL_COMMAND,
         SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &barrier,
-    )
-    .unwrap_or_else(|_| fail(LOGCTL_FAILED));
-    if ipc::grant_child(
-        process_id,
-        route_broker.observer_grant_source,
-        Rights::SEND,
-        READY_HANDLE,
-    )
-    .ok()
-        != Some(READY_HANDLE)
-    {
-        fail(LOGCTL_FAILED);
-    }
-    barrier.release().unwrap_or_else(|_| fail(LOGCTL_FAILED));
+        &[ManagedToolCapability::new(
+            route_broker.observer_grant_source,
+            Rights::SEND,
+            CapabilityRole::LOGGING_OBSERVER_INGRESS,
+        )],
+        LOGCTL_FAILED,
+    );
 
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     loop {
@@ -6658,32 +6626,16 @@ fn run_service_control_probe(
     control: &mut ServiceControlState,
     registry: ServiceRegistryView<'_>,
 ) {
-    let barrier =
-        syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(SERVICE_CONTROL_PROBE_FAILED));
-    let process_id = syscall::spawn_command_with_barrier(
+    let process_id = spawn_managed_capability_tool(
         command,
         SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &barrier,
-    )
-    .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROBE_FAILED));
-    if ipc::grant_child(
-        process_id,
-        control.observation_source,
-        Rights::SEND,
-        READY_HANDLE,
-    )
-    .ok()
-        != Some(READY_HANDLE)
-    {
-        fail(SERVICE_CONTROL_PROBE_FAILED);
-    }
-    barrier
-        .release()
-        .unwrap_or_else(|_| fail(SERVICE_CONTROL_PROBE_FAILED));
+        &[ManagedToolCapability::new(
+            control.observation_source,
+            Rights::SEND,
+            CapabilityRole::SERVICE_CONTROL_OBSERVATION,
+        )],
+        SERVICE_CONTROL_PROBE_FAILED,
+    );
 
     let mut remaining = LOGGING_PROBE_MAX_YIELDS;
     loop {
@@ -6709,47 +6661,28 @@ fn spawn_shell(
     service_control_observer: CapabilityHandle,
     service_control_mutation: CapabilityHandle,
 ) -> ProcessId {
-    let barrier = syscall::LaunchBarrier::new().unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
-    let process_id = syscall::spawn_command_with_barrier(
+    let process_id = spawn_managed_capability_tool(
         SHELL_COMMAND,
         SpawnFlags::FOREGROUND | SpawnFlags::NEW_PROCESS_GROUP,
-        None,
-        None,
-        None,
-        None,
-        &barrier,
-    )
-    .unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
-    if ipc::grant_child(
-        process_id,
-        observer_ingress,
-        Rights::SEND | Rights::DUPLICATE,
-        READY_HANDLE,
-    )
-    .ok()
-        != Some(READY_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            service_control_observer,
-            Rights::SEND | Rights::DUPLICATE,
-            SHELL_SERVICE_CONTROL_HANDLE,
-        )
-        .ok()
-            != Some(SHELL_SERVICE_CONTROL_HANDLE)
-        || ipc::grant_child(
-            process_id,
-            service_control_mutation,
-            Rights::SEND | Rights::DUPLICATE,
-            SHELL_SERVICE_CONTROL_MUTATION_HANDLE,
-        )
-        .ok()
-            != Some(SHELL_SERVICE_CONTROL_MUTATION_HANDLE)
-    {
-        fail(SHELL_SPAWN_FAILED);
-    }
-    barrier
-        .release()
-        .unwrap_or_else(|_| fail(SHELL_SPAWN_FAILED));
+        &[
+            ManagedToolCapability::new(
+                observer_ingress,
+                Rights::SEND | Rights::DUPLICATE,
+                CapabilityRole::LOGGING_OBSERVER_INGRESS,
+            ),
+            ManagedToolCapability::new(
+                service_control_observer,
+                Rights::SEND | Rights::DUPLICATE,
+                CapabilityRole::SERVICE_CONTROL_OBSERVATION,
+            ),
+            ManagedToolCapability::new(
+                service_control_mutation,
+                Rights::SEND | Rights::DUPLICATE,
+                CapabilityRole::SERVICE_CONTROL_MUTATION,
+            ),
+        ],
+        SHELL_SPAWN_FAILED,
+    );
     let _ = syscall::write_all(STDOUT, SHELL_LAUNCHED);
     process_id
 }

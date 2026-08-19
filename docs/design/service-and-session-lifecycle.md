@@ -633,10 +633,9 @@ The accepted model can be introduced incrementally:
    before replacement. NullFS clean replacement preserves the exact quiesce and clean-unmount
    proof before drainage; forced dirty recovery terminates and drains the complete job. Hierarchy
    remains future work.
-2. complete the partially implemented general-loader migration beyond managed shell commands,
-   pipelines, external `exec` replacement, and the compatible direct exec probes by covering the
-   remaining relative-path and capability-bearing `execve` callers, PID 1 probes, and other managed
-   processes;
+2. complete the partially implemented general-loader migration beyond capability-isolated shell
+   commands, pipelines, all bundled exec replacement paths, and PID 1's typed `sv`/`logctl`/`ush`
+   launches by covering its remaining filesystem/fault-injection probes and other managed processes;
 3. define stable service identity, generation, lifecycle state, readiness, and control
    protocols;
 4. extract dependency, restart, and resource policy into a separate system service

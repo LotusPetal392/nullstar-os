@@ -3,17 +3,19 @@
 
 use userspace::{
     args::Args,
+    managed_startup::{ManagedToolStartMode, managed_tool_start_mode},
     syscall::{self, Errno, STDOUT},
 };
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 const SUCCESS: &[u8] = b"transactional exec target passed\n";
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
-    if arguments.len() != 3
+    if managed_tool_start_mode() != ManagedToolStartMode::Managed
+        || arguments.len() != 3
         || arguments.get(0) != Some(b"/exec-target")
         || arguments.get(1) != Some(b"alpha")
         || arguments.get(2) != Some(b"beta")

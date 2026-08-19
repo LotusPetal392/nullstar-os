@@ -105,6 +105,50 @@ macro_rules! managed_tool_entry {
     };
 }
 
+/// Defines a raw ELF entry point that requires and validates a typed,
+/// capability-bearing managed-tool startup stream before program entry.
+#[macro_export]
+macro_rules! managed_capability_tool_entry {
+    ($entry:path, $capacity:expr, $policies:expr) => {
+        extern "C" fn __nullstar_managed_capability_tool_entry(initial_stack: *const usize) -> ! {
+            let start = match $crate::managed_startup::receive_capability_managed_tool_start::<
+                $capacity,
+            >(initial_stack, $policies)
+            {
+                Ok(start) => start,
+                Err(_) => $crate::syscall::exit(125),
+            };
+            $entry(initial_stack, start)
+        }
+
+        $crate::entry!(__nullstar_managed_capability_tool_entry);
+    };
+}
+
+/// Defines a mixed-launch entry point for a tool that is still started
+/// directly by a kernel compatibility test as well as by a capability-bearing
+/// userspace manager.
+#[macro_export]
+macro_rules! optional_managed_capability_tool_entry {
+    ($entry:path, $capacity:expr, $policies:expr) => {
+        extern "C" fn __nullstar_optional_managed_capability_tool_entry(
+            initial_stack: *const usize,
+        ) -> ! {
+            let start =
+                match $crate::managed_startup::receive_optional_capability_managed_tool_start::<
+                    $capacity,
+                >(initial_stack, $policies)
+                {
+                    Ok(start) => start,
+                    Err(_) => $crate::syscall::exit(125),
+                };
+            $entry(initial_stack, start)
+        }
+
+        $crate::entry!(__nullstar_optional_managed_capability_tool_entry);
+    };
+}
+
 /// Installs a minimal panic handler that terminates the current process.
 #[macro_export]
 macro_rules! panic_handler {

@@ -5,17 +5,20 @@ use service_control::ServiceId;
 use userspace::{
     abi::{limits, signal},
     environment::Environment,
-    ipc::{self, Rights},
+    handle::Endpoint,
+    ipc::{self, ObjectKind, Rights},
     logctl,
-    managed_startup::ManagedToolCommand,
-    platform, sv,
+    managed_startup::{ManagedToolCommand, ManagedToolStart},
+    platform,
+    runtime_context::{CapabilityRole, StartupCapabilityPolicy},
+    sv,
     syscall::{
         self, ChildStatus, DescriptorFlags, FileDescriptor, LaunchBarrier, OpenFlags, PipePair,
         ProcessGroupId, ProcessId, STDERR, STDIN, STDOUT, SpawnFlags,
     },
 };
 
-userspace::entry!(rust_main);
+userspace::optional_managed_capability_tool_entry!(rust_main, 3, &STARTUP_POLICIES);
 userspace::panic_handler!();
 
 const COMMAND_BYTES: usize = 512;
@@ -26,9 +29,38 @@ const MAX_JOBS: usize = 4;
 const MAX_VARIABLES: usize = limits::MAX_ENVIRONMENT_VARIABLES;
 const VARIABLE_NAME_BYTES: usize = limits::MAX_ENVIRONMENT_NAME_BYTES;
 const VARIABLE_VALUE_BYTES: usize = COMMAND_BYTES;
-const OBSERVER_ROUTE_HANDLE: u64 = 1;
-const SERVICE_CONTROL_OBSERVER_HANDLE: u64 = 2;
-const SERVICE_CONTROL_MUTATION_HANDLE: u64 = 3;
+const OBSERVER_ROUTE_HANDLE: u64 = 2;
+const SERVICE_CONTROL_OBSERVER_HANDLE: u64 = 3;
+const SERVICE_CONTROL_MUTATION_HANDLE: u64 = 4;
+const SHELL_GRANT_RIGHTS: Rights =
+    match Rights::from_bits(Rights::SEND.bits() | Rights::DUPLICATE.bits()) {
+        Some(rights) => rights,
+        None => Rights::EMPTY,
+    };
+
+const STARTUP_POLICIES: [StartupCapabilityPolicy; 3] = [
+    StartupCapabilityPolicy {
+        role: CapabilityRole::LOGGING_OBSERVER_INGRESS,
+        kind: ObjectKind::Endpoint,
+        minimum_rights: SHELL_GRANT_RIGHTS,
+        maximum_rights: SHELL_GRANT_RIGHTS,
+        required: true,
+    },
+    StartupCapabilityPolicy {
+        role: CapabilityRole::SERVICE_CONTROL_OBSERVATION,
+        kind: ObjectKind::Endpoint,
+        minimum_rights: SHELL_GRANT_RIGHTS,
+        maximum_rights: SHELL_GRANT_RIGHTS,
+        required: true,
+    },
+    StartupCapabilityPolicy {
+        role: CapabilityRole::SERVICE_CONTROL_MUTATION,
+        kind: ObjectKind::Endpoint,
+        minimum_rights: SHELL_GRANT_RIGHTS,
+        maximum_rights: SHELL_GRANT_RIGHTS,
+        required: true,
+    },
+];
 
 const PROMPT: &[u8] = b"ush> ";
 const READY: &[u8] = b"userspace shell ready\n";
@@ -1737,7 +1769,30 @@ const fn is_line_trailing(byte: u8) -> bool {
     is_horizontal_space(byte) || byte == b'\n' || byte == b'\r'
 }
 
-extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+fn rust_main(initial_stack: *const usize, start: Option<ManagedToolStart<3>>) -> ! {
+    if let Some(mut start) = start {
+        let observer = start
+            .context
+            .take::<Endpoint>(CapabilityRole::LOGGING_OBSERVER_INGRESS, SHELL_GRANT_RIGHTS);
+        let service_observer = start.context.take::<Endpoint>(
+            CapabilityRole::SERVICE_CONTROL_OBSERVATION,
+            SHELL_GRANT_RIGHTS,
+        );
+        let service_mutation = start
+            .context
+            .take::<Endpoint>(CapabilityRole::SERVICE_CONTROL_MUTATION, SHELL_GRANT_RIGHTS);
+        let handles_valid = match (observer, service_observer, service_mutation) {
+            (Ok(observer), Ok(service_observer), Ok(service_mutation)) => {
+                observer.into_raw() == OBSERVER_ROUTE_HANDLE
+                    && service_observer.into_raw() == SERVICE_CONTROL_OBSERVER_HANDLE
+                    && service_mutation.into_raw() == SERVICE_CONTROL_MUTATION_HANDLE
+            }
+            _ => false,
+        };
+        if !handles_valid || !start.context.is_empty() {
+            syscall::exit(125);
+        }
+    }
     let mut shell = Shell::new(initial_stack);
     shell.run()
 }

@@ -5,9 +5,11 @@ use core::{mem::size_of, slice};
 
 use nullfs_format::BLOCK_SIZE;
 use userspace::{
-    abi::{errno, file},
+    abi::{errno, file, limits},
     args::Args,
+    environment::Environment,
     ipc::{self, ObjectKind, Rights, Transfer},
+    managed_startup::ManagedToolCommand,
     nullfs_primary_volume, platform, syscall,
     vfs::protocol,
 };
@@ -88,7 +90,7 @@ const NULLFS_EXEC_PRESERVED_PATH: &[u8] = b"/tmp/nullfs-exec-preserved";
 const NULLFS_EXEC_CLOSED_PATH: &[u8] = b"/tmp/nullfs-exec-closed";
 const NULLFS_EXEC_SPAWN_STATUS: u64 = 41;
 const NULLFS_EXEC_FORK_STATUS: u64 = 42;
-
+const ROOT_ENVIRONMENT: &[(&[u8], &[u8])] = &[(b"PWD", b"/")];
 const CASES: &[(&[u8], u32, u16, u16)] = &[
     (
         b"/",
@@ -190,8 +192,19 @@ const CASES: &[(&[u8], u32, u16, u16)] = &[
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
+    let inherited_environment = unsafe { Environment::from_stack(initial_stack) };
+    let mut environment = [(&[][..], &[][..]); limits::MAX_ENVIRONMENT_VARIABLES];
+    let mut environment_count = 0usize;
+    for entry in inherited_environment.iter() {
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            syscall::exit(58);
+        };
+        environment[environment_count] = (&entry[..separator], &entry[separator + 1..]);
+        environment_count += 1;
+    }
+    let environment = &environment[..environment_count];
     if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_RESTART_MODE) {
-        probe_nullfs_restart();
+        probe_nullfs_restart(environment);
     }
     if arguments.len() == 2 && arguments.get(1) == Some(NULLFS_OUT_OF_SPACE_MODE) {
         probe_nullfs_out_of_space();
@@ -251,8 +264,8 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     {
         syscall::exit(15);
     }
-    let Ok(ls_process) = syscall::spawn_command(
-        b"/ls /invalid",
+    let Ok(ls_process) = syscall::spawn_managed_command(
+        ManagedToolCommand::new(b"/ls /invalid", environment),
         syscall::SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
@@ -399,7 +412,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
 
     probe_mounted_nullfs();
-    let executable_result = probe_nullfs_executable();
+    let executable_result = probe_nullfs_executable(ROOT_ENVIRONMENT);
     if executable_result != 0 {
         syscall::exit(130 + executable_result);
     }
@@ -1087,7 +1100,7 @@ fn probe_nullfs_out_of_space() -> ! {
     syscall::exit(0);
 }
 
-fn probe_nullfs_restart() -> ! {
+fn probe_nullfs_restart(environment: &[(&[u8], &[u8])]) -> ! {
     if !matches!(
         ipc::wait_for_handle(SERVICE_HANDLE),
         Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
@@ -1149,7 +1162,7 @@ fn probe_nullfs_restart() -> ! {
     {
         syscall::exit(100);
     }
-    let executable_result = probe_nullfs_executable();
+    let executable_result = probe_nullfs_executable(environment);
     if executable_result != 0 {
         syscall::exit(130 + executable_result);
     }
@@ -1239,7 +1252,7 @@ fn probe_nullfs_restart() -> ! {
     syscall::exit(0)
 }
 
-fn probe_nullfs_executable() -> u64 {
+fn probe_nullfs_executable(environment: &[(&[u8], &[u8])]) -> u64 {
     let mut executable_kind = None;
     for _ in 0..64 {
         match platform::stat(NULLFS_EXEC_TARGET) {
@@ -1316,8 +1329,8 @@ fn probe_nullfs_executable() -> u64 {
         return 8;
     }
 
-    let spawned = match syscall::spawn_command(
-        NULLFS_EXEC_SPAWN_COMMAND,
+    let spawned = match syscall::spawn_managed_command(
+        ManagedToolCommand::new(NULLFS_EXEC_SPAWN_COMMAND, environment),
         syscall::SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
@@ -1333,8 +1346,8 @@ fn probe_nullfs_executable() -> u64 {
         return 3;
     }
 
-    let system_spawned = match syscall::spawn_command(
-        NULLFS_SYSTEM_EXEC_SPAWN_COMMAND,
+    let system_spawned = match syscall::spawn_managed_command(
+        ManagedToolCommand::new(NULLFS_SYSTEM_EXEC_SPAWN_COMMAND, environment),
         syscall::SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
@@ -1365,6 +1378,9 @@ fn probe_nullfs_executable() -> u64 {
         Err(_) => return 6,
     };
     if child == 0 {
+        if syscall::close_all_capabilities().is_err() {
+            syscall::exit(132);
+        }
         let preserved = syscall::open(
             NULLFS_EXEC_PRESERVED_PATH,
             syscall::OpenFlags::WRITE | syscall::OpenFlags::CREATE | syscall::OpenFlags::TRUNCATE,
@@ -1387,15 +1403,24 @@ fn probe_nullfs_executable() -> u64 {
         {
             syscall::exit(122);
         }
-        match syscall::execve(NULLFS_EXEC_MISSING_COMMAND) {
+        match syscall::exec_managed_command(ManagedToolCommand::new(
+            NULLFS_EXEC_MISSING_COMMAND,
+            environment,
+        )) {
             Err(error) if error == syscall::Errno::NO_ENTRY => {}
             _ => syscall::exit(123),
         }
-        match syscall::execve(NULLFS_EXEC_NOT_DIRECTORY_COMMAND) {
+        match syscall::exec_managed_command(ManagedToolCommand::new(
+            NULLFS_EXEC_NOT_DIRECTORY_COMMAND,
+            environment,
+        )) {
             Err(error) if i64::from(error.code()) == -errno::NOT_DIRECTORY => {}
             _ => syscall::exit(131),
         }
-        match syscall::execve(NULLFS_EXEC_MALFORMED_COMMAND) {
+        match syscall::exec_managed_command(ManagedToolCommand::new(
+            NULLFS_EXEC_MALFORMED_COMMAND,
+            environment,
+        )) {
             Err(error) if error == syscall::Errno::IO => {}
             _ => syscall::exit(127),
         }
@@ -1418,7 +1443,9 @@ fn probe_nullfs_executable() -> u64 {
         {
             syscall::exit(124);
         }
-        if syscall::execve(&command[..length]).is_err() {
+        if syscall::exec_managed_command(ManagedToolCommand::new(&command[..length], environment))
+            .is_err()
+        {
             syscall::exit(125);
         }
         syscall::exit(126);

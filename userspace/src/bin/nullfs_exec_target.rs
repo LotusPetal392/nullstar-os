@@ -1,9 +1,13 @@
 #![no_std]
 #![no_main]
 
-use userspace::{args::Args, platform, syscall};
+use userspace::{
+    args::Args,
+    managed_startup::{ManagedToolStartMode, managed_tool_start_mode},
+    platform, syscall,
+};
 
-userspace::entry!(rust_main);
+userspace::managed_tool_entry!(rust_main);
 userspace::panic_handler!();
 
 const TARGET_PATH: &[u8] = b"/Applications/ExecProbe/bin/exec-target";
@@ -16,6 +20,9 @@ const FORK_EXEC_SUCCESS: u64 = 42;
 
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
+    if managed_tool_start_mode() != ManagedToolStartMode::Managed {
+        syscall::exit(65);
+    }
     let target_path = arguments.get(0);
     if target_path != Some(TARGET_PATH) && target_path != Some(SYSTEM_TARGET_PATH) {
         syscall::exit(64);

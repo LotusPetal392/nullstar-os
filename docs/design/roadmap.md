@@ -38,10 +38,14 @@ generation-local transfer-only authorities for logging and NullFS, reacquiring t
 The ordinary shell loader now applies the same capability-empty contract to single commands and every
 pipeline stage, using a private internal barrier before the existing process-group barrier. Converted
 tool entry points pin their parent and validate canonical identity, arguments, environment, and an
-otherwise empty initial capability table. The external `exec` tool and the environment- and
-signal-lifecycle probes carry the managed stream through image replacement as a same-PID handoff;
-the remaining relative-path retry and capability-bearing fork/VFS `execve` callers plus PID 1's
-capability-bearing probe launchers retain transitional startup paths. The next
+otherwise empty initial capability table. Managed spawn now waits for the child to discard inherited
+capabilities before installing bootstrap handle 1. Every bundled exec caller carries the managed
+stream through image replacement as a same-PID handoff, including CWD-relative resolution, repeated
+failure cleanup, and probes that explicitly discard inherited authority once it is no longer needed.
+PID 1 now uses typed capability-bearing managed-tool startup for `sv`, `logctl`, and its foreground
+`ush`, separating logging observation and service-control observation/mutation by role and exact
+rights. Filesystem and fault-injection probe launchers retain transitional startup paths, and the
+kernel smoke-test launch of `ush` retains one explicit mixed-launch compatibility entry. The next
 architecture stages are:
 
 1. finish formalizing common kernel-object ownership, typed handles, immutable rights, and
@@ -81,9 +85,9 @@ The detailed contract is in
    replacement. NullFS preserves exact quiesce, clean-unmount, and final-exit evidence before clean
    drainage; forced dirty recovery terminates and drains the complete job. PID 1 service generations
    remain flat roots; session and application hierarchy integration remains future work.
-2. complete the partially migrated general-loader path by covering the remaining relative-path and
-   capability-bearing `execve` callers, PID 1's capability-bearing probes, and other managed
-   processes, then remove the kernel-direct compatibility fallback;
+2. complete the partially migrated general-loader path by covering PID 1's remaining filesystem and
+   fault-injection probes and other managed processes, then remove the explicit kernel-direct `ush`
+   compatibility entry;
 3. define stable service identity, service generation, lifecycle state, readiness,
    control, and failure protocols;
 4. keep PID 1 as a minimal bootstrap and recovery supervisor while moving ordinary

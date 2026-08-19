@@ -311,9 +311,12 @@ the transitional fork/exec barrier and direct-child grant. The ordinary shell lo
 capability-empty tool stream for single commands and pipeline stages, and converted tool entry points
 validate parent identity plus canonical arguments and environment before program code. The external
 `exec` launcher stages the same contract for its replacement image with an authenticated same-PID
-flag, and the environment- and signal-lifecycle probes exercise that handoff directly. The remaining
-relative-path retry and capability-bearing fork/VFS `execve` callers, PID 1 probes, and removal of
-the kernel-direct compatibility fallback remain.
+flag. Managed children first acknowledge that inherited capabilities are closed, CWD-relative paths
+are canonicalized identically to the kernel, and every bundled exec probe now exercises the handoff.
+Capability-bearing tool entry points and sender support are now live for PID 1-launched `sv`,
+`logctl`, and `ush`; their endpoint rights and semantic roles are receiver-policy validated before
+program code. Filesystem/fault-injection probes and removal of the remaining explicit `ush`
+kernel-direct compatibility entry remain.
 
 ## Role-specific entry points
 
@@ -1127,10 +1130,9 @@ fragmentable typed identity, argument, environment, and launch sections with bou
 assembly and host validation. The definition-backed service, logging, NullFS, tmpfs, and VFS now provide QEMU coverage
 for live `NSPC` plus `NSPD` bootstrap streams; the lifecycle gates also prove logging, NullFS, tmpfs, and VFS
 replacement generations revalidate the contract after complete job drainage. The smoke gate also
-proves managed single-command environment agreement, managed pipeline startup, and same-PID managed
-replacement through the external `exec` launcher plus the environment- and signal-lifecycle probes.
-Remaining work includes migrating the relative-path retry and capability-bearing fork/VFS `execve`
-callers and PID 1 probes, replacing the
+proves managed single-command environment agreement, managed pipeline startup, synchronized child
+capability isolation, and same-PID managed replacement across every bundled exec probe. Remaining
+work includes migrating PID 1 probes, replacing the
 transitional launch/grant mechanics, and adding
 file, network, display, device, and media completion sources; the NSIDL compiler still needs to
 generate the descriptors and binding code now accepted by this runtime layer.

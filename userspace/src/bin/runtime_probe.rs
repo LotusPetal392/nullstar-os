@@ -24,7 +24,7 @@ use userspace::{
     },
     heap::BumpHeap,
     ipc::{self, Deadline, ObjectKind, Rights, Signals, Transfer, WaitItem},
-    managed_startup::{ManagedToolStartMode, managed_tool_start_mode},
+    managed_startup::{ManagedToolCommand, ManagedToolStartMode, managed_tool_start_mode},
     platform::{self, DirectoryEntry},
     process_start::{
         ProcessStartData, StartupIdentity, StartupLaunch, StartupLaunchReason,
@@ -2961,8 +2961,8 @@ fn relative_open_probe() -> bool {
 }
 
 fn relative_spawn_probe() -> bool {
-    let Ok(process_id) = syscall::spawn_command(
-        b"../pwd",
+    let Ok(process_id) = syscall::spawn_managed_command(
+        ManagedToolCommand::new(b"../pwd", &[(b"PWD", b"/tmp")]),
         SpawnFlags::NEW_PROCESS_GROUP,
         None,
         None,
