@@ -7,7 +7,7 @@
 //! spawn syscall; syscall 7 remains a kernel ABI compatibility entry point.
 
 use crate::{
-    abi::signal,
+    abi::{limits, signal},
     ipc::{self, Rights},
     managed_startup::{self, ManagedToolCommand, ManagedToolStartOrigin},
     platform,
@@ -72,6 +72,64 @@ impl LaunchBarrier {
 impl Drop for LaunchBarrier {
     fn drop(&mut self) {
         let _ = self.release_in_place();
+    }
+}
+
+#[derive(Debug)]
+struct CapabilityIsolationBarrier {
+    pair: PipePair,
+    reader_open: bool,
+    writer_open: bool,
+}
+
+impl CapabilityIsolationBarrier {
+    fn new() -> Result<Self> {
+        let pair = pipe_pair()?;
+        if set_descriptor_flags(pair.reader, DescriptorFlags::CLOSE_ON_EXEC).is_err()
+            || set_descriptor_flags(pair.writer, DescriptorFlags::CLOSE_ON_EXEC).is_err()
+        {
+            let _ = close(pair.writer);
+            let _ = close(pair.reader);
+            return Err(Errno::IO);
+        }
+        Ok(Self {
+            pair,
+            reader_open: true,
+            writer_open: true,
+        })
+    }
+
+    fn wait_for_child(&mut self) -> Result<()> {
+        if self.writer_open {
+            close(self.pair.writer)?;
+            self.writer_open = false;
+        }
+        let mut byte = [0_u8; 1];
+        let result = loop {
+            match read(self.pair.reader, &mut byte) {
+                Ok(1) if byte[0] == 1 => break Ok(()),
+                Ok(_) => break Err(Errno::IO),
+                Err(error) if error == Errno::INTERRUPTED => {}
+                Err(error) => break Err(error),
+            }
+        };
+        let close_result = if self.reader_open {
+            close(self.pair.reader).inspect(|()| self.reader_open = false)
+        } else {
+            Ok(())
+        };
+        result.and(close_result)
+    }
+}
+
+impl Drop for CapabilityIsolationBarrier {
+    fn drop(&mut self) {
+        if self.writer_open {
+            let _ = close(self.pair.writer);
+        }
+        if self.reader_open {
+            let _ = close(self.pair.reader);
+        }
     }
 }
 
@@ -210,6 +268,20 @@ pub fn exec_managed_command(command: ManagedToolCommand<'_>) -> Result<()> {
     }
 }
 
+/// Permanently discards every capability currently held by this process.
+///
+/// Callers use this before a capability-empty managed exec only after they no
+/// longer need inherited authority. File descriptors are a separate table and
+/// are unaffected.
+pub fn close_all_capabilities() -> Result<()> {
+    for handle in 1..=limits::MAX_CAPABILITIES_PER_PROCESS as u64 {
+        if ipc::info(handle).is_ok() && ipc::close(handle).is_err() {
+            return Err(Errno::IO);
+        }
+    }
+    Ok(())
+}
+
 fn spawn_command_inner(
     command: &[u8],
     flags: SpawnFlags,
@@ -233,6 +305,11 @@ fn spawn_command_inner(
     } else {
         None
     };
+    let mut capability_isolation = if managed_command.is_some() {
+        Some(CapabilityIsolationBarrier::new()?)
+    } else {
+        None
+    };
     let foreground = flags.contains(SpawnFlags::FOREGROUND);
     let child_process_id = fork()?;
     if child_process_id == 0 {
@@ -241,6 +318,7 @@ fn spawn_command_inner(
             foreground,
             descriptors,
             process_group,
+            capability_isolation.as_ref().map(|barrier| barrier.pair),
             startup_barrier.as_ref().map(|barrier| barrier.pair),
             barrier,
         )
@@ -248,6 +326,13 @@ fn spawn_command_inner(
 
     let target_group = process_group.unwrap_or(child_process_id);
     if platform::set_process_group(child_process_id, target_group).is_err() {
+        terminate_and_reap(child_process_id);
+        return Err(Errno::IO);
+    }
+    if capability_isolation
+        .as_mut()
+        .is_some_and(|barrier| barrier.wait_for_child().is_err())
+    {
         terminate_and_reap(child_process_id);
         return Err(Errno::IO);
     }
@@ -293,6 +378,7 @@ fn launch_child(
     foreground: bool,
     descriptors: LaunchDescriptors,
     process_group: Option<ProcessGroupId>,
+    capability_isolation: Option<PipePair>,
     startup_barrier: Option<PipePair>,
     barrier: Option<PipePair>,
 ) -> ! {
@@ -302,6 +388,9 @@ fn launch_child(
     };
     let expected_group = process_group.unwrap_or(process_id);
 
+    if let Some(pair) = capability_isolation {
+        isolate_child_capabilities(pair);
+    }
     if let Some(pair) = startup_barrier
         && close(pair.writer).is_err()
     {
@@ -336,6 +425,16 @@ fn launch_child(
         launch_failure();
     }
     exit(127)
+}
+
+fn isolate_child_capabilities(pair: PipePair) {
+    if close(pair.reader).is_err()
+        || close_all_capabilities().is_err()
+        || write_all(pair.writer, &[1]).is_err()
+        || close(pair.writer).is_err()
+    {
+        launch_failure();
+    }
 }
 
 fn install_managed_tool_start(process_id: ProcessId, command: ManagedToolCommand<'_>) -> bool {

@@ -2112,29 +2112,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && shell_filter.exit_code() == Some(0)
         && shell_consumer.exit_code() == Some(0)
         && shell_producer.pipe_write_count >= 1
-        && shell_producer.pipe_bytes_written == PIPE_TEST_BYTES
+        // Each managed child writes one capability-isolation acknowledgement.
+        && shell_producer.pipe_bytes_written == PIPE_TEST_BYTES.saturating_add(1)
         && shell_filter.pipe_read_count >= 2
         && shell_filter.pipe_write_count >= 1
         && shell_filter.pipe_bytes_read == PIPE_TEST_BYTES
-        && shell_filter.pipe_bytes_written == PIPE_TEST_BYTES
+        && shell_filter.pipe_bytes_written == PIPE_TEST_BYTES.saturating_add(1)
         && shell_filter.blocked_pipe_read_count >= 1
         && shell_consumer.pipe_read_count >= 2
         && shell_consumer.pipe_bytes_read == PIPE_TEST_BYTES
         && shell_consumer.blocked_pipe_read_count >= 1
+        // Every managed launch adds one isolation pair alongside its startup pair.
         && userspace_shell_result.pipe_pair_count
-            == userspace_shell_result.child_spawn_count.saturating_add(8)
-        && userspace_shell_result.pipe_descriptor_close_count
             == userspace_shell_result
                 .child_spawn_count
                 .saturating_mul(2)
+                .saturating_add(8)
+        && userspace_shell_result.pipe_descriptor_close_count
+            == userspace_shell_result
+                .child_spawn_count
+                .saturating_mul(4)
                 .saturating_add(16)
         && userspace_shell_result.pipe_descriptor_inherit_count == 0
-        && created_pipe_delta == 6
-        && destroyed_pipe_delta == 6
-        && reader_retain_delta == 14
-        && writer_retain_delta == 14
-        && pipe_bytes_read_delta == PIPE_TEST_BYTES.saturating_mul(2)
-        && pipe_bytes_written_delta == PIPE_TEST_BYTES.saturating_mul(2)
+        && created_pipe_delta == 9
+        && destroyed_pipe_delta == 9
+        && reader_retain_delta == 17
+        && writer_retain_delta == 17
+        && pipe_bytes_read_delta == PIPE_TEST_BYTES.saturating_mul(2).saturating_add(3)
+        && pipe_bytes_written_delta == PIPE_TEST_BYTES.saturating_mul(2).saturating_add(3)
         && userspace_pipeline_after.active_pipes == 0;
     if !userspace_pipeline_verified {
         serial_println!(
@@ -2289,8 +2294,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .any(|result| result.path == "/pipe-consumer")
         && terminal_after_interrupt.interrupts
             == terminal_before_interrupt.interrupts.saturating_add(1)
-        && signal_pipe_created == 8
-        && signal_pipe_destroyed == 8
+        // The five managed launches in this interval each add an isolation pair.
+        && signal_pipe_created == 13
+        && signal_pipe_destroyed == 13
         && userspace_signal_pipe_after.active_pipes == 0;
     let background_signal_verified = background_signal_group.process_ids.len() == 1
         && background_signal_results.len() == 1

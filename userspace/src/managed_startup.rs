@@ -12,7 +12,7 @@ use crate::{
     args::Args,
     environment::Environment,
     handle::{Endpoint, OwnedHandle},
-    ipc::{self, ObjectKind, Rights},
+    ipc::{self, ObjectKind, Rights, Transfer},
     platform,
     process_start::{
         PROCESS_START_BOOTSTRAP_HANDLE, StartupDataError, StartupIdentity, StartupLaunch,
@@ -21,8 +21,9 @@ use crate::{
         receive_process_start_data, send_process_start_data,
     },
     runtime_context::{
-        ProcessContext, ServiceProcess, StartupCapabilityPolicy, StartupMessage,
-        StartupReceiveError, StartupRuntimeRole, ToolProcess, send_startup_message,
+        CapabilityRole, ProcessContext, ServiceProcess, StartupCapabilityPolicy, StartupMessage,
+        StartupReceiveError, StartupResource, StartupRuntimeRole, ToolProcess,
+        send_startup_message,
     },
     syscall,
 };
@@ -48,6 +49,24 @@ static MANAGED_TOOL_MODE: AtomicU8 = AtomicU8::new(MANAGED_TOOL_MODE_UNINITIALIZ
 pub struct ManagedToolCommand<'a> {
     command: &'a [u8],
     environment: &'a [(&'a [u8], &'a [u8])],
+}
+
+/// One capability delegated into a managed tool's typed startup context.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedToolCapability {
+    pub source_handle: u64,
+    pub rights: Rights,
+    pub role: CapabilityRole,
+}
+
+impl ManagedToolCapability {
+    pub const fn new(source_handle: u64, rights: Rights, role: CapabilityRole) -> Self {
+        Self {
+            source_handle,
+            rights,
+            role,
+        }
+    }
 }
 
 impl<'a> ManagedToolCommand<'a> {
@@ -125,6 +144,13 @@ impl ManagedServiceIdentity {
 pub struct ManagedServiceStart<const N: usize> {
     pub context: ProcessContext<ServiceProcess, N>,
     pub generation: u64,
+}
+
+/// Validated authority and launch origin supplied to one managed tool.
+#[derive(Debug)]
+pub struct ManagedToolStart<const N: usize> {
+    pub context: ProcessContext<ToolProcess, N>,
+    pub origin: ManagedToolStartOrigin,
 }
 
 /// Receives and validates the complete managed-service startup stream.
@@ -227,24 +253,89 @@ pub fn send_managed_tool_start(
     command: ManagedToolCommand<'_>,
     origin: ManagedToolStartOrigin,
 ) -> Result<(), ManagedToolStartSendError> {
+    send_managed_tool_start_with_capabilities(sender, process_id, command, origin, &[])
+}
+
+/// Sends a typed capability-bearing startup stream for an ordinary tool.
+///
+/// Capabilities are duplicated into transfer-only temporary handles, so the
+/// manager retains its source authorities on both success and failure.
+pub fn send_managed_tool_start_with_capabilities<const N: usize>(
+    sender: u64,
+    process_id: u64,
+    command: ManagedToolCommand<'_>,
+    origin: ManagedToolStartOrigin,
+    capabilities: &[ManagedToolCapability; N],
+) -> Result<(), ManagedToolStartSendError> {
     if sender == 0 || process_id == 0 {
+        return Err(ManagedToolStartSendError::InvalidDescription);
+    }
+    if N > limits::MAX_IPC_MESSAGE_HANDLES {
         return Err(ManagedToolStartSendError::InvalidDescription);
     }
     let mut raw_arguments = [&[][..]; limits::MAX_ARGUMENTS];
     let argument_count = split_command(command.command, &mut raw_arguments)
         .ok_or(ManagedToolStartSendError::InvalidDescription)?;
+    let mut working_directory_bytes = [0; limits::MAX_PATH_BYTES + 1];
+    let working_directory =
+        if raw_arguments[0].first() != Some(&b'/') && raw_arguments[0].contains(&b'/') {
+            platform::getcwd(&mut working_directory_bytes)
+                .map_err(|_| ManagedToolStartSendError::InvalidDescription)?
+        } else {
+            &b"/"[..]
+        };
     let mut executable_bytes = [0; limits::MAX_ARGUMENT_BYTES];
     let executable_argument =
-        canonical_executable_argument(raw_arguments[0], &mut executable_bytes)
+        canonical_executable_argument(raw_arguments[0], working_directory, &mut executable_bytes)
             .ok_or(ManagedToolStartSendError::InvalidDescription)?;
     let mut arguments = [&[][..]; limits::MAX_ARGUMENTS];
     arguments[0] = executable_argument;
     arguments[1..argument_count].copy_from_slice(&raw_arguments[1..argument_count]);
     let executable = numeric_executable_id(arguments[0]);
-    let capability_message = StartupMessage::<0>::new(StartupRuntimeRole::Tool, [])
-        .map_err(ManagedToolStartSendError::Capabilities)?;
-    send_startup_message(sender, &capability_message, &[])
-        .map_err(ManagedToolStartSendError::CapabilityTransport)?;
+    let mut resources = [None; N];
+    let mut transfers = [Transfer {
+        handle: 0,
+        rights: Rights::EMPTY,
+    }; N];
+    let mut duplicates = [0; N];
+    for (index, capability) in capabilities.iter().enumerate() {
+        let duplicate = match ipc::duplicate(
+            capability.source_handle,
+            capability.rights | Rights::TRANSFER,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                for handle in duplicates[..index].iter().copied() {
+                    let _ = ipc::close(handle);
+                }
+                return Err(ManagedToolStartSendError::CapabilityDuplicate(error));
+            }
+        };
+        duplicates[index] = duplicate;
+        resources[index] = Some(StartupResource {
+            role: capability.role,
+            required: true,
+        });
+        transfers[index] = Transfer {
+            handle: duplicate,
+            rights: capability.rights,
+        };
+    }
+    let capability_message = match StartupMessage::<N>::new(StartupRuntimeRole::Tool, resources) {
+        Ok(message) => message,
+        Err(error) => {
+            for handle in duplicates {
+                let _ = ipc::close(handle);
+            }
+            return Err(ManagedToolStartSendError::Capabilities(error));
+        }
+    };
+    if let Err(error) = send_startup_message(sender, &capability_message, &transfers) {
+        for handle in duplicates {
+            let _ = ipc::close(handle);
+        }
+        return Err(ManagedToolStartSendError::CapabilityTransport(error));
+    }
 
     let mut argument_bytes = [0; limits::MAX_ARGUMENT_BYTES];
     let argument_length =
@@ -309,7 +400,11 @@ pub fn send_managed_tool_start(
 pub fn initialize_managed_tool_start(
     initial_stack: *const usize,
 ) -> Result<ManagedToolStartMode, ManagedToolStartError> {
-    let mode = receive_managed_tool_start(initial_stack)?;
+    let mode = if receive_managed_tool_start_inner::<0>(initial_stack, &[], true)?.is_some() {
+        ManagedToolStartMode::Managed
+    } else {
+        ManagedToolStartMode::Legacy
+    };
     MANAGED_TOOL_MODE.store(
         match mode {
             ManagedToolStartMode::Legacy => MANAGED_TOOL_MODE_LEGACY,
@@ -321,12 +416,44 @@ pub fn initialize_managed_tool_start(
     Ok(mode)
 }
 
-fn receive_managed_tool_start(
+/// Receives a mandatory typed capability-bearing managed-tool startup stream.
+pub fn receive_capability_managed_tool_start<const N: usize>(
     initial_stack: *const usize,
-) -> Result<ManagedToolStartMode, ManagedToolStartError> {
+    policies: &[StartupCapabilityPolicy],
+) -> Result<ManagedToolStart<N>, ManagedToolStartError> {
+    let start = receive_managed_tool_start_inner(initial_stack, policies, false)?
+        .ok_or(ManagedToolStartError::InvalidBootstrap)?;
+    MANAGED_TOOL_MODE.store(MANAGED_TOOL_MODE_MANAGED, Ordering::Relaxed);
+    Ok(start)
+}
+
+/// Receives a typed managed startup when present while preserving an explicit
+/// kernel-direct compatibility entry for mixed-launch test tools.
+pub fn receive_optional_capability_managed_tool_start<const N: usize>(
+    initial_stack: *const usize,
+    policies: &[StartupCapabilityPolicy],
+) -> Result<Option<ManagedToolStart<N>>, ManagedToolStartError> {
+    let start = receive_managed_tool_start_inner(initial_stack, policies, true)?;
+    MANAGED_TOOL_MODE.store(
+        if start.is_some() {
+            MANAGED_TOOL_MODE_MANAGED
+        } else {
+            MANAGED_TOOL_MODE_LEGACY
+        },
+        Ordering::Relaxed,
+    );
+    Ok(start)
+}
+
+fn receive_managed_tool_start_inner<const N: usize>(
+    initial_stack: *const usize,
+    policies: &[StartupCapabilityPolicy],
+    allow_legacy: bool,
+) -> Result<Option<ManagedToolStart<N>>, ManagedToolStartError> {
     let bootstrap_info = match ipc::info(PROCESS_START_BOOTSTRAP_HANDLE) {
         Ok(info) => info,
-        Err(_) => return Ok(ManagedToolStartMode::Legacy),
+        Err(_) if allow_legacy => return Ok(None),
+        Err(_) => return Err(ManagedToolStartError::InvalidBootstrap),
     };
     if bootstrap_info.kind != ObjectKind::Endpoint || bootstrap_info.rights != Rights::RECEIVE {
         return Err(ManagedToolStartError::InvalidBootstrap);
@@ -340,10 +467,7 @@ fn receive_managed_tool_start(
     let parent_process_id =
         platform::getppid().map_err(|_| ManagedToolStartError::ProcessIdentity)?;
     let (context, expected_sender, origin) =
-        receive_managed_tool_context(&bootstrap, parent_process_id, process_id)?;
-    if !context.is_empty() {
-        return Err(ManagedToolStartError::UnexpectedInitialCapability);
-    }
+        receive_managed_tool_context(&bootstrap, parent_process_id, process_id, policies)?;
     let data = receive_process_start_data::<4608, 4>(
         &bootstrap,
         expected_sender,
@@ -383,17 +507,18 @@ fn receive_managed_tool_start(
     {
         return Err(ManagedToolStartError::InvalidDescription);
     }
-    Ok(ManagedToolStartMode::Managed)
+    Ok(Some(ManagedToolStart { context, origin }))
 }
 
-fn receive_managed_tool_context(
+fn receive_managed_tool_context<const N: usize>(
     bootstrap: &OwnedHandle<Endpoint>,
     parent_process_id: u64,
     process_id: u64,
-) -> Result<(ProcessContext<ToolProcess, 0>, u64, ManagedToolStartOrigin), ManagedToolStartError> {
+    policies: &[StartupCapabilityPolicy],
+) -> Result<(ProcessContext<ToolProcess, N>, u64, ManagedToolStartOrigin), ManagedToolStartError> {
     let mut bytes = [0; limits::MAX_IPC_MESSAGE_BYTES];
     let message = loop {
-        match bootstrap.try_receive_many::<0>(&mut bytes) {
+        match bootstrap.try_receive_many::<N>(&mut bytes) {
             Ok(message) => break message,
             Err(error) if error.error() == ipc::Error::TRY_AGAIN => {
                 syscall::yield_now().map_err(|_| {
@@ -420,7 +545,7 @@ fn receive_managed_tool_context(
         .capabilities
         .map(|capability| capability.map(|capability| capability.handle));
     let context =
-        ProcessContext::<ToolProcess, 0>::from_startup(&bytes[..message.bytes], handles, &[])
+        ProcessContext::<ToolProcess, N>::from_startup(&bytes[..message.bytes], handles, policies)
             .map_err(|error| {
                 ManagedToolStartError::Capabilities(StartupReceiveError::Startup(error.error()))
             })?;
@@ -445,17 +570,77 @@ fn split_command<'a>(
     (count != 0).then_some(count)
 }
 
-fn canonical_executable_argument<'a>(argument: &'a [u8], output: &'a mut [u8]) -> Option<&'a [u8]> {
-    if argument.first() == Some(&b'/') {
-        return Some(argument);
-    }
-    let length = argument.len().checked_add(1)?;
-    if argument.is_empty() || length > output.len() {
+const MAX_PATH_COMPONENTS: usize = 32;
+
+fn canonical_executable_argument<'a>(
+    argument: &[u8],
+    working_directory: &[u8],
+    output: &'a mut [u8],
+) -> Option<&'a [u8]> {
+    if argument.is_empty() || output.is_empty() || working_directory.first() != Some(&b'/') {
         return None;
     }
     output[0] = b'/';
-    output[1..length].copy_from_slice(argument);
+    let mut length = 1usize;
+    let mut component_offsets = [0usize; MAX_PATH_COMPONENTS];
+    let mut component_count = 0usize;
+    if argument.first() != Some(&b'/') && argument.contains(&b'/') {
+        append_canonical_path(
+            working_directory,
+            output,
+            &mut length,
+            &mut component_offsets,
+            &mut component_count,
+        )?;
+    }
+    append_canonical_path(
+        argument,
+        output,
+        &mut length,
+        &mut component_offsets,
+        &mut component_count,
+    )?;
     Some(&output[..length])
+}
+
+fn append_canonical_path(
+    path: &[u8],
+    output: &mut [u8],
+    length: &mut usize,
+    component_offsets: &mut [usize; MAX_PATH_COMPONENTS],
+    component_count: &mut usize,
+) -> Option<()> {
+    for component in path.split(|byte| *byte == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+        if component == b".." {
+            if *component_count != 0 {
+                *component_count -= 1;
+                *length = component_offsets[*component_count];
+            }
+            continue;
+        }
+        if *component_count == component_offsets.len() {
+            return None;
+        }
+        let separator = usize::from(*length != 1);
+        let end = length
+            .checked_add(separator)?
+            .checked_add(component.len())?;
+        if end > output.len() {
+            return None;
+        }
+        component_offsets[*component_count] = *length;
+        *component_count += 1;
+        if separator != 0 {
+            output[*length] = b'/';
+            *length += 1;
+        }
+        output[*length..end].copy_from_slice(component);
+        *length = end;
+    }
+    Some(())
 }
 
 fn arguments_match(arguments: Args<'_>, start: ValidatedProcessStart<'_>) -> bool {
@@ -479,6 +664,7 @@ fn environment_matches(environment: Environment<'_>, start: ValidatedProcessStar
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedToolStartSendError {
     InvalidDescription,
+    CapabilityDuplicate(ipc::Error),
     Capabilities(crate::runtime_context::StartupError),
     CapabilityTransport(crate::runtime_context::StartupSendError),
     Data(StartupDataError),
@@ -557,12 +743,20 @@ mod tests {
     fn relative_executable_arguments_match_kernel_canonicalization() {
         let mut output = [0; 16];
         assert_eq!(
-            canonical_executable_argument(b"cat", &mut output),
+            canonical_executable_argument(b"cat", b"/tmp", &mut output),
             Some(&b"/cat"[..])
         );
         assert_eq!(
-            canonical_executable_argument(b"/cat", &mut output),
+            canonical_executable_argument(b"/cat", b"/tmp", &mut output),
             Some(&b"/cat"[..])
+        );
+        assert_eq!(
+            canonical_executable_argument(b"../exec-target", b"/tmp", &mut output),
+            Some(&b"/exec-target"[..])
+        );
+        assert_eq!(
+            canonical_executable_argument(b"./bin/../cat", b"/System", &mut output),
+            Some(&b"/System/cat"[..])
         );
     }
 }

@@ -49,11 +49,13 @@ experimentation, not production use or untrusted workloads.
   cursor-readable lifecycle trace. Role-specific process contexts own explicit startup capabilities,
   reject duplicate roles, validate object kinds, tighten rights on claim, and produce protocol- and
   side-typed service bindings from bounded protocol declarations. Ordinary shell commands and every
-  pipeline stage now receive a capability-empty managed tool startup stream whose converted entry
-  points authenticate the parent and validate canonical identity, arguments, environment, and initial
-  capability isolation before program code. The external `exec` launcher stages the same stream for
-  its replacement image, authenticated as a same-PID handoff. The environment- and
-  signal-lifecycle exec probes use the same path,
+  pipeline stage now receive a capability-empty managed tool startup stream. A synchronized
+  pre-bootstrap handshake strips inherited capabilities before the parent installs the child's
+  startup endpoint, and converted entry points authenticate the parent and validate canonical
+  identity, arguments, environment, and capability isolation before program code. Managed exec
+  handles absolute, command-name, and CWD-relative paths as authenticated same-PID handoffs; all
+  bundled exec probes now use that path. PID 1 also launches `sv`, `logctl`, and its foreground
+  `ush` with role-tagged, rights-limited managed-tool capabilities,
   and immutable hierarchical
   jobs with deterministic subtree exit
   observation, whole-subtree termination, tightening-only hierarchy-scoped and

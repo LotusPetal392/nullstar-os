@@ -153,14 +153,20 @@ reader and NullFS's transfer-only writable block-device endpoint are moved into 
 and reacquired by PID 1 for every later generation. The ordinary shell launcher now gives each
 single-command and pipeline child a private internal barrier, installs one receive-only bootstrap
 handle, and queues a capability-empty tool `NSPC` plus complete `NSPD`/`NSPX` stream before release.
+Before installation, a child-to-parent handshake confirms that the child discarded every capability
+inherited by `fork`, preventing a grant race and making the empty initial table structural rather
+than dependent on the launcher having no authority.
 Converted bundled tools authenticate their parent and validate canonical executable identity,
 arguments, compatibility environment, and the absence of ambient capabilities before program entry.
+PID 1 now uses the same descriptive stream with typed capability attachments for `sv`, `logctl`, and
+its foreground `ush`: the child receives only bootstrap handle 1 before release, then adopts logging
+observer and service-control observation/mutation authority by semantic role and exact rights.
 The external `exec` launcher also stages the stream on its own receive-only handle 1 before image
 replacement; the replacement accepts the same PID only when the authenticated exec flag is present.
-The environment- and signal-lifecycle probes now exercise that path while preserving their exec
-semantics. Kernel-direct compatibility launches may still omit the bootstrap handle; the remaining
-relative-path retry and capability-bearing fork/VFS `execve` callers, PID 1's remaining probe
-launchers, additional I/O event sources,
+All bundled exec probes now exercise that path, including CWD-relative canonicalization, repeated
+failed replacement cleanup, descriptor preservation, signal state, and explicit discard of
+no-longer-needed inherited capabilities. The kernel smoke-test launch of `ush` remains an explicit
+mixed-launch compatibility entry; PID 1's remaining filesystem and fault-injection probe launchers, additional I/O event sources,
 sender-side receiver-slot reservation, generated bindings, and parallel isolated blocking workers
 remain future migration work.
 

@@ -6,15 +6,18 @@ on:
     branches:
       - main
 
+concurrency:
+  group: kernel-qemu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   qemu-smoke-test:
     runs-on: ubuntu-latest
-    # The sequential suite includes two persistent-FAT boots, three boot-generation
-    # boots, and targeted restart, exhaustion, provider-loss, crash-remount,
-    # logging-lifecycle, and recovery gates.
+    # The suite keeps dependent boots ordered, while independent scenarios run
+    # through a bounded worker pool inside the test runner.
     timeout-minutes: 30
 
     steps:
@@ -35,17 +38,19 @@ jobs:
 
       - name: Install QEMU
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install --yes --quiet qemu-system-x86
+          if ! sudo apt-get install --yes --quiet --no-install-recommends qemu-system-x86; then
+            sudo apt-get update -qq
+            sudo apt-get install --yes --quiet --no-install-recommends qemu-system-x86
+          fi
 
       - name: Build bootable image
-        run: cargo +nightly-2026-02-01 build --locked --quiet
+        run: cargo +nightly-2026-02-01 build --release --locked --quiet
 
       - name: Boot partition and FAT smoke test in QEMU
         shell: bash
         run: |
           set -o pipefail
-          cargo +nightly-2026-02-01 run --locked --quiet -- --test 2>&1 | tee partition-fat-qemu.log
+          cargo +nightly-2026-02-01 run --release --locked --quiet -- --test 2>&1 | tee partition-fat-qemu.log
 
       - name: Upload runtime diagnostics
         if: always()
