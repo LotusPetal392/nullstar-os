@@ -19,6 +19,8 @@ use x86_64::{
 
 use crate::{gdt, preemption};
 
+pub use crate::process_model::ThreadState as TaskState;
+
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_STACK_WORDS: usize = KERNEL_STACK_SIZE / size_of::<u128>();
 const DEFAULT_QUANTUM_TICKS: u64 = 5;
@@ -138,25 +140,6 @@ impl fmt::Display for TaskKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskState {
-    Runnable,
-    Blocked,
-    Stopped,
-    Zombie,
-}
-
-impl fmt::Display for TaskState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Runnable => formatter.write_str("runnable"),
-            Self::Blocked => formatter.write_str("blocked"),
-            Self::Stopped => formatter.write_str("stopped"),
-            Self::Zombie => formatter.write_str("zombie"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct ReapedProcessTask {
     pub process_id: u64,
@@ -183,7 +166,7 @@ impl TaskSnapshot {
         id: 0,
         name: "",
         kind: TaskKind::KernelThread,
-        state: TaskState::Zombie,
+        state: TaskState::Exited,
         process_id: None,
         stack_bytes: 0,
         page_table_address: 0,
@@ -575,7 +558,7 @@ impl Scheduler {
             .find(|(index, task)| {
                 *index != self.current_task
                     && task.kind == TaskKind::UserProcess
-                    && task.state != TaskState::Zombie
+                    && task.state != TaskState::Exited
                     && task.process_id == Some(process_id)
             })
             .map(|(_, task)| task.stack_pointer)
@@ -592,7 +575,7 @@ impl Scheduler {
             .iter()
             .find(|task| {
                 task.kind == TaskKind::UserProcess
-                    && task.state != TaskState::Zombie
+                    && task.state != TaskState::Exited
                     && task.process_id == Some(process_id)
             })
             .map(|task| task.address_space)?;
@@ -669,7 +652,9 @@ impl Scheduler {
                 task.state = TaskState::Stopped;
                 true
             }
-            TaskState::Stopped | TaskState::Zombie => false,
+            TaskState::Running | TaskState::Sleeping | TaskState::Stopped | TaskState::Exited => {
+                false
+            }
         }
     }
 
@@ -701,10 +686,10 @@ impl Scheduler {
         else {
             return false;
         };
-        if index == current || task.state == TaskState::Zombie {
+        if index == current || task.state == TaskState::Exited {
             return false;
         }
-        task.state = TaskState::Zombie;
+        task.state = TaskState::Exited;
         task.stopped_resume_state = None;
         true
     }
@@ -716,7 +701,7 @@ impl Scheduler {
 
         let current = self.current_task;
         self.tasks[current].stack_pointer = current_stack_pointer;
-        self.tasks[current].state = TaskState::Zombie;
+        self.tasks[current].state = TaskState::Exited;
         self.tasks[current].stopped_resume_state = None;
         self.ticks_in_quantum = 0;
 
@@ -795,7 +780,7 @@ impl Scheduler {
         let current_id = self.tasks.get(self.current_task).map(|task| task.id);
         let mut process_tasks = Vec::new();
         self.tasks.retain(|task| {
-            if task.state == TaskState::Zombie {
+            if task.state == TaskState::Exited {
                 if let Some(process_id) = task.process_id {
                     process_tasks.push(ReapedProcessTask {
                         process_id,
@@ -850,7 +835,7 @@ impl Scheduler {
             zombie_task_count: self
                 .tasks
                 .iter()
-                .filter(|task| task.state == TaskState::Zombie)
+                .filter(|task| task.state == TaskState::Exited)
                 .count(),
             user_task_count: self
                 .tasks

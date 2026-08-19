@@ -21,7 +21,11 @@ mod nullfs_volume_selection;
 mod preemption;
 mod process;
 mod process_completion;
+#[allow(dead_code)]
+mod process_model;
 mod scheduler;
+#[allow(dead_code)]
+mod scheduling;
 mod shell;
 mod storage;
 mod tmpfs_abi;
