@@ -13,6 +13,7 @@ pub mod object;
 pub mod process_completion;
 pub mod process_model;
 pub mod scheduling;
+pub mod smp;
 pub mod timer;
 pub mod tmpfs_abi;
 pub mod wait_set;
