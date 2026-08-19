@@ -1295,12 +1295,15 @@ fn run_qemu_until(
 
     let (marker_sender, marker_receiver) = mpsc::channel();
     let reader = thread::spawn(move || -> io::Result<()> {
-        let mut terminal = io::stdout().lock();
+        let terminal = io::stdout();
 
         for line in BufReader::new(serial_output).lines() {
             let line = line?;
-            writeln!(terminal, "{line}")?;
-            terminal.flush()?;
+            {
+                let mut terminal = terminal.lock();
+                writeln!(terminal, "{line}")?;
+                terminal.flush()?;
+            }
 
             if completion(&line) {
                 let _ = marker_sender.send(());
