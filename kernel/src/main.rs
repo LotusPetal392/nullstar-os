@@ -27,6 +27,8 @@ mod scheduler;
 #[allow(dead_code)]
 mod scheduling;
 mod shell;
+#[allow(dead_code)]
+mod smp;
 mod storage;
 mod tmpfs_abi;
 mod vfs;

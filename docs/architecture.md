@@ -113,6 +113,13 @@ preserving deterministic queue accounting. This slice deliberately stops short o
 per-CPU GDT/TSS and interrupt state, inter-processor interrupts, and true parallel execution;
 those hardware bring-up pieces build on this topology and placement layer in the next SMP work.
 
+The synchronization/IPC layer adds an acquire/release `SmpMutex`, bounded FIFO channels with
+blocking and nonblocking operations, and fixed per-CPU mailboxes for reschedule, wake, address-space
+invalidation, and process-signal messages. Mailboxes validate both endpoints against the discovered
+online mask, preserve source and target identities, remain FIFO under contention, and drain queued
+messages before close. APIC delivery and interrupt-side draining are still hardware integration work;
+the host-testable ownership and queue semantics are established here first.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
