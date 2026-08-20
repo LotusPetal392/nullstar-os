@@ -10,6 +10,7 @@ pub mod containment;
 pub mod early_log;
 pub mod event;
 pub mod event_port;
+pub mod interrupt_model;
 pub mod job;
 pub mod nullfs_volume_selection;
 pub mod object;
