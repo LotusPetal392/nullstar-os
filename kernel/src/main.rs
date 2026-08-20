@@ -19,6 +19,8 @@ mod arch;
 mod boot_mode;
 #[allow(dead_code)]
 mod capability;
+#[allow(dead_code)]
+mod containment;
 mod drivers;
 mod memory;
 mod nullfs_volume_selection;

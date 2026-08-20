@@ -6,6 +6,7 @@ extern crate alloc;
 pub mod address_space;
 pub mod boot_mode;
 pub mod capability;
+pub mod containment;
 pub mod early_log;
 pub mod event;
 pub mod event_port;
