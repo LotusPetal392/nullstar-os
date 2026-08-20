@@ -13,6 +13,8 @@ use kernel::early_log;
 use nswp_logging::{EventId, LogSeverity, PrivacyClass};
 use x86_64::VirtAddr;
 
+#[allow(dead_code)]
+mod address_space;
 mod arch;
 mod boot_mode;
 mod drivers;
