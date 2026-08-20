@@ -22,6 +22,8 @@ mod capability;
 #[allow(dead_code)]
 mod containment;
 mod drivers;
+#[allow(dead_code)]
+mod interrupt_model;
 mod memory;
 mod nullfs_volume_selection;
 #[allow(dead_code)]

@@ -141,6 +141,15 @@ termination releases all reservations before retiring descendants, so memory, th
 and process accounting cannot leak across job boundaries. The existing job exit queue remains the
 per-object completion mechanism while this tree supplies hierarchy-wide resource policy.
 
+The interrupt milestone adds a bounded `InterruptRouter` and `InterruptTimerQueue` policy layer.
+Vector registration is explicit and duplicate timer/syscall routes are rejected; dispatch validates
+that the delivered event matches its registered route and records unhandled or mismatched delivery.
+Exception classification applies a context-aware policy: user faults terminate the current task,
+kernel faults panic, breakpoints resume, and double faults halt. Timer deadlines are monotonic,
+capacity-bounded, deterministic, and support one-shot or periodic operation with missed ticks
+coalesced into one delivery. The x86 IDT/APIC/PIT code remains the hardware integration boundary;
+this layer supplies the bounded policy and testable state transitions that interrupt handlers consume.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
