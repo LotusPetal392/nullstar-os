@@ -127,6 +127,13 @@ sharing plus fault-time replacement. The existing x86 page-table loader remains 
 mapper; this shared model makes ownership and isolation rules explicit before page-fault and TLB
 shootdown integration.
 
+The capability milestone adds a shared bounded `CapabilityRegistry` over the kernel object
+vocabulary. Process tables use generation-checked handles, object-type validation, rights
+attenuation for duplication and transfer, and explicit global revocation. Closing a handle advances
+its generation so stale tokens cannot be reused, while object records are reclaimed after their last
+authority disappears. The existing userspace capability ABI remains compatible while services
+incrementally adopt these common authority rules.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They

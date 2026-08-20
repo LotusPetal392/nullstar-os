@@ -17,9 +17,13 @@ use x86_64::VirtAddr;
 mod address_space;
 mod arch;
 mod boot_mode;
+#[allow(dead_code)]
+mod capability;
 mod drivers;
 mod memory;
 mod nullfs_volume_selection;
+#[allow(dead_code)]
+mod object;
 mod preemption;
 mod process;
 mod process_completion;
