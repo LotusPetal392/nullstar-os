@@ -120,6 +120,13 @@ online mask, preserve source and target identities, remain FIFO under contention
 messages before close. APIC delivery and interrupt-side draining are still hardware integration work;
 the host-testable ownership and queue semantics are established here first.
 
+The memory milestone adds a bounded `AddressSpaceTable` model for process-owned virtual address
+spaces. It validates canonical page alignment and W^X permissions, tracks physical-frame references
+across isolated mappings, supports map/unmap/protect operations, and models fork-style copy-on-write
+sharing plus fault-time replacement. The existing x86 page-table loader remains the hardware-facing
+mapper; this shared model makes ownership and isolation rules explicit before page-fault and TLB
+shootdown integration.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
