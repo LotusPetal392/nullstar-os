@@ -134,6 +134,13 @@ its generation so stale tokens cannot be reused, while object records are reclai
 authority disappears. The existing userspace capability ABI remains compatible while services
 incrementally adopt these common authority rules.
 
+The containment milestone adds an ancestor-accounted `ContainmentTree` for job/process policy.
+Each process reservation is charged to its job and every parent, effective limits are checked before
+admission or usage growth, and limits can only tighten without invalidating current usage. Subtree
+termination releases all reservations before retiring descendants, so memory, thread, handle, CPU,
+and process accounting cannot leak across job boundaries. The existing job exit queue remains the
+per-object completion mechanism while this tree supplies hierarchy-wide resource policy.
+
 ## Userspace and process lifecycle
 
 Userspace programs are statically linked ELF64 images with custom `_start` entries. They
