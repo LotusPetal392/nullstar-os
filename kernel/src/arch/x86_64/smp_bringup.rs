@@ -248,7 +248,9 @@ pub fn bring_up_application_processors(
                         "application processor startup timed out: cpu={}, lapic_id={}, stage={:?}",
                         cpu_index,
                         apic_id,
-                        AP_RENDEZVOUS.stage(cpu_index).unwrap_or(ApStartupStage::InitAsserted)
+                        AP_RENDEZVOUS
+                            .stage(cpu_index)
+                            .unwrap_or(ApStartupStage::InitAsserted)
                     );
                     summary.failed = summary.failed.saturating_add(1);
                 }
