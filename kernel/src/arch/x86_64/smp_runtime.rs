@@ -92,6 +92,19 @@ pub fn prepare_cpu(cpu_index: usize, apic_id: u8) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+pub fn activate_current_application_processor(
+    timer_vector: u8,
+    spurious_vector: u8,
+) -> Result<usize, RuntimeError> {
+    let apic_id = current_apic_id()?;
+    let cpu_index = mapped_cpu_index(apic_id)?;
+    if cpu_index == 0 {
+        return Err(RuntimeError::InvalidCpu);
+    }
+    activate_application_processor(cpu_index, apic_id, timer_vector, spurious_vector)?;
+    Ok(cpu_index)
+}
+
 pub fn activate_application_processor(
     cpu_index: usize,
     expected_apic_id: u8,
@@ -147,16 +160,9 @@ pub fn activate_application_processor(
 }
 
 pub fn current_cpu_index() -> usize {
-    let Ok(base) = local_apic_base() else {
-        return 0;
-    };
-    let apic_id = (read_u32(base, LOCAL_APIC_ID) >> 24) as u8;
-    let cpu_index = CPU_BY_APIC_ID[usize::from(apic_id)].load(Ordering::Acquire);
-    if cpu_index == UNMAPPED_CPU {
-        0
-    } else {
-        usize::from(cpu_index)
-    }
+    current_apic_id()
+        .and_then(mapped_cpu_index)
+        .unwrap_or(0)
 }
 
 pub fn record_timer_tick(cpu_index: usize) -> Result<u64, RuntimeError> {
@@ -194,6 +200,20 @@ pub fn is_online(cpu_index: usize) -> bool {
         .get(cpu_index)
         .map(|lane| lane.online.load(Ordering::Acquire))
         .unwrap_or(false)
+}
+
+fn mapped_cpu_index(apic_id: u8) -> Result<usize, RuntimeError> {
+    let cpu_index = CPU_BY_APIC_ID[usize::from(apic_id)].load(Ordering::Acquire);
+    if cpu_index == UNMAPPED_CPU {
+        Err(RuntimeError::InvalidCpu)
+    } else {
+        Ok(usize::from(cpu_index))
+    }
+}
+
+fn current_apic_id() -> Result<u8, RuntimeError> {
+    let base = local_apic_base()?;
+    Ok((read_u32(base, LOCAL_APIC_ID) >> 24) as u8)
 }
 
 fn local_apic_base() -> Result<usize, RuntimeError> {
