@@ -17,6 +17,7 @@ pub mod object;
 pub mod observability;
 pub mod process_completion;
 pub mod process_model;
+pub mod runtime_accounting;
 pub mod scheduling;
 pub mod smp;
 pub mod timer;
