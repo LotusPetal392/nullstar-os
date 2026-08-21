@@ -83,9 +83,13 @@ impl ApTrampoline {
             ptr::copy_nonoverlapping(image_start(), destination, image_len);
         }
 
-        let base = u32::try_from(physical_address)
-            .map_err(|_| TrampolineError::InvalidPhysicalAddress)?;
-        write_u32(destination, offset_of_gdt_pointer_base(), physical_address as u32);
+        let base =
+            u32::try_from(physical_address).map_err(|_| TrampolineError::InvalidPhysicalAddress)?;
+        write_u32(
+            destination,
+            offset_of_gdt_pointer_base(),
+            physical_address as u32,
+        );
         patch_segment_base(destination, offset_of_code32_descriptor(), base);
         patch_segment_base(destination, offset_of_data32_descriptor(), base);
         write_u32(
@@ -109,8 +113,7 @@ impl ApTrampoline {
         frame_allocator: &mut BootInfoFrameAllocator,
     ) -> Result<Self, TrampolineError> {
         let trampoline = Self::install(frame, physical_memory_offset, mapper, frame_allocator)?;
-        INSTALLED_TRAMPOLINE_PHYSICAL_ADDRESS
-            .store(trampoline.physical_address, Ordering::Release);
+        INSTALLED_TRAMPOLINE_PHYSICAL_ADDRESS.store(trampoline.physical_address, Ordering::Release);
         Ok(trampoline)
     }
 
