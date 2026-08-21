@@ -190,59 +190,59 @@ fn write_u64(destination: *mut u8, offset: usize, value: u64) {
 }
 
 fn image_start() -> *const u8 {
-    unsafe { &raw const __nullstar_ap_trampoline_start }
+    &raw const __nullstar_ap_trampoline_start
 }
 
 fn image_len() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_end })
+    symbol_offset(&raw const __nullstar_ap_trampoline_end)
 }
 
 fn offset_of_gdt() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_gdt })
+    symbol_offset(&raw const __nullstar_ap_trampoline_gdt)
 }
 
 fn offset_of_code32_descriptor() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_gdt_code32 })
+    symbol_offset(&raw const __nullstar_ap_trampoline_gdt_code32)
 }
 
 fn offset_of_data32_descriptor() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_gdt_data32 })
+    symbol_offset(&raw const __nullstar_ap_trampoline_gdt_data32)
 }
 
 fn offset_of_gdt_pointer_base() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_gdt_pointer_base })
+    symbol_offset(&raw const __nullstar_ap_trampoline_gdt_pointer_base)
 }
 
 fn offset_of_long_mode_jump_target() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_long_jump_target })
+    symbol_offset(&raw const __nullstar_ap_trampoline_long_jump_target)
 }
 
 fn offset_of_long_mode_entry() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_long_mode })
+    symbol_offset(&raw const __nullstar_ap_trampoline_long_mode)
 }
 
 fn offset_of_parameter_cr3() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_parameter_cr3 })
+    symbol_offset(&raw const __nullstar_ap_trampoline_parameter_cr3)
 }
 
 fn offset_of_parameter_cpu() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_parameter_cpu })
+    symbol_offset(&raw const __nullstar_ap_trampoline_parameter_cpu)
 }
 
 fn offset_of_parameter_apic() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_parameter_apic })
+    symbol_offset(&raw const __nullstar_ap_trampoline_parameter_apic)
 }
 
 fn offset_of_parameter_base() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_parameter_base })
+    symbol_offset(&raw const __nullstar_ap_trampoline_parameter_base)
 }
 
 fn offset_of_parameter_stack() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_parameter_stack })
+    symbol_offset(&raw const __nullstar_ap_trampoline_parameter_stack)
 }
 
 fn offset_of_parameter_entry() -> usize {
-    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_parameter_entry })
+    symbol_offset(&raw const __nullstar_ap_trampoline_parameter_entry)
 }
 
 fn symbol_offset(symbol: *const u8) -> usize {
@@ -293,19 +293,24 @@ __nullstar_ap_trampoline_protected_mode:
     movw %ax, %ss
 
     movl (__nullstar_ap_trampoline_parameter_base - __nullstar_ap_trampoline_start), %ebx
+
+    # Rust's x86_64 execution environment assumes SSE/SSE2 are available and
+    # the BSP's page tables may contain NX bits. INIT resets these control bits,
+    # so restore the minimum long-mode execution environment before loading CR3.
     movl %cr4, %eax
-    orl $0x20, %eax
+    orl $0x620, %eax
     movl %eax, %cr4
     movl (__nullstar_ap_trampoline_parameter_cr3 - __nullstar_ap_trampoline_start), %eax
     movl %eax, %cr3
 
     movl $0xc0000080, %ecx
     rdmsr
-    orl $0x100, %eax
+    orl $0x900, %eax
     wrmsr
 
     movl %cr0, %eax
-    orl $0x80000000, %eax
+    andl $0x9ffffff3, %eax
+    orl $0x80010023, %eax
     movl %eax, %cr0
     ljmpl *(__nullstar_ap_trampoline_long_jump - __nullstar_ap_trampoline_start)
 
@@ -317,6 +322,7 @@ __nullstar_ap_trampoline_long_mode:
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
+    fninit
 
     movq (__nullstar_ap_trampoline_parameter_stack - __nullstar_ap_trampoline_start)(%rbx), %rsp
     andq $-16, %rsp
