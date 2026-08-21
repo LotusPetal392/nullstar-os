@@ -130,10 +130,7 @@ impl BootInfoFrameAllocator {
     /// allocation begins. SMP uses this to hold a low-memory page for the AP
     /// startup trampoline without allowing the heap or a process mapping to
     /// recycle that page later.
-    pub fn reserve_frame_below(
-        &mut self,
-        exclusive_limit: u64,
-    ) -> Option<PhysFrame<Size4KiB>> {
+    pub fn reserve_frame_below(&mut self, exclusive_limit: u64) -> Option<PhysFrame<Size4KiB>> {
         if self.allocated_frames != 0 || !self.recycled_frames.is_empty() {
             return None;
         }
@@ -159,9 +156,7 @@ impl BootInfoFrameAllocator {
             }
             let frame = PhysFrame::containing_address(PhysAddr::new(address));
             if selected
-                .map(|current: PhysFrame<Size4KiB>| {
-                    frame.start_address() > current.start_address()
-                })
+                .map(|current: PhysFrame<Size4KiB>| frame.start_address() > current.start_address())
                 .unwrap_or(true)
             {
                 selected = Some(frame);
