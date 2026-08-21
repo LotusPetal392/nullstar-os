@@ -103,11 +103,7 @@ impl ApRendezvous {
     /// Bounded BSP-side wait used during bring-up. A timeout leaves the AP
     /// offline so scheduler admission cannot observe partially initialized CPU
     /// state.
-    pub fn wait_online(
-        &self,
-        cpu_index: usize,
-        spin_limit: usize,
-    ) -> Result<bool, ApStartupError> {
+    pub fn wait_online(&self, cpu_index: usize, spin_limit: usize) -> Result<bool, ApStartupError> {
         let state = self.state(cpu_index)?;
         for _ in 0..spin_limit {
             if state.load(Ordering::Acquire) == StageCode::Online as u64 {
@@ -119,9 +115,7 @@ impl ApRendezvous {
     }
 
     fn state(&self, cpu_index: usize) -> Result<&AtomicU64, ApStartupError> {
-        self.states
-            .get(cpu_index)
-            .ok_or(ApStartupError::InvalidCpu)
+        self.states.get(cpu_index).ok_or(ApStartupError::InvalidCpu)
     }
 }
 
@@ -219,7 +213,10 @@ mod tests {
         let rendezvous = ApRendezvous::new();
         rendezvous.reset(1).unwrap();
         rendezvous.publish_trampoline_entry(1).unwrap();
-        assert_eq!(rendezvous.publish_online(1), Err(ApStartupError::InvalidCpu));
+        assert_eq!(
+            rendezvous.publish_online(1),
+            Err(ApStartupError::InvalidCpu)
+        );
         rendezvous.publish_kernel_initialized(1).unwrap();
         rendezvous.publish_online(1).unwrap();
         assert!(rendezvous.is_online(1).unwrap());
