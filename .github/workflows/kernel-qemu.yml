@@ -43,20 +43,45 @@ jobs:
             sudo apt-get install --yes --quiet --no-install-recommends qemu-system-x86
           fi
 
+      - name: Configure two-CPU QEMU acceptance environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          wrapper_dir="$RUNNER_TEMP/nullstar-qemu-bin"
+          mkdir -p "$wrapper_dir"
+          cat > "$wrapper_dir/qemu-system-x86_64" <<'EOF'
+          #!/usr/bin/env bash
+          exec /usr/bin/qemu-system-x86_64 -smp 2 "$@"
+          EOF
+          chmod +x "$wrapper_dir/qemu-system-x86_64"
+          echo "$wrapper_dir" >> "$GITHUB_PATH"
+
       - name: Build bootable image
         run: cargo +nightly-2026-02-01 build --release --locked --quiet
 
-      - name: Boot partition and FAT smoke test in QEMU
+      - name: Boot two-CPU SMP acceptance check
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 run --release --locked --quiet -- --boot-check 2>&1 | tee smp-qemu.log
+          grep -F "application processor online: cpu=1" smp-qemu.log
+          grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" smp-qemu.log
+
+      - name: Boot partition, FAT, and SMP smoke test in QEMU
         shell: bash
         run: |
           set -o pipefail
           cargo +nightly-2026-02-01 run --release --locked --quiet -- --test 2>&1 | tee partition-fat-qemu.log
+          grep -F "application processor online: cpu=1" partition-fat-qemu.log
+          grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" partition-fat-qemu.log
 
       - name: Upload runtime diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: partition-fat-qemu-log
-          path: partition-fat-qemu.log
+          name: qemu-runtime-logs
+          path: |
+            smp-qemu.log
+            partition-fat-qemu.log
           if-no-files-found: ignore
           retention-days: 7

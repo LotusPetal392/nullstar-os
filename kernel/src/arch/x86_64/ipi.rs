@@ -149,11 +149,14 @@ fn local_apic_base(physical_memory_offset: u64) -> Result<usize, IpiError> {
 }
 
 fn wait_for_delivery(base: usize) -> Result<(), IpiError> {
+    // The volatile MMIO read itself prevents this loop from being optimized
+    // away. Avoid `spin_loop()`/PAUSE here: virtual CPUs may interpret PAUSE as
+    // a scheduler yield, turning a bounded hardware timeout into minutes of
+    // host wall-clock time when an IPI cannot be delivered.
     for _ in 0..DELIVERY_WAIT_LIMIT {
         if read_u32(base, LOCAL_APIC_ICR_LOW) & ICR_DELIVERY_STATUS == 0 {
             return Ok(());
         }
-        core::hint::spin_loop();
     }
     Err(IpiError::DeliveryTimeout)
 }

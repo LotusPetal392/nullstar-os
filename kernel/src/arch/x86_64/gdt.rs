@@ -1,3 +1,4 @@
+use alloc::{boxed::Box, vec};
 use core::cell::UnsafeCell;
 
 use lazy_static::lazy_static;
@@ -91,6 +92,46 @@ pub fn init() {
         ES::set_reg(GDT.1.data_selector);
         SS::set_reg(GDT.1.data_selector);
         load_tss(GDT.1.tss_selector);
+    }
+}
+
+/// Install an AP-private GDT and TSS.
+///
+/// Each application processor receives independent privilege and double-fault
+/// stacks. The objects are intentionally leaked for the lifetime of the kernel;
+/// descriptor tables and TSS state must remain at stable addresses while the
+/// processor is online.
+pub fn init_application_processor() {
+    use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
+    use x86_64::instructions::tables::load_tss;
+
+    let double_fault_stack = Box::leak(vec![0_u8; DOUBLE_FAULT_STACK_SIZE].into_boxed_slice());
+    let privilege_stack = Box::leak(vec![0_u8; PRIVILEGE_STACK_SIZE].into_boxed_slice());
+
+    let mut tss = Box::new(TaskStateSegment::new());
+    let double_fault_stack_start = VirtAddr::from_ptr(double_fault_stack.as_ptr());
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+        double_fault_stack_start + double_fault_stack.len() as u64;
+    let privilege_stack_start = VirtAddr::from_ptr(privilege_stack.as_ptr());
+    tss.privilege_stack_table[PRIVILEGE_STACK_TABLE_INDEX] =
+        privilege_stack_start + privilege_stack.len() as u64;
+    let tss = Box::leak(tss);
+
+    let mut gdt = GlobalDescriptorTable::new();
+    let code_selector = gdt.append(Descriptor::kernel_code_segment());
+    let data_selector = gdt.append(Descriptor::kernel_data_segment());
+    let _user_data_selector = gdt.append(Descriptor::user_data_segment());
+    let _user_code_selector = gdt.append(Descriptor::user_code_segment());
+    let tss_selector = gdt.append(Descriptor::tss_segment(tss));
+    let gdt = Box::leak(Box::new(gdt));
+
+    gdt.load();
+    unsafe {
+        CS::set_reg(code_selector);
+        DS::set_reg(data_selector);
+        ES::set_reg(data_selector);
+        SS::set_reg(data_selector);
+        load_tss(tss_selector);
     }
 }
 
