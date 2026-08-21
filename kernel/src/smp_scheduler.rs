@@ -622,10 +622,8 @@ pub fn request_live_migration(
     LIVE_MIGRATION_THREAD_ID.store(thread_id.raw(), Ordering::Release);
     LIVE_MIGRATION_FROM_CPU.store(source_cpu as u8, Ordering::Release);
     LIVE_MIGRATION_TO_CPU.store(destination.raw() as u8, Ordering::Release);
-    LIVE_MIGRATION_RESCHEDULE_BASELINE.store(
-        smp_runtime::reschedule_ipis(source_cpu),
-        Ordering::Release,
-    );
+    LIVE_MIGRATION_RESCHEDULE_BASELINE
+        .store(smp_runtime::reschedule_ipis(source_cpu), Ordering::Release);
     LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_PENDING, Ordering::Release);
     Ok(LiveMigrationRequest {
         thread_id,
@@ -771,11 +769,8 @@ pub fn snapshot(cpu_index: usize) -> Snapshot {
     {
         let thread_id = migration_probe_thread_id();
         if let Ok(request) = request_live_migration(thread_id, 1) {
-            if smp_runtime::send_fixed_ipi(
-                request.from_cpu,
-                crate::interrupts::RESCHEDULE_VECTOR,
-            )
-            .is_ok()
+            if smp_runtime::send_fixed_ipi(request.from_cpu, crate::interrupts::RESCHEDULE_VECTOR)
+                .is_ok()
             {
                 serial_println!(
                     "application processor live migration requested: thread={}, from_cpu={}, to_cpu={}",
