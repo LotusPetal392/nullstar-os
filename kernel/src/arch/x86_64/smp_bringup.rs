@@ -10,20 +10,29 @@ use core::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 
 use x86_64::VirtAddr;
 
-use crate::{acpi::MadtInfo, gdt, interrupts, serial_println};
+use crate::{
+    acpi::MadtInfo,
+    gdt,
+    hpet::{self, Hpet},
+    interrupts, serial_println,
+};
 
 use super::{
     ap_trampoline::ApTrampoline,
     ipi::{self, IpiError},
 };
 
-const INIT_DEASSERT_DELAY: usize = 20_000;
-const STARTUP_IPI_DELAY: usize = 20_000;
+const INIT_TO_SIPI_DELAY_FEMTOSECONDS: u64 = 10_000_000_000_000;
+const BETWEEN_SIPI_DELAY_FEMTOSECONDS: u64 = 200_000_000_000;
+const AP_ONLINE_POLL_DELAY_FEMTOSECONDS: u64 = 100_000_000_000;
+const AP_ONLINE_TIMER_POLLS: usize = 10_000;
+const FALLBACK_INIT_DELAY_ITERATIONS: usize = 2_000_000;
+const FALLBACK_SIPI_DELAY_ITERATIONS: usize = 50_000;
+const FALLBACK_ONLINE_POLL_LIMIT: usize = 5_000_000;
 const STARTUP_VECTOR_MIN: u8 = 1;
 const STARTUP_VECTOR_MAX: u8 = 0xff;
 const MAX_SMP_CPUS: usize = 64;
 const AP_BOOT_STACK_SIZE: usize = 128 * 1024;
-const AP_ONLINE_POLL_LIMIT: usize = 5_000_000;
 
 static AP_RENDEZVOUS: ApRendezvous = ApRendezvous::new();
 
@@ -33,11 +42,18 @@ pub enum ApStartupError {
     InvalidCpu,
     AlreadyOnline,
     Ipi(IpiError),
+    Timer(hpet::Error),
 }
 
 impl From<IpiError> for ApStartupError {
     fn from(error: IpiError) -> Self {
         Self::Ipi(error)
+    }
+}
+
+impl From<hpet::Error> for ApStartupError {
+    fn from(error: hpet::Error) -> Self {
+        Self::Timer(error)
     }
 }
 
@@ -123,10 +139,9 @@ impl ApRendezvous {
         Ok(decode_stage(self.state(cpu_index)?.load(Ordering::Acquire)))
     }
 
-    /// Bounded BSP-side poll used during bring-up. Do not use `spin_loop()`
-    /// here: on virtual CPUs PAUSE may deliberately yield, making an iteration
-    /// bound take minutes of wall-clock time. Atomic polling keeps a failed AP
-    /// startup deterministic and lets CI report the rendezvous stage quickly.
+    /// Fast fallback used when HPET timing is unavailable. Do not use
+    /// `spin_loop()` here: under virtualization PAUSE may deliberately yield,
+    /// turning an iteration bound into minutes of wall-clock time.
     pub fn wait_online(&self, cpu_index: usize, poll_limit: usize) -> Result<bool, ApStartupError> {
         let state = self.state(cpu_index)?;
         for _ in 0..poll_limit {
@@ -179,6 +194,7 @@ pub fn bring_up_application_processors(
     madt: &MadtInfo,
     bsp_apic_id: u8,
     physical_memory_offset: VirtAddr,
+    startup_timer: Option<Hpet>,
 ) -> Result<BringupSummary, BringupError> {
     let trampoline = ApTrampoline::installed().ok_or(BringupError::TrampolineUnavailable)?;
     let mut summary = BringupSummary {
@@ -191,10 +207,11 @@ pub fn bring_up_application_processors(
     let mut cpu_index = 1_usize;
 
     serial_println!(
-        "SMP application processor bring-up starting: bsp_lapic_id={}, recorded_processors={}, trampoline={:#x}",
+        "SMP application processor bring-up starting: bsp_lapic_id={}, recorded_processors={}, trampoline={:#x}, hpet_timing={}",
         bsp_apic_id,
         madt.processors().len(),
-        trampoline.physical_address()
+        trampoline.physical_address(),
+        startup_timer.is_some()
     );
 
     for processor in madt.processors() {
@@ -253,6 +270,7 @@ pub fn bring_up_application_processors(
             cpu_index,
             trampoline.startup_vector(),
             &AP_RENDEZVOUS,
+            startup_timer,
         ) {
             Ok(_) => {
                 serial_println!(
@@ -260,7 +278,7 @@ pub fn bring_up_application_processors(
                     cpu_index,
                     apic_id
                 );
-                match AP_RENDEZVOUS.wait_online(cpu_index, AP_ONLINE_POLL_LIMIT) {
+                match wait_for_online(cpu_index, startup_timer) {
                     Ok(true) => {
                         summary.online = summary.online.saturating_add(1);
                     }
@@ -320,6 +338,7 @@ pub fn start_ap(
     cpu_index: usize,
     startup_vector: u8,
     rendezvous: &ApRendezvous,
+    startup_timer: Option<Hpet>,
 ) -> Result<ApStartup, ApStartupError> {
     if cpu_index >= MAX_SMP_CPUS {
         return Err(ApStartupError::InvalidCpu);
@@ -350,7 +369,6 @@ pub fn start_ap(
         stage: ApStartupStage::InitAsserted,
     };
 
-    delay(INIT_DEASSERT_DELAY);
     ipi::send_init_deassert(physical_memory_offset, apic_id)?;
     startup.stage = ApStartupStage::InitDeasserted;
     serial_println!(
@@ -359,7 +377,11 @@ pub fn start_ap(
         apic_id
     );
 
-    delay(STARTUP_IPI_DELAY);
+    startup_delay(
+        startup_timer,
+        INIT_TO_SIPI_DELAY_FEMTOSECONDS,
+        FALLBACK_INIT_DELAY_ITERATIONS,
+    )?;
     ipi::send_startup(physical_memory_offset, apic_id, startup_vector)?;
     startup.stage = ApStartupStage::StartupSent;
     serial_println!(
@@ -369,9 +391,11 @@ pub fn start_ap(
         startup_vector
     );
 
-    // A second SIPI is required by the architectural startup protocol for
-    // compatibility with processors that did not observe the first one.
-    delay(STARTUP_IPI_DELAY);
+    startup_delay(
+        startup_timer,
+        BETWEEN_SIPI_DELAY_FEMTOSECONDS,
+        FALLBACK_SIPI_DELAY_ITERATIONS,
+    )?;
     ipi::send_startup(physical_memory_offset, apic_id, startup_vector)?;
     startup.stage = ApStartupStage::AwaitingTrampoline;
     serial_println!(
@@ -410,14 +434,34 @@ pub extern "C" fn nullstar_ap_kernel_entry(cpu_index: u32, apic_id: u32) -> ! {
     }
 }
 
-fn delay(iterations: usize) {
-    // Keep the short inter-IPI delay independent of scheduler/timer interrupts,
-    // which are intentionally disabled during AP startup. This delay is not
-    // used for the rendezvous timeout because PAUSE-style spinning can be very
-    // slow under virtualization.
-    for _ in 0..iterations {
+fn startup_delay(
+    timer: Option<Hpet>,
+    duration_femtoseconds: u64,
+    fallback_iterations: usize,
+) -> Result<(), ApStartupError> {
+    if let Some(timer) = timer {
+        timer.measure_duration(duration_femtoseconds)?;
+        return Ok(());
+    }
+
+    for _ in 0..fallback_iterations {
         compiler_fence(Ordering::SeqCst);
     }
+    Ok(())
+}
+
+fn wait_for_online(cpu_index: usize, timer: Option<Hpet>) -> Result<bool, ApStartupError> {
+    if let Some(timer) = timer {
+        for _ in 0..AP_ONLINE_TIMER_POLLS {
+            if AP_RENDEZVOUS.is_online(cpu_index)? {
+                return Ok(true);
+            }
+            timer.measure_duration(AP_ONLINE_POLL_DELAY_FEMTOSECONDS)?;
+        }
+        return Ok(false);
+    }
+
+    AP_RENDEZVOUS.wait_online(cpu_index, FALLBACK_ONLINE_POLL_LIMIT)
 }
 
 #[cfg(test)]
@@ -453,11 +497,11 @@ mod tests {
     fn rejects_invalid_cpu_and_vector_before_ipi_hardware() {
         let rendezvous = ApRendezvous::new();
         assert_eq!(
-            start_ap(0, 1, MAX_SMP_CPUS, 1, &rendezvous),
+            start_ap(0, 1, MAX_SMP_CPUS, 1, &rendezvous, None),
             Err(ApStartupError::InvalidCpu)
         );
         assert_eq!(
-            start_ap(0, 1, 1, 0, &rendezvous),
+            start_ap(0, 1, 1, 0, &rendezvous, None),
             Err(ApStartupError::InvalidVector)
         );
     }
