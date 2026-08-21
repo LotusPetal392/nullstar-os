@@ -1,16 +1,16 @@
 //! Application-processor kernel scheduling for the live SMP workload.
 //!
-//! Secondary CPUs own independent architecture contexts and stacks, while the
-//! queue/quantum semantics come from the same architecture-neutral round-robin
-//! policy used by the execution foundation. This removes the duplicate AP-only
-//! scheduling algorithm and gives later affinity/migration work one canonical
-//! run-queue implementation to extend.
+//! Secondary CPUs own independent architecture contexts and stacks, while a
+//! shared architecture-neutral SMP policy owns CPU placement, affinity, and
+//! per-CPU round-robin queues. Cross-CPU context transfer is deliberately
+//! restricted to disarmed AP lanes in this slice so a saved context can never
+//! move while it is executing.
 
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     arch::global_asm,
     mem::{align_of, size_of},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use spin::Mutex;
@@ -23,21 +23,29 @@ use crate::{
     arch::x86_64::smp_runtime,
     preemption,
     process_model::ThreadId,
-    scheduling::{self, RoundRobin},
+    scheduling::{self, CpuId, CpuMask, SmpRoundRobin},
+    serial_println,
 };
 
 const MAX_CPUS: usize = 64;
 const AP_KERNEL_STACK_SIZE: usize = 64 * 1024;
 const AP_KERNEL_STACK_WORDS: usize = AP_KERNEL_STACK_SIZE / size_of::<u128>();
 const INITIAL_RFLAGS: u64 = 0x202;
+const NO_MIGRATION_CPU: u8 = u8::MAX;
 // Probe-only identities live in a reserved high range until live kernel threads
 // are backed directly by ProcessTable thread identities.
 const AP_PROBE_THREAD_ID_BASE: u64 = 1_u64 << 63;
 
 static AP_SCHEDULERS: [Mutex<ApScheduler>; MAX_CPUS] =
     [const { Mutex::new(ApScheduler::new()) }; MAX_CPUS];
+static SMP_POLICY: Mutex<Option<SmpRoundRobin>> = Mutex::new(None);
 static PROBE_A_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static PROBE_B_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static MIGRATION_PROBE_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static MIGRATION_THREAD_ID: AtomicU64 = AtomicU64::new(0);
+static MIGRATION_FROM_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
+static MIGRATION_TO_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
+static MIGRATION_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 global_asm!(
     r#"
@@ -63,7 +71,28 @@ pub enum InitError {
     InvalidCpu,
     AlreadyInitialized,
     StackLayoutInvalid,
-    Policy(scheduling::Error),
+    Policy(scheduling::SmpError),
+    Migration(MigrationError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MigrationError {
+    InvalidCpu,
+    OfflineDestination,
+    CpuArmed,
+    PolicyUnavailable,
+    Policy(scheduling::SmpError),
+    ContextNotFound,
+    DestinationConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationSnapshot {
+    pub thread_id: ThreadId,
+    pub from_cpu: usize,
+    pub to_cpu: usize,
+    pub source_task_count: usize,
+    pub destination_task_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -80,6 +109,7 @@ pub struct Snapshot {
     pub policy_preemptions: u64,
     pub probe_a_heartbeats: u64,
     pub probe_b_heartbeats: u64,
+    pub migration_probe_heartbeats: u64,
 }
 
 struct ApTask {
@@ -160,7 +190,7 @@ struct ApScheduler {
     armed: bool,
     timer_ticks: u64,
     context_switches: u64,
-    policy: RoundRobin,
+    policy_preemptions: u64,
 }
 
 impl ApScheduler {
@@ -172,7 +202,7 @@ impl ApScheduler {
             armed: false,
             timer_ticks: 0,
             context_switches: 0,
-            policy: RoundRobin::with_default_quantum(),
+            policy_preemptions: 0,
         }
     }
 
@@ -180,14 +210,42 @@ impl ApScheduler {
         if self.running || !self.tasks.is_empty() {
             return Err(InitError::AlreadyInitialized);
         }
-
+        let cpu = CpuId::from_raw(cpu_index).ok_or(InitError::InvalidCpu)?;
         let probe_a = probe_thread_id(cpu_index, 0);
         let probe_b = probe_thread_id(cpu_index, 1);
+
         self.tasks.push(ApTask::bootstrap());
         self.tasks.push(ApTask::kernel(probe_a, ap_probe_a)?);
         self.tasks.push(ApTask::kernel(probe_b, ap_probe_b)?);
-        self.policy.admit(probe_a).map_err(InitError::Policy)?;
-        self.policy.admit(probe_b).map_err(InitError::Policy)?;
+        if cpu_index == 1 {
+            self.tasks.push(ApTask::kernel(
+                probe_thread_id(cpu_index, 2),
+                ap_migration_probe,
+            )?);
+        }
+
+        let mut policy_guard = SMP_POLICY.lock();
+        if policy_guard.is_none() {
+            *policy_guard = Some(
+                SmpRoundRobin::new(MAX_CPUS, scheduling::DEFAULT_QUANTUM_TICKS)
+                    .map_err(InitError::Policy)?,
+            );
+        }
+        let policy = policy_guard
+            .as_mut()
+            .expect("SMP policy must exist after initialization");
+        policy
+            .admit(probe_a, CpuMask::single(cpu))
+            .map_err(InitError::Policy)?;
+        policy
+            .admit(probe_b, CpuMask::single(cpu))
+            .map_err(InitError::Policy)?;
+        if cpu_index == 1 {
+            policy
+                .admit(probe_thread_id(cpu_index, 2), CpuMask::single(cpu))
+                .map_err(InitError::Policy)?;
+        }
+
         self.running = true;
         Ok(())
     }
@@ -196,7 +254,7 @@ impl ApScheduler {
         self.armed = true;
     }
 
-    fn on_timer_interrupt(&mut self, current_stack_pointer: usize) -> usize {
+    fn on_timer_interrupt(&mut self, cpu_index: usize, current_stack_pointer: usize) -> usize {
         if !self.running || !self.armed || self.tasks.len() < 2 {
             return current_stack_pointer;
         }
@@ -206,17 +264,33 @@ impl ApScheduler {
         self.tasks[current].runtime_ticks = self.tasks[current].runtime_ticks.saturating_add(1);
         self.timer_ticks = self.timer_ticks.saturating_add(1);
 
-        if current == 0 {
-            let Some(thread) = self.policy.snapshot().current else {
-                return current_stack_pointer;
-            };
-            return self.switch_to_thread(thread, current_stack_pointer);
-        }
-
-        let Some(switch) = self.policy.tick() else {
+        let Some(cpu) = CpuId::from_raw(cpu_index) else {
             return current_stack_pointer;
         };
-        self.switch_to_thread(switch.to, current_stack_pointer)
+        let selected = {
+            let mut policy_guard = SMP_POLICY.lock();
+            let Some(policy) = policy_guard.as_mut() else {
+                return current_stack_pointer;
+            };
+            if current == 0 {
+                policy
+                    .cpu_snapshot(cpu)
+                    .ok()
+                    .and_then(|snapshot| snapshot.current)
+            } else {
+                match policy.tick(cpu) {
+                    Ok(Some(switch)) => {
+                        self.policy_preemptions = self.policy_preemptions.saturating_add(1);
+                        Some(switch.to)
+                    }
+                    Ok(None) | Err(_) => None,
+                }
+            }
+        };
+        let Some(thread) = selected else {
+            return current_stack_pointer;
+        };
+        self.switch_to_thread(thread, current_stack_pointer)
     }
 
     fn switch_to_thread(&mut self, thread: ThreadId, current_stack_pointer: usize) -> usize {
@@ -237,7 +311,37 @@ impl ApScheduler {
     }
 
     fn snapshot(&self, cpu_index: usize) -> Snapshot {
-        let policy = self.policy.snapshot();
+        let policy_snapshot = CpuId::from_raw(cpu_index).and_then(|cpu| {
+            SMP_POLICY
+                .lock()
+                .as_ref()
+                .and_then(|policy| policy.cpu_snapshot(cpu).ok())
+        });
+        let migration_heartbeats = MIGRATION_PROBE_HEARTBEATS[cpu_index].load(Ordering::Acquire);
+        let migration_destination = MIGRATION_TO_CPU.load(Ordering::Acquire);
+        let migration_pending_here = migration_destination != NO_MIGRATION_CPU
+            && usize::from(migration_destination) == cpu_index;
+        let probe_b_heartbeats = if migration_pending_here && migration_heartbeats == 0 {
+            0
+        } else {
+            PROBE_B_HEARTBEATS[cpu_index].load(Ordering::Acquire)
+        };
+
+        if migration_pending_here
+            && migration_heartbeats > 0
+            && MIGRATION_VERIFIED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            serial_println!(
+                "application processor kernel migration verified: thread={}, from_cpu={}, to_cpu={}, heartbeats={}",
+                MIGRATION_THREAD_ID.load(Ordering::Acquire),
+                MIGRATION_FROM_CPU.load(Ordering::Acquire),
+                migration_destination,
+                migration_heartbeats
+            );
+        }
+
         Snapshot {
             cpu_index,
             running: self.running,
@@ -246,11 +350,18 @@ impl ApScheduler {
             current_task: self.current_task,
             timer_ticks: self.timer_ticks,
             context_switches: self.context_switches,
-            policy_current_thread: policy.current.map(ThreadId::raw),
-            policy_runnable_count: policy.runnable_count,
-            policy_preemptions: policy.preemptions,
+            policy_current_thread: policy_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.current)
+                .map(ThreadId::raw),
+            policy_runnable_count: policy_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.runnable_count)
+                .unwrap_or(0),
+            policy_preemptions: self.policy_preemptions,
             probe_a_heartbeats: PROBE_A_HEARTBEATS[cpu_index].load(Ordering::Acquire),
-            probe_b_heartbeats: PROBE_B_HEARTBEATS[cpu_index].load(Ordering::Acquire),
+            probe_b_heartbeats,
+            migration_probe_heartbeats: migration_heartbeats,
         }
     }
 }
@@ -285,6 +396,7 @@ pub fn init_application_processor(cpu_index: usize) -> Result<Snapshot, InitErro
     }
     PROBE_A_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     PROBE_B_HEARTBEATS[cpu_index].store(0, Ordering::Release);
+    MIGRATION_PROBE_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
     scheduler.initialize(cpu_index)?;
     Ok(scheduler.snapshot(cpu_index))
@@ -294,6 +406,17 @@ pub fn arm(cpu_index: usize) -> Result<(), InitError> {
     if cpu_index == 0 || cpu_index >= MAX_CPUS {
         return Err(InitError::InvalidCpu);
     }
+
+    // A three-CPU acceptance boot gives us two AP scheduling lanes. Move a
+    // never-run context from CPU 1 to CPU 2 before either lane is armed. This
+    // proves affinity and ownership transfer without racing a running context.
+    if cpu_index == 1
+        && smp_runtime::is_online(2)
+        && MIGRATION_TO_CPU.load(Ordering::Acquire) == NO_MIGRATION_CPU
+    {
+        migrate_unstarted(probe_thread_id(1, 2), 2).map_err(InitError::Migration)?;
+    }
+
     let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
     if !scheduler.running {
         return Err(InitError::InvalidCpu);
@@ -302,13 +425,120 @@ pub fn arm(cpu_index: usize) -> Result<(), InitError> {
     Ok(())
 }
 
+pub fn migrate_unstarted(
+    thread_id: ThreadId,
+    destination_cpu: usize,
+) -> Result<MigrationSnapshot, MigrationError> {
+    let destination = CpuId::from_raw(destination_cpu).ok_or(MigrationError::InvalidCpu)?;
+    if destination_cpu == 0 {
+        return Err(MigrationError::InvalidCpu);
+    }
+    if !smp_runtime::is_online(destination_cpu) {
+        return Err(MigrationError::OfflineDestination);
+    }
+
+    let source_cpu = {
+        let policy_guard = SMP_POLICY.lock();
+        let policy = policy_guard
+            .as_ref()
+            .ok_or(MigrationError::PolicyUnavailable)?;
+        policy
+            .placement(thread_id)
+            .map_err(MigrationError::Policy)?
+            .cpu
+            .raw()
+    };
+    if source_cpu == 0 || source_cpu >= MAX_CPUS || source_cpu == destination_cpu {
+        return Err(MigrationError::InvalidCpu);
+    }
+
+    let snapshot = if source_cpu < destination_cpu {
+        let mut source = AP_SCHEDULERS[source_cpu].lock();
+        let mut target = AP_SCHEDULERS[destination_cpu].lock();
+        migrate_locked(&mut source, &mut target, source_cpu, destination, thread_id)?
+    } else {
+        let mut target = AP_SCHEDULERS[destination_cpu].lock();
+        let mut source = AP_SCHEDULERS[source_cpu].lock();
+        migrate_locked(&mut source, &mut target, source_cpu, destination, thread_id)?
+    };
+
+    MIGRATION_THREAD_ID.store(thread_id.raw(), Ordering::Release);
+    MIGRATION_FROM_CPU.store(source_cpu as u8, Ordering::Release);
+    MIGRATION_TO_CPU.store(destination_cpu as u8, Ordering::Release);
+    MIGRATION_VERIFIED.store(false, Ordering::Release);
+    serial_println!(
+        "application processor kernel migration prepared: thread={}, from_cpu={}, to_cpu={}, source_tasks={}, destination_tasks={}",
+        thread_id.raw(),
+        source_cpu,
+        destination_cpu,
+        snapshot.source_task_count,
+        snapshot.destination_task_count
+    );
+    Ok(snapshot)
+}
+
+fn migrate_locked(
+    source: &mut ApScheduler,
+    target: &mut ApScheduler,
+    source_cpu: usize,
+    destination: CpuId,
+    thread_id: ThreadId,
+) -> Result<MigrationSnapshot, MigrationError> {
+    if !source.running || !target.running {
+        return Err(MigrationError::InvalidCpu);
+    }
+    if source.armed || target.armed || source.current_task != 0 || target.current_task != 0 {
+        return Err(MigrationError::CpuArmed);
+    }
+    let source_index = source
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == Some(thread_id))
+        .ok_or(MigrationError::ContextNotFound)?;
+    if source_index == 0 {
+        return Err(MigrationError::ContextNotFound);
+    }
+    if target
+        .tasks
+        .iter()
+        .any(|task| task.thread_id == Some(thread_id))
+    {
+        return Err(MigrationError::DestinationConflict);
+    }
+
+    {
+        let mut policy_guard = SMP_POLICY.lock();
+        let policy = policy_guard
+            .as_mut()
+            .ok_or(MigrationError::PolicyUnavailable)?;
+        let placement = policy
+            .set_affinity(thread_id, CpuMask::single(destination))
+            .map_err(MigrationError::Policy)?;
+        if !placement.migrated || placement.cpu != destination {
+            return Err(MigrationError::Policy(
+                scheduling::SmpError::AffinityViolation,
+            ));
+        }
+    }
+
+    let task = source.tasks.remove(source_index);
+    target.tasks.push(task);
+    Ok(MigrationSnapshot {
+        thread_id,
+        from_cpu: source_cpu,
+        to_cpu: destination.raw(),
+        source_task_count: source.tasks.len(),
+        destination_task_count: target.tasks.len(),
+    })
+}
+
 pub fn on_timer_interrupt(cpu_index: usize, current_stack_pointer: usize) -> usize {
     if cpu_index == 0 || cpu_index >= MAX_CPUS || preemption::is_disabled() {
         return current_stack_pointer;
     }
     AP_SCHEDULERS[cpu_index]
         .lock()
-        .on_timer_interrupt(current_stack_pointer)
+        .on_timer_interrupt(cpu_index, current_stack_pointer)
 }
 
 pub fn snapshot(cpu_index: usize) -> Snapshot {
@@ -343,6 +573,14 @@ extern "C" fn ap_probe_b() -> ! {
     }
 }
 
+extern "C" fn ap_migration_probe() -> ! {
+    let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
+    loop {
+        MIGRATION_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
+        hlt();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,18 +596,16 @@ mod tests {
     }
 
     #[test]
-    fn architecture_neutral_policy_rotates_live_ap_threads() {
-        let mut policy = RoundRobin::with_default_quantum();
-        let a = probe_thread_id(1, 0);
-        let b = probe_thread_id(1, 1);
-        policy.admit(a).unwrap();
-        policy.admit(b).unwrap();
-        assert_eq!(policy.snapshot().current, Some(a));
-        for _ in 0..scheduling::DEFAULT_QUANTUM_TICKS - 1 {
-            assert_eq!(policy.tick(), None);
-        }
-        let switch = policy.tick().expect("quantum should rotate the queue");
-        assert_eq!(switch.from, Some(a));
-        assert_eq!(switch.to, b);
+    fn smp_policy_honors_pinned_placement_and_affinity_migration() {
+        let mut policy = SmpRoundRobin::new(3, scheduling::DEFAULT_QUANTUM_TICKS).unwrap();
+        let cpu1 = CpuId::from_raw(1).unwrap();
+        let cpu2 = CpuId::from_raw(2).unwrap();
+        let thread = probe_thread_id(1, 2);
+        let placement = policy.admit(thread, CpuMask::single(cpu1)).unwrap();
+        assert_eq!(placement.cpu, cpu1);
+        let migrated = policy.set_affinity(thread, CpuMask::single(cpu2)).unwrap();
+        assert!(migrated.migrated);
+        assert_eq!(migrated.cpu, cpu2);
+        assert_eq!(policy.placement(thread).unwrap().cpu, cpu2);
     }
 }
