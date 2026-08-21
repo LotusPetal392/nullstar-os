@@ -59,13 +59,16 @@ jobs:
       - name: Build bootable image
         run: cargo +nightly-2026-02-01 build --release --locked --quiet
 
-      - name: Boot two-CPU SMP acceptance check
+      - name: Boot two-CPU SMP scheduler-lane acceptance check
         shell: bash
         run: |
           set -o pipefail
           cargo +nightly-2026-02-01 run --release --locked --quiet -- --boot-check 2>&1 | tee smp-qemu.log
           grep -F "application processor online: cpu=1" smp-qemu.log
           grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" smp-qemu.log
+          grep -F "application processor scheduler lane initialized: cpu=1" smp-qemu.log
+          grep -F "application processor timer verified: cpu=1" smp-qemu.log
+          grep -F "application processor reschedule IPI verified: cpu=1" smp-qemu.log
 
       - name: Boot partition, FAT, and SMP smoke test in QEMU
         shell: bash
@@ -74,6 +77,9 @@ jobs:
           cargo +nightly-2026-02-01 run --release --locked --quiet -- --test 2>&1 | tee partition-fat-qemu.log
           grep -F "application processor online: cpu=1" partition-fat-qemu.log
           grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" partition-fat-qemu.log
+          grep -F "application processor scheduler lane initialized: cpu=1" partition-fat-qemu.log
+          grep -F "application processor timer verified: cpu=1" partition-fat-qemu.log
+          grep -F "application processor reschedule IPI verified: cpu=1" partition-fat-qemu.log
 
       - name: Upload runtime diagnostics
         if: always()

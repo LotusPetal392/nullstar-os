@@ -1,6 +1,6 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering, compiler_fence},
 };
 
 use lazy_static::lazy_static;
@@ -19,13 +19,17 @@ use crate::{
     scheduler, serial_println,
 };
 
-use super::smp_bringup;
+use super::{ipi, smp_bringup, smp_runtime};
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 const PIT_COMMAND_PORT: u16 = 0x43;
 const PIT_CHANNEL_0_PORT: u16 = 0x40;
 const PIT_INPUT_HZ: u32 = 1_193_182;
+const MAX_SMP_CPUS: usize = 64;
+const AP_RUNTIME_POLL_DELAY_FEMTOSECONDS: u64 = 100_000_000_000;
+const AP_RUNTIME_TIMER_POLLS: usize = 1_000;
+const AP_RUNTIME_FALLBACK_POLLS: usize = 5_000_000;
 
 const CONTROLLER_UNINITIALIZED: u8 = 0;
 const CONTROLLER_PIC: u8 = 1;
@@ -33,6 +37,7 @@ const CONTROLLER_APIC: u8 = 2;
 
 pub const TIMER_VECTOR: u8 = PIC_1_OFFSET;
 pub const KEYBOARD_VECTOR: u8 = PIC_1_OFFSET + 1;
+pub const RESCHEDULE_VECTOR: u8 = 0xfe;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const TIMER_HZ: u64 = 100;
 const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
@@ -167,6 +172,7 @@ lazy_static! {
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt_handler);
+        idt[RESCHEDULE_VECTOR].set_handler_fn(reschedule_interrupt_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
 
         unsafe {
@@ -272,6 +278,13 @@ pub fn init(
 
     if controller.kind == ControllerKind::Apic {
         if let (Some(madt), Some(bsp_apic_id)) = (madt, controller.local_apic_id) {
+            smp_runtime::initialize_bootstrap(
+                physical_memory_offset.as_u64(),
+                bsp_apic_id,
+                controller.local_apic_timer_initial_count,
+            );
+            prepare_application_processor_mappings(madt, bsp_apic_id);
+
             let startup_timer = hpet.and_then(|hpet_info| {
                 match hpet_timer::Hpet::new(
                     hpet_info,
@@ -289,13 +302,21 @@ pub fn init(
                 }
             });
 
-            if let Err(error) = smp_bringup::bring_up_application_processors(
+            match smp_bringup::bring_up_application_processors(
                 madt,
                 bsp_apic_id,
                 physical_memory_offset,
                 startup_timer,
             ) {
-                serial_println!("SMP application processor bring-up unavailable: {error:?}");
+                Ok(_) => send_reschedule_probes(
+                    madt,
+                    bsp_apic_id,
+                    physical_memory_offset.as_u64(),
+                    startup_timer,
+                ),
+                Err(error) => {
+                    serial_println!("SMP application processor bring-up unavailable: {error:?}");
+                }
             }
         }
     }
@@ -304,11 +325,26 @@ pub fn init(
     controller
 }
 
-/// Load the shared IDT on an application processor while leaving maskable
-/// interrupts disabled until that CPU is attached to the live scheduler.
+/// Load the shared IDT and activate this AP's local interrupt/timer runtime.
 pub fn init_application_processor() {
     x86_64::instructions::interrupts::disable();
     IDT.load();
+
+    match smp_runtime::activate_current_application_processor(TIMER_VECTOR, SPURIOUS_VECTOR) {
+        Ok(cpu_index) => {
+            serial_println!(
+                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}",
+                cpu_index,
+                TIMER_VECTOR,
+                RESCHEDULE_VECTOR
+            );
+            x86_64::instructions::interrupts::enable();
+        }
+        Err(error) => {
+            serial_println!("application processor runtime initialization failed: {error:?}");
+            hlt_loop();
+        }
+    }
 }
 
 pub fn timer_ticks() -> u64 {
@@ -332,6 +368,107 @@ pub fn wait_for_timer_tick() {
     while timer_ticks() == starting_tick {
         x86_64::instructions::hlt();
     }
+}
+
+fn prepare_application_processor_mappings(madt: &MadtInfo, bsp_apic_id: u8) {
+    let mut cpu_index = 1_usize;
+    for processor in madt.processors() {
+        if !processor.enabled || processor.local_apic_id == u32::from(bsp_apic_id) {
+            continue;
+        }
+        if cpu_index < MAX_SMP_CPUS && processor.local_apic_id <= u32::from(u8::MAX) {
+            let apic_id = processor.local_apic_id as u8;
+            if let Err(error) = smp_runtime::prepare_cpu(cpu_index, apic_id) {
+                serial_println!(
+                    "application processor runtime mapping failed: cpu={}, lapic_id={}, error={error:?}",
+                    cpu_index,
+                    apic_id
+                );
+            }
+        }
+        cpu_index = cpu_index.saturating_add(1);
+    }
+}
+
+fn send_reschedule_probes(
+    madt: &MadtInfo,
+    bsp_apic_id: u8,
+    physical_memory_offset: u64,
+    startup_timer: Option<hpet_timer::Hpet>,
+) {
+    let mut cpu_index = 1_usize;
+    for processor in madt.processors() {
+        if !processor.enabled || processor.local_apic_id == u32::from(bsp_apic_id) {
+            continue;
+        }
+        if cpu_index < MAX_SMP_CPUS
+            && processor.local_apic_id <= u32::from(u8::MAX)
+            && smp_runtime::is_online(cpu_index)
+        {
+            let apic_id = processor.local_apic_id as u8;
+            match ipi::send_fixed(physical_memory_offset, apic_id, RESCHEDULE_VECTOR) {
+                Ok(()) => {
+                    serial_println!(
+                        "application processor reschedule IPI sent: cpu={}, lapic_id={}",
+                        cpu_index,
+                        apic_id
+                    );
+                    if wait_for_ap_runtime(cpu_index, startup_timer) {
+                        serial_println!(
+                            "application processor timer verified: cpu={}, ticks={}",
+                            cpu_index,
+                            smp_runtime::timer_ticks(cpu_index)
+                        );
+                        serial_println!(
+                            "application processor reschedule IPI verified: cpu={}, count={}",
+                            cpu_index,
+                            smp_runtime::reschedule_ipis(cpu_index)
+                        );
+                    } else {
+                        serial_println!(
+                            "application processor scheduler lane verification timed out: cpu={}, timer_ticks={}, reschedule_ipis={}",
+                            cpu_index,
+                            smp_runtime::timer_ticks(cpu_index),
+                            smp_runtime::reschedule_ipis(cpu_index)
+                        );
+                    }
+                }
+                Err(error) => serial_println!(
+                    "application processor reschedule IPI failed: cpu={}, lapic_id={}, error={error:?}",
+                    cpu_index,
+                    apic_id
+                ),
+            }
+        }
+        cpu_index = cpu_index.saturating_add(1);
+    }
+}
+
+fn wait_for_ap_runtime(cpu_index: usize, timer: Option<hpet_timer::Hpet>) -> bool {
+    if let Some(timer) = timer {
+        for _ in 0..AP_RUNTIME_TIMER_POLLS {
+            if smp_runtime::timer_ticks(cpu_index) > 0
+                && smp_runtime::reschedule_ipis(cpu_index) > 0
+            {
+                return true;
+            }
+            if timer
+                .measure_duration(AP_RUNTIME_POLL_DELAY_FEMTOSECONDS)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    for _ in 0..AP_RUNTIME_FALLBACK_POLLS {
+        if smp_runtime::timer_ticks(cpu_index) > 0 && smp_runtime::reschedule_ipis(cpu_index) > 0 {
+            return true;
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+    false
 }
 
 fn initialize_pics(master_mask: u8, slave_mask: u8) {
@@ -372,6 +509,13 @@ fn end_of_interrupt(vector: u8) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn galactic_timer_interrupt_dispatch(current_stack_pointer: usize) -> usize {
+    let cpu_index = smp_runtime::current_cpu_index();
+    if cpu_index != 0 {
+        let _ = smp_runtime::record_timer_tick(cpu_index);
+        end_of_interrupt(TIMER_VECTOR);
+        return current_stack_pointer;
+    }
+
     let ticks = TIMER_TICKS
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
@@ -391,6 +535,12 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let scancode = unsafe { keyboard_port.read() };
     keyboard::push_scancode(scancode);
     end_of_interrupt(KEYBOARD_VECTOR);
+}
+
+extern "x86-interrupt" fn reschedule_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let cpu_index = smp_runtime::current_cpu_index();
+    let _ = smp_runtime::record_reschedule_ipi(cpu_index);
+    end_of_interrupt(RESCHEDULE_VECTOR);
 }
 
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
