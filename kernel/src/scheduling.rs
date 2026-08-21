@@ -327,11 +327,7 @@ impl SmpRoundRobin {
                         imbalance > current_imbalance
                             || (imbalance == current_imbalance
                                 && (source.raw(), destination.raw(), candidate.thread.raw())
-                                    < (
-                                        current.from.raw(),
-                                        current.to.raw(),
-                                        current.thread.raw(),
-                                    ))
+                                    < (current.from.raw(), current.to.raw(), current.thread.raw()))
                     })
                     .unwrap_or(true);
                 if replace {
@@ -406,7 +402,7 @@ impl SmpRoundRobin {
 
     fn cpu_load(&self, cpu: CpuId) -> Result<usize, SmpError> {
         let snapshot = self.queue(cpu)?.snapshot();
-        Ok(snapshot.runnable_count + usize::from(snapshot.current.is_some()))
+        Ok(snapshot.runnable_count + if snapshot.current.is_some() { 1 } else { 0 })
     }
 
     fn assignment_index(&self, thread: ThreadId) -> Option<usize> {
@@ -785,9 +781,7 @@ mod tests {
         scheduler.admit(first, CpuMask::single(cpu1)).unwrap();
         scheduler.admit(second, CpuMask::single(cpu1)).unwrap();
         scheduler.admit(third, CpuMask::single(cpu1)).unwrap();
-        scheduler
-            .admit(destination, CpuMask::single(cpu2))
-            .unwrap();
+        scheduler.admit(destination, CpuMask::single(cpu2)).unwrap();
 
         assert_eq!(scheduler.rebalance_plan(ap_cpus).unwrap(), None);
     }
