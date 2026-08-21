@@ -80,11 +80,7 @@ impl CpuRuntime {
             return 0;
         }
         let ratio = self.busy_ticks.saturating_mul(10_000) / total;
-        if ratio > 10_000 {
-            10_000
-        } else {
-            ratio as u16
-        }
+        if ratio > 10_000 { 10_000 } else { ratio as u16 }
     }
 }
 
@@ -110,11 +106,7 @@ impl RuntimeAccounting {
     }
 
     pub fn register_process(&mut self, process_id: ProcessId) -> Result<(), AccountingError> {
-        if self
-            .processes
-            .iter()
-            .any(|p| p.process_id == process_id)
-        {
+        if self.processes.iter().any(|p| p.process_id == process_id) {
             return Err(AccountingError::DuplicateProcess);
         }
         if self.processes.len() >= MAX_ACCOUNTED_PROCESSES {
@@ -244,7 +236,8 @@ impl RuntimeAccounting {
             self.threads[ti].preemptions = self.threads[ti].preemptions.saturating_add(1);
             self.cpus[ci].preemptions = self.cpus[ci].preemptions.saturating_add(1);
         } else {
-            self.threads[ti].voluntary_switches = self.threads[ti].voluntary_switches.saturating_add(1);
+            self.threads[ti].voluntary_switches =
+                self.threads[ti].voluntary_switches.saturating_add(1);
             self.cpus[ci].voluntary_switches = self.cpus[ci].voluntary_switches.saturating_add(1);
         }
         Ok(())
