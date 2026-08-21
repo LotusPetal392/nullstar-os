@@ -19,7 +19,7 @@ use crate::{
     scheduler, serial_println,
 };
 
-use super::smp_bringup;
+use super::{smp_bringup, smp_runtime};
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -33,6 +33,7 @@ const CONTROLLER_APIC: u8 = 2;
 
 pub const TIMER_VECTOR: u8 = PIC_1_OFFSET;
 pub const KEYBOARD_VECTOR: u8 = PIC_1_OFFSET + 1;
+pub const RESCHEDULE_VECTOR: u8 = 0xfe;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const TIMER_HZ: u64 = 100;
 const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
@@ -167,6 +168,7 @@ lazy_static! {
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt_handler);
+        idt[RESCHEDULE_VECTOR].set_handler_fn(reschedule_interrupt_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
 
         unsafe {
@@ -272,6 +274,11 @@ pub fn init(
 
     if controller.kind == ControllerKind::Apic {
         if let (Some(madt), Some(bsp_apic_id)) = (madt, controller.local_apic_id) {
+            smp_runtime::initialize_bootstrap(
+                physical_memory_offset.as_u64(),
+                bsp_apic_id,
+                controller.local_apic_timer_initial_count,
+            );
             let startup_timer = hpet.and_then(|hpet_info| {
                 match hpet_timer::Hpet::new(
                     hpet_info,
@@ -305,7 +312,7 @@ pub fn init(
 }
 
 /// Load the shared IDT on an application processor while leaving maskable
-/// interrupts disabled until that CPU is attached to the live scheduler.
+/// interrupts disabled until its local APIC runtime state is ready.
 pub fn init_application_processor() {
     x86_64::instructions::interrupts::disable();
     IDT.load();
@@ -372,6 +379,20 @@ fn end_of_interrupt(vector: u8) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn galactic_timer_interrupt_dispatch(current_stack_pointer: usize) -> usize {
+    let cpu_index = smp_runtime::current_cpu_index();
+    if cpu_index != 0 {
+        let ticks = smp_runtime::record_timer_tick(cpu_index).unwrap_or(0);
+        end_of_interrupt(TIMER_VECTOR);
+        if ticks == 1 {
+            serial_println!(
+                "application processor timer verified: cpu={}, ticks={}",
+                cpu_index,
+                ticks
+            );
+        }
+        return current_stack_pointer;
+    }
+
     let ticks = TIMER_TICKS
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
@@ -391,6 +412,19 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let scancode = unsafe { keyboard_port.read() };
     keyboard::push_scancode(scancode);
     end_of_interrupt(KEYBOARD_VECTOR);
+}
+
+extern "x86-interrupt" fn reschedule_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let cpu_index = smp_runtime::current_cpu_index();
+    let count = smp_runtime::record_reschedule_ipi(cpu_index).unwrap_or(0);
+    end_of_interrupt(RESCHEDULE_VECTOR);
+    if cpu_index != 0 && count == 1 {
+        serial_println!(
+            "application processor reschedule IPI verified: cpu={}, count={}",
+            cpu_index,
+            count
+        );
+    }
 }
 
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
