@@ -104,6 +104,20 @@ pub struct Placement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionResult {
+    pub placement: Placement,
+    pub switch: Option<Switch>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationResult {
+    pub placement: Placement,
+    pub source_was_current: bool,
+    pub source_switch: Option<Switch>,
+    pub destination_switch: Option<Switch>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssignmentState {
     Runnable,
     Blocked,
@@ -223,6 +237,22 @@ impl SmpRoundRobin {
     }
 
     pub fn admit(&mut self, thread: ThreadId, affinity: CpuMask) -> Result<Placement, SmpError> {
+        Ok(self.admit_with_transition(thread, affinity)?.placement)
+    }
+
+    pub fn validate_admission(&self, affinity: CpuMask) -> Result<(), SmpError> {
+        self.validate_affinity(affinity)?;
+        if self.assignments.len() >= MAX_RUNNABLE_THREADS {
+            return Err(SmpError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub fn admit_with_transition(
+        &mut self,
+        thread: ThreadId,
+        affinity: CpuMask,
+    ) -> Result<AdmissionResult, SmpError> {
         self.validate_affinity(affinity)?;
         if self.assignment_index(thread).is_some() {
             return Err(SmpError::DuplicateThread);
@@ -231,7 +261,7 @@ impl SmpRoundRobin {
             return Err(SmpError::Capacity);
         }
         let cpu = self.least_loaded_cpu(affinity)?;
-        self.queues[cpu.raw()]
+        let switch = self.queues[cpu.raw()]
             .admit(thread)
             .map_err(|_| SmpError::Capacity)?;
         self.assignments.push(Assignment {
@@ -240,10 +270,13 @@ impl SmpRoundRobin {
             cpu,
             state: AssignmentState::Runnable,
         });
-        Ok(Placement {
-            thread,
-            cpu,
-            migrated: false,
+        Ok(AdmissionResult {
+            placement: Placement {
+                thread,
+                cpu,
+                migrated: false,
+            },
+            switch,
         })
     }
 
@@ -252,6 +285,16 @@ impl SmpRoundRobin {
         thread: ThreadId,
         affinity: CpuMask,
     ) -> Result<Placement, SmpError> {
+        Ok(self
+            .set_affinity_with_transition(thread, affinity)?
+            .placement)
+    }
+
+    pub fn set_affinity_with_transition(
+        &mut self,
+        thread: ThreadId,
+        affinity: CpuMask,
+    ) -> Result<MigrationResult, SmpError> {
         self.validate_affinity(affinity)?;
         let index = self
             .assignment_index(thread)
@@ -259,27 +302,48 @@ impl SmpRoundRobin {
         let current_cpu = self.assignments[index].cpu;
         if affinity.contains(current_cpu) {
             self.assignments[index].affinity = affinity;
-            return Ok(Placement {
-                thread,
-                cpu: current_cpu,
-                migrated: false,
+            return Ok(MigrationResult {
+                placement: Placement {
+                    thread,
+                    cpu: current_cpu,
+                    migrated: false,
+                },
+                source_was_current: false,
+                source_switch: None,
+                destination_switch: None,
             });
         }
 
         let destination = self.least_loaded_cpu(affinity)?;
-        if self.assignments[index].state == AssignmentState::Runnable {
-            self.move_runnable_assignment(thread, current_cpu, destination)?;
-        }
+        let (source_was_current, source_switch, destination_switch) =
+            if self.assignments[index].state == AssignmentState::Runnable {
+                self.move_runnable_assignment(thread, current_cpu, destination)?
+            } else {
+                (false, None, None)
+            };
         self.assignments[index].affinity = affinity;
         self.assignments[index].cpu = destination;
-        Ok(Placement {
-            thread,
-            cpu: destination,
-            migrated: true,
+        Ok(MigrationResult {
+            placement: Placement {
+                thread,
+                cpu: destination,
+                migrated: true,
+            },
+            source_was_current,
+            source_switch,
+            destination_switch,
         })
     }
 
     pub fn migrate(&mut self, thread: ThreadId, destination: CpuId) -> Result<Placement, SmpError> {
+        Ok(self.migrate_with_transition(thread, destination)?.placement)
+    }
+
+    pub fn migrate_with_transition(
+        &mut self,
+        thread: ThreadId,
+        destination: CpuId,
+    ) -> Result<MigrationResult, SmpError> {
         if !self.online_mask.contains(destination) {
             return Err(SmpError::InvalidCpu);
         }
@@ -291,20 +355,33 @@ impl SmpRoundRobin {
         }
         let current_cpu = self.assignments[index].cpu;
         if current_cpu == destination {
-            return Ok(Placement {
-                thread,
-                cpu: destination,
-                migrated: false,
+            return Ok(MigrationResult {
+                placement: Placement {
+                    thread,
+                    cpu: destination,
+                    migrated: false,
+                },
+                source_was_current: false,
+                source_switch: None,
+                destination_switch: None,
             });
         }
-        if self.assignments[index].state == AssignmentState::Runnable {
-            self.move_runnable_assignment(thread, current_cpu, destination)?;
-        }
+        let (source_was_current, source_switch, destination_switch) =
+            if self.assignments[index].state == AssignmentState::Runnable {
+                self.move_runnable_assignment(thread, current_cpu, destination)?
+            } else {
+                (false, None, None)
+            };
         self.assignments[index].cpu = destination;
-        Ok(Placement {
-            thread,
-            cpu: destination,
-            migrated: true,
+        Ok(MigrationResult {
+            placement: Placement {
+                thread,
+                cpu: destination,
+                migrated: true,
+            },
+            source_was_current,
+            source_switch,
+            destination_switch,
         })
     }
 
@@ -571,17 +648,18 @@ impl SmpRoundRobin {
         thread: ThreadId,
         source: CpuId,
         destination: CpuId,
-    ) -> Result<(), SmpError> {
+    ) -> Result<(bool, Option<Switch>, Option<Switch>), SmpError> {
         if !self.queue_can_accept(destination)? {
             return Err(SmpError::Capacity);
         }
-        self.queues[source.raw()]
+        let source_was_current = self.queues[source.raw()].snapshot().current == Some(thread);
+        let source_switch = self.queues[source.raw()]
             .remove(thread)
             .map_err(|_| SmpError::QueueStateMismatch)?;
-        self.queues[destination.raw()]
+        let destination_switch = self.queues[destination.raw()]
             .wake(thread)
             .map_err(|_| SmpError::QueueStateMismatch)?;
-        Ok(())
+        Ok((source_was_current, source_switch, destination_switch))
     }
 
     fn assignment_index(&self, thread: ThreadId) -> Option<usize> {

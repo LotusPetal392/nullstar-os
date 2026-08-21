@@ -89,9 +89,12 @@ bounded assignment, ownership, and affinity state. Wakeup reuses the previous CP
 eligible CPU is meaningfully less loaded, and affinity changes may move blocked ownership without
 making the thread runnable. Host tests cover these transitions and rebalance exclusion; the
 three-CPU QEMU path blocks a live context on one AP, transfers it during wakeup, and verifies its
-dispatch on another AP. The live workload still uses reserved probe thread identities;
-process-table integration and general event/wait-queue wakeup wiring remain part of this
-milestone.
+dispatch on another AP. An architecture-neutral `SmpExecution` coordinator now binds
+`ProcessTable` lifecycle transitions to SMP admission, dispatch, blocking, wakeup, migration,
+rebalance, and exit effects. It owns both models, prevalidates fallible operations, and retains
+enough source/destination transition detail to keep running state synchronized across CPUs. The
+live workload still uses reserved probe thread identities; adopting this coordinator in the AP
+context store and wiring general event/wait-queue wakeups remain part of this milestone.
 
 ### 4. Synchronization and concurrent execution
 

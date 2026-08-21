@@ -97,9 +97,13 @@ independently while holding kernel locks.
 The kernel also exposes a bounded, architecture-neutral process/thread lifecycle model.
 Processes own parent/child hierarchy and exit state; threads own schedulable lifecycle
 state, independent identities, join/detach policy, and exit records. The model is
-host-testable and intentionally sits beneath the existing single-thread-per-process
-userspace compatibility path; scheduler context and userspace thread creation will be
-connected in the scheduling and SMP milestones.
+host-testable. `SmpExecution` now owns a process table and SMP policy together, prevalidates
+admission, and applies dispatch, yield, block, sleep, wake, stop, continue, migration, rebalance,
+exit, detach, join, and reap transitions without exposing independent mutable state. Queue
+admission and migration report their source and destination dispatch effects so lifecycle
+`Running` state stays synchronized across CPUs. The coordinator remains beneath the existing
+single-thread-per-process userspace compatibility path; architecture-specific contexts and
+userspace thread creation still need to adopt it.
 
 The single-CPU scheduling milestone now shares that thread-state vocabulary and provides
 a bounded round-robin policy model. Timer ticks consume a configured quantum, rotate
@@ -121,8 +125,8 @@ destination scheduler selects the transferred context. Repeated passes converge 
 imbalances one move at a time and retain bounded check, request, completion, and delivery-failure
 counters. QEMU acceptance also blocks a live AP context, transfers it between CPU-local task
 stores during wakeup, and verifies its first destination dispatch. The live AP workload still
-uses reserved kernel-probe identities, while ordinary userspace tasks remain on the bootstrap
-scheduler pending process/thread and address-space integration.
+uses reserved kernel-probe identities rather than `SmpExecution`, while ordinary userspace tasks
+remain on the bootstrap scheduler pending context and address-space integration.
 
 The synchronization/IPC layer adds an acquire/release `SmpMutex`, bounded FIFO channels with
 blocking and nonblocking operations, and fixed per-CPU mailboxes for reschedule, wake, address-space
