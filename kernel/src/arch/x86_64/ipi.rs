@@ -63,7 +63,11 @@ pub fn send(
     };
 
     let base = local_apic_base(physical_memory_offset)?;
-    write_u32(base, LOCAL_APIC_ICR_HIGH, u32::from(destination_apic_id) << 24);
+    write_u32(
+        base,
+        LOCAL_APIC_ICR_HIGH,
+        u32::from(destination_apic_id) << 24,
+    );
 
     let low = match kind {
         IpiKind::Fixed { .. } => ICR_DELIVERY_MODE_FIXED | u32::from(vector),
@@ -77,10 +81,7 @@ pub fn send(
 }
 
 /// Perform the architectural INIT portion of an AP startup sequence.
-pub fn send_init(
-    physical_memory_offset: u64,
-    destination_apic_id: u8,
-) -> Result<(), IpiError> {
+pub fn send_init(physical_memory_offset: u64, destination_apic_id: u8) -> Result<(), IpiError> {
     send(
         physical_memory_offset,
         destination_apic_id,
