@@ -14,6 +14,7 @@ pub mod interrupt_model;
 pub mod job;
 pub mod nullfs_volume_selection;
 pub mod object;
+pub mod observability;
 pub mod process_completion;
 pub mod process_model;
 pub mod scheduling;
