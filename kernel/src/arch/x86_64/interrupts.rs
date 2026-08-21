@@ -447,7 +447,8 @@ fn send_reschedule_probes(
 fn wait_for_ap_runtime(cpu_index: usize, timer: Option<hpet_timer::Hpet>) -> bool {
     if let Some(timer) = timer {
         for _ in 0..AP_RUNTIME_TIMER_POLLS {
-            if smp_runtime::timer_ticks(cpu_index) > 0 && smp_runtime::reschedule_ipis(cpu_index) > 0
+            if smp_runtime::timer_ticks(cpu_index) > 0
+                && smp_runtime::reschedule_ipis(cpu_index) > 0
             {
                 return true;
             }
