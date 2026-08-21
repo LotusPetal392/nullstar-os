@@ -28,10 +28,8 @@ const INITIAL_RFLAGS: u64 = 0x202;
 
 static AP_SCHEDULERS: [Mutex<ApScheduler>; MAX_CPUS] =
     [const { Mutex::new(ApScheduler::new()) }; MAX_CPUS];
-static PROBE_A_HEARTBEATS: [AtomicU64; MAX_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_CPUS];
-static PROBE_B_HEARTBEATS: [AtomicU64; MAX_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_CPUS];
+static PROBE_A_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static PROBE_B_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 global_asm!(
     r#"
