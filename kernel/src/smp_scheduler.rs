@@ -14,8 +14,7 @@ use core::{
 
 use spin::Mutex;
 use x86_64::instructions::{
-    hlt,
-    interrupts as cpu_interrupts,
+    hlt, interrupts as cpu_interrupts,
     segmentation::{CS, SS, Segment},
 };
 
