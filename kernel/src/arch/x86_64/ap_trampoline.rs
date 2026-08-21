@@ -10,7 +10,7 @@
 use core::{
     arch::global_asm,
     ptr,
-    sync::atomic::{fence, Ordering},
+    sync::atomic::{AtomicU64, Ordering, fence},
 };
 
 use x86_64::{
@@ -25,6 +25,8 @@ use crate::memory::BootInfoFrameAllocator;
 
 const PAGE_SIZE: usize = 4096;
 const LOW_MEMORY_LIMIT: u64 = 0x10_0000;
+
+static INSTALLED_TRAMPOLINE_PHYSICAL_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrampolineError {
@@ -97,6 +99,29 @@ impl ApTrampoline {
         Ok(Self {
             physical_address,
             startup_vector,
+        })
+    }
+
+    pub fn install_global(
+        frame: PhysFrame<Size4KiB>,
+        physical_memory_offset: VirtAddr,
+        mapper: &mut OffsetPageTable<'static>,
+        frame_allocator: &mut BootInfoFrameAllocator,
+    ) -> Result<Self, TrampolineError> {
+        let trampoline = Self::install(frame, physical_memory_offset, mapper, frame_allocator)?;
+        INSTALLED_TRAMPOLINE_PHYSICAL_ADDRESS
+            .store(trampoline.physical_address, Ordering::Release);
+        Ok(trampoline)
+    }
+
+    pub fn installed() -> Option<Self> {
+        let physical_address = INSTALLED_TRAMPOLINE_PHYSICAL_ADDRESS.load(Ordering::Acquire);
+        if physical_address == 0 {
+            return None;
+        }
+        Some(Self {
+            physical_address,
+            startup_vector: (physical_address >> 12) as u8,
         })
     }
 
