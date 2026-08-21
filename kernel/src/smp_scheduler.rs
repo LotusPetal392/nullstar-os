@@ -35,6 +35,10 @@ const LIVE_MIGRATION_IDLE: u8 = 0;
 const LIVE_MIGRATION_PENDING: u8 = 1;
 const LIVE_MIGRATION_TRANSFERRED: u8 = 2;
 const LIVE_MIGRATION_VERIFIED: u8 = 3;
+const AUTOMATIC_REBALANCE_COORDINATOR_CPU: usize = 1;
+const AUTOMATIC_REBALANCE_INTERVAL_TICKS: u64 = 16;
+const BALANCE_PROBE_FIRST_SLOT: u8 = 3;
+const BALANCE_PROBE_LAST_SLOT: u8 = 6;
 // Probe-only identities live in a reserved high range until live kernel threads
 // are backed directly by ProcessTable thread identities.
 const AP_PROBE_THREAD_ID_BASE: u64 = 1_u64 << 63;
@@ -56,7 +60,10 @@ static LIVE_MIGRATION_TO_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
 static LIVE_MIGRATION_STATE: AtomicU8 = AtomicU8::new(LIVE_MIGRATION_IDLE);
 static LIVE_MIGRATION_RESCHEDULE_BASELINE: AtomicU64 = AtomicU64::new(0);
 static LIVE_MIGRATION_PRESERVE_AFFINITY: AtomicBool = AtomicBool::new(false);
+static AUTOMATIC_REBALANCE_CHECKS: AtomicU64 = AtomicU64::new(0);
+static AUTOMATIC_REBALANCE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static AUTOMATIC_REBALANCES: AtomicU64 = AtomicU64::new(0);
+static AUTOMATIC_REBALANCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 global_asm!(
     r#"
@@ -140,7 +147,10 @@ pub struct Snapshot {
     pub balance_probe_heartbeats: u64,
     pub live_migrations_in: u64,
     pub live_migrations_out: u64,
+    pub automatic_rebalance_checks: u64,
+    pub automatic_rebalance_requests: u64,
     pub automatic_rebalances: u64,
+    pub automatic_rebalance_failures: u64,
 }
 
 struct ApTask {
@@ -257,14 +267,12 @@ impl ApScheduler {
                 probe_thread_id(cpu_index, 2),
                 ap_migration_probe,
             )?);
-            self.tasks.push(ApTask::kernel(
-                probe_thread_id(cpu_index, 3),
-                ap_balance_probe,
-            )?);
-            self.tasks.push(ApTask::kernel(
-                probe_thread_id(cpu_index, 4),
-                ap_balance_probe,
-            )?);
+            for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
+                self.tasks.push(ApTask::kernel(
+                    probe_thread_id(cpu_index, slot),
+                    ap_balance_probe,
+                )?);
+            }
         }
 
         let mut policy_guard = SMP_POLICY.lock();
@@ -287,12 +295,11 @@ impl ApScheduler {
             policy
                 .admit(probe_thread_id(cpu_index, 2), CpuMask::single(cpu))
                 .map_err(InitError::Policy)?;
-            policy
-                .admit(probe_thread_id(cpu_index, 3), CpuMask::single(cpu))
-                .map_err(InitError::Policy)?;
-            policy
-                .admit(probe_thread_id(cpu_index, 4), CpuMask::single(cpu))
-                .map_err(InitError::Policy)?;
+            for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
+                policy
+                    .admit(probe_thread_id(cpu_index, slot), CpuMask::single(cpu))
+                    .map_err(InitError::Policy)?;
+            }
         }
 
         self.running = true;
@@ -345,10 +352,15 @@ impl ApScheduler {
         let Some(thread) = selected else {
             return current_stack_pointer;
         };
-        self.switch_to_thread(thread, current_stack_pointer)
+        self.switch_to_thread(cpu_index, thread, current_stack_pointer)
     }
 
-    fn switch_to_thread(&mut self, thread: ThreadId, current_stack_pointer: usize) -> usize {
+    fn switch_to_thread(
+        &mut self,
+        cpu_index: usize,
+        thread: ThreadId,
+        current_stack_pointer: usize,
+    ) -> usize {
         let Some(next) = self
             .tasks
             .iter()
@@ -362,6 +374,7 @@ impl ApScheduler {
 
         self.current_task = next;
         self.context_switches = self.context_switches.saturating_add(1);
+        verify_automatic_rebalance_dispatch(cpu_index, thread);
         self.tasks[next].stack_pointer
     }
 
@@ -420,7 +433,10 @@ impl ApScheduler {
             balance_probe_heartbeats: BALANCE_PROBE_HEARTBEATS[cpu_index].load(Ordering::Acquire),
             live_migrations_in: self.live_migrations_in,
             live_migrations_out: self.live_migrations_out,
+            automatic_rebalance_checks: AUTOMATIC_REBALANCE_CHECKS.load(Ordering::Acquire),
+            automatic_rebalance_requests: AUTOMATIC_REBALANCE_REQUESTS.load(Ordering::Acquire),
             automatic_rebalances: AUTOMATIC_REBALANCES.load(Ordering::Acquire),
+            automatic_rebalance_failures: AUTOMATIC_REBALANCE_FAILURES.load(Ordering::Acquire),
         }
     }
 }
@@ -457,6 +473,12 @@ pub fn init_application_processor(cpu_index: usize) -> Result<Snapshot, InitErro
     PROBE_B_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     MIGRATION_PROBE_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     BALANCE_PROBE_HEARTBEATS[cpu_index].store(0, Ordering::Release);
+    if cpu_index == AUTOMATIC_REBALANCE_COORDINATOR_CPU {
+        AUTOMATIC_REBALANCE_CHECKS.store(0, Ordering::Release);
+        AUTOMATIC_REBALANCE_REQUESTS.store(0, Ordering::Release);
+        AUTOMATIC_REBALANCES.store(0, Ordering::Release);
+        AUTOMATIC_REBALANCE_FAILURES.store(0, Ordering::Release);
+    }
     let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
     scheduler.initialize(cpu_index)?;
     Ok(scheduler.snapshot(cpu_index))
@@ -494,7 +516,7 @@ fn enable_balanceable_probe_affinity() -> Result<(), MigrationError> {
     let policy = policy_guard
         .as_mut()
         .ok_or(MigrationError::PolicyUnavailable)?;
-    for slot in 3..=4 {
+    for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
         let thread = probe_thread_id(1, slot);
         let placement = policy
             .set_affinity(thread, affinity)
@@ -841,9 +863,20 @@ pub fn on_timer_interrupt(cpu_index: usize, current_stack_pointer: usize) -> usi
     if cpu_index == 0 || cpu_index >= MAX_CPUS || preemption::is_disabled() {
         return current_stack_pointer;
     }
-    AP_SCHEDULERS[cpu_index]
-        .lock()
-        .on_timer_interrupt(cpu_index, current_stack_pointer)
+    let (next_stack_pointer, timer_ticks) = {
+        let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
+        let next_stack_pointer = scheduler.on_timer_interrupt(cpu_index, current_stack_pointer);
+        (next_stack_pointer, scheduler.timer_ticks)
+    };
+
+    // Planning can lock both a source and destination scheduler. Run it only
+    // after releasing this CPU's scheduler lock so the fixed lock ordering in
+    // migration preparation remains valid.
+    if automatic_rebalance_due(cpu_index, timer_ticks) {
+        dispatch_automatic_rebalance(cpu_index, timer_ticks);
+    }
+
+    next_stack_pointer
 }
 
 pub fn snapshot(cpu_index: usize) -> Snapshot {
@@ -860,6 +893,97 @@ fn probe_thread_id(cpu_index: usize, slot: u8) -> ThreadId {
 
 fn thread_entry_trampoline_address() -> u64 {
     nullstar_ap_thread_entry_trampoline as *const () as usize as u64
+}
+
+fn automatic_rebalance_due(cpu_index: usize, timer_ticks: u64) -> bool {
+    let Some(cpu) = CpuId::from_raw(cpu_index) else {
+        return false;
+    };
+    let Some(coordinator) = CpuId::from_raw(AUTOMATIC_REBALANCE_COORDINATOR_CPU) else {
+        return false;
+    };
+    scheduling::periodic_rebalance_due(
+        cpu,
+        coordinator,
+        timer_ticks,
+        AUTOMATIC_REBALANCE_INTERVAL_TICKS,
+    )
+}
+
+fn increment_saturating(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.saturating_add(1))
+        })
+        .unwrap_or_else(|value| value)
+        .saturating_add(1)
+}
+
+fn dispatch_automatic_rebalance(trigger_cpu: usize, trigger_tick: u64) {
+    // The current AP acceptance workload first proves explicit live migration.
+    // Preserve that deterministic bootstrap ordering, then let timer-driven
+    // passes handle this and any later imbalance after each verified transfer.
+    if LIVE_MIGRATION_STATE.load(Ordering::Acquire) != LIVE_MIGRATION_VERIFIED {
+        return;
+    }
+    let checks = increment_saturating(&AUTOMATIC_REBALANCE_CHECKS);
+    let rebalance = match request_automatic_rebalance() {
+        Ok(Some(rebalance)) => rebalance,
+        Ok(None) => return,
+        Err(_) => {
+            increment_saturating(&AUTOMATIC_REBALANCE_FAILURES);
+            return;
+        }
+    };
+    let request = rebalance.migration;
+    if smp_runtime::send_fixed_ipi(request.from_cpu, crate::interrupts::RESCHEDULE_VECTOR).is_ok() {
+        let requests = increment_saturating(&AUTOMATIC_REBALANCE_REQUESTS);
+        serial_println!(
+            "application processor automatic rebalance requested: thread={}, from_cpu={}, to_cpu={}, source_load={}, destination_load={}, trigger_cpu={}, trigger_tick={}, checks={}, requests={}",
+            request.thread_id.raw(),
+            request.from_cpu,
+            request.to_cpu,
+            rebalance.source_load,
+            rebalance.destination_load,
+            trigger_cpu,
+            trigger_tick,
+            checks,
+            requests
+        );
+    } else {
+        increment_saturating(&AUTOMATIC_REBALANCE_FAILURES);
+        LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_VERIFIED, Ordering::Release);
+        LIVE_MIGRATION_PRESERVE_AFFINITY.store(false, Ordering::Release);
+    }
+}
+
+fn verify_automatic_rebalance_dispatch(cpu_index: usize, thread_id: ThreadId) {
+    if !LIVE_MIGRATION_PRESERVE_AFFINITY.load(Ordering::Acquire)
+        || LIVE_MIGRATION_STATE.load(Ordering::Acquire) != LIVE_MIGRATION_TRANSFERRED
+        || LIVE_MIGRATION_THREAD_ID.load(Ordering::Acquire) != thread_id.raw()
+        || usize::from(LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire)) != cpu_index
+        || LIVE_MIGRATION_STATE
+            .compare_exchange(
+                LIVE_MIGRATION_TRANSFERRED,
+                LIVE_MIGRATION_VERIFIED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        return;
+    }
+
+    LIVE_MIGRATION_PRESERVE_AFFINITY.store(false, Ordering::Release);
+    let rebalances = increment_saturating(&AUTOMATIC_REBALANCES);
+    serial_println!(
+        "application processor automatic rebalance verified: thread={}, from_cpu={}, to_cpu={}, dispatch_cpu={}, rebalances={}",
+        thread_id.raw(),
+        LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire),
+        LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire),
+        cpu_index,
+        rebalances
+    );
 }
 
 extern "C" fn ap_probe_a() -> ! {
@@ -881,39 +1005,7 @@ extern "C" fn ap_probe_b() -> ! {
 extern "C" fn ap_balance_probe() -> ! {
     loop {
         let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
-        let heartbeats = BALANCE_PROBE_HEARTBEATS[cpu_index]
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let migrated_thread = LIVE_MIGRATION_THREAD_ID.load(Ordering::Acquire);
-        let is_balance_thread = migrated_thread == probe_thread_id(1, 3).raw()
-            || migrated_thread == probe_thread_id(1, 4).raw();
-
-        if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_TRANSFERRED
-            && LIVE_MIGRATION_PRESERVE_AFFINITY.load(Ordering::Acquire)
-            && is_balance_thread
-            && LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire) != NO_MIGRATION_CPU
-            && usize::from(LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire)) == cpu_index
-            && LIVE_MIGRATION_STATE
-                .compare_exchange(
-                    LIVE_MIGRATION_TRANSFERRED,
-                    LIVE_MIGRATION_VERIFIED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        {
-            let rebalances = AUTOMATIC_REBALANCES
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1);
-            serial_println!(
-                "application processor automatic rebalance verified: thread={}, from_cpu={}, to_cpu={}, destination_heartbeats={}, rebalances={}",
-                migrated_thread,
-                LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire),
-                LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire),
-                heartbeats,
-                rebalances
-            );
-        }
+        BALANCE_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
         hlt();
     }
 }
@@ -990,31 +1082,6 @@ extern "C" fn ap_migration_probe() -> ! {
                 LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire),
                 MIGRATION_PROBE_HEARTBEATS[cpu_index].load(Ordering::Acquire)
             );
-
-            cpu_interrupts::without_interrupts(|| {
-                let Ok(Some(rebalance)) = request_automatic_rebalance() else {
-                    return;
-                };
-                let request = rebalance.migration;
-                if smp_runtime::send_fixed_ipi(
-                    request.from_cpu,
-                    crate::interrupts::RESCHEDULE_VECTOR,
-                )
-                .is_ok()
-                {
-                    serial_println!(
-                        "application processor automatic rebalance requested: thread={}, from_cpu={}, to_cpu={}, source_load={}, destination_load={}",
-                        request.thread_id.raw(),
-                        request.from_cpu,
-                        request.to_cpu,
-                        rebalance.source_load,
-                        rebalance.destination_load
-                    );
-                } else {
-                    LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_VERIFIED, Ordering::Release);
-                    LIVE_MIGRATION_PRESERVE_AFFINITY.store(false, Ordering::Release);
-                }
-            });
         }
         hlt();
     }

@@ -91,7 +91,13 @@ jobs:
           grep -F "from_cpu=2, to_cpu=1" smp-migration-qemu.log
           grep -F "application processor live migration verified:" smp-migration-qemu.log
           grep -F "application processor automatic rebalance requested:" smp-migration-qemu.log
+          grep -F "trigger_cpu=1" smp-migration-qemu.log
+          grep -F "requests=2" smp-migration-qemu.log
           grep -F "application processor automatic rebalance verified:" smp-migration-qemu.log
+          grep -F "dispatch_cpu=2" smp-migration-qemu.log
+          grep -F "rebalances=2" smp-migration-qemu.log
+          test "$(grep -Fc 'application processor automatic rebalance requested:' smp-migration-qemu.log)" -eq 2
+          test "$(grep -Fc 'application processor automatic rebalance verified:' smp-migration-qemu.log)" -eq 2
 
       - name: Boot partition, FAT, and SMP smoke test in QEMU
         shell: bash

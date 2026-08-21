@@ -126,6 +126,22 @@ pub struct RebalancePlan {
     pub destination_load: usize,
 }
 
+/// Decide whether one CPU should run a periodic rebalance pass.
+///
+/// A single coordinator bounds global policy-lock traffic, while the nonzero
+/// interval keeps the interrupt-facing caller from evaluating on every tick.
+pub const fn periodic_rebalance_due(
+    cpu: CpuId,
+    coordinator: CpuId,
+    timer_ticks: u64,
+    interval_ticks: u64,
+) -> bool {
+    cpu.0 == coordinator.0
+        && timer_ticks != 0
+        && interval_ticks != 0
+        && timer_ticks.is_multiple_of(interval_ticks)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SmpError {
     InvalidCpuCount,
@@ -784,6 +800,58 @@ mod tests {
         scheduler.admit(destination, CpuMask::single(cpu2)).unwrap();
 
         assert_eq!(scheduler.rebalance_plan(ap_cpus).unwrap(), None);
+    }
+
+    #[test]
+    fn repeated_rebalance_plans_converge_without_ping_pong() {
+        let mut processes = ProcessTable::new();
+        let process = processes.create_process(None).unwrap();
+        let cpu1 = CpuId::from_raw(1).unwrap();
+        let cpu2 = CpuId::from_raw(2).unwrap();
+        let ap_cpus = CpuMask::single(cpu1).union(CpuMask::single(cpu2));
+        let mut scheduler = SmpRoundRobin::new(3, 1).unwrap();
+
+        for name in ["source-pinned-a", "source-pinned-b", "source-pinned-c"] {
+            let thread = processes.create_thread(process, name).unwrap();
+            scheduler.admit(thread, CpuMask::single(cpu1)).unwrap();
+        }
+        for name in ["movable-a", "movable-b", "movable-c", "movable-d"] {
+            let thread = processes.create_thread(process, name).unwrap();
+            scheduler.admit(thread, CpuMask::single(cpu1)).unwrap();
+            assert!(!scheduler.set_affinity(thread, ap_cpus).unwrap().migrated);
+        }
+        for name in ["destination-pinned-a", "destination-pinned-b"] {
+            let thread = processes.create_thread(process, name).unwrap();
+            scheduler.admit(thread, CpuMask::single(cpu2)).unwrap();
+        }
+
+        let first = scheduler.rebalance_plan(ap_cpus).unwrap().unwrap();
+        assert_eq!((first.source_load, first.destination_load), (7, 2));
+        assert!(scheduler.migrate(first.thread, first.to).unwrap().migrated);
+
+        let second = scheduler.rebalance_plan(ap_cpus).unwrap().unwrap();
+        assert_eq!((second.source_load, second.destination_load), (6, 3));
+        assert!(
+            scheduler
+                .migrate(second.thread, second.to)
+                .unwrap()
+                .migrated
+        );
+
+        assert_eq!(scheduler.rebalance_plan(ap_cpus).unwrap(), None);
+    }
+
+    #[test]
+    fn periodic_rebalance_is_bounded_to_the_coordinator_and_interval() {
+        let coordinator = CpuId::from_raw(1).unwrap();
+        let other = CpuId::from_raw(2).unwrap();
+
+        assert!(!periodic_rebalance_due(coordinator, coordinator, 0, 16));
+        assert!(!periodic_rebalance_due(coordinator, coordinator, 15, 16));
+        assert!(periodic_rebalance_due(coordinator, coordinator, 16, 16));
+        assert!(periodic_rebalance_due(coordinator, coordinator, 32, 16));
+        assert!(!periodic_rebalance_due(other, coordinator, 16, 16));
+        assert!(!periodic_rebalance_due(coordinator, coordinator, 16, 0));
     }
 
     #[test]
