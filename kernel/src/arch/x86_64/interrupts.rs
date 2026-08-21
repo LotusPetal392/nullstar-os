@@ -14,7 +14,7 @@ use x86_64::{
 
 use crate::{
     acpi::{HpetInfo, MadtInfo},
-    apic, gdt, hlt_loop, keyboard, preemption,
+    apic, gdt, hlt_loop, hpet as hpet_timer, keyboard, preemption,
     process::userspace,
     scheduler, serial_println,
 };
@@ -272,10 +272,28 @@ pub fn init(
 
     if controller.kind == ControllerKind::Apic {
         if let (Some(madt), Some(bsp_apic_id)) = (madt, controller.local_apic_id) {
+            let startup_timer = hpet.and_then(|hpet_info| {
+                match hpet_timer::Hpet::new(
+                    hpet_info,
+                    physical_memory_offset,
+                    physical_memory_end,
+                ) {
+                    Ok(timer) => Some(timer),
+                    Err(error) => {
+                        serial_println!(
+                            "SMP HPET startup timing unavailable: {}; using bounded fallback delays",
+                            error.description()
+                        );
+                        None
+                    }
+                }
+            });
+
             if let Err(error) = smp_bringup::bring_up_application_processors(
                 madt,
                 bsp_apic_id,
                 physical_memory_offset,
+                startup_timer,
             ) {
                 serial_println!("SMP application processor bring-up unavailable: {error:?}");
             }
