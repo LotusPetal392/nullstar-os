@@ -13,7 +13,7 @@ use core::{
 
 use x86_64::VirtAddr;
 
-use crate::{acpi::MadtInfo, gdt, serial_println};
+use crate::{acpi::MadtInfo, gdt, interrupts, serial_println};
 
 use super::{
     ap_trampoline::{ApTrampoline, TrampolineError},
@@ -339,6 +339,7 @@ pub extern "C" fn nullstar_ap_kernel_entry(cpu_index: u32, apic_id: u32) -> ! {
     let _ = AP_RENDEZVOUS.publish_trampoline_entry(cpu_index);
 
     gdt::init_application_processor();
+    interrupts::init_application_processor();
 
     let _ = AP_RENDEZVOUS.publish_kernel_initialized(cpu_index);
     let _ = AP_RENDEZVOUS.publish_online(cpu_index);
