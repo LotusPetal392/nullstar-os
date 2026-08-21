@@ -16,8 +16,10 @@ use crate::{
     acpi::{HpetInfo, MadtInfo},
     apic, gdt, hlt_loop, keyboard, preemption,
     process::userspace,
-    scheduler, serial_println, smp_bringup,
+    scheduler, serial_println,
 };
+
+use super::smp_bringup;
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -152,7 +154,7 @@ impl ControllerInfo {
             calibration_hpet_ticks: local_timer.map(|timer| timer.calibration_hpet_ticks),
             hpet_period_femtoseconds: local_timer.map(|timer| timer.hpet_period_femtoseconds),
             hpet_frequency_hz: local_timer.map(|timer| timer.hpet_frequency_hz),
-            hpet_counter_is_64_bit: local_timer.map(|timer| timer.counter_is_64_bit),
+            hpet_counter_is_64_bit: local_timer.map(|timer| timer.hpet_counter_is_64_bit),
             timer_fallback_reason: info.timer_fallback_reason,
             fallback_reason: None,
         }
