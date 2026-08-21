@@ -1,9 +1,10 @@
-//! Architecture-neutral single-CPU round-robin scheduling policy.
+//! Architecture-neutral round-robin scheduling policy.
 //!
 //! The interrupt-facing scheduler owns register contexts and address spaces;
-//! this bounded policy owns only runnable thread identity and quantum state.
-//! Keeping the policy independent makes preemption and wakeup ordering
-//! testable without booting a kernel or pretending to provide SMP semantics.
+//! this bounded policy owns only runnable thread identity, quantum state, CPU
+//! placement, affinity, and deterministic rebalance planning. Keeping the
+//! policy independent makes preemption, wakeup ordering, and SMP balancing
+//! testable without booting a kernel.
 
 use alloc::{collections::VecDeque, vec::Vec};
 
@@ -78,6 +79,10 @@ impl CpuMask {
         }))
     }
 
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     pub const fn contains(self, cpu: CpuId) -> bool {
         self.0 & (1_u64 << cpu.0) != 0
     }
@@ -110,6 +115,15 @@ pub struct SmpSnapshot {
     pub cpu_count: usize,
     pub assigned_thread_count: usize,
     pub online_mask: CpuMask,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RebalancePlan {
+    pub thread: ThreadId,
+    pub from: CpuId,
+    pub to: CpuId,
+    pub source_load: usize,
+    pub destination_load: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +263,81 @@ impl SmpRoundRobin {
         })
     }
 
+    /// Return one deterministic affinity-safe balancing move without mutating
+    /// queue state. A move is proposed only when it reduces a load difference
+    /// of at least two runnable/current threads, so applying the move cannot
+    /// immediately invert a one-thread imbalance and cause ping-pong.
+    pub fn rebalance_plan(
+        &self,
+        eligible_cpus: CpuMask,
+    ) -> Result<Option<RebalancePlan>, SmpError> {
+        self.validate_affinity(eligible_cpus)?;
+
+        let mut best: Option<RebalancePlan> = None;
+        for source_raw in 0..self.queues.len() {
+            let source = CpuId::from_raw(source_raw).expect("queue CPU is within the CPU bound");
+            if !eligible_cpus.contains(source) {
+                continue;
+            }
+            let source_load = self.cpu_load(source)?;
+            if source_load < 2 {
+                continue;
+            }
+            let source_current = self.queues[source_raw].snapshot().current;
+
+            for destination_raw in 0..self.queues.len() {
+                let destination =
+                    CpuId::from_raw(destination_raw).expect("queue CPU is within the CPU bound");
+                if destination == source || !eligible_cpus.contains(destination) {
+                    continue;
+                }
+                let destination_load = self.cpu_load(destination)?;
+                if source_load <= destination_load.saturating_add(1) {
+                    continue;
+                }
+
+                let candidate = self
+                    .assignments
+                    .iter()
+                    .filter(|assignment| {
+                        assignment.cpu == source && assignment.affinity.contains(destination)
+                    })
+                    .find(|assignment| Some(assignment.thread) != source_current)
+                    .or_else(|| {
+                        self.assignments.iter().find(|assignment| {
+                            assignment.cpu == source && assignment.affinity.contains(destination)
+                        })
+                    });
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+
+                let plan = RebalancePlan {
+                    thread: candidate.thread,
+                    from: source,
+                    to: destination,
+                    source_load,
+                    destination_load,
+                };
+                let imbalance = source_load - destination_load;
+                let replace = best
+                    .as_ref()
+                    .map(|current| {
+                        let current_imbalance = current.source_load - current.destination_load;
+                        imbalance > current_imbalance
+                            || (imbalance == current_imbalance
+                                && (source.raw(), destination.raw(), candidate.thread.raw())
+                                    < (current.from.raw(), current.to.raw(), current.thread.raw()))
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best = Some(plan);
+                }
+            }
+        }
+        Ok(best)
+    }
+
     pub fn tick(&mut self, cpu: CpuId) -> Result<Option<Switch>, SmpError> {
         let queue = self.queue_mut(cpu)?;
         Ok(queue.tick())
@@ -302,14 +391,18 @@ impl SmpRoundRobin {
             if !affinity.contains(cpu) {
                 continue;
             }
-            let snapshot = self.queues[raw].snapshot();
-            let load = snapshot.runnable_count + if snapshot.current.is_some() { 1 } else { 0 };
+            let load = self.cpu_load(cpu)?;
             if load < selected_load {
                 selected = Some(cpu);
                 selected_load = load;
             }
         }
         selected.ok_or(SmpError::EmptyAffinity)
+    }
+
+    fn cpu_load(&self, cpu: CpuId) -> Result<usize, SmpError> {
+        let snapshot = self.queue(cpu)?.snapshot();
+        Ok(snapshot.runnable_count + if snapshot.current.is_some() { 1 } else { 0 })
     }
 
     fn assignment_index(&self, thread: ThreadId) -> Option<usize> {
@@ -628,6 +721,72 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_plan_moves_only_affinity_eligible_work() {
+        let mut processes = ProcessTable::new();
+        let process = processes.create_process(None).unwrap();
+        let movable = processes.create_thread(process, "movable").unwrap();
+        let source_a = processes.create_thread(process, "source-a").unwrap();
+        let source_b = processes.create_thread(process, "source-b").unwrap();
+        let destination_task = processes.create_thread(process, "destination").unwrap();
+        let cpu1 = CpuId::from_raw(1).unwrap();
+        let cpu2 = CpuId::from_raw(2).unwrap();
+        let ap_cpus = CpuMask::single(cpu1).union(CpuMask::single(cpu2));
+        let mut scheduler = SmpRoundRobin::new(3, 1).unwrap();
+
+        scheduler.admit(movable, CpuMask::single(cpu1)).unwrap();
+        scheduler.admit(source_a, CpuMask::single(cpu1)).unwrap();
+        scheduler.admit(source_b, CpuMask::single(cpu1)).unwrap();
+        scheduler
+            .admit(destination_task, CpuMask::single(cpu2))
+            .unwrap();
+        assert_eq!(
+            scheduler.set_affinity(movable, ap_cpus).unwrap(),
+            Placement {
+                thread: movable,
+                cpu: cpu1,
+                migrated: false,
+            }
+        );
+
+        let plan = scheduler.rebalance_plan(ap_cpus).unwrap().unwrap();
+        assert_eq!(
+            plan,
+            RebalancePlan {
+                thread: movable,
+                from: cpu1,
+                to: cpu2,
+                source_load: 3,
+                destination_load: 1,
+            }
+        );
+
+        assert!(scheduler.migrate(plan.thread, plan.to).unwrap().migrated);
+        assert_eq!(scheduler.rebalance_plan(ap_cpus).unwrap(), None);
+        assert!(scheduler.migrate(movable, cpu1).unwrap().migrated);
+    }
+
+    #[test]
+    fn rebalance_plan_does_not_override_pinned_affinity() {
+        let mut processes = ProcessTable::new();
+        let process = processes.create_process(None).unwrap();
+        let first = processes.create_thread(process, "first").unwrap();
+        let second = processes.create_thread(process, "second").unwrap();
+        let third = processes.create_thread(process, "third").unwrap();
+        let destination = processes.create_thread(process, "destination").unwrap();
+        let cpu1 = CpuId::from_raw(1).unwrap();
+        let cpu2 = CpuId::from_raw(2).unwrap();
+        let ap_cpus = CpuMask::single(cpu1).union(CpuMask::single(cpu2));
+        let mut scheduler = SmpRoundRobin::new(3, 1).unwrap();
+
+        scheduler.admit(first, CpuMask::single(cpu1)).unwrap();
+        scheduler.admit(second, CpuMask::single(cpu1)).unwrap();
+        scheduler.admit(third, CpuMask::single(cpu1)).unwrap();
+        scheduler.admit(destination, CpuMask::single(cpu2)).unwrap();
+
+        assert_eq!(scheduler.rebalance_plan(ap_cpus).unwrap(), None);
+    }
+
+    #[test]
     fn affinity_rejects_empty_and_offline_cpu_masks() {
         let (_processes, first, _second) = two_threads();
         let cpu2 = CpuId::from_raw(2).unwrap();
@@ -640,6 +799,10 @@ mod tests {
         assert_eq!(
             scheduler.admit(first, CpuMask::single(cpu2)),
             Err(SmpError::AffinityOutsideTopology)
+        );
+        assert_eq!(
+            scheduler.rebalance_plan(CpuMask::empty()),
+            Err(SmpError::EmptyAffinity)
         );
     }
 
