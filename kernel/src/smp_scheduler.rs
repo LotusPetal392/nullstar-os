@@ -758,7 +758,38 @@ pub fn snapshot(cpu_index: usize) -> Snapshot {
     if cpu_index >= MAX_CPUS {
         return Snapshot::default();
     }
-    AP_SCHEDULERS[cpu_index].lock().snapshot(cpu_index)
+    let snapshot = AP_SCHEDULERS[cpu_index].lock().snapshot(cpu_index);
+
+    // The BSP polls AP snapshots during the acceptance bring-up. Once the
+    // migration probe has demonstrably executed on CPU 2, request a live move
+    // back to CPU 1 and notify CPU 2 with a new reschedule IPI. This keeps the
+    // request-side locks off the AP thread being migrated.
+    if cpu_index == 2
+        && snapshot.migration_probe_heartbeats > 0
+        && smp_runtime::is_online(1)
+        && LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_IDLE
+    {
+        let thread_id = migration_probe_thread_id();
+        if let Ok(request) = request_live_migration(thread_id, 1) {
+            if smp_runtime::send_fixed_ipi(
+                request.from_cpu,
+                crate::interrupts::RESCHEDULE_VECTOR,
+            )
+            .is_ok()
+            {
+                serial_println!(
+                    "application processor live migration requested: thread={}, from_cpu={}, to_cpu={}",
+                    request.thread_id.raw(),
+                    request.from_cpu,
+                    request.to_cpu
+                );
+            } else {
+                LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_IDLE, Ordering::Release);
+            }
+        }
+    }
+
+    snapshot
 }
 
 fn probe_thread_id(cpu_index: usize, slot: u8) -> ThreadId {
@@ -790,35 +821,6 @@ extern "C" fn ap_migration_probe() -> ! {
     loop {
         let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
         MIGRATION_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
-
-        // The three-CPU acceptance path first moves this never-run context to
-        // CPU 2. Once it has genuinely executed there, request a live move back
-        // to CPU 1 and notify the source lane with a reschedule IPI. The actual
-        // ownership transfer occurs only on a later timer boundary while this
-        // exact thread is current.
-        if cpu_index == 2
-            && smp_runtime::is_online(1)
-            && LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_IDLE
-        {
-            let thread_id = migration_probe_thread_id();
-            if let Ok(request) = request_live_migration(thread_id, 1) {
-                if smp_runtime::send_fixed_ipi(
-                    request.from_cpu,
-                    crate::interrupts::RESCHEDULE_VECTOR,
-                )
-                .is_ok()
-                {
-                    serial_println!(
-                        "application processor live migration requested: thread={}, from_cpu={}, to_cpu={}",
-                        request.thread_id.raw(),
-                        request.from_cpu,
-                        request.to_cpu
-                    );
-                } else {
-                    LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_IDLE, Ordering::Release);
-                }
-            }
-        }
 
         if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_TRANSFERRED
             && LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire) != NO_MIGRATION_CPU
