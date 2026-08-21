@@ -15,6 +15,7 @@ use core::{
 use spin::Mutex;
 use x86_64::instructions::{
     hlt,
+    interrupts as cpu_interrupts,
     segmentation::{CS, SS, Segment},
 };
 
@@ -94,7 +95,6 @@ pub enum MigrationError {
     Policy(scheduling::SmpError),
     ContextNotFound,
     DestinationConflict,
-    NoReplacement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -632,32 +632,6 @@ pub fn request_live_migration(
     })
 }
 
-pub fn live_migration_transferred() -> bool {
-    LIVE_MIGRATION_STATE.load(Ordering::Acquire) >= LIVE_MIGRATION_TRANSFERRED
-}
-
-pub fn live_migration_verified() -> bool {
-    LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_VERIFIED
-}
-
-pub fn live_migration_request() -> Option<LiveMigrationRequest> {
-    let state = LIVE_MIGRATION_STATE.load(Ordering::Acquire);
-    if state == LIVE_MIGRATION_IDLE {
-        return None;
-    }
-    let thread_id = ThreadId::from_raw(LIVE_MIGRATION_THREAD_ID.load(Ordering::Acquire))?;
-    let from_cpu = LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire);
-    let to_cpu = LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire);
-    if from_cpu == NO_MIGRATION_CPU || to_cpu == NO_MIGRATION_CPU {
-        return None;
-    }
-    Some(LiveMigrationRequest {
-        thread_id,
-        from_cpu: usize::from(from_cpu),
-        to_cpu: usize::from(to_cpu),
-    })
-}
-
 fn try_live_migrate_current(
     source_cpu: usize,
     source: &mut ApScheduler,
@@ -756,35 +730,7 @@ pub fn snapshot(cpu_index: usize) -> Snapshot {
     if cpu_index >= MAX_CPUS {
         return Snapshot::default();
     }
-    let snapshot = AP_SCHEDULERS[cpu_index].lock().snapshot(cpu_index);
-
-    // The BSP polls AP snapshots during the acceptance bring-up. Once the
-    // migration probe has demonstrably executed on CPU 2, request a live move
-    // back to CPU 1 and notify CPU 2 with a new reschedule IPI. This keeps the
-    // request-side locks off the AP thread being migrated.
-    if cpu_index == 2
-        && snapshot.migration_probe_heartbeats > 0
-        && smp_runtime::is_online(1)
-        && LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_IDLE
-    {
-        let thread_id = migration_probe_thread_id();
-        if let Ok(request) = request_live_migration(thread_id, 1) {
-            if smp_runtime::send_fixed_ipi(request.from_cpu, crate::interrupts::RESCHEDULE_VECTOR)
-                .is_ok()
-            {
-                serial_println!(
-                    "application processor live migration requested: thread={}, from_cpu={}, to_cpu={}",
-                    request.thread_id.raw(),
-                    request.from_cpu,
-                    request.to_cpu
-                );
-            } else {
-                LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_IDLE, Ordering::Release);
-            }
-        }
-    }
-
-    snapshot
+    AP_SCHEDULERS[cpu_index].lock().snapshot(cpu_index)
 }
 
 fn probe_thread_id(cpu_index: usize, slot: u8) -> ThreadId {
@@ -815,7 +761,54 @@ extern "C" fn ap_probe_b() -> ! {
 extern "C" fn ap_migration_probe() -> ! {
     loop {
         let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
-        MIGRATION_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
+        let heartbeats = MIGRATION_PROBE_HEARTBEATS[cpu_index]
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+
+        let quiescent_destination = MIGRATION_TO_CPU.load(Ordering::Acquire);
+        if quiescent_destination != NO_MIGRATION_CPU
+            && usize::from(quiescent_destination) == cpu_index
+            && MIGRATION_VERIFIED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            serial_println!(
+                "application processor kernel migration verified: thread={}, from_cpu={}, to_cpu={}, heartbeats={}",
+                MIGRATION_THREAD_ID.load(Ordering::Acquire),
+                MIGRATION_FROM_CPU.load(Ordering::Acquire),
+                quiescent_destination,
+                heartbeats
+            );
+        }
+
+        if cpu_index == 2
+            && smp_runtime::is_online(1)
+            && LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_IDLE
+        {
+            cpu_interrupts::without_interrupts(|| {
+                if LIVE_MIGRATION_STATE.load(Ordering::Acquire) != LIVE_MIGRATION_IDLE {
+                    return;
+                }
+                let thread_id = migration_probe_thread_id();
+                if let Ok(request) = request_live_migration(thread_id, 1) {
+                    if smp_runtime::send_fixed_ipi(
+                        request.from_cpu,
+                        crate::interrupts::RESCHEDULE_VECTOR,
+                    )
+                    .is_ok()
+                    {
+                        serial_println!(
+                            "application processor live migration requested: thread={}, from_cpu={}, to_cpu={}",
+                            request.thread_id.raw(),
+                            request.from_cpu,
+                            request.to_cpu
+                        );
+                    } else {
+                        LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_IDLE, Ordering::Release);
+                    }
+                }
+            });
+        }
 
         if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_TRANSFERRED
             && LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire) != NO_MIGRATION_CPU
