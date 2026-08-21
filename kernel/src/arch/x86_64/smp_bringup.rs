@@ -61,7 +61,7 @@ pub struct ApRendezvous {
 impl ApRendezvous {
     pub const fn new() -> Self {
         Self {
-            states: [const { AtomicU64::new(ApStartupStage::InitAsserted as u64) }; MAX_SMP_CPUS],
+            states: [const { AtomicU64::new(StageCode::InitAsserted as u64) }; MAX_SMP_CPUS],
         }
     }
 
