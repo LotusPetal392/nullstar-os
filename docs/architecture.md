@@ -111,13 +111,18 @@ The SMP foundation retains bounded processor identities from the ACPI MADT, star
 processors with per-CPU GDT/TSS, interrupt, timer, preemption, and scheduler state, and exposes
 an affinity-aware per-CPU round-robin policy model. `SmpRoundRobin` validates online CPU masks,
 balances unrestricted threads, and supports explicit affinity changes, live context migration,
-and deterministic rebalance planning. A single AP timer coordinator evaluates that plan at a
-bounded interval after releasing its local scheduler lock; one migration is dispatched through
-a reschedule IPI and verified when the destination scheduler selects the transferred context.
-Repeated passes converge larger imbalances one move at a time and retain bounded check, request,
-completion, and delivery-failure counters. The live AP workload still uses reserved kernel-probe
-identities, while ordinary userspace tasks remain on the bootstrap scheduler pending
-process/thread and address-space integration.
+blocking, waking, yielding, removal, and deterministic rebalance planning. Blocked assignments
+retain their thread identity, CPU ownership, and affinity without contributing runnable load.
+Wakeup prefers the previous CPU while its eligible load remains within one runnable thread of
+the least-loaded allowed CPU; otherwise it migrates ownership before queueing the thread. A
+single AP timer coordinator evaluates rebalance plans at a bounded interval after releasing its
+local scheduler lock; one migration is dispatched through a reschedule IPI and verified when the
+destination scheduler selects the transferred context. Repeated passes converge larger
+imbalances one move at a time and retain bounded check, request, completion, and delivery-failure
+counters. QEMU acceptance also blocks a live AP context, transfers it between CPU-local task
+stores during wakeup, and verifies its first destination dispatch. The live AP workload still
+uses reserved kernel-probe identities, while ordinary userspace tasks remain on the bootstrap
+scheduler pending process/thread and address-space integration.
 
 The synchronization/IPC layer adds an acquire/release `SmpMutex`, bounded FIFO channels with
 blocking and nonblocking operations, and fixed per-CPU mailboxes for reschedule, wake, address-space

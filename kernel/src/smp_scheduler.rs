@@ -35,10 +35,16 @@ const LIVE_MIGRATION_IDLE: u8 = 0;
 const LIVE_MIGRATION_PENDING: u8 = 1;
 const LIVE_MIGRATION_TRANSFERRED: u8 = 2;
 const LIVE_MIGRATION_VERIFIED: u8 = 3;
+const BLOCK_WAKE_IDLE: u8 = 0;
+const BLOCK_WAKE_REQUESTED: u8 = 1;
+const BLOCK_WAKE_BLOCKED: u8 = 2;
+const BLOCK_WAKE_WOKEN: u8 = 3;
+const BLOCK_WAKE_VERIFIED: u8 = 4;
 const AUTOMATIC_REBALANCE_COORDINATOR_CPU: usize = 1;
 const AUTOMATIC_REBALANCE_INTERVAL_TICKS: u64 = 16;
 const BALANCE_PROBE_FIRST_SLOT: u8 = 3;
 const BALANCE_PROBE_LAST_SLOT: u8 = 6;
+const BLOCK_WAKE_PROBE_SLOT: u8 = 5;
 // Probe-only identities live in a reserved high range until live kernel threads
 // are backed directly by ProcessTable thread identities.
 const AP_PROBE_THREAD_ID_BASE: u64 = 1_u64 << 63;
@@ -50,6 +56,7 @@ static PROBE_A_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) };
 static PROBE_B_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static MIGRATION_PROBE_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static BALANCE_PROBE_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static BLOCK_WAKE_PROBE_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static MIGRATION_THREAD_ID: AtomicU64 = AtomicU64::new(0);
 static MIGRATION_FROM_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
 static MIGRATION_TO_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
@@ -64,6 +71,7 @@ static AUTOMATIC_REBALANCE_CHECKS: AtomicU64 = AtomicU64::new(0);
 static AUTOMATIC_REBALANCE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static AUTOMATIC_REBALANCES: AtomicU64 = AtomicU64::new(0);
 static AUTOMATIC_REBALANCE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static BLOCK_WAKE_STATE: AtomicU8 = AtomicU8::new(BLOCK_WAKE_IDLE);
 
 global_asm!(
     r#"
@@ -145,6 +153,8 @@ pub struct Snapshot {
     pub probe_b_heartbeats: u64,
     pub migration_probe_heartbeats: u64,
     pub balance_probe_heartbeats: u64,
+    pub block_wake_probe_heartbeats: u64,
+    pub block_wake_state: u8,
     pub live_migrations_in: u64,
     pub live_migrations_out: u64,
     pub automatic_rebalance_checks: u64,
@@ -268,10 +278,13 @@ impl ApScheduler {
                 ap_migration_probe,
             )?);
             for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
-                self.tasks.push(ApTask::kernel(
-                    probe_thread_id(cpu_index, slot),
-                    ap_balance_probe,
-                )?);
+                let entry = if slot == BLOCK_WAKE_PROBE_SLOT {
+                    ap_block_wake_probe
+                } else {
+                    ap_balance_probe
+                };
+                self.tasks
+                    .push(ApTask::kernel(probe_thread_id(cpu_index, slot), entry)?);
             }
         }
 
@@ -325,6 +338,11 @@ impl ApScheduler {
         {
             return next_stack_pointer;
         }
+        if let Some(next_stack_pointer) =
+            try_block_probe_current(cpu_index, self, current_stack_pointer)
+        {
+            return next_stack_pointer;
+        }
 
         let Some(cpu) = CpuId::from_raw(cpu_index) else {
             return current_stack_pointer;
@@ -375,6 +393,7 @@ impl ApScheduler {
         self.current_task = next;
         self.context_switches = self.context_switches.saturating_add(1);
         verify_automatic_rebalance_dispatch(cpu_index, thread);
+        verify_block_wake_dispatch(cpu_index, thread);
         self.tasks[next].stack_pointer
     }
 
@@ -431,6 +450,9 @@ impl ApScheduler {
             probe_b_heartbeats,
             migration_probe_heartbeats: migration_heartbeats,
             balance_probe_heartbeats: BALANCE_PROBE_HEARTBEATS[cpu_index].load(Ordering::Acquire),
+            block_wake_probe_heartbeats: BLOCK_WAKE_PROBE_HEARTBEATS[cpu_index]
+                .load(Ordering::Acquire),
+            block_wake_state: BLOCK_WAKE_STATE.load(Ordering::Acquire),
             live_migrations_in: self.live_migrations_in,
             live_migrations_out: self.live_migrations_out,
             automatic_rebalance_checks: AUTOMATIC_REBALANCE_CHECKS.load(Ordering::Acquire),
@@ -473,11 +495,13 @@ pub fn init_application_processor(cpu_index: usize) -> Result<Snapshot, InitErro
     PROBE_B_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     MIGRATION_PROBE_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     BALANCE_PROBE_HEARTBEATS[cpu_index].store(0, Ordering::Release);
+    BLOCK_WAKE_PROBE_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     if cpu_index == AUTOMATIC_REBALANCE_COORDINATOR_CPU {
         AUTOMATIC_REBALANCE_CHECKS.store(0, Ordering::Release);
         AUTOMATIC_REBALANCE_REQUESTS.store(0, Ordering::Release);
         AUTOMATIC_REBALANCES.store(0, Ordering::Release);
         AUTOMATIC_REBALANCE_FAILURES.store(0, Ordering::Release);
+        BLOCK_WAKE_STATE.store(BLOCK_WAKE_IDLE, Ordering::Release);
     }
     let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
     scheduler.initialize(cpu_index)?;
@@ -639,6 +663,10 @@ fn migrate_locked(
 
 pub fn migration_probe_thread_id() -> ThreadId {
     probe_thread_id(1, 2)
+}
+
+fn block_wake_probe_thread_id() -> ThreadId {
+    probe_thread_id(1, BLOCK_WAKE_PROBE_SLOT)
 }
 
 pub fn request_live_migration(
@@ -859,6 +887,46 @@ fn try_live_migrate_current(
     Some(replacement_stack_pointer)
 }
 
+fn try_block_probe_current(
+    cpu_index: usize,
+    source: &mut ApScheduler,
+    current_stack_pointer: usize,
+) -> Option<usize> {
+    if BLOCK_WAKE_STATE.load(Ordering::Acquire) != BLOCK_WAKE_REQUESTED {
+        return None;
+    }
+    let thread_id = block_wake_probe_thread_id();
+    if source.tasks.get(source.current_task)?.thread_id != Some(thread_id) {
+        return None;
+    }
+    let cpu = CpuId::from_raw(cpu_index)?;
+    let transition = {
+        let mut policy_guard = SMP_POLICY.try_lock()?;
+        let policy = policy_guard.as_mut()?;
+        if policy.cpu_snapshot(cpu).ok()?.runnable_count == 0 {
+            return None;
+        }
+        policy.block(thread_id).ok()?
+    };
+    let replacement = transition.switch?.to;
+    let replacement_index = source
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == Some(replacement) && task.stack_pointer != 0)?;
+
+    source.tasks[source.current_task].stack_pointer = current_stack_pointer;
+    source.current_task = replacement_index;
+    source.context_switches = source.context_switches.saturating_add(1);
+    BLOCK_WAKE_STATE.store(BLOCK_WAKE_BLOCKED, Ordering::Release);
+    serial_println!(
+        "application processor probe blocked: thread={}, cpu={}, replacement={}",
+        thread_id.raw(),
+        cpu_index,
+        replacement.raw()
+    );
+    Some(source.tasks[replacement_index].stack_pointer)
+}
+
 pub fn on_timer_interrupt(cpu_index: usize, current_stack_pointer: usize) -> usize {
     if cpu_index == 0 || cpu_index >= MAX_CPUS || preemption::is_disabled() {
         return current_stack_pointer;
@@ -874,6 +942,9 @@ pub fn on_timer_interrupt(cpu_index: usize, current_stack_pointer: usize) -> usi
     // migration preparation remains valid.
     if automatic_rebalance_due(cpu_index, timer_ticks) {
         dispatch_automatic_rebalance(cpu_index, timer_ticks);
+    }
+    if cpu_index == AUTOMATIC_REBALANCE_COORDINATOR_CPU {
+        wake_blocked_probe();
     }
 
     next_stack_pointer
@@ -986,6 +1057,122 @@ fn verify_automatic_rebalance_dispatch(cpu_index: usize, thread_id: ThreadId) {
     );
 }
 
+fn wake_blocked_probe() {
+    if BLOCK_WAKE_STATE.load(Ordering::Acquire) != BLOCK_WAKE_BLOCKED || !smp_runtime::is_online(2)
+    {
+        return;
+    }
+    let thread_id = block_wake_probe_thread_id();
+    let destination = CpuId::from_raw(2).expect("CPU 2 is within the scheduler CPU bound");
+    let (source_cpu, original_affinity) = {
+        let policy_guard = SMP_POLICY.lock();
+        let policy = match policy_guard.as_ref() {
+            Some(policy) => policy,
+            None => return,
+        };
+        let assignment = match policy.assignment_snapshot(thread_id) {
+            Ok(assignment) => assignment,
+            Err(_) => return,
+        };
+        if assignment.state != scheduling::AssignmentState::Blocked {
+            return;
+        }
+        (assignment.cpu.raw(), assignment.affinity)
+    };
+    let destination_cpu = destination.raw();
+    if source_cpu == 0 || source_cpu >= MAX_CPUS || source_cpu == destination_cpu {
+        return;
+    }
+
+    let (mut source, mut target) = if source_cpu < destination_cpu {
+        (
+            AP_SCHEDULERS[source_cpu].lock(),
+            AP_SCHEDULERS[destination_cpu].lock(),
+        )
+    } else {
+        let target = AP_SCHEDULERS[destination_cpu].lock();
+        let source = AP_SCHEDULERS[source_cpu].lock();
+        (source, target)
+    };
+    if !source.running || !source.armed || !target.running || !target.armed {
+        return;
+    }
+    let Some(source_index) = source
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == Some(thread_id))
+    else {
+        return;
+    };
+    if source_index == source.current_task
+        || target
+            .tasks
+            .iter()
+            .any(|task| task.thread_id == Some(thread_id))
+    {
+        return;
+    }
+
+    let (affinity_placement, wake) = {
+        let mut policy_guard = SMP_POLICY.lock();
+        let policy = match policy_guard.as_mut() {
+            Some(policy) => policy,
+            None => return,
+        };
+        let placement = match policy.set_affinity(thread_id, CpuMask::single(destination)) {
+            Ok(placement) if placement.migrated && placement.cpu == destination => placement,
+            _ => return,
+        };
+        let wake = match policy.wake(thread_id) {
+            Ok(wake) if wake.placement.cpu == destination => wake,
+            _ => {
+                let source = CpuId::from_raw(source_cpu)
+                    .expect("source CPU is within the scheduler CPU bound");
+                let _ = policy.migrate(thread_id, source);
+                let _ = policy.set_affinity(thread_id, original_affinity);
+                return;
+            }
+        };
+        (placement, wake)
+    };
+
+    let task = source.tasks.remove(source_index);
+    target.tasks.push(task);
+    BLOCK_WAKE_STATE.store(BLOCK_WAKE_WOKEN, Ordering::Release);
+    serial_println!(
+        "application processor probe wake requested: thread={}, from_cpu={}, to_cpu={}, affinity_migrated={}, wake_migrated={}",
+        thread_id.raw(),
+        source_cpu,
+        destination_cpu,
+        affinity_placement.migrated,
+        wake.placement.migrated
+    );
+    drop(target);
+    drop(source);
+    let _ = smp_runtime::send_fixed_ipi(destination_cpu, crate::interrupts::RESCHEDULE_VECTOR);
+}
+
+fn verify_block_wake_dispatch(cpu_index: usize, thread_id: ThreadId) {
+    if thread_id != block_wake_probe_thread_id()
+        || cpu_index != 2
+        || BLOCK_WAKE_STATE
+            .compare_exchange(
+                BLOCK_WAKE_WOKEN,
+                BLOCK_WAKE_VERIFIED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        return;
+    }
+    serial_println!(
+        "application processor probe wake verified: thread={}, dispatch_cpu={}",
+        thread_id.raw(),
+        cpu_index
+    );
+}
+
 extern "C" fn ap_probe_a() -> ! {
     let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
     loop {
@@ -1006,6 +1193,30 @@ extern "C" fn ap_balance_probe() -> ! {
     loop {
         let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
         BALANCE_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
+        hlt();
+    }
+}
+
+extern "C" fn ap_block_wake_probe() -> ! {
+    loop {
+        let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
+        BLOCK_WAKE_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
+        if AUTOMATIC_REBALANCES.load(Ordering::Acquire) >= 2
+            && BLOCK_WAKE_STATE
+                .compare_exchange(
+                    BLOCK_WAKE_IDLE,
+                    BLOCK_WAKE_REQUESTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            serial_println!(
+                "application processor probe block requested: thread={}, cpu={}",
+                block_wake_probe_thread_id().raw(),
+                cpu_index
+            );
+        }
         hlt();
     }
 }

@@ -98,6 +98,12 @@ jobs:
           grep -F "rebalances=2" smp-migration-qemu.log
           test "$(grep -Fc 'application processor automatic rebalance requested:' smp-migration-qemu.log)" -eq 2
           test "$(grep -Fc 'application processor automatic rebalance verified:' smp-migration-qemu.log)" -eq 2
+          grep -F "application processor probe block requested:" smp-migration-qemu.log
+          grep -F "application processor probe blocked:" smp-migration-qemu.log
+          grep -F "application processor probe wake requested:" smp-migration-qemu.log
+          grep -E "application processor probe wake verified: .*dispatch_cpu=2" smp-migration-qemu.log
+          test "$(grep -Fc 'application processor probe blocked:' smp-migration-qemu.log)" -eq 1
+          test "$(grep -Fc 'application processor probe wake verified:' smp-migration-qemu.log)" -eq 1
 
       - name: Boot partition, FAT, and SMP smoke test in QEMU
         shell: bash
