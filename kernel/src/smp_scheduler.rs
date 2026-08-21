@@ -41,8 +41,7 @@ static AP_SCHEDULERS: [Mutex<ApScheduler>; MAX_CPUS] =
 static SMP_POLICY: Mutex<Option<SmpRoundRobin>> = Mutex::new(None);
 static PROBE_A_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static PROBE_B_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-static MIGRATION_PROBE_HEARTBEATS: [AtomicU64; MAX_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_CPUS];
+static MIGRATION_PROBE_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static MIGRATION_THREAD_ID: AtomicU64 = AtomicU64::new(0);
 static MIGRATION_FROM_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
 static MIGRATION_TO_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
@@ -274,7 +273,10 @@ impl ApScheduler {
                 return current_stack_pointer;
             };
             if current == 0 {
-                policy.cpu_snapshot(cpu).ok().and_then(|snapshot| snapshot.current)
+                policy
+                    .cpu_snapshot(cpu)
+                    .ok()
+                    .and_then(|snapshot| snapshot.current)
             } else {
                 match policy.tick(cpu) {
                     Ok(Some(switch)) => {
@@ -453,23 +455,11 @@ pub fn migrate_unstarted(
     let snapshot = if source_cpu < destination_cpu {
         let mut source = AP_SCHEDULERS[source_cpu].lock();
         let mut target = AP_SCHEDULERS[destination_cpu].lock();
-        migrate_locked(
-            &mut source,
-            &mut target,
-            source_cpu,
-            destination,
-            thread_id,
-        )?
+        migrate_locked(&mut source, &mut target, source_cpu, destination, thread_id)?
     } else {
         let mut target = AP_SCHEDULERS[destination_cpu].lock();
         let mut source = AP_SCHEDULERS[source_cpu].lock();
-        migrate_locked(
-            &mut source,
-            &mut target,
-            source_cpu,
-            destination,
-            thread_id,
-        )?
+        migrate_locked(&mut source, &mut target, source_cpu, destination, thread_id)?
     };
 
     MIGRATION_THREAD_ID.store(thread_id.raw(), Ordering::Release);
@@ -525,7 +515,9 @@ fn migrate_locked(
             .set_affinity(thread_id, CpuMask::single(destination))
             .map_err(MigrationError::Policy)?;
         if !placement.migrated || placement.cpu != destination {
-            return Err(MigrationError::Policy(scheduling::SmpError::AffinityViolation));
+            return Err(MigrationError::Policy(
+                scheduling::SmpError::AffinityViolation,
+            ));
         }
     }
 
