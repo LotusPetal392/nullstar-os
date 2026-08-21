@@ -19,13 +19,14 @@ use crate::{
     scheduler, serial_println,
 };
 
-use super::{smp_bringup, smp_runtime};
+use super::{ipi, smp_bringup, smp_runtime};
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 const PIT_COMMAND_PORT: u16 = 0x43;
 const PIT_CHANNEL_0_PORT: u16 = 0x40;
 const PIT_INPUT_HZ: u32 = 1_193_182;
+const MAX_SMP_CPUS: usize = 64;
 
 const CONTROLLER_UNINITIALIZED: u8 = 0;
 const CONTROLLER_PIC: u8 = 1;
@@ -279,6 +280,8 @@ pub fn init(
                 bsp_apic_id,
                 controller.local_apic_timer_initial_count,
             );
+            prepare_application_processor_mappings(madt, bsp_apic_id);
+
             let startup_timer = hpet.and_then(|hpet_info| {
                 match hpet_timer::Hpet::new(
                     hpet_info,
@@ -296,13 +299,16 @@ pub fn init(
                 }
             });
 
-            if let Err(error) = smp_bringup::bring_up_application_processors(
+            match smp_bringup::bring_up_application_processors(
                 madt,
                 bsp_apic_id,
                 physical_memory_offset,
                 startup_timer,
             ) {
-                serial_println!("SMP application processor bring-up unavailable: {error:?}");
+                Ok(_) => send_reschedule_probes(madt, bsp_apic_id, physical_memory_offset.as_u64()),
+                Err(error) => {
+                    serial_println!("SMP application processor bring-up unavailable: {error:?}");
+                }
             }
         }
     }
@@ -311,11 +317,26 @@ pub fn init(
     controller
 }
 
-/// Load the shared IDT on an application processor while leaving maskable
-/// interrupts disabled until its local APIC runtime state is ready.
+/// Load the shared IDT and activate this AP's local interrupt/timer runtime.
 pub fn init_application_processor() {
     x86_64::instructions::interrupts::disable();
     IDT.load();
+
+    match smp_runtime::activate_current_application_processor(TIMER_VECTOR, SPURIOUS_VECTOR) {
+        Ok(cpu_index) => {
+            serial_println!(
+                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}",
+                cpu_index,
+                TIMER_VECTOR,
+                RESCHEDULE_VECTOR
+            );
+            x86_64::instructions::interrupts::enable();
+        }
+        Err(error) => {
+            serial_println!("application processor runtime initialization failed: {error:?}");
+            hlt_loop();
+        }
+    }
 }
 
 pub fn timer_ticks() -> u64 {
@@ -338,6 +359,54 @@ pub fn wait_for_timer_tick() {
     let starting_tick = timer_ticks();
     while timer_ticks() == starting_tick {
         x86_64::instructions::hlt();
+    }
+}
+
+fn prepare_application_processor_mappings(madt: &MadtInfo, bsp_apic_id: u8) {
+    let mut cpu_index = 1_usize;
+    for processor in madt.processors() {
+        if !processor.enabled || processor.local_apic_id == u32::from(bsp_apic_id) {
+            continue;
+        }
+        if cpu_index < MAX_SMP_CPUS && processor.local_apic_id <= u32::from(u8::MAX) {
+            let apic_id = processor.local_apic_id as u8;
+            if let Err(error) = smp_runtime::prepare_cpu(cpu_index, apic_id) {
+                serial_println!(
+                    "application processor runtime mapping failed: cpu={}, lapic_id={}, error={error:?}",
+                    cpu_index,
+                    apic_id
+                );
+            }
+        }
+        cpu_index = cpu_index.saturating_add(1);
+    }
+}
+
+fn send_reschedule_probes(madt: &MadtInfo, bsp_apic_id: u8, physical_memory_offset: u64) {
+    let mut cpu_index = 1_usize;
+    for processor in madt.processors() {
+        if !processor.enabled || processor.local_apic_id == u32::from(bsp_apic_id) {
+            continue;
+        }
+        if cpu_index < MAX_SMP_CPUS
+            && processor.local_apic_id <= u32::from(u8::MAX)
+            && smp_runtime::is_online(cpu_index)
+        {
+            let apic_id = processor.local_apic_id as u8;
+            match ipi::send_fixed(physical_memory_offset, apic_id, RESCHEDULE_VECTOR) {
+                Ok(()) => serial_println!(
+                    "application processor reschedule IPI sent: cpu={}, lapic_id={}",
+                    cpu_index,
+                    apic_id
+                ),
+                Err(error) => serial_println!(
+                    "application processor reschedule IPI failed: cpu={}, lapic_id={}, error={error:?}",
+                    cpu_index,
+                    apic_id
+                ),
+            }
+        }
+        cpu_index = cpu_index.saturating_add(1);
     }
 }
 
