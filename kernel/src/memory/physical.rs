@@ -62,7 +62,7 @@ pub struct BootInfoFrameAllocator {
     allocated_frames: u64,
     usable_frames: u64,
     recycled_frames: Vec<PhysFrame<Size4KiB>>,
-    reserved_frames: Vec<PhysFrame<Size4KiB>>,
+    reserved_low_frame: Option<PhysFrame<Size4KiB>>,
     reclaimed_frames: u64,
     reused_frames: u64,
 }
@@ -86,7 +86,7 @@ impl BootInfoFrameAllocator {
             allocated_frames: 0,
             usable_frames,
             recycled_frames: Vec::new(),
-            reserved_frames: Vec::new(),
+            reserved_low_frame: None,
             reclaimed_frames: 0,
             reused_frames: 0,
         };
@@ -111,11 +111,11 @@ impl BootInfoFrameAllocator {
     }
 
     pub fn reserved_frame_count(&self) -> usize {
-        self.reserved_frames.len()
+        usize::from(self.reserved_low_frame.is_some())
     }
 
     pub fn reserved_low_frame(&self) -> Option<PhysFrame<Size4KiB>> {
-        self.reserved_frames.first().copied()
+        self.reserved_low_frame
     }
 
     pub fn reclaimed_frame_count(&self) -> u64 {
@@ -130,8 +130,14 @@ impl BootInfoFrameAllocator {
     /// allocation begins. SMP uses this to hold a low-memory page for the AP
     /// startup trampoline without allowing the heap or a process mapping to
     /// recycle that page later.
+    ///
+    /// This path must remain allocation-free because it runs before the kernel
+    /// heap is initialized.
     pub fn reserve_frame_below(&mut self, exclusive_limit: u64) -> Option<PhysFrame<Size4KiB>> {
-        if self.allocated_frames != 0 || !self.recycled_frames.is_empty() {
+        if self.allocated_frames != 0
+            || !self.recycled_frames.is_empty()
+            || self.reserved_low_frame.is_some()
+        {
             return None;
         }
 
@@ -164,7 +170,7 @@ impl BootInfoFrameAllocator {
         }
 
         let frame = selected?;
-        self.reserved_frames.push(frame);
+        self.reserved_low_frame = Some(frame);
         self.allocated_frames = self.allocated_frames.saturating_add(1);
         Some(frame)
     }
@@ -173,8 +179,9 @@ impl BootInfoFrameAllocator {
     /// has been removed and the frame is no longer reachable through an active
     /// CR3. Process reaping is the first caller of this interface.
     pub fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
-        debug_assert!(
-            !self.reserved_frames.contains(&frame),
+        debug_assert_ne!(
+            self.reserved_low_frame,
+            Some(frame),
             "reserved physical frame cannot be returned to the allocator"
         );
         debug_assert!(
@@ -202,7 +209,7 @@ impl BootInfoFrameAllocator {
                 let frame_address = self.next_frame_address;
                 self.next_frame_address = frame_address.saturating_add(FRAME_SIZE);
                 let frame = PhysFrame::containing_address(PhysAddr::new(frame_address));
-                if self.reserved_frames.contains(&frame) {
+                if self.reserved_low_frame == Some(frame) {
                     continue;
                 }
                 return Some(frame);
