@@ -2,9 +2,8 @@
 //!
 //! Secondary CPUs own independent architecture contexts and stacks, while a
 //! shared architecture-neutral SMP policy owns CPU placement, affinity, and
-//! per-CPU round-robin queues. Cross-CPU context transfer is deliberately
-//! restricted to disarmed AP lanes in this slice so a saved context can never
-//! move while it is executing.
+//! per-CPU round-robin queues. Quiescent and live migration both transfer the
+//! owned saved context only at scheduler-safe boundaries.
 
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
@@ -32,6 +31,10 @@ const AP_KERNEL_STACK_SIZE: usize = 64 * 1024;
 const AP_KERNEL_STACK_WORDS: usize = AP_KERNEL_STACK_SIZE / size_of::<u128>();
 const INITIAL_RFLAGS: u64 = 0x202;
 const NO_MIGRATION_CPU: u8 = u8::MAX;
+const LIVE_MIGRATION_IDLE: u8 = 0;
+const LIVE_MIGRATION_PENDING: u8 = 1;
+const LIVE_MIGRATION_TRANSFERRED: u8 = 2;
+const LIVE_MIGRATION_VERIFIED: u8 = 3;
 // Probe-only identities live in a reserved high range until live kernel threads
 // are backed directly by ProcessTable thread identities.
 const AP_PROBE_THREAD_ID_BASE: u64 = 1_u64 << 63;
@@ -46,6 +49,11 @@ static MIGRATION_THREAD_ID: AtomicU64 = AtomicU64::new(0);
 static MIGRATION_FROM_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
 static MIGRATION_TO_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
 static MIGRATION_VERIFIED: AtomicBool = AtomicBool::new(false);
+static LIVE_MIGRATION_THREAD_ID: AtomicU64 = AtomicU64::new(0);
+static LIVE_MIGRATION_FROM_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
+static LIVE_MIGRATION_TO_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
+static LIVE_MIGRATION_STATE: AtomicU8 = AtomicU8::new(LIVE_MIGRATION_IDLE);
+static LIVE_MIGRATION_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
 global_asm!(
     r#"
@@ -80,10 +88,13 @@ pub enum MigrationError {
     InvalidCpu,
     OfflineDestination,
     CpuArmed,
+    CpuNotArmed,
+    MigrationPending,
     PolicyUnavailable,
     Policy(scheduling::SmpError),
     ContextNotFound,
     DestinationConflict,
+    NoReplacement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +104,13 @@ pub struct MigrationSnapshot {
     pub to_cpu: usize,
     pub source_task_count: usize,
     pub destination_task_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveMigrationRequest {
+    pub thread_id: ThreadId,
+    pub from_cpu: usize,
+    pub to_cpu: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -110,6 +128,8 @@ pub struct Snapshot {
     pub probe_a_heartbeats: u64,
     pub probe_b_heartbeats: u64,
     pub migration_probe_heartbeats: u64,
+    pub live_migrations_in: u64,
+    pub live_migrations_out: u64,
 }
 
 struct ApTask {
@@ -191,6 +211,8 @@ struct ApScheduler {
     timer_ticks: u64,
     context_switches: u64,
     policy_preemptions: u64,
+    live_migrations_in: u64,
+    live_migrations_out: u64,
 }
 
 impl ApScheduler {
@@ -203,6 +225,8 @@ impl ApScheduler {
             timer_ticks: 0,
             context_switches: 0,
             policy_preemptions: 0,
+            live_migrations_in: 0,
+            live_migrations_out: 0,
         }
     }
 
@@ -263,6 +287,12 @@ impl ApScheduler {
         self.tasks[current].stack_pointer = current_stack_pointer;
         self.tasks[current].runtime_ticks = self.tasks[current].runtime_ticks.saturating_add(1);
         self.timer_ticks = self.timer_ticks.saturating_add(1);
+
+        if let Some(next_stack_pointer) =
+            try_live_migrate_current(cpu_index, self, current_stack_pointer)
+        {
+            return next_stack_pointer;
+        }
 
         let Some(cpu) = CpuId::from_raw(cpu_index) else {
             return current_stack_pointer;
@@ -362,6 +392,8 @@ impl ApScheduler {
             probe_a_heartbeats: PROBE_A_HEARTBEATS[cpu_index].load(Ordering::Acquire),
             probe_b_heartbeats,
             migration_probe_heartbeats: migration_heartbeats,
+            live_migrations_in: self.live_migrations_in,
+            live_migrations_out: self.live_migrations_out,
         }
     }
 }
@@ -532,6 +564,179 @@ fn migrate_locked(
     })
 }
 
+pub fn migration_probe_thread_id() -> ThreadId {
+    probe_thread_id(1, 2)
+}
+
+pub fn request_live_migration(
+    thread_id: ThreadId,
+    destination_cpu: usize,
+) -> Result<LiveMigrationRequest, MigrationError> {
+    if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_PENDING
+        || LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_TRANSFERRED
+    {
+        return Err(MigrationError::MigrationPending);
+    }
+    let destination = CpuId::from_raw(destination_cpu).ok_or(MigrationError::InvalidCpu)?;
+    if destination_cpu == 0 || !smp_runtime::is_online(destination_cpu) {
+        return Err(MigrationError::OfflineDestination);
+    }
+
+    let source_cpu = {
+        let policy_guard = SMP_POLICY.lock();
+        let policy = policy_guard
+            .as_ref()
+            .ok_or(MigrationError::PolicyUnavailable)?;
+        policy
+            .placement(thread_id)
+            .map_err(MigrationError::Policy)?
+            .cpu
+            .raw()
+    };
+    if source_cpu == 0 || source_cpu >= MAX_CPUS || source_cpu == destination_cpu {
+        return Err(MigrationError::InvalidCpu);
+    }
+
+    {
+        let source = AP_SCHEDULERS[source_cpu].lock();
+        let target = AP_SCHEDULERS[destination_cpu].lock();
+        if !source.running || !target.running || !source.armed || !target.armed {
+            return Err(MigrationError::CpuNotArmed);
+        }
+        if !source
+            .tasks
+            .iter()
+            .any(|task| task.thread_id == Some(thread_id))
+        {
+            return Err(MigrationError::ContextNotFound);
+        }
+        if target
+            .tasks
+            .iter()
+            .any(|task| task.thread_id == Some(thread_id))
+        {
+            return Err(MigrationError::DestinationConflict);
+        }
+    }
+
+    LIVE_MIGRATION_THREAD_ID.store(thread_id.raw(), Ordering::Release);
+    LIVE_MIGRATION_FROM_CPU.store(source_cpu as u8, Ordering::Release);
+    LIVE_MIGRATION_TO_CPU.store(destination.raw() as u8, Ordering::Release);
+    LIVE_MIGRATION_NOTIFIED.store(false, Ordering::Release);
+    LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_PENDING, Ordering::Release);
+    Ok(LiveMigrationRequest {
+        thread_id,
+        from_cpu: source_cpu,
+        to_cpu: destination.raw(),
+    })
+}
+
+pub fn notify_reschedule(cpu_index: usize) {
+    if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_PENDING
+        && LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire) != NO_MIGRATION_CPU
+        && usize::from(LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire)) == cpu_index
+    {
+        LIVE_MIGRATION_NOTIFIED.store(true, Ordering::Release);
+    }
+}
+
+pub fn live_migration_transferred() -> bool {
+    LIVE_MIGRATION_STATE.load(Ordering::Acquire) >= LIVE_MIGRATION_TRANSFERRED
+}
+
+pub fn live_migration_verified() -> bool {
+    LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_VERIFIED
+}
+
+pub fn live_migration_request() -> Option<LiveMigrationRequest> {
+    let state = LIVE_MIGRATION_STATE.load(Ordering::Acquire);
+    if state == LIVE_MIGRATION_IDLE {
+        return None;
+    }
+    let thread_id = ThreadId::from_raw(LIVE_MIGRATION_THREAD_ID.load(Ordering::Acquire))?;
+    let from_cpu = LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire);
+    let to_cpu = LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire);
+    if from_cpu == NO_MIGRATION_CPU || to_cpu == NO_MIGRATION_CPU {
+        return None;
+    }
+    Some(LiveMigrationRequest {
+        thread_id,
+        from_cpu: usize::from(from_cpu),
+        to_cpu: usize::from(to_cpu),
+    })
+}
+
+fn try_live_migrate_current(
+    source_cpu: usize,
+    source: &mut ApScheduler,
+    current_stack_pointer: usize,
+) -> Option<usize> {
+    if LIVE_MIGRATION_STATE.load(Ordering::Acquire) != LIVE_MIGRATION_PENDING
+        || !LIVE_MIGRATION_NOTIFIED.load(Ordering::Acquire)
+        || usize::from(LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire)) != source_cpu
+    {
+        return None;
+    }
+    let thread_id = ThreadId::from_raw(LIVE_MIGRATION_THREAD_ID.load(Ordering::Acquire))?;
+    if source.tasks.get(source.current_task)?.thread_id != Some(thread_id) {
+        return None;
+    }
+    let destination_cpu = usize::from(LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire));
+    if destination_cpu == 0 || destination_cpu >= MAX_CPUS || destination_cpu == source_cpu {
+        return None;
+    }
+    let destination = CpuId::from_raw(destination_cpu)?;
+    let mut target = AP_SCHEDULERS[destination_cpu].try_lock()?;
+    if !target.running || !target.armed {
+        return None;
+    }
+    if target
+        .tasks
+        .iter()
+        .any(|task| task.thread_id == Some(thread_id))
+    {
+        return None;
+    }
+
+    let source_index = source.current_task;
+    source.tasks[source_index].stack_pointer = current_stack_pointer;
+
+    let replacement = {
+        let mut policy_guard = SMP_POLICY.try_lock()?;
+        let policy = policy_guard.as_mut()?;
+        let placement = policy
+            .set_affinity(thread_id, CpuMask::single(destination))
+            .ok()?;
+        if !placement.migrated || placement.cpu != destination {
+            return None;
+        }
+        let source_id = CpuId::from_raw(source_cpu)?;
+        policy.cpu_snapshot(source_id).ok()?.current?
+    };
+
+    let replacement_index = source
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == Some(replacement))?;
+    let replacement_stack_pointer = source.tasks[replacement_index].stack_pointer;
+    if replacement_stack_pointer == 0 {
+        return None;
+    }
+
+    let task = source.tasks.remove(source_index);
+    target.tasks.push(task);
+    let replacement_index = source
+        .tasks
+        .iter()
+        .position(|task| task.thread_id == Some(replacement))?;
+    source.current_task = replacement_index;
+    source.context_switches = source.context_switches.saturating_add(1);
+    source.live_migrations_out = source.live_migrations_out.saturating_add(1);
+    target.live_migrations_in = target.live_migrations_in.saturating_add(1);
+    LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_TRANSFERRED, Ordering::Release);
+    Some(replacement_stack_pointer)
+}
+
 pub fn on_timer_interrupt(cpu_index: usize, current_stack_pointer: usize) -> usize {
     if cpu_index == 0 || cpu_index >= MAX_CPUS || preemption::is_disabled() {
         return current_stack_pointer;
@@ -574,9 +779,20 @@ extern "C" fn ap_probe_b() -> ! {
 }
 
 extern "C" fn ap_migration_probe() -> ! {
-    let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
     loop {
+        let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
         MIGRATION_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
+        if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_TRANSFERRED
+            && LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire) != NO_MIGRATION_CPU
+            && usize::from(LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire)) == cpu_index
+        {
+            let _ = LIVE_MIGRATION_STATE.compare_exchange(
+                LIVE_MIGRATION_TRANSFERRED,
+                LIVE_MIGRATION_VERIFIED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         hlt();
     }
 }
@@ -607,5 +823,12 @@ mod tests {
         assert!(migrated.migrated);
         assert_eq!(migrated.cpu, cpu2);
         assert_eq!(policy.placement(thread).unwrap().cpu, cpu2);
+    }
+
+    #[test]
+    fn live_migration_state_codes_are_monotonic() {
+        assert!(LIVE_MIGRATION_IDLE < LIVE_MIGRATION_PENDING);
+        assert!(LIVE_MIGRATION_PENDING < LIVE_MIGRATION_TRANSFERRED);
+        assert!(LIVE_MIGRATION_TRANSFERRED < LIVE_MIGRATION_VERIFIED);
     }
 }
