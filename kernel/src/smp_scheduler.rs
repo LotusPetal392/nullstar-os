@@ -1,7 +1,7 @@
 //! Application-processor kernel scheduling for the first live SMP workload.
 //!
 //! The bootstrap processor still owns the existing userspace-capable scheduler.
-//! Each online AP gets an independent kernel-only round-robin lane here.  This
+//! Each online AP gets an independent kernel-only round-robin lane here. This
 //! lets secondary CPUs perform real context switches without sharing the BSP's
 //! single `current_task`, address-space, or privilege-stack state prematurely.
 
@@ -63,6 +63,7 @@ pub enum InitError {
 pub struct Snapshot {
     pub cpu_index: usize,
     pub running: bool,
+    pub armed: bool,
     pub task_count: usize,
     pub current_task: usize,
     pub timer_ticks: u64,
@@ -146,6 +147,7 @@ struct ApScheduler {
     tasks: Vec<ApTask>,
     current_task: usize,
     running: bool,
+    armed: bool,
     ticks_in_quantum: u64,
     timer_ticks: u64,
     context_switches: u64,
@@ -157,6 +159,7 @@ impl ApScheduler {
             tasks: Vec::new(),
             current_task: 0,
             running: false,
+            armed: false,
             ticks_in_quantum: 0,
             timer_ticks: 0,
             context_switches: 0,
@@ -174,8 +177,13 @@ impl ApScheduler {
         Ok(())
     }
 
+    fn arm(&mut self) {
+        self.armed = true;
+        self.ticks_in_quantum = 0;
+    }
+
     fn on_timer_interrupt(&mut self, current_stack_pointer: usize) -> usize {
-        if !self.running || self.tasks.len() < 2 {
+        if !self.running || !self.armed || self.tasks.len() < 2 {
             return current_stack_pointer;
         }
 
@@ -227,6 +235,7 @@ impl ApScheduler {
         Snapshot {
             cpu_index,
             running: self.running,
+            armed: self.armed,
             task_count: self.tasks.len(),
             current_task: self.current_task,
             timer_ticks: self.timer_ticks,
@@ -270,6 +279,18 @@ pub fn init_application_processor(cpu_index: usize) -> Result<Snapshot, InitErro
     let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
     scheduler.initialize()?;
     Ok(scheduler.snapshot(cpu_index))
+}
+
+pub fn arm(cpu_index: usize) -> Result<(), InitError> {
+    if cpu_index == 0 || cpu_index >= MAX_CPUS {
+        return Err(InitError::InvalidCpu);
+    }
+    let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
+    if !scheduler.running {
+        return Err(InitError::InvalidCpu);
+    }
+    scheduler.arm();
+    Ok(())
 }
 
 pub fn on_timer_interrupt(cpu_index: usize, current_stack_pointer: usize) -> usize {
