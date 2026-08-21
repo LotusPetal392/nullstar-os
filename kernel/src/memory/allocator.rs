@@ -8,8 +8,15 @@ use x86_64::{
     VirtAddr,
     instructions::interrupts,
     structures::paging::{
-        FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
+        FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, Size4KiB,
+        mapper::MapToError,
     },
+};
+
+use crate::{
+    arch::x86_64::ap_trampoline::ApTrampoline,
+    memory::{BootInfoFrameAllocator, physical_memory_offset},
+    serial_println,
 };
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
@@ -22,8 +29,8 @@ static ALLOCATOR: LockedAllocator = LockedAllocator::new();
 
 /// Maps the virtual heap and initializes the global linked-list allocator.
 pub fn init_heap(
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    mapper: &mut OffsetPageTable<'static>,
+    frame_allocator: &mut BootInfoFrameAllocator,
 ) -> Result<(), MapToError<Size4KiB>> {
     let heap_start = VirtAddr::new(HEAP_START as u64);
     let heap_end = heap_start + (HEAP_SIZE - 1) as u64;
@@ -43,6 +50,25 @@ pub fn init_heap(
 
     unsafe {
         ALLOCATOR.init(HEAP_START, HEAP_SIZE);
+    }
+
+    match (
+        frame_allocator.reserved_low_frame(),
+        physical_memory_offset(),
+    ) {
+        (Some(frame), Some(offset)) => {
+            match ApTrampoline::install_global(frame, offset, mapper, frame_allocator) {
+                Ok(trampoline) => serial_println!(
+                    "SMP AP trampoline installed: physical={:#x}, vector={:#x}",
+                    trampoline.physical_address(),
+                    trampoline.startup_vector()
+                ),
+                Err(error) => {
+                    serial_println!("SMP AP trampoline installation failed: {error:?}")
+                }
+            }
+        }
+        _ => serial_println!("SMP AP trampoline unavailable: no reserved low-memory frame"),
     }
 
     Ok(())
