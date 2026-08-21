@@ -15,9 +15,11 @@ and the [Architecture roadmap](roadmap.md).
 
 ## Why this is a near-term milestone
 
-The current kernel has a working scheduler and preemption model, but it is fundamentally
-single-CPU. Preemption depth and scheduler state can therefore be shared globally today;
-they must become per-CPU before multiple cores execute kernel code concurrently.
+The current kernel brings application processors online with CPU-local timer interrupts,
+preemption depth, kernel contexts, and round-robin scheduler lanes. Affinity-safe live
+migration and a bounded periodic coordinator can rebalance kernel probe workloads between
+APs. The bootstrap userspace scheduler remains separate, so the next integration step is
+to back these live contexts with ordinary process/thread identities and lifecycle state.
 
 The process model already distinguishes a process from a thread: a process is a security
 and resource container, while a thread is a schedulable execution context. The ABI must
@@ -75,6 +77,16 @@ Move scheduling from a single global execution context to scalable per-CPU sched
 The initial design should favor predictable behavior and bounded synchronization over
 maximum throughput. Cache-aware placement can be refined after the basic SMP scheduler
 is correct and measurable.
+
+The implemented AP scheduler now has per-CPU run queues, explicit affinity, live migration,
+deterministic rebalance planning, and a single timer-driven coordinator that evaluates the
+policy at a fixed interval. Migration planning runs outside the triggering CPU's scheduler
+lock, only one migration may be active, and completion is recorded when the destination
+scheduler dispatches the transferred context. Repeated passes converge larger imbalances
+one affinity-safe move at a time, with checks, requests, completions, and delivery failures
+retained as bounded counters. The live workload still uses reserved probe thread identities;
+process-table integration, blocked-thread migration, and general wakeup/idle balancing remain
+part of this milestone.
 
 ### 4. Synchronization and concurrent execution
 
