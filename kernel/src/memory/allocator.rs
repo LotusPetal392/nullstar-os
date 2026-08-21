@@ -8,8 +8,7 @@ use x86_64::{
     VirtAddr,
     instructions::interrupts,
     structures::paging::{
-        FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, Size4KiB,
-        mapper::MapToError,
+        FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, Size4KiB, mapper::MapToError,
     },
 };
 
