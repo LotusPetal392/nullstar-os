@@ -74,7 +74,7 @@ jobs:
           grep -F "application processor reschedule IPI verified: cpu=1" smp-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" smp-qemu.log
 
-      - name: Boot three-CPU live affinity and migration acceptance check
+      - name: Boot three-CPU live migration and balancing acceptance check
         shell: bash
         env:
           NULLSTAR_QEMU_CPUS: "3"
@@ -90,6 +90,8 @@ jobs:
           grep -F "application processor live migration requested:" smp-migration-qemu.log
           grep -F "from_cpu=2, to_cpu=1" smp-migration-qemu.log
           grep -F "application processor live migration verified:" smp-migration-qemu.log
+          grep -F "application processor automatic rebalance requested:" smp-migration-qemu.log
+          grep -F "application processor automatic rebalance verified:" smp-migration-qemu.log
 
       - name: Boot partition, FAT, and SMP smoke test in QEMU
         shell: bash
