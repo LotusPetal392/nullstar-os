@@ -252,7 +252,8 @@ mod tests {
             records.push(thread(raw, process(1)));
         }
 
-        let snapshot = KernelSnapshot::from_parts(1, &[], MemorySummary::ZERO, &[], &records, &[], &[]);
+        let snapshot =
+            KernelSnapshot::from_parts(1, &[], MemorySummary::ZERO, &[], &records, &[], &[]);
 
         assert_eq!(snapshot.thread_count(), MAX_SNAPSHOT_RECORDS);
     }
