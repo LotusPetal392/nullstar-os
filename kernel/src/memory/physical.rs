@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind, MemoryRegions};
 use x86_64::{
@@ -10,6 +11,9 @@ use x86_64::{
 };
 
 pub const FRAME_SIZE: u64 = Size4KiB::SIZE;
+const SMP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
+
+static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Provides access to the active level 4 page table through the bootloader's
 /// physical-memory mapping.
@@ -20,8 +24,14 @@ pub const FRAME_SIZE: u64 = Size4KiB::SIZE;
 /// complete physical-memory mapping and that this function is called at most
 /// once for the active page-table hierarchy.
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset.as_u64(), Ordering::Release);
     let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
+}
+
+pub fn physical_memory_offset() -> Option<VirtAddr> {
+    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::Acquire);
+    (offset != 0).then(|| VirtAddr::new(offset))
 }
 
 /// Returns a mutable reference to the currently active level 4 page table.
@@ -69,7 +79,7 @@ impl BootInfoFrameAllocator {
         let memory_regions: &'static [MemoryRegion] = memory_regions;
         let usable_frames = memory_regions.iter().map(usable_frame_count).sum();
 
-        Self {
+        let mut allocator = Self {
             memory_regions,
             next_region: 0,
             next_frame_address: 0,
@@ -79,7 +89,9 @@ impl BootInfoFrameAllocator {
             reserved_frames: Vec::new(),
             reclaimed_frames: 0,
             reused_frames: 0,
-        }
+        };
+        let _ = allocator.reserve_frame_below(SMP_TRAMPOLINE_LIMIT);
+        allocator
     }
 
     pub fn usable_frame_count(&self) -> u64 {
@@ -100,6 +112,10 @@ impl BootInfoFrameAllocator {
 
     pub fn reserved_frame_count(&self) -> usize {
         self.reserved_frames.len()
+    }
+
+    pub fn reserved_low_frame(&self) -> Option<PhysFrame<Size4KiB>> {
+        self.reserved_frames.first().copied()
     }
 
     pub fn reclaimed_frame_count(&self) -> u64 {
