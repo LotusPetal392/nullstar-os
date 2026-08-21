@@ -36,6 +36,9 @@ jobs:
       - name: Check formatting
         run: cargo +nightly-2026-02-01 fmt --all -- --check
 
+      - name: Run kernel policy tests
+        run: cargo +nightly-2026-02-01 test --locked -p kernel
+
       - name: Install QEMU
         run: |
           if ! sudo apt-get install --yes --quiet --no-install-recommends qemu-system-x86; then

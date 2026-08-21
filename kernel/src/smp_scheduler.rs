@@ -1,9 +1,10 @@
-//! Application-processor kernel scheduling for the first live SMP workload.
+//! Application-processor kernel scheduling for the live SMP workload.
 //!
-//! The bootstrap processor still owns the existing userspace-capable scheduler.
-//! Each online AP gets an independent kernel-only round-robin lane here. This
-//! lets secondary CPUs perform real context switches without sharing the BSP's
-//! single `current_task`, address-space, or privilege-stack state prematurely.
+//! Secondary CPUs own independent architecture contexts and stacks, while the
+//! queue/quantum semantics come from the same architecture-neutral round-robin
+//! policy used by the execution foundation. This removes the duplicate AP-only
+//! scheduling algorithm and gives later affinity/migration work one canonical
+//! run-queue implementation to extend.
 
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
@@ -18,13 +19,20 @@ use x86_64::instructions::{
     segmentation::{CS, SS, Segment},
 };
 
-use crate::{arch::x86_64::smp_runtime, preemption};
+use crate::{
+    arch::x86_64::smp_runtime,
+    preemption,
+    process_model::ThreadId,
+    scheduling::{self, RoundRobin},
+};
 
 const MAX_CPUS: usize = 64;
 const AP_KERNEL_STACK_SIZE: usize = 64 * 1024;
 const AP_KERNEL_STACK_WORDS: usize = AP_KERNEL_STACK_SIZE / size_of::<u128>();
-const DEFAULT_QUANTUM_TICKS: u64 = 5;
 const INITIAL_RFLAGS: u64 = 0x202;
+// Probe-only identities live in a reserved high range until live kernel threads
+// are backed directly by ProcessTable thread identities.
+const AP_PROBE_THREAD_ID_BASE: u64 = 1_u64 << 63;
 
 static AP_SCHEDULERS: [Mutex<ApScheduler>; MAX_CPUS] =
     [const { Mutex::new(ApScheduler::new()) }; MAX_CPUS];
@@ -55,6 +63,7 @@ pub enum InitError {
     InvalidCpu,
     AlreadyInitialized,
     StackLayoutInvalid,
+    Policy(scheduling::Error),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,13 +75,16 @@ pub struct Snapshot {
     pub current_task: usize,
     pub timer_ticks: u64,
     pub context_switches: u64,
+    pub policy_current_thread: Option<u64>,
+    pub policy_runnable_count: usize,
+    pub policy_preemptions: u64,
     pub probe_a_heartbeats: u64,
     pub probe_b_heartbeats: u64,
 }
 
 struct ApTask {
+    thread_id: Option<ThreadId>,
     stack_pointer: usize,
-    runnable: bool,
     _stack: Option<Box<[u128]>>,
     runtime_ticks: u64,
 }
@@ -80,14 +92,14 @@ struct ApTask {
 impl ApTask {
     const fn bootstrap() -> Self {
         Self {
+            thread_id: None,
             stack_pointer: 0,
-            runnable: true,
             _stack: None,
             runtime_ticks: 0,
         }
     }
 
-    fn kernel(entry: ThreadEntry) -> Result<Self, InitError> {
+    fn kernel(thread_id: ThreadId, entry: ThreadEntry) -> Result<Self, InitError> {
         let mut stack = vec![0_u128; AP_KERNEL_STACK_WORDS].into_boxed_slice();
         let stack_start = stack.as_mut_ptr() as usize;
         let stack_bytes = stack
@@ -133,8 +145,8 @@ impl ApTask {
         unsafe { (stack_pointer as *mut SavedContext).write(context) };
 
         Ok(Self {
+            thread_id: Some(thread_id),
             stack_pointer,
-            runnable: true,
             _stack: Some(stack),
             runtime_ticks: 0,
         })
@@ -146,9 +158,9 @@ struct ApScheduler {
     current_task: usize,
     running: bool,
     armed: bool,
-    ticks_in_quantum: u64,
     timer_ticks: u64,
     context_switches: u64,
+    policy: RoundRobin,
 }
 
 impl ApScheduler {
@@ -158,26 +170,30 @@ impl ApScheduler {
             current_task: 0,
             running: false,
             armed: false,
-            ticks_in_quantum: 0,
             timer_ticks: 0,
             context_switches: 0,
+            policy: RoundRobin::with_default_quantum(),
         }
     }
 
-    fn initialize(&mut self) -> Result<(), InitError> {
+    fn initialize(&mut self, cpu_index: usize) -> Result<(), InitError> {
         if self.running || !self.tasks.is_empty() {
             return Err(InitError::AlreadyInitialized);
         }
+
+        let probe_a = probe_thread_id(cpu_index, 0);
+        let probe_b = probe_thread_id(cpu_index, 1);
         self.tasks.push(ApTask::bootstrap());
-        self.tasks.push(ApTask::kernel(ap_probe_a)?);
-        self.tasks.push(ApTask::kernel(ap_probe_b)?);
+        self.tasks.push(ApTask::kernel(probe_a, ap_probe_a)?);
+        self.tasks.push(ApTask::kernel(probe_b, ap_probe_b)?);
+        self.policy.admit(probe_a).map_err(InitError::Policy)?;
+        self.policy.admit(probe_b).map_err(InitError::Policy)?;
         self.running = true;
         Ok(())
     }
 
     fn arm(&mut self) {
         self.armed = true;
-        self.ticks_in_quantum = 0;
     }
 
     fn on_timer_interrupt(&mut self, current_stack_pointer: usize) -> usize {
@@ -189,25 +205,30 @@ impl ApScheduler {
         self.tasks[current].stack_pointer = current_stack_pointer;
         self.tasks[current].runtime_ticks = self.tasks[current].runtime_ticks.saturating_add(1);
         self.timer_ticks = self.timer_ticks.saturating_add(1);
-        self.ticks_in_quantum = self.ticks_in_quantum.saturating_add(1);
 
-        if self.ticks_in_quantum < DEFAULT_QUANTUM_TICKS {
-            return current_stack_pointer;
+        if current == 0 {
+            let Some(thread) = self.policy.snapshot().current else {
+                return current_stack_pointer;
+            };
+            return self.switch_to_thread(thread, current_stack_pointer);
         }
-        self.ticks_in_quantum = 0;
 
-        let Some(next) = self.next_runnable_after(current) else {
+        let Some(switch) = self.policy.tick() else {
             return current_stack_pointer;
         };
-        if next == current {
-            return current_stack_pointer;
-        }
+        self.switch_to_thread(switch.to, current_stack_pointer)
+    }
 
-        // Once the AP has entered its first scheduled kernel thread, retire the
-        // bootstrap rendezvous loop. The lane then alternates only among real
-        // schedulable tasks.
-        if current == 0 {
-            self.tasks[0].runnable = false;
+    fn switch_to_thread(&mut self, thread: ThreadId, current_stack_pointer: usize) -> usize {
+        let Some(next) = self
+            .tasks
+            .iter()
+            .position(|task| task.thread_id == Some(thread))
+        else {
+            return current_stack_pointer;
+        };
+        if next == self.current_task || self.tasks[next].stack_pointer == 0 {
+            return current_stack_pointer;
         }
 
         self.current_task = next;
@@ -215,21 +236,8 @@ impl ApScheduler {
         self.tasks[next].stack_pointer
     }
 
-    fn next_runnable_after(&self, current: usize) -> Option<usize> {
-        if self.tasks.is_empty() {
-            return None;
-        }
-        for offset in 1..=self.tasks.len() {
-            let index = (current + offset) % self.tasks.len();
-            let task = &self.tasks[index];
-            if task.runnable && task.stack_pointer != 0 {
-                return Some(index);
-            }
-        }
-        None
-    }
-
     fn snapshot(&self, cpu_index: usize) -> Snapshot {
+        let policy = self.policy.snapshot();
         Snapshot {
             cpu_index,
             running: self.running,
@@ -238,6 +246,9 @@ impl ApScheduler {
             current_task: self.current_task,
             timer_ticks: self.timer_ticks,
             context_switches: self.context_switches,
+            policy_current_thread: policy.current.map(ThreadId::raw),
+            policy_runnable_count: policy.runnable_count,
+            policy_preemptions: policy.preemptions,
             probe_a_heartbeats: PROBE_A_HEARTBEATS[cpu_index].load(Ordering::Acquire),
             probe_b_heartbeats: PROBE_B_HEARTBEATS[cpu_index].load(Ordering::Acquire),
         }
@@ -275,7 +286,7 @@ pub fn init_application_processor(cpu_index: usize) -> Result<Snapshot, InitErro
     PROBE_A_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     PROBE_B_HEARTBEATS[cpu_index].store(0, Ordering::Release);
     let mut scheduler = AP_SCHEDULERS[cpu_index].lock();
-    scheduler.initialize()?;
+    scheduler.initialize(cpu_index)?;
     Ok(scheduler.snapshot(cpu_index))
 }
 
@@ -307,6 +318,11 @@ pub fn snapshot(cpu_index: usize) -> Snapshot {
     AP_SCHEDULERS[cpu_index].lock().snapshot(cpu_index)
 }
 
+fn probe_thread_id(cpu_index: usize, slot: u8) -> ThreadId {
+    let raw = AP_PROBE_THREAD_ID_BASE | ((cpu_index as u64) << 8) | u64::from(slot) + 1;
+    ThreadId::from_raw(raw).expect("AP probe thread identity must be nonzero")
+}
+
 fn thread_entry_trampoline_address() -> u64 {
     nullstar_ap_thread_entry_trampoline as *const () as usize as u64
 }
@@ -324,5 +340,36 @@ extern "C" fn ap_probe_b() -> ! {
     loop {
         PROBE_B_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
         hlt();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_thread_ids_are_cpu_local_and_nonzero() {
+        let cpu1_a = probe_thread_id(1, 0);
+        let cpu1_b = probe_thread_id(1, 1);
+        let cpu2_a = probe_thread_id(2, 0);
+        assert_ne!(cpu1_a, cpu1_b);
+        assert_ne!(cpu1_a, cpu2_a);
+        assert_ne!(cpu1_a.raw(), 0);
+    }
+
+    #[test]
+    fn architecture_neutral_policy_rotates_live_ap_threads() {
+        let mut policy = RoundRobin::with_default_quantum();
+        let a = probe_thread_id(1, 0);
+        let b = probe_thread_id(1, 1);
+        policy.admit(a).unwrap();
+        policy.admit(b).unwrap();
+        assert_eq!(policy.snapshot().current, Some(a));
+        for _ in 0..scheduling::DEFAULT_QUANTUM_TICKS - 1 {
+            assert_eq!(policy.tick(), None);
+        }
+        let switch = policy.tick().expect("quantum should rotate the queue");
+        assert_eq!(switch.from, Some(a));
+        assert_eq!(switch.to, b);
     }
 }
