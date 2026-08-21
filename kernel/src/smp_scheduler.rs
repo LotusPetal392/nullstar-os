@@ -53,7 +53,7 @@ static LIVE_MIGRATION_THREAD_ID: AtomicU64 = AtomicU64::new(0);
 static LIVE_MIGRATION_FROM_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
 static LIVE_MIGRATION_TO_CPU: AtomicU8 = AtomicU8::new(NO_MIGRATION_CPU);
 static LIVE_MIGRATION_STATE: AtomicU8 = AtomicU8::new(LIVE_MIGRATION_IDLE);
-static LIVE_MIGRATION_NOTIFIED: AtomicBool = AtomicBool::new(false);
+static LIVE_MIGRATION_RESCHEDULE_BASELINE: AtomicU64 = AtomicU64::new(0);
 
 global_asm!(
     r#"
@@ -622,22 +622,16 @@ pub fn request_live_migration(
     LIVE_MIGRATION_THREAD_ID.store(thread_id.raw(), Ordering::Release);
     LIVE_MIGRATION_FROM_CPU.store(source_cpu as u8, Ordering::Release);
     LIVE_MIGRATION_TO_CPU.store(destination.raw() as u8, Ordering::Release);
-    LIVE_MIGRATION_NOTIFIED.store(false, Ordering::Release);
+    LIVE_MIGRATION_RESCHEDULE_BASELINE.store(
+        smp_runtime::reschedule_ipis(source_cpu),
+        Ordering::Release,
+    );
     LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_PENDING, Ordering::Release);
     Ok(LiveMigrationRequest {
         thread_id,
         from_cpu: source_cpu,
         to_cpu: destination.raw(),
     })
-}
-
-pub fn notify_reschedule(cpu_index: usize) {
-    if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_PENDING
-        && LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire) != NO_MIGRATION_CPU
-        && usize::from(LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire)) == cpu_index
-    {
-        LIVE_MIGRATION_NOTIFIED.store(true, Ordering::Release);
-    }
 }
 
 pub fn live_migration_transferred() -> bool {
@@ -672,8 +666,9 @@ fn try_live_migrate_current(
     current_stack_pointer: usize,
 ) -> Option<usize> {
     if LIVE_MIGRATION_STATE.load(Ordering::Acquire) != LIVE_MIGRATION_PENDING
-        || !LIVE_MIGRATION_NOTIFIED.load(Ordering::Acquire)
         || usize::from(LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire)) != source_cpu
+        || smp_runtime::reschedule_ipis(source_cpu)
+            <= LIVE_MIGRATION_RESCHEDULE_BASELINE.load(Ordering::Acquire)
     {
         return None;
     }
@@ -704,14 +699,30 @@ fn try_live_migrate_current(
     let replacement = {
         let mut policy_guard = SMP_POLICY.try_lock()?;
         let policy = policy_guard.as_mut()?;
+        let source_id = CpuId::from_raw(source_cpu)?;
         let placement = policy
             .set_affinity(thread_id, CpuMask::single(destination))
             .ok()?;
         if !placement.migrated || placement.cpu != destination {
             return None;
         }
-        let source_id = CpuId::from_raw(source_cpu)?;
-        policy.cpu_snapshot(source_id).ok()?.current?
+        let Some(replacement) = policy
+            .cpu_snapshot(source_id)
+            .ok()
+            .and_then(|snapshot| snapshot.current)
+        else {
+            let _ = policy.set_affinity(thread_id, CpuMask::single(source_id));
+            return None;
+        };
+        let replacement_ready = source
+            .tasks
+            .iter()
+            .any(|task| task.thread_id == Some(replacement) && task.stack_pointer != 0);
+        if !replacement_ready {
+            let _ = policy.set_affinity(thread_id, CpuMask::single(source_id));
+            return None;
+        }
+        replacement
     };
 
     let replacement_index = source
@@ -719,9 +730,6 @@ fn try_live_migrate_current(
         .iter()
         .position(|task| task.thread_id == Some(replacement))?;
     let replacement_stack_pointer = source.tasks[replacement_index].stack_pointer;
-    if replacement_stack_pointer == 0 {
-        return None;
-    }
 
     let task = source.tasks.remove(source_index);
     target.tasks.push(task);
@@ -782,15 +790,54 @@ extern "C" fn ap_migration_probe() -> ! {
     loop {
         let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
         MIGRATION_PROBE_HEARTBEATS[cpu_index].fetch_add(1, Ordering::Relaxed);
+
+        // The three-CPU acceptance path first moves this never-run context to
+        // CPU 2. Once it has genuinely executed there, request a live move back
+        // to CPU 1 and notify the source lane with a reschedule IPI. The actual
+        // ownership transfer occurs only on a later timer boundary while this
+        // exact thread is current.
+        if cpu_index == 2
+            && smp_runtime::is_online(1)
+            && LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_IDLE
+        {
+            let thread_id = migration_probe_thread_id();
+            if let Ok(request) = request_live_migration(thread_id, 1) {
+                if smp_runtime::send_fixed_ipi(
+                    request.from_cpu,
+                    crate::interrupts::RESCHEDULE_VECTOR,
+                )
+                .is_ok()
+                {
+                    serial_println!(
+                        "application processor live migration requested: thread={}, from_cpu={}, to_cpu={}",
+                        request.thread_id.raw(),
+                        request.from_cpu,
+                        request.to_cpu
+                    );
+                } else {
+                    LIVE_MIGRATION_STATE.store(LIVE_MIGRATION_IDLE, Ordering::Release);
+                }
+            }
+        }
+
         if LIVE_MIGRATION_STATE.load(Ordering::Acquire) == LIVE_MIGRATION_TRANSFERRED
             && LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire) != NO_MIGRATION_CPU
             && usize::from(LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire)) == cpu_index
+            && LIVE_MIGRATION_STATE
+                .compare_exchange(
+                    LIVE_MIGRATION_TRANSFERRED,
+                    LIVE_MIGRATION_VERIFIED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
         {
-            let _ = LIVE_MIGRATION_STATE.compare_exchange(
-                LIVE_MIGRATION_TRANSFERRED,
-                LIVE_MIGRATION_VERIFIED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+            serial_println!(
+                "application processor live migration verified: thread={}, from_cpu={}, to_cpu={}, destination_heartbeats={}",
+                LIVE_MIGRATION_THREAD_ID.load(Ordering::Acquire),
+                LIVE_MIGRATION_FROM_CPU.load(Ordering::Acquire),
+                LIVE_MIGRATION_TO_CPU.load(Ordering::Acquire),
+                MIGRATION_PROBE_HEARTBEATS[cpu_index].load(Ordering::Acquire)
             );
         }
         hlt();
