@@ -1,12 +1,14 @@
 //! Local APIC inter-processor interrupt primitives used by SMP bring-up.
 //!
 //! This module owns the xAPIC ICR programming needed to send fixed, INIT, and
-//! startup IPIs.  It deliberately does not choose the AP trampoline address or
+//! startup IPIs. It deliberately does not choose the AP trampoline address or
 //! manage scheduler state; those belong to the SMP bring-up coordinator.
 
-use core::{arch::asm, ptr};
-
-use super::apic;
+use core::{
+    arch::asm,
+    ptr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 const APIC_BASE_MSR: u32 = 0x1b;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
@@ -23,16 +25,16 @@ const ICR_DELIVERY_STATUS: u32 = 1 << 12;
 const ICR_LEVEL_ASSERT: u32 = 1 << 14;
 const ICR_TRIGGER_LEVEL: u32 = 1 << 15;
 
-const MAX_APIC_ID: u8 = u8::MAX;
 const STARTUP_VECTOR_MIN: u8 = 1;
 const STARTUP_VECTOR_MAX: u8 = 0xff;
 const DELIVERY_WAIT_LIMIT: usize = 1_000_000;
+
+static LOCAL_APIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpiError {
     ApicUnavailable,
     X2ApicUnsupported,
-    InvalidDestination,
     InvalidVector,
     DeliveryTimeout,
 }
@@ -45,16 +47,32 @@ pub enum IpiKind {
     Startup { vector: u8 },
 }
 
+/// Publish the mapped local APIC base after normal APIC initialization.
+pub fn initialize(physical_memory_offset: u64) -> Result<(), IpiError> {
+    let base = unsafe { read_msr(APIC_BASE_MSR) };
+    if base & APIC_BASE_X2APIC != 0 {
+        return Err(IpiError::X2ApicUnsupported);
+    }
+    if base & APIC_BASE_ENABLE == 0 {
+        return Err(IpiError::ApicUnavailable);
+    }
+    let physical = base & APIC_BASE_ADDRESS_MASK;
+    if physical == 0 {
+        return Err(IpiError::ApicUnavailable);
+    }
+    let virtual_base = physical_memory_offset
+        .checked_add(physical)
+        .ok_or(IpiError::ApicUnavailable)?;
+    LOCAL_APIC_VIRTUAL_BASE.store(virtual_base, Ordering::Release);
+    Ok(())
+}
+
 /// Send an IPI through the already-initialized local APIC.
 ///
 /// The caller must ensure the destination is an enabled processor from the
 /// MADT topology. Startup vectors are physical page numbers in the low 1 MiB;
 /// the bring-up coordinator owns the trampoline allocation and validation.
 pub fn send(destination_apic_id: u8, kind: IpiKind) -> Result<(), IpiError> {
-    if destination_apic_id > MAX_APIC_ID {
-        return Err(IpiError::InvalidDestination);
-    }
-
     let vector = match kind {
         IpiKind::Fixed { vector } => vector,
         IpiKind::InitAssert | IpiKind::InitDeassert => 0,
@@ -107,24 +125,10 @@ pub fn send_fixed(destination_apic_id: u8, vector: u8) -> Result<(), IpiError> {
 }
 
 fn local_apic_base() -> Result<usize, IpiError> {
-    let base = unsafe { read_msr(APIC_BASE_MSR) };
-    if base & APIC_BASE_X2APIC != 0 {
-        return Err(IpiError::X2ApicUnsupported);
-    }
-    if base & APIC_BASE_ENABLE == 0 {
+    let virtual_base = LOCAL_APIC_VIRTUAL_BASE.load(Ordering::Acquire);
+    if virtual_base == 0 {
         return Err(IpiError::ApicUnavailable);
     }
-    let physical = base & APIC_BASE_ADDRESS_MASK;
-    if physical == 0 {
-        return Err(IpiError::ApicUnavailable);
-    }
-
-    let Some(offset) = apic::physical_memory_offset() else {
-        return Err(IpiError::ApicUnavailable);
-    };
-    let virtual_base = offset
-        .checked_add(physical)
-        .ok_or(IpiError::ApicUnavailable)?;
     usize::try_from(virtual_base).map_err(|_| IpiError::ApicUnavailable)
 }
 
