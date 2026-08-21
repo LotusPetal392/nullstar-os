@@ -85,11 +85,12 @@ impl ApTrampoline {
 
         let base =
             u32::try_from(physical_address).map_err(|_| TrampolineError::InvalidPhysicalAddress)?;
-        write_u32(
-            destination,
-            offset_of_gdt_pointer_base(),
-            physical_address as u32,
-        );
+        let gdt_offset =
+            u32::try_from(offset_of_gdt()).map_err(|_| TrampolineError::InvalidPhysicalAddress)?;
+        let gdt_base = base
+            .checked_add(gdt_offset)
+            .ok_or(TrampolineError::InvalidPhysicalAddress)?;
+        write_u32(destination, offset_of_gdt_pointer_base(), gdt_base);
         patch_segment_base(destination, offset_of_code32_descriptor(), base);
         patch_segment_base(destination, offset_of_data32_descriptor(), base);
         write_u32(
@@ -196,6 +197,10 @@ fn image_len() -> usize {
     symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_end })
 }
 
+fn offset_of_gdt() -> usize {
+    symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_gdt })
+}
+
 fn offset_of_code32_descriptor() -> usize {
     symbol_offset(unsafe { &raw const __nullstar_ap_trampoline_gdt_code32 })
 }
@@ -247,6 +252,7 @@ fn symbol_offset(symbol: *const u8) -> usize {
 unsafe extern "C" {
     static __nullstar_ap_trampoline_start: u8;
     static __nullstar_ap_trampoline_end: u8;
+    static __nullstar_ap_trampoline_gdt: u8;
     static __nullstar_ap_trampoline_gdt_code32: u8;
     static __nullstar_ap_trampoline_gdt_data32: u8;
     static __nullstar_ap_trampoline_gdt_pointer_base: u8;
@@ -329,6 +335,7 @@ __nullstar_ap_trampoline_long_jump_target:
     .word 0x18
 
     .balign 8
+    .global __nullstar_ap_trampoline_gdt
 __nullstar_ap_trampoline_gdt:
     .quad 0x0000000000000000
     .global __nullstar_ap_trampoline_gdt_code32
