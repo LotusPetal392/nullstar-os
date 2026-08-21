@@ -4,11 +4,7 @@
 //! startup IPIs. It deliberately does not choose the AP trampoline address or
 //! manage scheduler state; those belong to the SMP bring-up coordinator.
 
-use core::{
-    arch::asm,
-    ptr,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::{arch::asm, ptr};
 
 const APIC_BASE_MSR: u32 = 0x1b;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
@@ -29,8 +25,6 @@ const STARTUP_VECTOR_MIN: u8 = 1;
 const STARTUP_VECTOR_MAX: u8 = 0xff;
 const DELIVERY_WAIT_LIMIT: usize = 1_000_000;
 
-static LOCAL_APIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpiError {
     ApicUnavailable,
@@ -47,32 +41,16 @@ pub enum IpiKind {
     Startup { vector: u8 },
 }
 
-/// Publish the mapped local APIC base after normal APIC initialization.
-pub fn initialize(physical_memory_offset: u64) -> Result<(), IpiError> {
-    let base = unsafe { read_msr(APIC_BASE_MSR) };
-    if base & APIC_BASE_X2APIC != 0 {
-        return Err(IpiError::X2ApicUnsupported);
-    }
-    if base & APIC_BASE_ENABLE == 0 {
-        return Err(IpiError::ApicUnavailable);
-    }
-    let physical = base & APIC_BASE_ADDRESS_MASK;
-    if physical == 0 {
-        return Err(IpiError::ApicUnavailable);
-    }
-    let virtual_base = physical_memory_offset
-        .checked_add(physical)
-        .ok_or(IpiError::ApicUnavailable)?;
-    LOCAL_APIC_VIRTUAL_BASE.store(virtual_base, Ordering::Release);
-    Ok(())
-}
-
 /// Send an IPI through the already-initialized local APIC.
 ///
-/// The caller must ensure the destination is an enabled processor from the
-/// MADT topology. Startup vectors are physical page numbers in the low 1 MiB;
+/// The caller must provide the physical-to-virtual mapping offset established
+/// during boot. Startup vectors are physical page numbers in the low 1 MiB;
 /// the bring-up coordinator owns the trampoline allocation and validation.
-pub fn send(destination_apic_id: u8, kind: IpiKind) -> Result<(), IpiError> {
+pub fn send(
+    physical_memory_offset: u64,
+    destination_apic_id: u8,
+    kind: IpiKind,
+) -> Result<(), IpiError> {
     let vector = match kind {
         IpiKind::Fixed { vector } => vector,
         IpiKind::InitAssert | IpiKind::InitDeassert => 0,
@@ -84,7 +62,7 @@ pub fn send(destination_apic_id: u8, kind: IpiKind) -> Result<(), IpiError> {
         }
     };
 
-    let base = local_apic_base()?;
+    let base = local_apic_base(physical_memory_offset)?;
     write_u32(base, LOCAL_APIC_ICR_HIGH, u32::from(destination_apic_id) << 24);
 
     let low = match kind {
@@ -99,18 +77,37 @@ pub fn send(destination_apic_id: u8, kind: IpiKind) -> Result<(), IpiError> {
 }
 
 /// Perform the architectural INIT portion of an AP startup sequence.
-pub fn send_init(destination_apic_id: u8) -> Result<(), IpiError> {
-    send(destination_apic_id, IpiKind::InitAssert)
+pub fn send_init(
+    physical_memory_offset: u64,
+    destination_apic_id: u8,
+) -> Result<(), IpiError> {
+    send(
+        physical_memory_offset,
+        destination_apic_id,
+        IpiKind::InitAssert,
+    )
 }
 
 /// Release the INIT level after the required inter-IPI delay.
-pub fn send_init_deassert(destination_apic_id: u8) -> Result<(), IpiError> {
-    send(destination_apic_id, IpiKind::InitDeassert)
+pub fn send_init_deassert(
+    physical_memory_offset: u64,
+    destination_apic_id: u8,
+) -> Result<(), IpiError> {
+    send(
+        physical_memory_offset,
+        destination_apic_id,
+        IpiKind::InitDeassert,
+    )
 }
 
 /// Send a startup IPI for a low-memory trampoline page.
-pub fn send_startup(destination_apic_id: u8, startup_vector: u8) -> Result<(), IpiError> {
+pub fn send_startup(
+    physical_memory_offset: u64,
+    destination_apic_id: u8,
+    startup_vector: u8,
+) -> Result<(), IpiError> {
     send(
+        physical_memory_offset,
         destination_apic_id,
         IpiKind::Startup {
             vector: startup_vector,
@@ -120,15 +117,33 @@ pub fn send_startup(destination_apic_id: u8, startup_vector: u8) -> Result<(), I
 
 /// Send a fixed-vector IPI, normally used for reschedule or TLB-shootdown
 /// notifications once APs are online.
-pub fn send_fixed(destination_apic_id: u8, vector: u8) -> Result<(), IpiError> {
-    send(destination_apic_id, IpiKind::Fixed { vector })
+pub fn send_fixed(
+    physical_memory_offset: u64,
+    destination_apic_id: u8,
+    vector: u8,
+) -> Result<(), IpiError> {
+    send(
+        physical_memory_offset,
+        destination_apic_id,
+        IpiKind::Fixed { vector },
+    )
 }
 
-fn local_apic_base() -> Result<usize, IpiError> {
-    let virtual_base = LOCAL_APIC_VIRTUAL_BASE.load(Ordering::Acquire);
-    if virtual_base == 0 {
+fn local_apic_base(physical_memory_offset: u64) -> Result<usize, IpiError> {
+    let base = unsafe { read_msr(APIC_BASE_MSR) };
+    if base & APIC_BASE_X2APIC != 0 {
+        return Err(IpiError::X2ApicUnsupported);
+    }
+    if base & APIC_BASE_ENABLE == 0 {
         return Err(IpiError::ApicUnavailable);
     }
+    let physical = base & APIC_BASE_ADDRESS_MASK;
+    if physical == 0 {
+        return Err(IpiError::ApicUnavailable);
+    }
+    let virtual_base = physical_memory_offset
+        .checked_add(physical)
+        .ok_or(IpiError::ApicUnavailable)?;
     usize::try_from(virtual_base).map_err(|_| IpiError::ApicUnavailable)
 }
 
