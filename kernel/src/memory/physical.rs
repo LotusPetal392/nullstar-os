@@ -52,6 +52,7 @@ pub struct BootInfoFrameAllocator {
     allocated_frames: u64,
     usable_frames: u64,
     recycled_frames: Vec<PhysFrame<Size4KiB>>,
+    reserved_frames: Vec<PhysFrame<Size4KiB>>,
     reclaimed_frames: u64,
     reused_frames: u64,
 }
@@ -75,6 +76,7 @@ impl BootInfoFrameAllocator {
             allocated_frames: 0,
             usable_frames,
             recycled_frames: Vec::new(),
+            reserved_frames: Vec::new(),
             reclaimed_frames: 0,
             reused_frames: 0,
         }
@@ -96,6 +98,10 @@ impl BootInfoFrameAllocator {
         self.recycled_frames.len()
     }
 
+    pub fn reserved_frame_count(&self) -> usize {
+        self.reserved_frames.len()
+    }
+
     pub fn reclaimed_frame_count(&self) -> u64 {
         self.reclaimed_frames
     }
@@ -104,10 +110,62 @@ impl BootInfoFrameAllocator {
         self.reused_frames
     }
 
+    /// Reserve one usable frame below `exclusive_limit` before normal frame
+    /// allocation begins. SMP uses this to hold a low-memory page for the AP
+    /// startup trampoline without allowing the heap or a process mapping to
+    /// recycle that page later.
+    pub fn reserve_frame_below(
+        &mut self,
+        exclusive_limit: u64,
+    ) -> Option<PhysFrame<Size4KiB>> {
+        if self.allocated_frames != 0 || !self.recycled_frames.is_empty() {
+            return None;
+        }
+
+        let limit = align_down(exclusive_limit);
+        if limit < FRAME_SIZE {
+            return None;
+        }
+
+        let mut selected = None;
+        for region in self.memory_regions {
+            let Some((region_start, region_end)) = usable_frame_bounds(region) else {
+                continue;
+            };
+            let region_end = region_end.min(limit);
+            if region_start >= region_end {
+                continue;
+            }
+
+            let address = region_end.saturating_sub(FRAME_SIZE);
+            if address < FRAME_SIZE {
+                continue;
+            }
+            let frame = PhysFrame::containing_address(PhysAddr::new(address));
+            if selected
+                .map(|current: PhysFrame<Size4KiB>| {
+                    frame.start_address() > current.start_address()
+                })
+                .unwrap_or(true)
+            {
+                selected = Some(frame);
+            }
+        }
+
+        let frame = selected?;
+        self.reserved_frames.push(frame);
+        self.allocated_frames = self.allocated_frames.saturating_add(1);
+        Some(frame)
+    }
+
     /// Returns a frame to the allocator after every mapping that references it
     /// has been removed and the frame is no longer reachable through an active
     /// CR3. Process reaping is the first caller of this interface.
     pub fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        debug_assert!(
+            !self.reserved_frames.contains(&frame),
+            "reserved physical frame cannot be returned to the allocator"
+        );
         debug_assert!(
             !self.recycled_frames.contains(&frame),
             "physical frame was returned to the allocator twice"
@@ -132,8 +190,11 @@ impl BootInfoFrameAllocator {
             if self.next_frame_address < region_end {
                 let frame_address = self.next_frame_address;
                 self.next_frame_address = frame_address.saturating_add(FRAME_SIZE);
-
-                return Some(PhysFrame::containing_address(PhysAddr::new(frame_address)));
+                let frame = PhysFrame::containing_address(PhysAddr::new(frame_address));
+                if self.reserved_frames.contains(&frame) {
+                    continue;
+                }
+                return Some(frame);
             }
 
             self.advance_region();
