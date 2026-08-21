@@ -1,6 +1,6 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering, compiler_fence},
 };
 
 use lazy_static::lazy_static;
@@ -27,6 +27,9 @@ const PIT_COMMAND_PORT: u16 = 0x43;
 const PIT_CHANNEL_0_PORT: u16 = 0x40;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 const MAX_SMP_CPUS: usize = 64;
+const AP_RUNTIME_POLL_DELAY_FEMTOSECONDS: u64 = 100_000_000_000;
+const AP_RUNTIME_TIMER_POLLS: usize = 1_000;
+const AP_RUNTIME_FALLBACK_POLLS: usize = 5_000_000;
 
 const CONTROLLER_UNINITIALIZED: u8 = 0;
 const CONTROLLER_PIC: u8 = 1;
@@ -305,7 +308,12 @@ pub fn init(
                 physical_memory_offset,
                 startup_timer,
             ) {
-                Ok(_) => send_reschedule_probes(madt, bsp_apic_id, physical_memory_offset.as_u64()),
+                Ok(_) => send_reschedule_probes(
+                    madt,
+                    bsp_apic_id,
+                    physical_memory_offset.as_u64(),
+                    startup_timer,
+                ),
                 Err(error) => {
                     serial_println!("SMP application processor bring-up unavailable: {error:?}");
                 }
@@ -382,7 +390,12 @@ fn prepare_application_processor_mappings(madt: &MadtInfo, bsp_apic_id: u8) {
     }
 }
 
-fn send_reschedule_probes(madt: &MadtInfo, bsp_apic_id: u8, physical_memory_offset: u64) {
+fn send_reschedule_probes(
+    madt: &MadtInfo,
+    bsp_apic_id: u8,
+    physical_memory_offset: u64,
+    startup_timer: Option<hpet_timer::Hpet>,
+) {
     let mut cpu_index = 1_usize;
     for processor in madt.processors() {
         if !processor.enabled || processor.local_apic_id == u32::from(bsp_apic_id) {
@@ -394,11 +407,32 @@ fn send_reschedule_probes(madt: &MadtInfo, bsp_apic_id: u8, physical_memory_offs
         {
             let apic_id = processor.local_apic_id as u8;
             match ipi::send_fixed(physical_memory_offset, apic_id, RESCHEDULE_VECTOR) {
-                Ok(()) => serial_println!(
-                    "application processor reschedule IPI sent: cpu={}, lapic_id={}",
-                    cpu_index,
-                    apic_id
-                ),
+                Ok(()) => {
+                    serial_println!(
+                        "application processor reschedule IPI sent: cpu={}, lapic_id={}",
+                        cpu_index,
+                        apic_id
+                    );
+                    if wait_for_ap_runtime(cpu_index, startup_timer) {
+                        serial_println!(
+                            "application processor timer verified: cpu={}, ticks={}",
+                            cpu_index,
+                            smp_runtime::timer_ticks(cpu_index)
+                        );
+                        serial_println!(
+                            "application processor reschedule IPI verified: cpu={}, count={}",
+                            cpu_index,
+                            smp_runtime::reschedule_ipis(cpu_index)
+                        );
+                    } else {
+                        serial_println!(
+                            "application processor scheduler lane verification timed out: cpu={}, timer_ticks={}, reschedule_ipis={}",
+                            cpu_index,
+                            smp_runtime::timer_ticks(cpu_index),
+                            smp_runtime::reschedule_ipis(cpu_index)
+                        );
+                    }
+                }
                 Err(error) => serial_println!(
                     "application processor reschedule IPI failed: cpu={}, lapic_id={}, error={error:?}",
                     cpu_index,
@@ -408,6 +442,32 @@ fn send_reschedule_probes(madt: &MadtInfo, bsp_apic_id: u8, physical_memory_offs
         }
         cpu_index = cpu_index.saturating_add(1);
     }
+}
+
+fn wait_for_ap_runtime(cpu_index: usize, timer: Option<hpet_timer::Hpet>) -> bool {
+    if let Some(timer) = timer {
+        for _ in 0..AP_RUNTIME_TIMER_POLLS {
+            if smp_runtime::timer_ticks(cpu_index) > 0 && smp_runtime::reschedule_ipis(cpu_index) > 0
+            {
+                return true;
+            }
+            if timer
+                .measure_duration(AP_RUNTIME_POLL_DELAY_FEMTOSECONDS)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    for _ in 0..AP_RUNTIME_FALLBACK_POLLS {
+        if smp_runtime::timer_ticks(cpu_index) > 0 && smp_runtime::reschedule_ipis(cpu_index) > 0 {
+            return true;
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+    false
 }
 
 fn initialize_pics(master_mask: u8, slave_mask: u8) {
@@ -450,15 +510,8 @@ fn end_of_interrupt(vector: u8) {
 pub extern "C" fn galactic_timer_interrupt_dispatch(current_stack_pointer: usize) -> usize {
     let cpu_index = smp_runtime::current_cpu_index();
     if cpu_index != 0 {
-        let ticks = smp_runtime::record_timer_tick(cpu_index).unwrap_or(0);
+        let _ = smp_runtime::record_timer_tick(cpu_index);
         end_of_interrupt(TIMER_VECTOR);
-        if ticks == 1 {
-            serial_println!(
-                "application processor timer verified: cpu={}, ticks={}",
-                cpu_index,
-                ticks
-            );
-        }
         return current_stack_pointer;
     }
 
@@ -485,15 +538,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
 extern "x86-interrupt" fn reschedule_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let cpu_index = smp_runtime::current_cpu_index();
-    let count = smp_runtime::record_reschedule_ipi(cpu_index).unwrap_or(0);
+    let _ = smp_runtime::record_reschedule_ipi(cpu_index);
     end_of_interrupt(RESCHEDULE_VECTOR);
-    if cpu_index != 0 && count == 1 {
-        serial_println!(
-            "application processor reschedule IPI verified: cpu={}, count={}",
-            cpu_index,
-            count
-        );
-    }
 }
 
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
