@@ -69,6 +69,7 @@ jobs:
           grep -F "application processor scheduler lane initialized: cpu=1" smp-qemu.log
           grep -F "application processor timer verified: cpu=1" smp-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" smp-qemu.log
+          grep -F "application processor kernel scheduling verified: cpu=1" smp-qemu.log
 
       - name: Boot partition, FAT, and SMP smoke test in QEMU
         shell: bash
@@ -80,6 +81,7 @@ jobs:
           grep -F "application processor scheduler lane initialized: cpu=1" partition-fat-qemu.log
           grep -F "application processor timer verified: cpu=1" partition-fat-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" partition-fat-qemu.log
+          grep -F "application processor kernel scheduling verified: cpu=1" partition-fat-qemu.log
 
       - name: Upload runtime diagnostics
         if: always()
