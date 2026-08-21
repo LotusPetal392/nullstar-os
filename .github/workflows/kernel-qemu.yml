@@ -46,7 +46,7 @@ jobs:
             sudo apt-get install --yes --quiet --no-install-recommends qemu-system-x86
           fi
 
-      - name: Configure two-CPU QEMU acceptance environment
+      - name: Configure SMP QEMU acceptance environment
         shell: bash
         run: |
           set -euo pipefail
@@ -54,7 +54,7 @@ jobs:
           mkdir -p "$wrapper_dir"
           cat > "$wrapper_dir/qemu-system-x86_64" <<'EOF'
           #!/usr/bin/env bash
-          exec /usr/bin/qemu-system-x86_64 -smp 2 "$@"
+          exec /usr/bin/qemu-system-x86_64 -smp "${NULLSTAR_QEMU_CPUS:-2}" "$@"
           EOF
           chmod +x "$wrapper_dir/qemu-system-x86_64"
           echo "$wrapper_dir" >> "$GITHUB_PATH"
@@ -73,6 +73,20 @@ jobs:
           grep -F "application processor timer verified: cpu=1" smp-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" smp-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" smp-qemu.log
+
+      - name: Boot three-CPU affinity and migration acceptance check
+        shell: bash
+        env:
+          NULLSTAR_QEMU_CPUS: "3"
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-02-01 run --release --locked --quiet -- --boot-check 2>&1 | tee smp-migration-qemu.log
+          grep -F "application processor online: cpu=1" smp-migration-qemu.log
+          grep -F "application processor online: cpu=2" smp-migration-qemu.log
+          grep -F "SMP application processors online: candidates=2, attempted=2, online=2, failed=0" smp-migration-qemu.log
+          grep -F "application processor kernel migration prepared:" smp-migration-qemu.log
+          grep -F "from_cpu=1, to_cpu=2" smp-migration-qemu.log
+          grep -F "application processor kernel migration verified:" smp-migration-qemu.log
 
       - name: Boot partition, FAT, and SMP smoke test in QEMU
         shell: bash
@@ -93,6 +107,7 @@ jobs:
           name: qemu-runtime-logs
           path: |
             smp-qemu.log
+            smp-migration-qemu.log
             partition-fat-qemu.log
           if-no-files-found: ignore
           retention-days: 7
