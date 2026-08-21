@@ -6,31 +6,46 @@ use core::{
 use spin::{Mutex, MutexGuard};
 use x86_64::instructions::interrupts;
 
-static PREEMPTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+use crate::arch::x86_64::smp_runtime;
 
-pub struct Guard;
+const MAX_CPUS: usize = 64;
+static PREEMPTION_DEPTHS: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+pub struct Guard {
+    cpu_index: usize,
+}
 
 impl Guard {
     pub fn enter() -> Self {
         interrupts::without_interrupts(|| {
-            let previous = PREEMPTION_DEPTH.fetch_add(1, Ordering::AcqRel);
+            let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
+            let previous = PREEMPTION_DEPTHS[cpu_index].fetch_add(1, Ordering::AcqRel);
             assert!(previous != usize::MAX, "kernel preemption depth overflowed");
-        });
-        Self
+            Self { cpu_index }
+        })
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         interrupts::without_interrupts(|| {
-            let previous = PREEMPTION_DEPTH.fetch_sub(1, Ordering::AcqRel);
+            let previous = PREEMPTION_DEPTHS[self.cpu_index].fetch_sub(1, Ordering::AcqRel);
             assert!(previous != 0, "kernel preemption depth underflowed");
         });
     }
 }
 
 pub fn is_disabled() -> bool {
-    PREEMPTION_DEPTH.load(Ordering::Acquire) != 0
+    let cpu_index = smp_runtime::current_cpu_index().min(MAX_CPUS - 1);
+    PREEMPTION_DEPTHS[cpu_index].load(Ordering::Acquire) != 0
+}
+
+pub fn depth_for_cpu(cpu_index: usize) -> usize {
+    PREEMPTION_DEPTHS
+        .get(cpu_index)
+        .map(|depth| depth.load(Ordering::Acquire))
+        .unwrap_or(0)
 }
 
 pub struct PreemptMutex<T> {
