@@ -12,6 +12,8 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
+use super::ipi;
+
 const MAX_CPUS: usize = 64;
 const MAX_XAPIC_IDS: usize = 256;
 const UNMAPPED_CPU: u8 = u8::MAX;
@@ -71,6 +73,7 @@ pub enum RuntimeError {
     X2ApicUnsupported,
     ApicIdMismatch,
     TimerUnavailable,
+    Ipi(ipi::IpiError),
 }
 
 pub fn initialize_bootstrap(
@@ -177,6 +180,20 @@ pub fn record_reschedule_ipi(cpu_index: usize) -> Result<u64, RuntimeError> {
         .reschedule_ipis
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1))
+}
+
+pub fn send_fixed_ipi(cpu_index: usize, vector: u8) -> Result<(), RuntimeError> {
+    let lane = CPU_LANES.get(cpu_index).ok_or(RuntimeError::InvalidCpu)?;
+    if !lane.online.load(Ordering::Acquire) {
+        return Err(RuntimeError::InvalidCpu);
+    }
+    let apic_id = lane.apic_id.load(Ordering::Acquire);
+    let apic_id = u8::try_from(apic_id).map_err(|_| RuntimeError::InvalidCpu)?;
+    let physical_memory_offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::Acquire);
+    if physical_memory_offset == 0 {
+        return Err(RuntimeError::ApicUnavailable);
+    }
+    ipi::send_fixed(physical_memory_offset, apic_id, vector).map_err(RuntimeError::Ipi)
 }
 
 pub fn timer_ticks(cpu_index: usize) -> u64 {
