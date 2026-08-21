@@ -19,7 +19,7 @@ use crate::{
     scheduler, serial_println,
 };
 
-use super::{ipi, smp_bringup, smp_runtime};
+use super::{ipi, smp_bringup, smp_runtime, smp_scheduler};
 
 const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -325,18 +325,31 @@ pub fn init(
     controller
 }
 
-/// Load the shared IDT and activate this AP's local interrupt/timer runtime.
+/// Load the shared IDT, initialize the AP's local runtime, and prepare its
+/// kernel-only scheduler. The scheduler remains disarmed until the BSP has
+/// observed the AP's completed rendezvous.
 pub fn init_application_processor() {
     x86_64::instructions::interrupts::disable();
     IDT.load();
 
     match smp_runtime::activate_current_application_processor(TIMER_VECTOR, SPURIOUS_VECTOR) {
         Ok(cpu_index) => {
+            let scheduler_snapshot = match smp_scheduler::init_application_processor(cpu_index) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    serial_println!(
+                        "application processor kernel scheduler initialization failed: cpu={}, error={error:?}",
+                        cpu_index
+                    );
+                    hlt_loop();
+                }
+            };
             serial_println!(
-                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}",
+                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}, kernel_tasks={}",
                 cpu_index,
                 TIMER_VECTOR,
-                RESCHEDULE_VECTOR
+                RESCHEDULE_VECTOR,
+                scheduler_snapshot.task_count
             );
             x86_64::instructions::interrupts::enable();
         }
@@ -406,6 +419,14 @@ fn send_reschedule_probes(
             && smp_runtime::is_online(cpu_index)
         {
             let apic_id = processor.local_apic_id as u8;
+            if let Err(error) = smp_scheduler::arm(cpu_index) {
+                serial_println!(
+                    "application processor kernel scheduler arm failed: cpu={}, error={error:?}",
+                    cpu_index
+                );
+                cpu_index = cpu_index.saturating_add(1);
+                continue;
+            }
             match ipi::send_fixed(physical_memory_offset, apic_id, RESCHEDULE_VECTOR) {
                 Ok(()) => {
                     serial_println!(
@@ -414,6 +435,7 @@ fn send_reschedule_probes(
                         apic_id
                     );
                     if wait_for_ap_runtime(cpu_index, startup_timer) {
+                        let scheduler_snapshot = smp_scheduler::snapshot(cpu_index);
                         serial_println!(
                             "application processor timer verified: cpu={}, ticks={}",
                             cpu_index,
@@ -424,12 +446,23 @@ fn send_reschedule_probes(
                             cpu_index,
                             smp_runtime::reschedule_ipis(cpu_index)
                         );
-                    } else {
                         serial_println!(
-                            "application processor scheduler lane verification timed out: cpu={}, timer_ticks={}, reschedule_ipis={}",
+                            "application processor kernel scheduling verified: cpu={}, context_switches={}, probe_a={}, probe_b={}",
+                            cpu_index,
+                            scheduler_snapshot.context_switches,
+                            scheduler_snapshot.probe_a_heartbeats,
+                            scheduler_snapshot.probe_b_heartbeats
+                        );
+                    } else {
+                        let scheduler_snapshot = smp_scheduler::snapshot(cpu_index);
+                        serial_println!(
+                            "application processor scheduler lane verification timed out: cpu={}, timer_ticks={}, reschedule_ipis={}, context_switches={}, probe_a={}, probe_b={}",
                             cpu_index,
                             smp_runtime::timer_ticks(cpu_index),
-                            smp_runtime::reschedule_ipis(cpu_index)
+                            smp_runtime::reschedule_ipis(cpu_index),
+                            scheduler_snapshot.context_switches,
+                            scheduler_snapshot.probe_a_heartbeats,
+                            scheduler_snapshot.probe_b_heartbeats
                         );
                     }
                 }
@@ -444,12 +477,19 @@ fn send_reschedule_probes(
     }
 }
 
+fn ap_runtime_ready(cpu_index: usize) -> bool {
+    let scheduler_snapshot = smp_scheduler::snapshot(cpu_index);
+    smp_runtime::timer_ticks(cpu_index) > 0
+        && smp_runtime::reschedule_ipis(cpu_index) > 0
+        && scheduler_snapshot.context_switches >= 2
+        && scheduler_snapshot.probe_a_heartbeats > 0
+        && scheduler_snapshot.probe_b_heartbeats > 0
+}
+
 fn wait_for_ap_runtime(cpu_index: usize, timer: Option<hpet_timer::Hpet>) -> bool {
     if let Some(timer) = timer {
         for _ in 0..AP_RUNTIME_TIMER_POLLS {
-            if smp_runtime::timer_ticks(cpu_index) > 0
-                && smp_runtime::reschedule_ipis(cpu_index) > 0
-            {
+            if ap_runtime_ready(cpu_index) {
                 return true;
             }
             if timer
@@ -463,7 +503,7 @@ fn wait_for_ap_runtime(cpu_index: usize, timer: Option<hpet_timer::Hpet>) -> boo
     }
 
     for _ in 0..AP_RUNTIME_FALLBACK_POLLS {
-        if smp_runtime::timer_ticks(cpu_index) > 0 && smp_runtime::reschedule_ipis(cpu_index) > 0 {
+        if ap_runtime_ready(cpu_index) {
             return true;
         }
         compiler_fence(Ordering::SeqCst);
@@ -512,8 +552,10 @@ pub extern "C" fn galactic_timer_interrupt_dispatch(current_stack_pointer: usize
     let cpu_index = smp_runtime::current_cpu_index();
     if cpu_index != 0 {
         let _ = smp_runtime::record_timer_tick(cpu_index);
+        let next_stack_pointer =
+            smp_scheduler::on_timer_interrupt(cpu_index, current_stack_pointer);
         end_of_interrupt(TIMER_VECTOR);
-        return current_stack_pointer;
+        return next_stack_pointer;
     }
 
     let ticks = TIMER_TICKS

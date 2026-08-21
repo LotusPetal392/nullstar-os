@@ -7,3 +7,5 @@ pub(crate) mod interrupts;
 pub(crate) mod ipi;
 pub(crate) mod smp_bringup;
 pub(crate) mod smp_runtime;
+#[path = "../../smp_scheduler.rs"]
+pub(crate) mod smp_scheduler;
