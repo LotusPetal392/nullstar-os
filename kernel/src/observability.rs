@@ -1,10 +1,8 @@
 //! Kernel-side observability contract for Nova and the system monitor.
 //!
-//! The execution subsystems intentionally keep their state private.  This module
-//! provides the stable, read-only shape used to publish that state without making
-//! the monitor depend on scheduler or process-manager internals.  Architecture
-//! code can collect the existing subsystem snapshots and build one bounded
-//! `KernelSnapshot` from them.
+//! The execution subsystems intentionally keep their state private. This module
+//! provides a stable, read-only shape for publishing that state without making
+//! the monitor depend on scheduler or process-manager internals.
 
 use alloc::vec::Vec;
 
@@ -50,38 +48,24 @@ impl MemorySummary {
     }
 }
 
-/// Aggregate CPU accounting exposed to the system monitor.
+/// Aggregate CPU state currently available from the scheduler.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CpuSummary {
     pub online_cpus: usize,
-    pub busy_ticks: u64,
-    pub total_ticks: u64,
+    pub busy_cpus: usize,
     pub runnable_threads: usize,
-    pub context_switches: u64,
-    pub preemptions: u64,
 }
 
 impl CpuSummary {
     pub const ZERO: Self = Self {
         online_cpus: 0,
-        busy_ticks: 0,
-        total_ticks: 0,
+        busy_cpus: 0,
         runnable_threads: 0,
-        context_switches: 0,
-        preemptions: 0,
     };
-
-    /// Aggregate utilization as basis points (0..=10_000).
-    pub const fn utilization_basis_points(self) -> u16 {
-        if self.total_ticks == 0 {
-            return 0;
-        }
-        let ratio = self.busy_ticks.saturating_mul(10_000) / self.total_ticks;
-        if ratio > 10_000 { 10_000 } else { ratio as u16 }
-    }
 }
 
-/// Per-process monitor record.
+/// Per-process monitor record. CPU and memory accounting are supplied by the
+/// execution/accounting layer once those counters are attached to processes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessRecord {
     pub process: ProcessSnapshot,
@@ -127,11 +111,10 @@ impl KernelSnapshot {
         let mut cpu = CpuSummary::ZERO;
         cpu.online_cpus = cpus.len();
         for record in &cpus {
+            if record.current.is_some() {
+                cpu.busy_cpus = cpu.busy_cpus.saturating_add(1);
+            }
             cpu.runnable_threads = cpu.runnable_threads.saturating_add(record.runnable_count);
-            cpu.context_switches = cpu
-                .context_switches
-                .saturating_add(record.context_switches);
-            cpu.preemptions = cpu.preemptions.saturating_add(record.preemptions);
         }
 
         Self {
@@ -192,27 +175,17 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_monitor_counters() {
+    fn aggregates_monitor_state() {
         let cpu = [
             CpuSnapshot {
                 cpu: CpuId::from_raw(0).unwrap(),
                 current: Some(ThreadId::from_raw(1).unwrap()),
                 runnable_count: 2,
-                quantum_ticks: 5,
-                ticks_in_quantum: 2,
-                context_switches: 7,
-                preemptions: 3,
-                voluntary_switches: 1,
             },
             CpuSnapshot {
                 cpu: CpuId::from_raw(1).unwrap(),
                 current: None,
                 runnable_count: 1,
-                quantum_ticks: 5,
-                ticks_in_quantum: 0,
-                context_switches: 4,
-                preemptions: 2,
-                voluntary_switches: 0,
             },
         ];
         let pid = process(1);
@@ -263,9 +236,8 @@ mod tests {
 
         assert_eq!(snapshot.sequence, 9);
         assert_eq!(snapshot.cpu.online_cpus, 2);
+        assert_eq!(snapshot.cpu.busy_cpus, 1);
         assert_eq!(snapshot.cpu.runnable_threads, 3);
-        assert_eq!(snapshot.cpu.context_switches, 11);
-        assert_eq!(snapshot.cpu.preemptions, 5);
         assert_eq!(snapshot.memory.available_bytes(), 750_000);
         assert_eq!(snapshot.memory.utilization_basis_points(), 2_500);
         assert_eq!(snapshot.process_count(), 1);
