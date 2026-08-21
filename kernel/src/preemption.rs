@@ -9,8 +9,7 @@ use x86_64::instructions::interrupts;
 use crate::arch::x86_64::smp_runtime;
 
 const MAX_CPUS: usize = 64;
-static PREEMPTION_DEPTHS: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PREEMPTION_DEPTHS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 pub struct Guard {
     cpu_index: usize,
