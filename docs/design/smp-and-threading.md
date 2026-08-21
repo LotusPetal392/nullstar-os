@@ -84,9 +84,14 @@ policy at a fixed interval. Migration planning runs outside the triggering CPU's
 lock, only one migration may be active, and completion is recorded when the destination
 scheduler dispatches the transferred context. Repeated passes converge larger imbalances
 one affinity-safe move at a time, with checks, requests, completions, and delivery failures
-retained as bounded counters. The live workload still uses reserved probe thread identities;
-process-table integration, blocked-thread migration, and general wakeup/idle balancing remain
-part of this milestone.
+retained as bounded counters. Blocking removes a thread from runnable load while preserving its
+bounded assignment, ownership, and affinity state. Wakeup reuses the previous CPU unless an
+eligible CPU is meaningfully less loaded, and affinity changes may move blocked ownership without
+making the thread runnable. Host tests cover these transitions and rebalance exclusion; the
+three-CPU QEMU path blocks a live context on one AP, transfers it during wakeup, and verifies its
+dispatch on another AP. The live workload still uses reserved probe thread identities;
+process-table integration and general event/wait-queue wakeup wiring remain part of this
+milestone.
 
 ### 4. Synchronization and concurrent execution
 

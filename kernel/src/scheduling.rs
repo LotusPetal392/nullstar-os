@@ -104,6 +104,33 @@ pub struct Placement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssignmentState {
+    Runnable,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssignmentSnapshot {
+    pub thread: ThreadId,
+    pub affinity: CpuMask,
+    pub cpu: CpuId,
+    pub state: AssignmentState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueTransition {
+    pub thread: ThreadId,
+    pub cpu: CpuId,
+    pub switch: Option<Switch>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WakeResult {
+    pub placement: Placement,
+    pub switch: Option<Switch>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuSnapshot {
     pub cpu: CpuId,
     pub current: Option<ThreadId>,
@@ -114,6 +141,8 @@ pub struct CpuSnapshot {
 pub struct SmpSnapshot {
     pub cpu_count: usize,
     pub assigned_thread_count: usize,
+    pub runnable_thread_count: usize,
+    pub blocked_thread_count: usize,
     pub online_mask: CpuMask,
 }
 
@@ -153,12 +182,16 @@ pub enum SmpError {
     Capacity,
     UnknownThread,
     AffinityViolation,
+    AlreadyRunnable,
+    NotRunnable,
+    QueueStateMismatch,
 }
 
 struct Assignment {
     thread: ThreadId,
     affinity: CpuMask,
     cpu: CpuId,
+    state: AssignmentState,
 }
 
 /// Affinity-aware per-CPU round-robin queues.
@@ -205,6 +238,7 @@ impl SmpRoundRobin {
             thread,
             affinity,
             cpu,
+            state: AssignmentState::Runnable,
         });
         Ok(Placement {
             thread,
@@ -223,8 +257,8 @@ impl SmpRoundRobin {
             .assignment_index(thread)
             .ok_or(SmpError::UnknownThread)?;
         let current_cpu = self.assignments[index].cpu;
-        self.assignments[index].affinity = affinity;
         if affinity.contains(current_cpu) {
+            self.assignments[index].affinity = affinity;
             return Ok(Placement {
                 thread,
                 cpu: current_cpu,
@@ -233,12 +267,10 @@ impl SmpRoundRobin {
         }
 
         let destination = self.least_loaded_cpu(affinity)?;
-        self.queues[current_cpu.raw()]
-            .remove(thread)
-            .map_err(|_| SmpError::UnknownThread)?;
-        self.queues[destination.raw()]
-            .admit(thread)
-            .map_err(|_| SmpError::Capacity)?;
+        if self.assignments[index].state == AssignmentState::Runnable {
+            self.move_runnable_assignment(thread, current_cpu, destination)?;
+        }
+        self.assignments[index].affinity = affinity;
         self.assignments[index].cpu = destination;
         Ok(Placement {
             thread,
@@ -265,12 +297,9 @@ impl SmpRoundRobin {
                 migrated: false,
             });
         }
-        self.queues[current_cpu.raw()]
-            .remove(thread)
-            .map_err(|_| SmpError::UnknownThread)?;
-        self.queues[destination.raw()]
-            .admit(thread)
-            .map_err(|_| SmpError::Capacity)?;
+        if self.assignments[index].state == AssignmentState::Runnable {
+            self.move_runnable_assignment(thread, current_cpu, destination)?;
+        }
         self.assignments[index].cpu = destination;
         Ok(Placement {
             thread,
@@ -316,12 +345,16 @@ impl SmpRoundRobin {
                     .assignments
                     .iter()
                     .filter(|assignment| {
-                        assignment.cpu == source && assignment.affinity.contains(destination)
+                        assignment.state == AssignmentState::Runnable
+                            && assignment.cpu == source
+                            && assignment.affinity.contains(destination)
                     })
                     .find(|assignment| Some(assignment.thread) != source_current)
                     .or_else(|| {
                         self.assignments.iter().find(|assignment| {
-                            assignment.cpu == source && assignment.affinity.contains(destination)
+                            assignment.state == AssignmentState::Runnable
+                                && assignment.cpu == source
+                                && assignment.affinity.contains(destination)
                         })
                     });
                 let Some(candidate) = candidate else {
@@ -359,6 +392,93 @@ impl SmpRoundRobin {
         Ok(queue.tick())
     }
 
+    pub fn yield_current(&mut self, cpu: CpuId) -> Result<Option<Switch>, SmpError> {
+        let queue = self.queue_mut(cpu)?;
+        Ok(queue.yield_current())
+    }
+
+    pub fn block(&mut self, thread: ThreadId) -> Result<QueueTransition, SmpError> {
+        let index = self
+            .assignment_index(thread)
+            .ok_or(SmpError::UnknownThread)?;
+        if self.assignments[index].state != AssignmentState::Runnable {
+            return Err(SmpError::NotRunnable);
+        }
+        let cpu = self.assignments[index].cpu;
+        let switch = self.queues[cpu.raw()]
+            .remove(thread)
+            .map_err(|_| SmpError::QueueStateMismatch)?;
+        self.assignments[index].state = AssignmentState::Blocked;
+        Ok(QueueTransition {
+            thread,
+            cpu,
+            switch,
+        })
+    }
+
+    pub fn wake(&mut self, thread: ThreadId) -> Result<WakeResult, SmpError> {
+        let index = self
+            .assignment_index(thread)
+            .ok_or(SmpError::UnknownThread)?;
+        if self.assignments[index].state == AssignmentState::Runnable {
+            return Err(SmpError::AlreadyRunnable);
+        }
+
+        let previous_cpu = self.assignments[index].cpu;
+        let affinity = self.assignments[index].affinity;
+        let least_loaded = self.least_loaded_cpu(affinity)?;
+        let previous_load = self.cpu_load(previous_cpu)?;
+        let least_load = self.cpu_load(least_loaded)?;
+        let destination =
+            if affinity.contains(previous_cpu) && previous_load <= least_load.saturating_add(1) {
+                previous_cpu
+            } else {
+                least_loaded
+            };
+        if !self.queue_can_accept(destination)? {
+            return Err(SmpError::Capacity);
+        }
+
+        let switch = self.queues[destination.raw()]
+            .wake(thread)
+            .map_err(|error| match error {
+                Error::Capacity => SmpError::Capacity,
+                Error::AlreadyRunnable => SmpError::QueueStateMismatch,
+                Error::UnknownThread | Error::InvalidQuantum => SmpError::QueueStateMismatch,
+            })?;
+        self.assignments[index].cpu = destination;
+        self.assignments[index].state = AssignmentState::Runnable;
+        Ok(WakeResult {
+            placement: Placement {
+                thread,
+                cpu: destination,
+                migrated: destination != previous_cpu,
+            },
+            switch,
+        })
+    }
+
+    pub fn remove(&mut self, thread: ThreadId) -> Result<QueueTransition, SmpError> {
+        let index = self
+            .assignment_index(thread)
+            .ok_or(SmpError::UnknownThread)?;
+        let assignment = &self.assignments[index];
+        let cpu = assignment.cpu;
+        let switch = if assignment.state == AssignmentState::Runnable {
+            self.queues[cpu.raw()]
+                .remove(thread)
+                .map_err(|_| SmpError::QueueStateMismatch)?
+        } else {
+            None
+        };
+        self.assignments.remove(index);
+        Ok(QueueTransition {
+            thread,
+            cpu,
+            switch,
+        })
+    }
+
     pub fn cpu_snapshot(&self, cpu: CpuId) -> Result<CpuSnapshot, SmpError> {
         let queue = self.queue(cpu)?;
         let snapshot = queue.snapshot();
@@ -370,9 +490,16 @@ impl SmpRoundRobin {
     }
 
     pub fn snapshot(&self) -> SmpSnapshot {
+        let runnable_thread_count = self
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.state == AssignmentState::Runnable)
+            .count();
         SmpSnapshot {
             cpu_count: self.queues.len(),
             assigned_thread_count: self.assignments.len(),
+            runnable_thread_count,
+            blocked_thread_count: self.assignments.len() - runnable_thread_count,
             online_mask: self.online_mask,
         }
     }
@@ -386,6 +513,19 @@ impl SmpRoundRobin {
             thread,
             cpu: assignment.cpu,
             migrated: false,
+        })
+    }
+
+    pub fn assignment_snapshot(&self, thread: ThreadId) -> Result<AssignmentSnapshot, SmpError> {
+        let assignment = self
+            .assignment_index(thread)
+            .map(|index| &self.assignments[index])
+            .ok_or(SmpError::UnknownThread)?;
+        Ok(AssignmentSnapshot {
+            thread,
+            affinity: assignment.affinity,
+            cpu: assignment.cpu,
+            state: assignment.state,
         })
     }
 
@@ -419,6 +559,29 @@ impl SmpRoundRobin {
     fn cpu_load(&self, cpu: CpuId) -> Result<usize, SmpError> {
         let snapshot = self.queue(cpu)?.snapshot();
         Ok(snapshot.runnable_count + if snapshot.current.is_some() { 1 } else { 0 })
+    }
+
+    fn queue_can_accept(&self, cpu: CpuId) -> Result<bool, SmpError> {
+        let snapshot = self.queue(cpu)?.snapshot();
+        Ok(snapshot.current.is_none() || snapshot.runnable_count < MAX_RUNNABLE_THREADS)
+    }
+
+    fn move_runnable_assignment(
+        &mut self,
+        thread: ThreadId,
+        source: CpuId,
+        destination: CpuId,
+    ) -> Result<(), SmpError> {
+        if !self.queue_can_accept(destination)? {
+            return Err(SmpError::Capacity);
+        }
+        self.queues[source.raw()]
+            .remove(thread)
+            .map_err(|_| SmpError::QueueStateMismatch)?;
+        self.queues[destination.raw()]
+            .wake(thread)
+            .map_err(|_| SmpError::QueueStateMismatch)?;
+        Ok(())
     }
 
     fn assignment_index(&self, thread: ThreadId) -> Option<usize> {
@@ -718,6 +881,136 @@ mod tests {
             }
         );
         assert_eq!(scheduler.placement(second).unwrap().cpu, cpu1);
+    }
+
+    #[test]
+    fn smp_block_and_wake_move_only_for_meaningful_load_relief() {
+        let mut processes = ProcessTable::new();
+        let process = processes.create_process(None).unwrap();
+        let pinned = processes.create_thread(process, "pinned").unwrap();
+        let movable = processes.create_thread(process, "movable").unwrap();
+        let pressure = processes.create_thread(process, "pressure").unwrap();
+        let cpu0 = CpuId::from_raw(0).unwrap();
+        let cpu1 = CpuId::from_raw(1).unwrap();
+        let both = CpuMask::first(2).unwrap();
+        let mut scheduler = SmpRoundRobin::new(2, 2).unwrap();
+
+        scheduler.admit(pinned, CpuMask::single(cpu0)).unwrap();
+        scheduler.admit(movable, CpuMask::single(cpu0)).unwrap();
+        scheduler.set_affinity(movable, both).unwrap();
+
+        assert_eq!(
+            scheduler.block(movable).unwrap(),
+            QueueTransition {
+                thread: movable,
+                cpu: cpu0,
+                switch: None,
+            }
+        );
+        assert_eq!(scheduler.snapshot().runnable_thread_count, 1);
+        assert_eq!(scheduler.snapshot().blocked_thread_count, 1);
+
+        let first_wake = scheduler.wake(movable).unwrap();
+        assert_eq!(
+            first_wake,
+            WakeResult {
+                placement: Placement {
+                    thread: movable,
+                    cpu: cpu0,
+                    migrated: false,
+                },
+                switch: None,
+            }
+        );
+        assert_eq!(scheduler.wake(movable), Err(SmpError::AlreadyRunnable));
+
+        scheduler.admit(pressure, CpuMask::single(cpu0)).unwrap();
+        assert_eq!(scheduler.block(movable).unwrap().switch, None);
+        let relief_wake = scheduler.wake(movable).unwrap();
+        assert_eq!(relief_wake.placement.cpu, cpu1);
+        assert!(relief_wake.placement.migrated);
+        assert_eq!(relief_wake.switch.unwrap().to, movable);
+
+        assert_eq!(scheduler.block(movable).unwrap().switch, None);
+        assert_eq!(scheduler.block(movable), Err(SmpError::NotRunnable));
+        let second_wake = scheduler.wake(movable).unwrap();
+        assert_eq!(second_wake.placement.cpu, cpu1);
+        assert!(!second_wake.placement.migrated);
+        assert_eq!(second_wake.switch.unwrap().to, movable);
+    }
+
+    #[test]
+    fn blocked_affinity_changes_migrate_ownership_without_queueing() {
+        let (_processes, thread, other) = two_threads();
+        let cpu0 = CpuId::from_raw(0).unwrap();
+        let cpu1 = CpuId::from_raw(1).unwrap();
+        let mut scheduler = SmpRoundRobin::new(2, 1).unwrap();
+
+        scheduler.admit(thread, CpuMask::single(cpu0)).unwrap();
+        scheduler.admit(other, CpuMask::single(cpu0)).unwrap();
+        assert_eq!(scheduler.block(thread).unwrap().switch.unwrap().to, other);
+
+        assert_eq!(
+            scheduler
+                .set_affinity(thread, CpuMask::single(cpu1))
+                .unwrap(),
+            Placement {
+                thread,
+                cpu: cpu1,
+                migrated: true,
+            }
+        );
+        assert_eq!(
+            scheduler.assignment_snapshot(thread).unwrap(),
+            AssignmentSnapshot {
+                thread,
+                affinity: CpuMask::single(cpu1),
+                cpu: cpu1,
+                state: AssignmentState::Blocked,
+            }
+        );
+        assert_eq!(scheduler.wake(thread).unwrap().placement.cpu, cpu1);
+    }
+
+    #[test]
+    fn removal_and_yield_preserve_smp_assignment_accounting() {
+        let (_processes, first, second) = two_threads();
+        let cpu0 = CpuId::from_raw(0).unwrap();
+        let mut scheduler = SmpRoundRobin::new(1, 1).unwrap();
+
+        scheduler.admit(first, CpuMask::single(cpu0)).unwrap();
+        scheduler.admit(second, CpuMask::single(cpu0)).unwrap();
+        assert_eq!(scheduler.yield_current(cpu0).unwrap().unwrap().to, second);
+        scheduler.block(first).unwrap();
+        assert_eq!(scheduler.remove(first).unwrap().switch, None);
+        assert_eq!(scheduler.snapshot().assigned_thread_count, 1);
+        assert_eq!(scheduler.snapshot().runnable_thread_count, 1);
+        assert_eq!(scheduler.snapshot().blocked_thread_count, 0);
+        assert_eq!(
+            scheduler.assignment_snapshot(first),
+            Err(SmpError::UnknownThread)
+        );
+    }
+
+    #[test]
+    fn rebalance_planning_ignores_blocked_movable_assignments() {
+        let mut processes = ProcessTable::new();
+        let process = processes.create_process(None).unwrap();
+        let cpu1 = CpuId::from_raw(1).unwrap();
+        let cpu2 = CpuId::from_raw(2).unwrap();
+        let ap_cpus = CpuMask::single(cpu1).union(CpuMask::single(cpu2));
+        let mut scheduler = SmpRoundRobin::new(3, 1).unwrap();
+
+        for name in ["pinned-a", "pinned-b", "pinned-c"] {
+            let thread = processes.create_thread(process, name).unwrap();
+            scheduler.admit(thread, CpuMask::single(cpu1)).unwrap();
+        }
+        let blocked = processes.create_thread(process, "blocked-movable").unwrap();
+        scheduler.admit(blocked, CpuMask::single(cpu1)).unwrap();
+        scheduler.set_affinity(blocked, ap_cpus).unwrap();
+        scheduler.block(blocked).unwrap();
+
+        assert_eq!(scheduler.rebalance_plan(ap_cpus).unwrap(), None);
     }
 
     #[test]
