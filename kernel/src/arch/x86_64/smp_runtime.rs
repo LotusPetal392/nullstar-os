@@ -160,9 +160,7 @@ pub fn activate_application_processor(
 }
 
 pub fn current_cpu_index() -> usize {
-    current_apic_id()
-        .and_then(mapped_cpu_index)
-        .unwrap_or(0)
+    current_apic_id().and_then(mapped_cpu_index).unwrap_or(0)
 }
 
 pub fn record_timer_tick(cpu_index: usize) -> Result<u64, RuntimeError> {
