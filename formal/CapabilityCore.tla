@@ -11,17 +11,17 @@ EXTENDS FiniteSets, Naturals
 CONSTANTS
     P1, P2,
     O1, O2,
-    H1, H2, H3, H4,
+    H1, H2, H3,
     UseRight, DuplicateRight, TransferRight
 
 Processes == {P1, P2}
 Objects == {O1, O2}
-Handles == {H1, H2, H3, H4}
+Handles == {H1, H2, H3}
 Rights == {UseRight, DuplicateRight, TransferRight}
 
 ASSUME /\ P1 # P2
        /\ O1 # O2
-       /\ Cardinality(Handles) = 4
+       /\ Cardinality(Handles) = 3
        /\ Cardinality(Rights) = 3
 
 VARIABLES
@@ -42,8 +42,18 @@ TypeOK ==
     /\ originObject \in [Handles -> Objects]
     /\ originRights \in [Handles -> SUBSET Rights]
 
-\* Two initial roots make both object identities reachable while leaving two
-\* free handle slots for duplication and transfer interleavings.
+\* Inactive slots have no security meaning.  Canonicalizing their metadata
+\* avoids exploring states that differ only in unreachable stale model data.
+InactiveCanonical ==
+    \A h \in Handles \ active:
+        /\ owner[h] = P1
+        /\ objectOf[h] = O1
+        /\ rightsOf[h] = {}
+        /\ originObject[h] = O1
+        /\ originRights[h] = {}
+
+\* Two initial roots make both object identities reachable while leaving one
+\* free handle slot for duplication, transfer, close, and reuse interleavings.
 Init ==
     /\ active = {H1, H2}
     /\ owner = [h \in Handles |-> IF h = H2 THEN P2 ELSE P1]
@@ -56,7 +66,11 @@ Close ==
     \E p \in Processes, src \in active:
         /\ owner[src] = p
         /\ active' = active \ {src}
-        /\ UNCHANGED <<owner, objectOf, rightsOf, originObject, originRights>>
+        /\ owner' = [owner EXCEPT ![src] = P1]
+        /\ objectOf' = [objectOf EXCEPT ![src] = O1]
+        /\ rightsOf' = [rightsOf EXCEPT ![src] = {}]
+        /\ originObject' = [originObject EXCEPT ![src] = O1]
+        /\ originRights' = [originRights EXCEPT ![src] = {}]
 
 Duplicate ==
     \E p \in Processes, src \in active:
@@ -97,11 +111,13 @@ MoveTransfer ==
             /\ TransferRight \in rightsOf[src]
             /\ requested # {}
             /\ active' = (active \ {src}) \cup {dst}
-            /\ owner' = [owner EXCEPT ![dst] = targetProcess]
-            /\ objectOf' = [objectOf EXCEPT ![dst] = objectOf[src]]
-            /\ rightsOf' = [rightsOf EXCEPT ![dst] = requested]
-            /\ originObject' = [originObject EXCEPT ![dst] = originObject[src]]
-            /\ originRights' = [originRights EXCEPT ![dst] = originRights[src]]
+            /\ owner' = [owner EXCEPT ![src] = P1, ![dst] = targetProcess]
+            /\ objectOf' = [objectOf EXCEPT ![src] = O1, ![dst] = objectOf[src]]
+            /\ rightsOf' = [rightsOf EXCEPT ![src] = {}, ![dst] = requested]
+            /\ originObject' = [originObject EXCEPT ![src] = O1,
+                                                ![dst] = originObject[src]]
+            /\ originRights' = [originRights EXCEPT ![src] = {},
+                                              ![dst] = originRights[src]]
 
 Next ==
     \/ Close
@@ -126,6 +142,7 @@ BoundedAuthority ==
 
 SecurityInvariant ==
     /\ TypeOK
+    /\ InactiveCanonical
     /\ NoEmptyAuthority
     /\ RightsNeverAmplify
     /\ ObjectIdentityStable
