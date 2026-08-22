@@ -108,8 +108,13 @@ context group, transactionally admits each userspace compatibility process/threa
 parentage, and delegates timer, yield, block, wake, stop, continue, exit, and reap transitions to
 the same coordinator. A stopped blocked thread retains its deferred resume state, so an event can
 make it ready without dispatching it before a continue operation. Register contexts and address
-spaces remain architecture-owned. General event/wait-queue objects still need to invoke the shared
-wake path directly, and the userspace ABI still needs true multi-thread creation.
+spaces remain architecture-owned. Generic object waits, wait sets, event ports, timers, and endpoint
+wait queues now capture the exact shared process/thread execution context at registration and wake
+that identity through the shared runtime. Capability ownership and process-wide cleanup remain keyed
+by the compatibility process ID, while duplicate waiter replacement is thread-scoped, removing the
+one-waiter-per-process assumption before the ABI exposes multiple userspace threads. Process-level
+compatibility wakeups remain for signals and legacy I/O completion; the userspace ABI still needs true
+multi-thread creation.
 
 ### 4. Synchronization and concurrent execution
 

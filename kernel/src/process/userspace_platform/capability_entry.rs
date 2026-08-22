@@ -594,7 +594,7 @@ fn capability_reap_dead_processes() {
             .map(|process| process.process_id)
             .collect::<Vec<_>>()
     };
-    retain_live_object_waiters(&live_processes);
+    retain_live_blocking_waiters(&live_processes);
     let mut registry = CAPABILITY_REGISTRY.lock();
     registry
         .tables

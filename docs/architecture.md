@@ -146,7 +146,10 @@ CPU-local task stores during wakeup, and verifies both destination dispatch and 
 Ordinary userspace tasks remain physically hosted by the bootstrap context/address-space store, but
 their lifecycle identity and CPU 0 queue decisions now come from the same execution runtime as AP
 kernel contexts. This compatibility cutover deliberately leaves register storage CPU-local while
-removing the second independent source of scheduling truth.
+removing the second independent source of scheduling truth. Generic object, wait-set, event-port,
+timer, and endpoint waits capture that exact execution identity when blocking and wake the recorded
+thread through the shared runtime. Capability ownership and process teardown still use compatibility
+process IDs, but independent threads in one process no longer overwrite one another's waiter records.
 
 The synchronization/IPC layer adds an acquire/release `SmpMutex`, bounded FIFO channels with
 blocking and nonblocking operations, and fixed per-CPU mailboxes for reschedule, wake, address-space

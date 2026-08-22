@@ -6261,7 +6261,7 @@ pub fn reap(frame_allocator: &mut BootInfoFrameAllocator) -> Result<usize, Error
             PROCESS_MANAGER.lock().remove_process(process_id)
         })
         .ok_or(Error::ProcessNotFound(process_id))?;
-        remove_object_waiter(process_id);
+        remove_blocking_waiters(process_id);
         capability_remove_process(process_id);
         let terminal_parent = process.terminal_parent;
         terminal::detach(process_id);
