@@ -38,8 +38,13 @@ and `tla2tools.jar` available:
 
 ```sh
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
-  tlc2.TLC -config formal/CapabilityCore.cfg formal/CapabilityCore.tla
+  tlc2.TLC -deadlock \
+  -config formal/CapabilityCore.cfg formal/CapabilityCore.tla
 ```
+
+`-deadlock` disables TLC's deadlock error because closing the final modeled
+capability is an intentional terminal state.  The safety invariants remain
+checked over the complete reachable state graph.
 
 The repository CI pins TLA+ Tools 1.7.4 for repeatability.
 
