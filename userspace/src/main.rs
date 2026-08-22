@@ -2617,8 +2617,7 @@ fn spawn_managed_capability_tool<const N: usize>(
         Rights::RECEIVE,
         PROCESS_START_BOOTSTRAP_SLOT,
     )
-    .ok()
-        == Some(PROCESS_START_BOOTSTRAP_SLOT);
+    .is_ok();
     let startup_sent = bootstrap_granted
         && send_managed_tool_start_with_capabilities(
             sender,
@@ -3593,8 +3592,7 @@ fn start_definition_service(
             Rights::RECEIVE,
             PROCESS_START_BOOTSTRAP_SLOT,
         )
-        .ok()
-            == Some(PROCESS_START_BOOTSTRAP_SLOT)
+        .is_ok()
     });
     let startup_sent = bootstrap_granted
         && send_definition_process_start(&mut attempt, runtime, process_id, generation);
@@ -5564,8 +5562,7 @@ fn launch_logging_generation(
         Rights::RECEIVE,
         PROCESS_START_BOOTSTRAP_SLOT,
     )
-    .ok()
-        != Some(PROCESS_START_BOOTSTRAP_SLOT)
+    .is_err()
     {
         fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
@@ -6105,8 +6102,7 @@ fn start_contained_service(
             Rights::RECEIVE,
             PROCESS_START_BOOTSTRAP_SLOT,
         )
-        .ok()
-            != Some(PROCESS_START_BOOTSTRAP_SLOT)
+        .is_err()
         {
             fail_contained_activation(attempt, messages, messages.bootstrap_failed);
         }
