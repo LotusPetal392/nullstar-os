@@ -263,21 +263,12 @@ impl ProcessTable {
         process_id: ProcessId,
         name: &'static str,
     ) -> Result<ThreadId, CreateError> {
-        if self.thread_count >= MAX_THREADS {
-            return Err(CreateError::ThreadLimitReached);
-        }
+        self.validate_thread_creation(process_id)?;
         let process_index = self
             .processes
             .iter()
             .position(|process| process.id == process_id)
-            .ok_or(CreateError::InvalidProcess)?;
-        let process = &self.processes[process_index];
-        if process.state == ProcessState::Exited {
-            return Err(CreateError::ProcessExited);
-        }
-        if process.threads.len() >= MAX_THREADS_PER_PROCESS {
-            return Err(CreateError::ThreadLimitPerProcessReached);
-        }
+            .expect("validated process disappeared");
 
         let id = ThreadId(self.next_thread_id);
         self.next_thread_id = self.next_thread_id.saturating_add(1);
@@ -293,6 +284,58 @@ impl ProcessTable {
         process.state = ProcessState::Running;
         self.thread_count += 1;
         Ok(id)
+    }
+
+    pub(crate) fn validate_thread_creation(
+        &self,
+        process_id: ProcessId,
+    ) -> Result<(), CreateError> {
+        if self.thread_count >= MAX_THREADS {
+            return Err(CreateError::ThreadLimitReached);
+        }
+        let process = self
+            .process(process_id)
+            .ok_or(CreateError::InvalidProcess)?;
+        if process.state == ProcessState::Exited {
+            return Err(CreateError::ProcessExited);
+        }
+        if process.threads.len() >= MAX_THREADS_PER_PROCESS {
+            return Err(CreateError::ThreadLimitPerProcessReached);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rollback_thread_creation(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<(), StateError> {
+        let (process_id, state, detached, has_exit) = {
+            let thread = self.thread(thread_id).ok_or(StateError::InvalidThread)?;
+            (
+                thread.process_id,
+                thread.state,
+                thread.detached,
+                thread.exit.is_some(),
+            )
+        };
+        if state != ThreadState::Runnable || detached || has_exit {
+            return Err(StateError::InvalidTransition);
+        }
+
+        let process = self
+            .process_mut(process_id)
+            .ok_or(StateError::InvalidThread)?;
+        let index = process
+            .threads
+            .iter()
+            .position(|thread| thread.id == thread_id)
+            .ok_or(StateError::InvalidThread)?;
+        process.threads.remove(index);
+        if process.threads.is_empty() {
+            process.state = ProcessState::Created;
+        }
+        self.thread_count = self.thread_count.saturating_sub(1);
+        Ok(())
     }
 
     pub fn process_snapshot(&self, process_id: ProcessId) -> Result<ProcessSnapshot, LookupError> {
@@ -629,5 +672,25 @@ mod tests {
             Err(CreateError::ProcessExited)
         );
         assert_eq!(table.reap_process(process).unwrap().status, 1);
+    }
+
+    #[test]
+    fn unadmitted_thread_creation_can_roll_back_without_advancing_process_state() {
+        let mut table = ProcessTable::new();
+        let process = table.create_process(None).unwrap();
+        let thread = table.create_thread(process, "unadmitted").unwrap();
+
+        table.rollback_thread_creation(thread).unwrap();
+
+        assert_eq!(table.thread_count(), 0);
+        assert_eq!(table.process_snapshot(process).unwrap().thread_count, 0);
+        assert_eq!(
+            table.process_snapshot(process).unwrap().state,
+            ProcessState::Created
+        );
+        assert_eq!(
+            table.thread_snapshot(thread),
+            Err(LookupError::InvalidThread)
+        );
     }
 }

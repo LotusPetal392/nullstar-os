@@ -20,6 +20,7 @@ pub mod process_model;
 pub mod runtime_accounting;
 pub mod scheduling;
 pub mod smp;
+pub mod smp_execution;
 pub mod timer;
 pub mod tmpfs_abi;
 pub mod wait_set;
