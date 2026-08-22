@@ -60,10 +60,11 @@ A table entry conceptually contains:
 object reference + immutable rights + handle flags
 ```
 
-Handle values are opaque and meaningful only in the owning process. A generation plus
-slot index is the preferred implementation so a stale value cannot accidentally refer
-to a newly allocated object after table-slot reuse. The exact width and bit layout are
-not a public promise until the ABI is specified.
+Handle values are opaque and meaningful only in the owning process. ABI 1.31 implements
+generation-checked handle values so a stale value cannot accidentally refer to newly
+allocated authority after table-slot reuse. A bounded slot may be used as a local
+discovery coordinate, but the generation/slot encoding and exact bit layout remain
+private implementation details rather than a public ABI promise.
 
 ### Core object family
 
