@@ -621,6 +621,9 @@ pub struct SpawnInfo {
     pub process_id: u64,
     pub process_group_id: u64,
     pub task_id: u64,
+    pub execution_process_id: u64,
+    pub execution_thread_id: u64,
+    pub execution_cpu: usize,
     pub path: String,
     pub entry_point: u64,
     pub page_table_address: u64,
@@ -2398,7 +2401,7 @@ fn spawn_with_mode(
         return Err(Error::JobLimitReached);
     }
 
-    let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
+    let task_result = cpu_interrupts::without_interrupts(|| -> Result<scheduler::SpawnedUserTask, Error> {
         if foreground {
             let attached = match terminal_parent {
                 Some(parent_process) => terminal::transfer(parent_process, process_id),
@@ -2408,14 +2411,16 @@ fn spawn_with_mode(
                 return Err(Error::TerminalBusy);
             }
         }
-        let task_id = scheduler::spawn_user_process(
-            task_name,
+        let spawned_task = scheduler::spawn_user_process(scheduler::UserTaskRegistration {
+            name: task_name,
             process_id,
-            initial_stack_pointer,
-            VirtAddr::new(kernel_stack_top as u64),
+            parent_process_id,
+            stack_pointer: initial_stack_pointer,
+            kernel_stack_top: VirtAddr::new(kernel_stack_top as u64),
             kernel_stack_bytes,
             page_table_address,
-        )?;
+        })?;
+        let task_id = spawned_task.task_id;
         let mut process = pending_process
             .take()
             .ok_or(scheduler::InitError::InvalidUserContext)?;
@@ -2423,11 +2428,11 @@ fn spawn_with_mode(
         let mut manager = PROCESS_MANAGER.lock();
         manager.spawned = manager.spawned.saturating_add(1);
         manager.processes.push(process);
-        Ok(task_id)
+        Ok(spawned_task)
     });
 
-    let task_id = match task_result {
-        Ok(task_id) => task_id,
+    let spawned_task = match task_result {
+        Ok(spawned_task) => spawned_task,
         Err(error) => {
             if let Some(job) = inherited_job {
                 capability_job_remove_unstarted(job, process_id);
@@ -2447,11 +2452,23 @@ fn spawn_with_mode(
             return Err(error);
         }
     };
+    let task_id = spawned_task.task_id;
+
+    crate::serial_println!(
+        "userspace execution context registered: pid={}, execution_process={}, execution_thread={}, cpu={}",
+        process_id,
+        spawned_task.execution_process_id,
+        spawned_task.execution_thread_id,
+        spawned_task.cpu
+    );
 
     Ok(SpawnInfo {
         process_id,
         process_group_id,
         task_id,
+        execution_process_id: spawned_task.execution_process_id,
+        execution_thread_id: spawned_task.execution_thread_id,
+        execution_cpu: spawned_task.cpu,
         path: path.to_string(),
         entry_point: image.entry_point,
         page_table_address,
@@ -3067,16 +3084,18 @@ impl Runtime {
         let mut owned_frames = core::mem::take(&mut address_space.page_table_frames);
         owned_frames.extend(snapshot.pages.iter().map(|page| page.frame));
 
-        let task_result = cpu_interrupts::without_interrupts(|| -> Result<u64, Error> {
+        let task_result = cpu_interrupts::without_interrupts(|| -> Result<scheduler::SpawnedUserTask, Error> {
             let _ = protect_parent_pages_for_fork(parent_process_id, self.physical_memory_offset)?;
-            let task_id = scheduler::spawn_user_process(
-                SHELL_PROCESS_TASK_NAME,
-                child_process_id,
-                child_stack_pointer,
-                VirtAddr::new(kernel_stack_top as u64),
+            let spawned_task = scheduler::spawn_user_process(scheduler::UserTaskRegistration {
+                name: SHELL_PROCESS_TASK_NAME,
+                process_id: child_process_id,
+                parent_process_id: Some(parent_process_id),
+                stack_pointer: child_stack_pointer,
+                kernel_stack_top: VirtAddr::new(kernel_stack_top as u64),
                 kernel_stack_bytes,
                 page_table_address,
-            )?;
+            })?;
+            let task_id = spawned_task.task_id;
             for page in &snapshot.pages {
                 retain_shared_frame(page.frame);
             }
@@ -3185,28 +3204,34 @@ impl Runtime {
             manager.forks = manager.forks.saturating_add(1);
             manager.spawned = manager.spawned.saturating_add(1);
             manager.processes.push(child);
-            Ok(task_id)
+            Ok(spawned_task)
         });
 
-        if let Err(error) = task_result {
-            if let Some(job) = snapshot.job {
-                capability_job_remove_unstarted(job, child_process_id);
+        let spawned_task = match task_result {
+            Ok(spawned_task) => spawned_task,
+            Err(error) => {
+                if let Some(job) = snapshot.job {
+                    capability_job_remove_unstarted(job, child_process_id);
+                }
+                release_fork_resources(&snapshot);
+                for frame in address_space.page_table_frames.drain(..) {
+                    self.frame_allocator.deallocate_frame(frame);
+                }
+                return Err(error);
             }
-            release_fork_resources(&snapshot);
-            for frame in address_space.page_table_frames.drain(..) {
-                self.frame_allocator.deallocate_frame(frame);
-            }
-            return Err(error);
-        }
+        };
         if !scheduler::wake_process(parent_process_id) {
             return Err(Error::ProcessNotFound(parent_process_id));
         }
         crate::serial_println!(
-            "userspace process forked: parent={}, child={}, group={}, shared_pages={}",
+            "userspace process forked: parent={}, child={}, group={}, shared_pages={}, execution_process={}, execution_thread={}, cpu={}",
             parent_process_id,
             child_process_id,
             snapshot.process_group_id,
-            snapshot.pages.len()
+            snapshot.pages.len(),
+            spawned_task.execution_process_id,
+            spawned_task.execution_thread_id,
+            spawned_task.cpu
         );
         Ok(child_process_id)
     }
@@ -6507,7 +6532,7 @@ pub extern "C" fn galactic_syscall_dispatch(current_stack_pointer: usize) -> usi
                 process_path(process_id),
                 exit_code
             );
-            scheduler::terminate_current(current_stack_pointer)
+            scheduler::terminate_current(current_stack_pointer, exit_code)
         }
         _ => {
             registers.rax = error_return(ERR_NOT_IMPLEMENTED);
@@ -6615,7 +6640,7 @@ pub extern "C" fn galactic_user_fault_dispatch(current_stack_pointer: usize, vec
         fault.address,
         fault.instruction_pointer
     );
-    scheduler::terminate_current(current_stack_pointer)
+    scheduler::terminate_current(current_stack_pointer, vector)
 }
 
 #[repr(C)]
@@ -7399,7 +7424,7 @@ fn default_signal_action(signal: u64) -> Option<DefaultSignalAction> {
 }
 
 fn terminate_process_with_signal(process_id: u64, signal: u64, record_received: bool) -> bool {
-    if !scheduler::terminate_process(process_id) {
+    if !scheduler::terminate_process(process_id, signal) {
         return false;
     }
     let mut manager = PROCESS_MANAGER.lock();

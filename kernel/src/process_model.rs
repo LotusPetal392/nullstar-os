@@ -88,6 +88,7 @@ pub struct ThreadSnapshot {
     pub process_id: ProcessId,
     pub name: &'static str,
     pub state: ThreadState,
+    pub stopped_resume_state: Option<ThreadState>,
     pub detached: bool,
     pub exit: Option<ThreadExit>,
 }
@@ -146,6 +147,7 @@ struct Thread {
     process_id: ProcessId,
     name: &'static str,
     state: ThreadState,
+    stopped_resume_state: Option<ThreadState>,
     detached: bool,
     exit: Option<ThreadExit>,
 }
@@ -157,6 +159,7 @@ impl Thread {
             process_id: self.process_id,
             name: self.name,
             state: self.state,
+            stopped_resume_state: self.stopped_resume_state,
             detached: self.detached,
             exit: self.exit,
         }
@@ -296,6 +299,7 @@ impl ProcessTable {
             process_id,
             name,
             state: ThreadState::Runnable,
+            stopped_resume_state: None,
             detached: false,
             exit: None,
         });
@@ -478,10 +482,20 @@ impl ProcessTable {
         let thread = self
             .thread_mut(thread_id)
             .ok_or(StateError::InvalidThread)?;
-        if !matches!(thread.state, ThreadState::Blocked | ThreadState::Sleeping) {
-            return Err(StateError::InvalidTransition);
+        match thread.state {
+            ThreadState::Blocked | ThreadState::Sleeping => {
+                thread.state = ThreadState::Runnable;
+            }
+            ThreadState::Stopped
+                if matches!(
+                    thread.stopped_resume_state,
+                    Some(ThreadState::Blocked | ThreadState::Sleeping)
+                ) =>
+            {
+                thread.stopped_resume_state = Some(ThreadState::Runnable);
+            }
+            _ => return Err(StateError::InvalidTransition),
         }
-        thread.state = ThreadState::Runnable;
         Ok(())
     }
 
@@ -489,28 +503,35 @@ impl ProcessTable {
         let thread = self
             .thread_mut(thread_id)
             .ok_or(StateError::InvalidThread)?;
-        if !matches!(
-            thread.state,
-            ThreadState::Runnable
-                | ThreadState::Running
-                | ThreadState::Blocked
-                | ThreadState::Sleeping
-        ) {
+        let resume_state = match thread.state {
+            ThreadState::Runnable | ThreadState::Running => ThreadState::Runnable,
+            ThreadState::Blocked => ThreadState::Blocked,
+            ThreadState::Sleeping => ThreadState::Sleeping,
+            ThreadState::Stopped | ThreadState::Exited => {
+                return Err(StateError::InvalidTransition);
+            }
+        };
+        if thread.stopped_resume_state.is_some() {
             return Err(StateError::InvalidTransition);
         }
+        thread.stopped_resume_state = Some(resume_state);
         thread.state = ThreadState::Stopped;
         Ok(())
     }
 
-    pub fn continue_thread(&mut self, thread_id: ThreadId) -> Result<(), StateError> {
+    pub fn continue_thread(&mut self, thread_id: ThreadId) -> Result<ThreadState, StateError> {
         let thread = self
             .thread_mut(thread_id)
             .ok_or(StateError::InvalidThread)?;
         if thread.state != ThreadState::Stopped {
             return Err(StateError::InvalidTransition);
         }
-        thread.state = ThreadState::Runnable;
-        Ok(())
+        let resume_state = thread
+            .stopped_resume_state
+            .take()
+            .ok_or(StateError::InvalidTransition)?;
+        thread.state = resume_state;
+        Ok(resume_state)
     }
 
     pub fn exit_thread(
@@ -526,6 +547,7 @@ impl ProcessTable {
                 return Err(StateError::InvalidTransition);
             }
             thread.state = ThreadState::Exited;
+            thread.stopped_resume_state = None;
             thread.exit = Some(ThreadExit {
                 thread_id,
                 process_id: thread.process_id,
@@ -584,6 +606,26 @@ impl ProcessTable {
         };
         self.reclaim_exited_thread(process_id, thread_id);
         Ok(exit)
+    }
+
+    /// Detach every live child from a process that is leaving the userspace
+    /// compatibility layer. The higher-level process manager is responsible
+    /// for any reparenting policy; the shared lifecycle table must not retain
+    /// a stale parent edge that prevents eventual reclamation.
+    pub fn orphan_children(&mut self, process_id: ProcessId) -> Result<usize, LookupError> {
+        let process_index = self
+            .processes
+            .iter()
+            .position(|process| process.id == process_id)
+            .ok_or(LookupError::InvalidProcess)?;
+        let children = core::mem::take(&mut self.processes[process_index].children);
+        let orphaned = children.len();
+        for child_id in children {
+            if let Some(child) = self.process_mut(child_id) {
+                child.parent = None;
+            }
+        }
+        Ok(orphaned)
     }
 
     pub fn reap_process(&mut self, process_id: ProcessId) -> Result<ProcessExit, ReapError> {
@@ -713,6 +755,41 @@ mod tests {
             table.yield_thread(thread),
             Err(StateError::InvalidTransition)
         );
+    }
+
+    #[test]
+    fn stopped_blocked_thread_defers_wake_until_continue() {
+        let mut table = ProcessTable::new();
+        let process = table.create_process(None).unwrap();
+        let thread = table.create_thread(process, "deferred-wake").unwrap();
+
+        table.block_thread(thread).unwrap();
+        table.stop_thread(thread).unwrap();
+        let stopped = table.thread_snapshot(thread).unwrap();
+        assert_eq!(stopped.state, ThreadState::Stopped);
+        assert_eq!(stopped.stopped_resume_state, Some(ThreadState::Blocked));
+
+        table.wake_thread(thread).unwrap();
+        let woken = table.thread_snapshot(thread).unwrap();
+        assert_eq!(woken.state, ThreadState::Stopped);
+        assert_eq!(woken.stopped_resume_state, Some(ThreadState::Runnable));
+        assert_eq!(
+            table.continue_thread(thread).unwrap(),
+            ThreadState::Runnable
+        );
+    }
+
+    #[test]
+    fn orphaning_children_releases_both_sides_of_parent_edges() {
+        let mut table = ProcessTable::new();
+        let parent = table.create_process(None).unwrap();
+        let first = table.create_process(Some(parent)).unwrap();
+        let second = table.create_process(Some(parent)).unwrap();
+
+        assert_eq!(table.orphan_children(parent).unwrap(), 2);
+        assert_eq!(table.process_snapshot(parent).unwrap().child_count, 0);
+        assert_eq!(table.process_snapshot(first).unwrap().parent, None);
+        assert_eq!(table.process_snapshot(second).unwrap().parent, None);
     }
 
     #[test]

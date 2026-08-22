@@ -72,6 +72,8 @@ jobs:
           grep -F "application processor scheduler lane initialized: cpu=1" smp-qemu.log
           grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" smp-qemu.log
           grep -F "execution_cpus=2/64, execution_online_mask=0x3, execution_registered_cpus=1" smp-qemu.log
+          grep -E "scheduler initialized: .*execution_process=[1-9][0-9]*, execution_thread=[1-9][0-9]*, execution_processes=2, execution_threads=8, execution_registered_cpus=2" smp-qemu.log
+          grep -E "userspace execution context registered: pid=1, execution_process=[1-9][0-9]*, execution_thread=[1-9][0-9]*, cpu=0" smp-qemu.log
           grep -F "application processor timer verified: cpu=1" smp-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" smp-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" smp-qemu.log
@@ -90,6 +92,8 @@ jobs:
           grep -F "lifecycle_process=2, lifecycle_threads=2, lifecycle_running=1" smp-migration-qemu.log
           grep -F "execution_cpus=2/64, execution_online_mask=0x3, execution_registered_cpus=1" smp-migration-qemu.log
           grep -F "execution_cpus=3/64, execution_online_mask=0x7, execution_registered_cpus=2" smp-migration-qemu.log
+          grep -E "scheduler initialized: .*execution_process=[1-9][0-9]*, execution_thread=[1-9][0-9]*, execution_processes=3, execution_threads=10, execution_registered_cpus=3" smp-migration-qemu.log
+          grep -E "userspace execution context registered: pid=1, execution_process=[1-9][0-9]*, execution_thread=[1-9][0-9]*, cpu=0" smp-migration-qemu.log
           grep -F "application processor kernel migration prepared:" smp-migration-qemu.log
           grep -F "from_cpu=1, to_cpu=2" smp-migration-qemu.log
           grep -F "application processor kernel migration verified:" smp-migration-qemu.log
@@ -124,6 +128,8 @@ jobs:
           grep -F "application processor scheduler lane initialized: cpu=1" partition-fat-qemu.log
           grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" partition-fat-qemu.log
           grep -F "execution_cpus=2/64, execution_online_mask=0x3, execution_registered_cpus=1" partition-fat-qemu.log
+          grep -E "scheduler initialized: .*execution_process=[1-9][0-9]*, execution_thread=[1-9][0-9]*, execution_processes=2, execution_threads=10, execution_registered_cpus=2" partition-fat-qemu.log
+          grep -E "userspace execution context registered: pid=1, execution_process=[1-9][0-9]*, execution_thread=[1-9][0-9]*, cpu=0" partition-fat-qemu.log
           grep -F "application processor timer verified: cpu=1" partition-fat-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" partition-fat-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" partition-fat-qemu.log

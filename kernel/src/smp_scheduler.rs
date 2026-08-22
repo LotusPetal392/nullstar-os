@@ -1160,7 +1160,7 @@ fn wake_blocked_probe() {
             _ => return None,
         };
         let wake = match execution.wake_thread(thread_id) {
-            Ok(wake) if wake.placement.cpu == destination => wake,
+            Ok(Some(wake)) if wake.placement.cpu == destination => wake,
             _ => {
                 let source = CpuId::from_raw(source_cpu)
                     .expect("source CPU is within the scheduler CPU bound");

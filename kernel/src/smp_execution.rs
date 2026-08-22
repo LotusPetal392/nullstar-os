@@ -214,14 +214,25 @@ impl SmpExecution {
         Ok(transition)
     }
 
-    pub fn wake_thread(&mut self, thread: ThreadId) -> Result<WakeResult, ExecutionError> {
-        self.require_state(thread, &[ThreadState::Blocked, ThreadState::Sleeping])?;
-        let wake = self.scheduler.wake(thread)?;
-        self.processes
-            .wake_thread(thread)
-            .expect("wake transition was prevalidated");
-        self.activate(wake.switch);
-        Ok(wake)
+    pub fn wake_thread(&mut self, thread: ThreadId) -> Result<Option<WakeResult>, ExecutionError> {
+        let state = self.thread_state(thread)?;
+        match state {
+            ThreadState::Blocked | ThreadState::Sleeping => {
+                let wake = self.scheduler.wake(thread)?;
+                self.processes
+                    .wake_thread(thread)
+                    .expect("wake transition was prevalidated");
+                self.activate(wake.switch);
+                Ok(Some(wake))
+            }
+            ThreadState::Stopped => {
+                self.processes.wake_thread(thread)?;
+                Ok(None)
+            }
+            ThreadState::Runnable | ThreadState::Running | ThreadState::Exited => {
+                Err(StateError::InvalidTransition.into())
+            }
+        }
     }
 
     pub fn stop_thread(
@@ -245,13 +256,30 @@ impl SmpExecution {
         Ok(transition)
     }
 
-    pub fn continue_thread(&mut self, thread: ThreadId) -> Result<WakeResult, ExecutionError> {
+    pub fn continue_thread(
+        &mut self,
+        thread: ThreadId,
+    ) -> Result<Option<WakeResult>, ExecutionError> {
         self.require_state(thread, &[ThreadState::Stopped])?;
-        let wake = self.scheduler.wake(thread)?;
-        self.processes
+        let resume_state = self
+            .processes
+            .thread_snapshot(thread)
+            .expect("continue thread was prevalidated")
+            .stopped_resume_state
+            .expect("stopped thread must retain its resume state");
+        let wake = if resume_state == ThreadState::Runnable {
+            Some(self.scheduler.wake(thread)?)
+        } else {
+            None
+        };
+        let continued_state = self
+            .processes
             .continue_thread(thread)
             .expect("continue transition was prevalidated");
-        self.activate(wake.switch);
+        debug_assert_eq!(continued_state, resume_state);
+        if let Some(wake) = wake {
+            self.activate(wake.switch);
+        }
         Ok(wake)
     }
 
@@ -323,6 +351,10 @@ impl SmpExecution {
 
     pub fn reap_process(&mut self, process: ProcessId) -> Result<ProcessExit, ReapError> {
         self.processes.reap_process(process)
+    }
+
+    pub fn orphan_process_children(&mut self, process: ProcessId) -> Result<usize, LookupError> {
+        self.processes.orphan_children(process)
     }
 
     pub(crate) fn rollback_process_creation(
@@ -485,7 +517,7 @@ mod tests {
             ThreadState::Blocked
         );
         assert_eq!(execution.scheduler_snapshot().blocked_thread_count, 1);
-        assert_eq!(execution.wake_thread(first).unwrap().switch, None);
+        assert_eq!(execution.wake_thread(first).unwrap().unwrap().switch, None);
         assert_eq!(
             execution.thread_snapshot(first).unwrap().state,
             ThreadState::Runnable
@@ -504,10 +536,48 @@ mod tests {
             execution.thread_snapshot(second).unwrap().state,
             ThreadState::Stopped
         );
-        assert_eq!(execution.continue_thread(second).unwrap().switch, None);
+        assert_eq!(execution.continue_thread(second).unwrap(), None);
         assert_eq!(
             execution.thread_snapshot(second).unwrap().state,
-            ThreadState::Runnable
+            ThreadState::Sleeping
+        );
+        assert_eq!(execution.scheduler_snapshot().blocked_thread_count, 1);
+        assert_eq!(execution.wake_thread(second).unwrap().unwrap().switch, None);
+        assert_eq!(execution.scheduler_snapshot().blocked_thread_count, 0);
+    }
+
+    #[test]
+    fn stopped_blocked_wake_is_deferred_until_continue() {
+        let cpu0 = cpu(0);
+        let mut execution = SmpExecution::new(1, DEFAULT_QUANTUM_TICKS).unwrap();
+        let process = execution.create_process(None).unwrap();
+        let thread = execution
+            .create_thread(process, "deferred-wake", CpuMask::single(cpu0))
+            .unwrap()
+            .placement
+            .thread;
+
+        execution.block_thread(thread).unwrap();
+        execution.stop_thread(thread).unwrap();
+        assert_eq!(execution.wake_thread(thread).unwrap(), None);
+        assert_eq!(
+            execution.thread_snapshot(thread).unwrap().state,
+            ThreadState::Stopped
+        );
+        assert_eq!(execution.scheduler_snapshot().blocked_thread_count, 1);
+
+        assert_eq!(
+            execution
+                .continue_thread(thread)
+                .unwrap()
+                .unwrap()
+                .placement
+                .thread,
+            thread
+        );
+        assert_eq!(
+            execution.thread_snapshot(thread).unwrap().state,
+            ThreadState::Running
         );
         assert_eq!(execution.scheduler_snapshot().blocked_thread_count, 0);
     }

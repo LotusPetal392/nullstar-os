@@ -169,6 +169,7 @@ mod tests {
             process_id,
             name: "worker",
             state: ThreadState::Runnable,
+            stopped_resume_state: None,
             detached: false,
             exit: None,
         }
