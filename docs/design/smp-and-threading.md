@@ -95,9 +95,15 @@ rebalance, and exit effects. It owns both models, prevalidates fallible operatio
 enough source/destination transition detail to keep running state synchronized across CPUs. The
 live AP context store now registers its reserved probe identities in one bounded lifecycle process
 per AP and routes timer, migration, rebalance, block, and wake operations through the coordinator.
-Boot snapshots expose lifecycle process, thread, and running counts, while dispatch verification
-checks the authoritative thread state. General event/wait-queue wakeups and the userspace context
-store still need to adopt this path.
+A kernel-wide execution runtime now owns that coordinator independently of the x86 AP context store,
+initializes CPU 0 first, distinguishes 64-slot topology capacity from the actual online mask, and
+publishes each CPU's context group only after atomic admission succeeds. The shared bounds are 128
+processes and 256 threads/assignments; host coverage admits the full 64-CPU topology and all 131 AP
+probe contexts, then admits a low-range userspace identity without colliding with the reserved
+architecture namespace. Boot snapshots expose the online mask, registered CPU count, and lifecycle
+process/thread/running counts, while dispatch verification checks the authoritative thread state.
+General event/wait-queue wakeups and the userspace context store still need to adopt this shared
+path.
 
 ### 4. Synchronization and concurrent execution
 

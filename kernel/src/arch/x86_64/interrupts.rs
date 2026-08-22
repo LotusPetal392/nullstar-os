@@ -14,7 +14,7 @@ use x86_64::{
 
 use crate::{
     acpi::{HpetInfo, MadtInfo},
-    apic, gdt, hlt_loop, hpet as hpet_timer, keyboard, preemption,
+    apic, execution_runtime, gdt, hlt_loop, hpet as hpet_timer, keyboard, preemption,
     process::userspace,
     scheduler, serial_println,
 };
@@ -276,6 +276,9 @@ pub fn init(
         }
     }
 
+    execution_runtime::initialize_bootstrap()
+        .expect("kernel execution runtime must initialize exactly once");
+
     if controller.kind == ControllerKind::Apic {
         if let (Some(madt), Some(bsp_apic_id)) = (madt, controller.local_apic_id) {
             smp_runtime::initialize_bootstrap(
@@ -345,14 +348,18 @@ pub fn init_application_processor() {
                 }
             };
             serial_println!(
-                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}, kernel_tasks={}, lifecycle_process={}, lifecycle_threads={}, lifecycle_running={}",
+                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}, kernel_tasks={}, lifecycle_process={}, lifecycle_threads={}, lifecycle_running={}, execution_cpus={}/{}, execution_online_mask={:#x}, execution_registered_cpus={}",
                 cpu_index,
                 TIMER_VECTOR,
                 RESCHEDULE_VECTOR,
                 scheduler_snapshot.task_count,
                 scheduler_snapshot.lifecycle_process_id.unwrap_or(0),
                 scheduler_snapshot.lifecycle_thread_count,
-                scheduler_snapshot.lifecycle_running_thread_count
+                scheduler_snapshot.lifecycle_running_thread_count,
+                scheduler_snapshot.execution_online_cpu_count,
+                scheduler_snapshot.execution_cpu_capacity,
+                scheduler_snapshot.execution_online_mask,
+                scheduler_snapshot.execution_registered_cpu_count
             );
             x86_64::instructions::interrupts::enable();
         }

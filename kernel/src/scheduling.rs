@@ -11,7 +11,7 @@ use alloc::{collections::VecDeque, vec::Vec};
 use crate::process_model::ThreadId;
 
 pub const DEFAULT_QUANTUM_TICKS: u64 = 5;
-pub const MAX_RUNNABLE_THREADS: usize = 128;
+pub const MAX_RUNNABLE_THREADS: usize = 256;
 pub const MAX_CPUS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +153,7 @@ pub struct CpuSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SmpSnapshot {
+    pub cpu_capacity: usize,
     pub cpu_count: usize,
     pub assigned_thread_count: usize,
     pub runnable_thread_count: usize,
@@ -225,8 +226,24 @@ impl SmpRoundRobin {
             return Err(SmpError::InvalidCpuCount);
         }
         let online_mask = CpuMask::first(cpu_count).ok_or(SmpError::InvalidCpuCount)?;
-        let mut queues = Vec::with_capacity(cpu_count);
-        for _ in 0..cpu_count {
+        Self::with_online_mask(cpu_count, quantum_ticks, online_mask)
+    }
+
+    /// Create queue capacity independently from the CPUs currently online.
+    pub fn with_online_mask(
+        cpu_capacity: usize,
+        quantum_ticks: u64,
+        online_mask: CpuMask,
+    ) -> Result<Self, SmpError> {
+        if cpu_capacity == 0 || cpu_capacity > MAX_CPUS {
+            return Err(SmpError::InvalidCpuCount);
+        }
+        let capacity_mask = CpuMask::first(cpu_capacity).ok_or(SmpError::InvalidCpuCount)?;
+        if online_mask.is_empty() || online_mask.bits() & !capacity_mask.bits() != 0 {
+            return Err(SmpError::InvalidCpu);
+        }
+        let mut queues = Vec::with_capacity(cpu_capacity);
+        for _ in 0..cpu_capacity {
             queues.push(RoundRobin::new(quantum_ticks).map_err(|_| SmpError::InvalidQuantum)?);
         }
         Ok(Self {
@@ -234,6 +251,18 @@ impl SmpRoundRobin {
             assignments: Vec::new(),
             online_mask,
         })
+    }
+
+    /// Mark a topology slot online without disturbing existing queue state.
+    pub fn online_cpu(&mut self, cpu: CpuId) -> Result<bool, SmpError> {
+        if cpu.raw() >= self.queues.len() {
+            return Err(SmpError::InvalidCpu);
+        }
+        if self.online_mask.contains(cpu) {
+            return Ok(false);
+        }
+        self.online_mask = self.online_mask.union(CpuMask::single(cpu));
+        Ok(true)
     }
 
     pub fn admit(&mut self, thread: ThreadId, affinity: CpuMask) -> Result<Placement, SmpError> {
@@ -573,7 +602,8 @@ impl SmpRoundRobin {
             .filter(|assignment| assignment.state == AssignmentState::Runnable)
             .count();
         SmpSnapshot {
-            cpu_count: self.queues.len(),
+            cpu_capacity: self.queues.len(),
+            cpu_count: self.online_mask.bits().count_ones() as usize,
             assigned_thread_count: self.assignments.len(),
             runnable_thread_count,
             blocked_thread_count: self.assignments.len() - runnable_thread_count,
@@ -669,10 +699,16 @@ impl SmpRoundRobin {
     }
 
     fn queue(&self, cpu: CpuId) -> Result<&RoundRobin, SmpError> {
+        if !self.online_mask.contains(cpu) {
+            return Err(SmpError::InvalidCpu);
+        }
         self.queues.get(cpu.raw()).ok_or(SmpError::InvalidCpu)
     }
 
     fn queue_mut(&mut self, cpu: CpuId) -> Result<&mut RoundRobin, SmpError> {
+        if !self.online_mask.contains(cpu) {
+            return Err(SmpError::InvalidCpu);
+        }
         self.queues.get_mut(cpu.raw()).ok_or(SmpError::InvalidCpu)
     }
 }

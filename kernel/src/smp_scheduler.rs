@@ -20,14 +20,14 @@ use x86_64::instructions::{
 
 use crate::{
     arch::x86_64::smp_runtime,
+    execution_runtime::{self, KernelContextRegistration, RuntimeError},
     preemption,
-    process_model::{ProcessId, ThreadId, ThreadState},
-    scheduling::{self, CpuId, CpuMask},
+    process_model::{ThreadId, ThreadState},
+    scheduling::{self, CpuId, CpuMask, MAX_CPUS},
     serial_println,
     smp_execution::{ExecutionError, SmpExecution},
 };
 
-const MAX_CPUS: usize = 64;
 const AP_KERNEL_STACK_SIZE: usize = 64 * 1024;
 const AP_KERNEL_STACK_WORDS: usize = AP_KERNEL_STACK_SIZE / size_of::<u128>();
 const INITIAL_RFLAGS: u64 = 0x202;
@@ -46,13 +46,8 @@ const AUTOMATIC_REBALANCE_INTERVAL_TICKS: u64 = 16;
 const BALANCE_PROBE_FIRST_SLOT: u8 = 3;
 const BALANCE_PROBE_LAST_SLOT: u8 = 6;
 const BLOCK_WAKE_PROBE_SLOT: u8 = 5;
-// Probe-only identities live in a reserved high range and are registered in
-// the live ProcessTable before their contexts can run.
-const AP_PROBE_THREAD_ID_BASE: u64 = 1_u64 << 63;
-
 static AP_SCHEDULERS: [Mutex<ApScheduler>; MAX_CPUS] =
     [const { Mutex::new(ApScheduler::new()) }; MAX_CPUS];
-static SMP_EXECUTION: Mutex<Option<LiveSmpExecution>> = Mutex::new(None);
 static PROBE_A_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static PROBE_B_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static MIGRATION_PROBE_HEARTBEATS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
@@ -98,8 +93,7 @@ pub enum InitError {
     InvalidCpu,
     AlreadyInitialized,
     StackLayoutInvalid,
-    Policy(scheduling::SmpError),
-    Lifecycle(ExecutionError),
+    Runtime(RuntimeError),
     Migration(MigrationError),
 }
 
@@ -122,6 +116,22 @@ fn migration_execution_error(error: ExecutionError) -> MigrationError {
         ExecutionError::Scheduling(error) => MigrationError::Policy(error),
         other => MigrationError::Lifecycle(other),
     }
+}
+
+fn with_execution<R>(operation: impl FnOnce(&SmpExecution) -> R) -> Result<R, MigrationError> {
+    execution_runtime::with(|runtime| operation(runtime.execution()))
+        .map_err(|_| MigrationError::PolicyUnavailable)
+}
+
+fn with_execution_mut<R>(
+    operation: impl FnOnce(&mut SmpExecution) -> R,
+) -> Result<R, MigrationError> {
+    execution_runtime::with_mut(|runtime| operation(runtime.execution_mut()))
+        .map_err(|_| MigrationError::PolicyUnavailable)
+}
+
+fn try_with_execution_mut<R>(operation: impl FnOnce(&mut SmpExecution) -> R) -> Option<R> {
+    execution_runtime::try_with_mut(|runtime| operation(runtime.execution_mut()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +171,10 @@ pub struct Snapshot {
     pub lifecycle_process_id: Option<u64>,
     pub lifecycle_thread_count: usize,
     pub lifecycle_running_thread_count: usize,
+    pub execution_cpu_capacity: usize,
+    pub execution_online_cpu_count: usize,
+    pub execution_online_mask: u64,
+    pub execution_registered_cpu_count: usize,
     pub policy_preemptions: u64,
     pub probe_a_heartbeats: u64,
     pub probe_b_heartbeats: u64,
@@ -174,21 +188,6 @@ pub struct Snapshot {
     pub automatic_rebalance_requests: u64,
     pub automatic_rebalances: u64,
     pub automatic_rebalance_failures: u64,
-}
-
-struct LiveSmpExecution {
-    execution: SmpExecution,
-    probe_processes: [Option<ProcessId>; MAX_CPUS],
-}
-
-impl LiveSmpExecution {
-    fn new() -> Result<Self, InitError> {
-        Ok(Self {
-            execution: SmpExecution::new(MAX_CPUS, scheduling::DEFAULT_QUANTUM_TICKS)
-                .map_err(InitError::Policy)?,
-            probe_processes: [None; MAX_CPUS],
-        })
-    }
 }
 
 struct ApTask {
@@ -296,15 +295,22 @@ impl ApScheduler {
         let cpu = CpuId::from_raw(cpu_index).ok_or(InitError::InvalidCpu)?;
         let probe_a = probe_thread_id(cpu_index, 0);
         let probe_b = probe_thread_id(cpu_index, 1);
+        let mut contexts = Vec::new();
 
         self.tasks.push(ApTask::bootstrap());
         self.tasks.push(ApTask::kernel(probe_a, ap_probe_a)?);
         self.tasks.push(ApTask::kernel(probe_b, ap_probe_b)?);
+        contexts.push(KernelContextRegistration::new(0, "ap-probe-a").map_err(InitError::Runtime)?);
+        contexts.push(KernelContextRegistration::new(1, "ap-probe-b").map_err(InitError::Runtime)?);
         if cpu_index == 1 {
             self.tasks.push(ApTask::kernel(
                 probe_thread_id(cpu_index, 2),
                 ap_migration_probe,
             )?);
+            contexts.push(
+                KernelContextRegistration::new(2, "ap-migration-probe")
+                    .map_err(InitError::Runtime)?,
+            );
             for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
                 let entry = if slot == BLOCK_WAKE_PROBE_SLOT {
                     ap_block_wake_probe
@@ -313,55 +319,19 @@ impl ApScheduler {
                 };
                 self.tasks
                     .push(ApTask::kernel(probe_thread_id(cpu_index, slot), entry)?);
-            }
-        }
-
-        let mut execution_guard = SMP_EXECUTION.lock();
-        if execution_guard.is_none() {
-            *execution_guard = Some(LiveSmpExecution::new()?);
-        }
-        let live = execution_guard
-            .as_mut()
-            .expect("SMP execution state must exist after initialization");
-        if live.probe_processes[cpu_index].is_some() {
-            return Err(InitError::AlreadyInitialized);
-        }
-        let process = live
-            .execution
-            .create_process(None)
-            .map_err(|error| InitError::Lifecycle(error.into()))?;
-        live.probe_processes[cpu_index] = Some(process);
-        live.execution
-            .create_thread_with_id(process, probe_a, "ap-probe-a", CpuMask::single(cpu))
-            .map_err(InitError::Lifecycle)?;
-        live.execution
-            .create_thread_with_id(process, probe_b, "ap-probe-b", CpuMask::single(cpu))
-            .map_err(InitError::Lifecycle)?;
-        if cpu_index == 1 {
-            live.execution
-                .create_thread_with_id(
-                    process,
-                    probe_thread_id(cpu_index, 2),
-                    "ap-migration-probe",
-                    CpuMask::single(cpu),
-                )
-                .map_err(InitError::Lifecycle)?;
-            for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
                 let name = if slot == BLOCK_WAKE_PROBE_SLOT {
                     "ap-block-wake-probe"
                 } else {
                     "ap-balance-probe"
                 };
-                live.execution
-                    .create_thread_with_id(
-                        process,
-                        probe_thread_id(cpu_index, slot),
-                        name,
-                        CpuMask::single(cpu),
-                    )
-                    .map_err(InitError::Lifecycle)?;
+                contexts
+                    .push(KernelContextRegistration::new(slot, name).map_err(InitError::Runtime)?);
             }
         }
+
+        execution_runtime::with_mut(|runtime| runtime.register_cpu_contexts(cpu, &contexts))
+            .map_err(InitError::Runtime)?
+            .map_err(InitError::Runtime)?;
 
         self.running = true;
         Ok(())
@@ -395,18 +365,15 @@ impl ApScheduler {
         let Some(cpu) = CpuId::from_raw(cpu_index) else {
             return current_stack_pointer;
         };
-        let selected = {
-            let mut execution_guard = SMP_EXECUTION.lock();
-            let Some(live) = execution_guard.as_mut() else {
-                return current_stack_pointer;
-            };
+        let selected = execution_runtime::with_mut(|runtime| {
             if current == 0 {
-                live.execution
+                runtime
+                    .execution()
                     .cpu_snapshot(cpu)
                     .ok()
                     .and_then(|snapshot| snapshot.current)
             } else {
-                match live.execution.tick(cpu) {
+                match runtime.execution_mut().tick(cpu) {
                     Ok(Some(switch)) => {
                         self.policy_preemptions = self.policy_preemptions.saturating_add(1);
                         Some(switch.to)
@@ -414,7 +381,9 @@ impl ApScheduler {
                     Ok(None) | Err(_) => None,
                 }
             }
-        };
+        })
+        .ok()
+        .flatten();
         let Some(thread) = selected else {
             return current_stack_pointer;
         };
@@ -446,29 +415,18 @@ impl ApScheduler {
     }
 
     fn snapshot(&self, cpu_index: usize) -> Snapshot {
-        let (policy_snapshot, lifecycle_process_id, lifecycle_thread_count, lifecycle_running) = {
-            let execution_guard = SMP_EXECUTION.lock();
-            let live = execution_guard.as_ref();
-            let policy_snapshot = CpuId::from_raw(cpu_index)
-                .and_then(|cpu| live.and_then(|live| live.execution.cpu_snapshot(cpu).ok()));
-            let process = live.and_then(|live| live.probe_processes[cpu_index]);
-            let thread_count = process
-                .and_then(|process| {
-                    live.and_then(|live| live.execution.process_snapshot(process).ok())
+        let (policy_snapshot, lifecycle, runtime_snapshot) = CpuId::from_raw(cpu_index)
+            .and_then(|cpu| {
+                execution_runtime::with(|runtime| {
+                    (
+                        runtime.execution().cpu_snapshot(cpu).ok(),
+                        runtime.cpu_lifecycle_snapshot(cpu),
+                        Some(runtime.snapshot()),
+                    )
                 })
-                .map(|snapshot| snapshot.thread_count)
-                .unwrap_or(0);
-            let running = process
-                .and_then(|process| {
-                    live.and_then(|live| {
-                        live.execution
-                            .thread_state_count(process, ThreadState::Running)
-                            .ok()
-                    })
-                })
-                .unwrap_or(0);
-            (policy_snapshot, process, thread_count, running)
-        };
+                .ok()
+            })
+            .unwrap_or((None, Default::default(), None));
         let migration_heartbeats = MIGRATION_PROBE_HEARTBEATS[cpu_index].load(Ordering::Acquire);
         let migration_destination = MIGRATION_TO_CPU.load(Ordering::Acquire);
         let migration_pending_here = migration_destination != NO_MIGRATION_CPU
@@ -510,9 +468,21 @@ impl ApScheduler {
                 .as_ref()
                 .map(|snapshot| snapshot.runnable_count)
                 .unwrap_or(0),
-            lifecycle_process_id: lifecycle_process_id.map(ProcessId::raw),
-            lifecycle_thread_count,
-            lifecycle_running_thread_count: lifecycle_running,
+            lifecycle_process_id: lifecycle.process_id.map(|process| process.raw()),
+            lifecycle_thread_count: lifecycle.thread_count,
+            lifecycle_running_thread_count: lifecycle.running_thread_count,
+            execution_cpu_capacity: runtime_snapshot
+                .map(|snapshot| snapshot.scheduler.cpu_capacity)
+                .unwrap_or(0),
+            execution_online_cpu_count: runtime_snapshot
+                .map(|snapshot| snapshot.scheduler.cpu_count)
+                .unwrap_or(0),
+            execution_online_mask: runtime_snapshot
+                .map(|snapshot| snapshot.scheduler.online_mask.bits())
+                .unwrap_or(0),
+            execution_registered_cpu_count: runtime_snapshot
+                .map(|snapshot| snapshot.registered_cpu_count)
+                .unwrap_or(0),
             policy_preemptions: self.policy_preemptions,
             probe_a_heartbeats: PROBE_A_HEARTBEATS[cpu_index].load(Ordering::Acquire),
             probe_b_heartbeats,
@@ -604,24 +574,21 @@ fn enable_balanceable_probe_affinity() -> Result<(), MigrationError> {
     let cpu1 = CpuId::from_raw(1).ok_or(MigrationError::InvalidCpu)?;
     let cpu2 = CpuId::from_raw(2).ok_or(MigrationError::InvalidCpu)?;
     let affinity = CpuMask::single(cpu1).union(CpuMask::single(cpu2));
-    let mut execution_guard = SMP_EXECUTION.lock();
-    let live = execution_guard
-        .as_mut()
-        .ok_or(MigrationError::PolicyUnavailable)?;
-    for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
-        let thread = probe_thread_id(1, slot);
-        let placement = live
-            .execution
-            .set_affinity(thread, affinity)
-            .map_err(migration_execution_error)?
-            .placement;
-        if placement.migrated || placement.cpu != cpu1 {
-            return Err(MigrationError::Policy(
-                scheduling::SmpError::AffinityViolation,
-            ));
+    with_execution_mut(|execution| {
+        for slot in BALANCE_PROBE_FIRST_SLOT..=BALANCE_PROBE_LAST_SLOT {
+            let thread = probe_thread_id(1, slot);
+            let placement = execution
+                .set_affinity(thread, affinity)
+                .map_err(migration_execution_error)?
+                .placement;
+            if placement.migrated || placement.cpu != cpu1 {
+                return Err(MigrationError::Policy(
+                    scheduling::SmpError::AffinityViolation,
+                ));
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })?
 }
 
 pub fn migrate_unstarted(
@@ -636,17 +603,13 @@ pub fn migrate_unstarted(
         return Err(MigrationError::OfflineDestination);
     }
 
-    let source_cpu = {
-        let execution_guard = SMP_EXECUTION.lock();
-        let live = execution_guard
-            .as_ref()
-            .ok_or(MigrationError::PolicyUnavailable)?;
-        live.execution
+    let source_cpu = with_execution(|execution| {
+        let cpu = execution
             .placement(thread_id)
             .map_err(MigrationError::Policy)?
-            .cpu
-            .raw()
-    };
+            .cpu;
+        Ok::<usize, MigrationError>(cpu.raw())
+    })??;
     if source_cpu == 0 || source_cpu >= MAX_CPUS || source_cpu == destination_cpu {
         return Err(MigrationError::InvalidCpu);
     }
@@ -705,13 +668,8 @@ fn migrate_locked(
         return Err(MigrationError::DestinationConflict);
     }
 
-    {
-        let mut execution_guard = SMP_EXECUTION.lock();
-        let live = execution_guard
-            .as_mut()
-            .ok_or(MigrationError::PolicyUnavailable)?;
-        let placement = live
-            .execution
+    with_execution_mut(|execution| {
+        let placement = execution
             .set_affinity(thread_id, CpuMask::single(destination))
             .map_err(migration_execution_error)?
             .placement;
@@ -720,7 +678,8 @@ fn migrate_locked(
                 scheduling::SmpError::AffinityViolation,
             ));
         }
-    }
+        Ok::<(), MigrationError>(())
+    })??;
 
     let task = source.tasks.remove(source_index);
     target.tasks.push(task);
@@ -767,15 +726,11 @@ pub fn request_automatic_rebalance() -> Result<Option<RebalanceRequest>, Migrati
         return Ok(None);
     }
 
-    let plan = {
-        let execution_guard = SMP_EXECUTION.lock();
-        let live = execution_guard
-            .as_ref()
-            .ok_or(MigrationError::PolicyUnavailable)?;
-        live.execution
+    let plan = with_execution(|execution| {
+        execution
             .rebalance_plan(eligible)
-            .map_err(MigrationError::Policy)?
-    };
+            .map_err(MigrationError::Policy)
+    })??;
     let Some(plan) = plan else {
         return Ok(None);
     };
@@ -810,17 +765,13 @@ fn prepare_live_migration(
         return Err(MigrationError::OfflineDestination);
     }
 
-    let source_cpu = {
-        let execution_guard = SMP_EXECUTION.lock();
-        let live = execution_guard
-            .as_ref()
-            .ok_or(MigrationError::PolicyUnavailable)?;
-        live.execution
+    let source_cpu = with_execution(|execution| {
+        let cpu = execution
             .placement(thread_id)
             .map_err(MigrationError::Policy)?
-            .cpu
-            .raw()
-    };
+            .cpu;
+        Ok::<usize, MigrationError>(cpu.raw())
+    })??;
     if source_cpu == 0 || source_cpu >= MAX_CPUS || source_cpu == destination_cpu {
         return Err(MigrationError::InvalidCpu);
     }
@@ -898,17 +849,12 @@ fn try_live_migrate_current(
     source.tasks[source_index].stack_pointer = current_stack_pointer;
     let preserve_affinity = LIVE_MIGRATION_PRESERVE_AFFINITY.load(Ordering::Acquire);
 
-    let replacement = {
-        let mut execution_guard = SMP_EXECUTION.try_lock()?;
-        let live = execution_guard.as_mut()?;
+    let replacement = try_with_execution_mut(|execution| {
         let source_id = CpuId::from_raw(source_cpu)?;
         let placement = if preserve_affinity {
-            live.execution
-                .migrate(thread_id, destination)
-                .ok()?
-                .placement
+            execution.migrate(thread_id, destination).ok()?.placement
         } else {
-            live.execution
+            execution
                 .set_affinity(thread_id, CpuMask::single(destination))
                 .ok()?
                 .placement
@@ -916,18 +862,15 @@ fn try_live_migrate_current(
         if !placement.migrated || placement.cpu != destination {
             return None;
         }
-        let Some(replacement) = live
-            .execution
+        let Some(replacement) = execution
             .cpu_snapshot(source_id)
             .ok()
             .and_then(|snapshot| snapshot.current)
         else {
             if preserve_affinity {
-                let _ = live.execution.migrate(thread_id, source_id);
+                let _ = execution.migrate(thread_id, source_id);
             } else {
-                let _ = live
-                    .execution
-                    .set_affinity(thread_id, CpuMask::single(source_id));
+                let _ = execution.set_affinity(thread_id, CpuMask::single(source_id));
             }
             return None;
         };
@@ -937,16 +880,14 @@ fn try_live_migrate_current(
             .any(|task| task.thread_id == Some(replacement) && task.stack_pointer != 0);
         if !replacement_ready {
             if preserve_affinity {
-                let _ = live.execution.migrate(thread_id, source_id);
+                let _ = execution.migrate(thread_id, source_id);
             } else {
-                let _ = live
-                    .execution
-                    .set_affinity(thread_id, CpuMask::single(source_id));
+                let _ = execution.set_affinity(thread_id, CpuMask::single(source_id));
             }
             return None;
         }
-        replacement
-    };
+        Some(replacement)
+    })??;
 
     let replacement_index = source
         .tasks
@@ -981,14 +922,12 @@ fn try_block_probe_current(
         return None;
     }
     let cpu = CpuId::from_raw(cpu_index)?;
-    let transition = {
-        let mut execution_guard = SMP_EXECUTION.try_lock()?;
-        let live = execution_guard.as_mut()?;
-        if live.execution.cpu_snapshot(cpu).ok()?.runnable_count == 0 {
+    let transition = try_with_execution_mut(|execution| {
+        if execution.cpu_snapshot(cpu).ok()?.runnable_count == 0 {
             return None;
         }
-        live.execution.block_thread(thread_id).ok()?
-    };
+        execution.block_thread(thread_id).ok()
+    })??;
     let replacement = transition.switch?.to;
     let replacement_index = source
         .tasks
@@ -1042,16 +981,21 @@ pub fn snapshot(cpu_index: usize) -> Snapshot {
 }
 
 fn probe_thread_id(cpu_index: usize, slot: u8) -> ThreadId {
-    let raw = AP_PROBE_THREAD_ID_BASE | ((cpu_index as u64) << 8) | u64::from(slot) + 1;
-    ThreadId::from_raw(raw).expect("AP probe thread identity must be nonzero")
+    let cpu = CpuId::from_raw(cpu_index).expect("AP probe CPU identity must be valid");
+    execution_runtime::kernel_thread_id(cpu, slot)
+        .expect("AP probe context slot must fit the kernel identity namespace")
 }
 
 fn lifecycle_thread_state(thread_id: ThreadId) -> Option<ThreadState> {
-    SMP_EXECUTION
-        .lock()
-        .as_ref()
-        .and_then(|live| live.execution.thread_snapshot(thread_id).ok())
-        .map(|snapshot| snapshot.state)
+    execution_runtime::with(|runtime| {
+        runtime
+            .execution()
+            .thread_snapshot(thread_id)
+            .ok()
+            .map(|snapshot| snapshot.state)
+    })
+    .ok()
+    .flatten()
 }
 
 fn thread_entry_trampoline_address() -> u64 {
@@ -1157,20 +1101,19 @@ fn wake_blocked_probe() {
     }
     let thread_id = block_wake_probe_thread_id();
     let destination = CpuId::from_raw(2).expect("CPU 2 is within the scheduler CPU bound");
-    let (source_cpu, original_affinity) = {
-        let execution_guard = SMP_EXECUTION.lock();
-        let live = match execution_guard.as_ref() {
-            Some(live) => live,
-            None => return,
-        };
-        let assignment = match live.execution.assignment_snapshot(thread_id) {
+    let Some((source_cpu, original_affinity)) = execution_runtime::with(|runtime| {
+        let assignment = match runtime.execution().assignment_snapshot(thread_id) {
             Ok(assignment) => assignment,
-            Err(_) => return,
+            Err(_) => return None,
         };
         if assignment.state != scheduling::AssignmentState::Blocked {
-            return;
+            return None;
         }
-        (assignment.cpu.raw(), assignment.affinity)
+        Some((assignment.cpu.raw(), assignment.affinity))
+    })
+    .ok()
+    .flatten() else {
+        return;
     };
     let destination_cpu = destination.raw();
     if source_cpu == 0 || source_cpu >= MAX_CPUS || source_cpu == destination_cpu {
@@ -1206,34 +1149,31 @@ fn wake_blocked_probe() {
         return;
     }
 
-    let (affinity_placement, wake) = {
-        let mut execution_guard = SMP_EXECUTION.lock();
-        let live = match execution_guard.as_mut() {
-            Some(live) => live,
-            None => return,
-        };
-        let placement = match live
-            .execution
-            .set_affinity(thread_id, CpuMask::single(destination))
-        {
+    let Some((affinity_placement, wake)) = execution_runtime::with_mut(|runtime| {
+        let execution = runtime.execution_mut();
+        let placement = match execution.set_affinity(thread_id, CpuMask::single(destination)) {
             Ok(migration)
                 if migration.placement.migrated && migration.placement.cpu == destination =>
             {
                 migration.placement
             }
-            _ => return,
+            _ => return None,
         };
-        let wake = match live.execution.wake_thread(thread_id) {
+        let wake = match execution.wake_thread(thread_id) {
             Ok(wake) if wake.placement.cpu == destination => wake,
             _ => {
                 let source = CpuId::from_raw(source_cpu)
                     .expect("source CPU is within the scheduler CPU bound");
-                let _ = live.execution.migrate(thread_id, source);
-                let _ = live.execution.set_affinity(thread_id, original_affinity);
-                return;
+                let _ = execution.migrate(thread_id, source);
+                let _ = execution.set_affinity(thread_id, original_affinity);
+                return None;
             }
         };
-        (placement, wake)
+        Some((placement, wake))
+    })
+    .ok()
+    .flatten() else {
+        return;
     };
 
     let task = source.tasks.remove(source_index);
