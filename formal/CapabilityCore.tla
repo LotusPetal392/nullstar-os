@@ -1,5 +1,5 @@
 ---- MODULE CapabilityCore ----
-EXTENDS FiniteSets
+EXTENDS FiniteSets, Naturals
 
 \* Phase-one abstract security model for NullStar capability authority.
 \*
@@ -59,32 +59,30 @@ Close ==
         /\ UNCHANGED <<owner, objectOf, rightsOf, originObject, originRights>>
 
 Duplicate ==
-    \E p \in Processes,
-       src \in active,
-       dst \in Handles \ active,
-       requested \in SUBSET rightsOf[src]:
-        /\ owner[src] = p
-        /\ DuplicateRight \in rightsOf[src]
-        /\ requested # {}
-        /\ active' = active \cup {dst}
-        /\ owner' = [owner EXCEPT ![dst] = p]
-        /\ objectOf' = [objectOf EXCEPT ![dst] = objectOf[src]]
-        /\ rightsOf' = [rightsOf EXCEPT ![dst] = requested]
-        /\ originObject' = [originObject EXCEPT ![dst] = originObject[src]]
-        /\ originRights' = [originRights EXCEPT ![dst] = originRights[src]]
+    \E p \in Processes, src \in active:
+        \E dst \in Handles \ active,
+           requested \in SUBSET rightsOf[src]:
+            /\ owner[src] = p
+            /\ DuplicateRight \in rightsOf[src]
+            /\ requested # {}
+            /\ active' = active \cup {dst}
+            /\ owner' = [owner EXCEPT ![dst] = p]
+            /\ objectOf' = [objectOf EXCEPT ![dst] = objectOf[src]]
+            /\ rightsOf' = [rightsOf EXCEPT ![dst] = requested]
+            /\ originObject' = [originObject EXCEPT ![dst] = originObject[src]]
+            /\ originRights' = [originRights EXCEPT ![dst] = originRights[src]]
 
 \* Atomic rights replacement preserves the token's object identity and can
 \* only attenuate authority.  The source must itself carry DUPLICATE authority,
 \* matching NullStar's current replacement contract.
 Replace ==
-    \E p \in Processes,
-       src \in active,
-       requested \in SUBSET rightsOf[src]:
-        /\ owner[src] = p
-        /\ DuplicateRight \in rightsOf[src]
-        /\ requested # {}
-        /\ rightsOf' = [rightsOf EXCEPT ![src] = requested]
-        /\ UNCHANGED <<active, owner, objectOf, originObject, originRights>>
+    \E p \in Processes, src \in active:
+        \E requested \in SUBSET rightsOf[src]:
+            /\ owner[src] = p
+            /\ DuplicateRight \in rightsOf[src]
+            /\ requested # {}
+            /\ rightsOf' = [rightsOf EXCEPT ![src] = requested]
+            /\ UNCHANGED <<active, owner, objectOf, originObject, originRights>>
 
 \* This is the authority effect of a successful move-transfer.  Endpoint queue
 \* commit and receive installation are introduced in EndpointIPC.tla later.
@@ -92,18 +90,18 @@ Replace ==
 MoveTransfer ==
     \E sourceProcess \in Processes,
        targetProcess \in Processes,
-       src \in active,
-       dst \in Handles \ active,
-       requested \in SUBSET rightsOf[src]:
-        /\ owner[src] = sourceProcess
-        /\ TransferRight \in rightsOf[src]
-        /\ requested # {}
-        /\ active' = (active \ {src}) \cup {dst}
-        /\ owner' = [owner EXCEPT ![dst] = targetProcess]
-        /\ objectOf' = [objectOf EXCEPT ![dst] = objectOf[src]]
-        /\ rightsOf' = [rightsOf EXCEPT ![dst] = requested]
-        /\ originObject' = [originObject EXCEPT ![dst] = originObject[src]]
-        /\ originRights' = [originRights EXCEPT ![dst] = originRights[src]]
+       src \in active:
+        \E dst \in Handles \ active,
+           requested \in SUBSET rightsOf[src]:
+            /\ owner[src] = sourceProcess
+            /\ TransferRight \in rightsOf[src]
+            /\ requested # {}
+            /\ active' = (active \ {src}) \cup {dst}
+            /\ owner' = [owner EXCEPT ![dst] = targetProcess]
+            /\ objectOf' = [objectOf EXCEPT ![dst] = objectOf[src]]
+            /\ rightsOf' = [rightsOf EXCEPT ![dst] = requested]
+            /\ originObject' = [originObject EXCEPT ![dst] = originObject[src]]
+            /\ originRights' = [originRights EXCEPT ![dst] = originRights[src]]
 
 Next ==
     \/ Close
