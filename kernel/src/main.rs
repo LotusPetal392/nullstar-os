@@ -22,6 +22,7 @@ mod capability;
 #[allow(dead_code)]
 mod containment;
 mod drivers;
+mod execution_runtime;
 #[allow(dead_code)]
 mod interrupt_model;
 mod memory;

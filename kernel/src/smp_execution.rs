@@ -69,8 +69,31 @@ impl SmpExecution {
         })
     }
 
+    pub fn with_online_mask(
+        cpu_capacity: usize,
+        quantum_ticks: u64,
+        online_mask: CpuMask,
+    ) -> Result<Self, SmpError> {
+        Ok(Self {
+            processes: ProcessTable::new(),
+            scheduler: SmpRoundRobin::with_online_mask(cpu_capacity, quantum_ticks, online_mask)?,
+        })
+    }
+
+    pub fn online_cpu(&mut self, cpu: CpuId) -> Result<bool, SmpError> {
+        self.scheduler.online_cpu(cpu)
+    }
+
     pub fn create_process(&mut self, parent: Option<ProcessId>) -> Result<ProcessId, CreateError> {
         self.processes.create_process(parent)
+    }
+
+    pub fn process_count(&self) -> usize {
+        self.processes.process_count()
+    }
+
+    pub fn thread_count(&self) -> usize {
+        self.processes.thread_count()
     }
 
     pub fn create_thread(
@@ -300,6 +323,22 @@ impl SmpExecution {
 
     pub fn reap_process(&mut self, process: ProcessId) -> Result<ProcessExit, ReapError> {
         self.processes.reap_process(process)
+    }
+
+    pub(crate) fn rollback_process_creation(
+        &mut self,
+        process: ProcessId,
+    ) -> Result<(), ExecutionError> {
+        let threads = self
+            .processes
+            .threads(process)
+            .map_err(|_| StateError::InvalidThread)?;
+        for thread in threads {
+            let transition = self.scheduler.remove(thread.id)?;
+            self.activate(transition.switch);
+        }
+        self.processes.rollback_process_creation(process)?;
+        Ok(())
     }
 
     fn thread_state(&self, thread: ThreadId) -> Result<ThreadState, ExecutionError> {

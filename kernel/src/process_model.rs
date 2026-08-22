@@ -8,8 +8,8 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-pub const MAX_PROCESSES: usize = 64;
-pub const MAX_THREADS: usize = 128;
+pub const MAX_PROCESSES: usize = 128;
+pub const MAX_THREADS: usize = 256;
 pub const MAX_THREADS_PER_PROCESS: usize = 16;
 pub const MAX_CHILDREN_PER_PROCESS: usize = 16;
 
@@ -364,6 +364,35 @@ impl ProcessTable {
             process.state = ProcessState::Created;
         }
         self.thread_count = self.thread_count.saturating_sub(1);
+        Ok(())
+    }
+
+    /// Remove a newly admitted process and all of its still-private threads.
+    ///
+    /// The execution coordinator uses this only to roll back a batch before
+    /// the process identity is published to an architecture context store.
+    pub(crate) fn rollback_process_creation(
+        &mut self,
+        process_id: ProcessId,
+    ) -> Result<(), StateError> {
+        let process = self.process(process_id).ok_or(StateError::InvalidThread)?;
+        if process.exit.is_some() || !process.children.is_empty() {
+            return Err(StateError::InvalidTransition);
+        }
+        let parent = process.parent;
+        let removed_threads = process.threads.len();
+        let index = self
+            .processes
+            .iter()
+            .position(|process| process.id == process_id)
+            .expect("validated process disappeared");
+        self.processes.remove(index);
+        if let Some(parent_id) = parent
+            && let Some(parent) = self.process_mut(parent_id)
+        {
+            parent.children.retain(|child| *child != process_id);
+        }
+        self.thread_count = self.thread_count.saturating_sub(removed_threads);
         Ok(())
     }
 

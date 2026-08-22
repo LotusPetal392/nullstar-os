@@ -71,6 +71,7 @@ jobs:
           grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" smp-qemu.log
           grep -F "application processor scheduler lane initialized: cpu=1" smp-qemu.log
           grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" smp-qemu.log
+          grep -F "execution_cpus=2/64, execution_online_mask=0x3, execution_registered_cpus=1" smp-qemu.log
           grep -F "application processor timer verified: cpu=1" smp-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" smp-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" smp-qemu.log
@@ -87,6 +88,8 @@ jobs:
           grep -F "SMP application processors online: candidates=2, attempted=2, online=2, failed=0" smp-migration-qemu.log
           grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" smp-migration-qemu.log
           grep -F "lifecycle_process=2, lifecycle_threads=2, lifecycle_running=1" smp-migration-qemu.log
+          grep -F "execution_cpus=2/64, execution_online_mask=0x3, execution_registered_cpus=1" smp-migration-qemu.log
+          grep -F "execution_cpus=3/64, execution_online_mask=0x7, execution_registered_cpus=2" smp-migration-qemu.log
           grep -F "application processor kernel migration prepared:" smp-migration-qemu.log
           grep -F "from_cpu=1, to_cpu=2" smp-migration-qemu.log
           grep -F "application processor kernel migration verified:" smp-migration-qemu.log
@@ -120,6 +123,7 @@ jobs:
           grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" partition-fat-qemu.log
           grep -F "application processor scheduler lane initialized: cpu=1" partition-fat-qemu.log
           grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" partition-fat-qemu.log
+          grep -F "execution_cpus=2/64, execution_online_mask=0x3, execution_registered_cpus=1" partition-fat-qemu.log
           grep -F "application processor timer verified: cpu=1" partition-fat-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" partition-fat-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" partition-fat-qemu.log

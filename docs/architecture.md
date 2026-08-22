@@ -101,9 +101,16 @@ host-testable. `SmpExecution` now owns a process table and SMP policy together, 
 admission, and applies dispatch, yield, block, sleep, wake, stop, continue, migration, rebalance,
 exit, detach, join, and reap transitions without exposing independent mutable state. Queue
 admission and migration report their source and destination dispatch effects so lifecycle
-`Running` state stays synchronized across CPUs. Application-processor kernel contexts now use
-this coordinator, while the existing single-thread-per-process userspace compatibility path and
-userspace thread creation still need to adopt it.
+`Running` state stays synchronized across CPUs. A kernel-wide `ExecutionRuntime` now owns the one
+live coordinator shared by architecture context stores. It initializes with CPU 0 online, keeps
+fixed topology capacity separate from the actual online mask, assigns architecture-owned thread
+identities from one reserved namespace, and admits each CPU's context group transactionally.
+The bounded registry now retains 128 processes and 256 threads/queue assignments, which covers all
+131 current AP contexts at the 64-CPU topology limit while reserving process capacity for the next
+userspace integration stage. Automatically allocated userspace-facing thread identities remain in
+the low namespace and cannot collide with reserved high-range architecture identities.
+Application-processor kernel contexts use this runtime, while the existing single-thread-per-process
+userspace compatibility path and userspace thread creation still need to adopt it.
 
 The single-CPU scheduling milestone now shares that thread-state vocabulary and provides
 a bounded round-robin policy model. Timer ticks consume a configured quantum, rotate
@@ -124,8 +131,10 @@ local scheduler lock; one migration is dispatched through a reschedule IPI and v
 destination scheduler selects the transferred context. Repeated passes converge larger
 imbalances one move at a time and retain bounded check, request, completion, and delivery-failure
 counters. Each live AP owns a bounded lifecycle process whose reserved probe identities are
-registered through `SmpExecution`; timer rotation, migration, rebalance, block, and wake paths
-update lifecycle and queue state under the same coordinator. QEMU acceptance records nonzero AP
+registered through the shared execution runtime; timer rotation, migration, rebalance, block, and
+wake paths update lifecycle and queue state under the same coordinator. Failed context-group
+admission rolls back its process, threads, and queue assignments before publication. QEMU acceptance
+records the incremental online CPU mask and registered context-group count alongside nonzero AP
 process identities and expected thread/running counts, blocks a live context, transfers it between
 CPU-local task stores during wakeup, and verifies both destination dispatch and lifecycle state.
 Ordinary userspace tasks remain on the bootstrap scheduler pending context and address-space
