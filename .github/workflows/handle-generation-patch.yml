@@ -7,17 +7,23 @@ on:
     paths:
       - "scripts/apply-handle-generation.py"
       - ".github/workflows/handle-generation-patch.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "scripts/apply-handle-generation.py"
+      - ".github/workflows/handle-generation-patch.yml"
 
 permissions:
   contents: write
 
 concurrency:
-  group: handle-generation-patch-${{ github.ref }}
+  group: handle-generation-patch
   cancel-in-progress: true
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'Stage handle generation implementation'
+    if: github.event_name == 'pull_request' || github.event.head_commit.message == 'Stage handle generation implementation'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
