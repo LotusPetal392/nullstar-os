@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: handle-generation-patch-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   apply:
     if: github.event.head_commit.message == 'Stage handle generation implementation'
