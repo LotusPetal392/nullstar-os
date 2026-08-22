@@ -1,30 +1,24 @@
-name: Apply handle generation implementation
+name: Apply handle generation documentation
 
 on:
-  push:
-    branches:
-      - formal/handle-generation
-    paths:
-      - "scripts/fix-handle-generation-main.py"
-      - ".github/workflows/handle-generation-patch.yml"
   pull_request:
     branches:
       - main
     paths:
-      - "scripts/fix-handle-generation-main.py"
+      - "scripts/update-handle-generation-docs.py"
       - ".github/workflows/handle-generation-patch.yml"
 
 permissions:
   contents: write
 
 concurrency:
-  group: handle-generation-patch
+  group: handle-generation-docs
   cancel-in-progress: true
 
 jobs:
   apply:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
       - name: Check out implementation branch
@@ -32,36 +26,25 @@ jobs:
         with:
           ref: formal/handle-generation
 
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup -q toolchain install nightly-2026-02-01 \
-            --profile minimal \
-            --component llvm-tools-preview \
-            --component rust-src \
-            --component rustfmt
-          rustup -q target add x86_64-unknown-none --toolchain nightly-2026-02-01
-
-      - name: Fix PID 1 bootstrap grant comparisons
-        run: python3 scripts/fix-handle-generation-main.py
-
-      - name: Format patched sources
-        run: cargo +nightly-2026-02-01 fmt --all
+      - name: Update authoritative documentation
+        run: python3 scripts/update-handle-generation-docs.py
 
       - name: Check diff whitespace
         run: git diff --check
 
-      - name: Run kernel tests
-        run: cargo +nightly-2026-02-01 test --locked -p kernel
-
-      - name: Build complete release image
-        run: cargo +nightly-2026-02-01 build --release --locked --quiet
-
-      - name: Commit implementation fix
+      - name: Commit documentation
         shell: bash
         run: |
           set -euo pipefail
+          if git diff --quiet; then
+            echo "documentation already up to date"
+            exit 0
+          fi
           git config user.name "lotuspetalagent"
           git config user.email "305597532+lotuspetalagent@users.noreply.github.com"
-          git add userspace/src/main.rs
-          git commit -m "Fix bootstrap slot grant validation"
+          git add \
+            docs/protection-model.md \
+            docs/syscall-abi.md \
+            docs/design/ipc-and-object-model.md
+          git commit -m "Document generation-checked capability handles"
           git push origin HEAD:formal/handle-generation
