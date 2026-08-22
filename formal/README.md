@@ -1,8 +1,8 @@
 # NullStar formal security models
 
 This directory contains small executable specifications for security-relevant
-NullStar kernel semantics.  These models are intentionally not a formal model of
-the whole operating system.  They isolate authority and lifecycle transitions so
+NullStar kernel semantics. These models are intentionally not a formal model of
+the whole operating system. They isolate authority and lifecycle transitions so
 important invariants can be machine-checked before those semantics spread across
 more kernel objects and services.
 
@@ -28,35 +28,61 @@ The first checked invariants are:
 - capability operations never change the referenced object identity;
 - live authority remains bounded by the finite handle universe.
 
-These are architecture properties, not claims that the complete kernel has been
-formally verified.
+## Phase 2: handle generation
+
+`HandleGeneration.tla` refines capability identity across table-slot reuse. A
+modeled userspace handle is the pair `<<slot, generation>>`. Closing a handle
+retires that exact pair and advances the slot generation. When the final modeled
+generation is consumed, the slot enters an exhausted state rather than wrapping.
+
+The phase-two invariants check that:
+
+- a retired opaque handle never resolves as a live handle again;
+- a slot's current generation always remains beyond every retired generation for
+  that slot, unless the generation space has been exhausted;
+- an exhausted slot cannot become active again;
+- every live handle contains a valid nonzero generation.
+
+The live ABI now follows the same security rule while keeping `u64` handles
+opaque. The current implementation uses a bounded slot plus a registry-wide
+nonzero generation allocated for each new live handle. Userspace may ask the
+kernel which opaque handle is currently installed at one of its own bounded table
+slots, but the slot number itself is not authority and the ABI does not expose the
+handle bit layout.
+
+These are architecture properties and implementation-alignment checks, not a
+claim that the complete kernel has been formally verified.
 
 ## Running TLC
 
-The model is compatible with the command-line TLA+ tools.  With Java 11 or newer
+The models are compatible with the command-line TLA+ tools. With Java 11 or newer
 and `tla2tools.jar` available:
 
 ```sh
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
   tlc2.TLC -deadlock \
   -config formal/CapabilityCore.cfg formal/CapabilityCore.tla
+
+java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
+  tlc2.TLC -deadlock \
+  -config formal/HandleGeneration.cfg formal/HandleGeneration.tla
 ```
 
-`-deadlock` disables TLC's deadlock error because closing the final modeled
-capability is an intentional terminal state.  The safety invariants remain
+`-deadlock` disables TLC's deadlock error because intentional terminal states are
+allowed in these bounded safety models. The configured safety invariants remain
 checked over the complete reachable state graph.
 
-The repository CI pins TLA+ Tools 1.7.4 for repeatability.
+The repository CI pins TLA+ Tools 1.7.4 for repeatability and checks both modules.
 
 ## Refinement plan
 
-The model is intentionally layered.  Later modules should add semantics only when
+The model is intentionally layered. Later modules should add semantics only when
 the lower layer is stable:
 
 1. **CapabilityCore** — authority ownership, attenuation, replacement, close, and
-   move-transfer.
-2. **HandleGeneration** — slot reuse, generation checks, and the guarantee that a
-   stale userspace handle cannot become authority over a later object.
+   move-transfer. Implemented and machine-checked.
+2. **HandleGeneration** — slot reuse, generation checks, explicit exhaustion, and
+   stale-handle non-revival. Implemented and machine-checked by this phase.
 3. **EndpointIPC** — bounded queues, atomic move-send, all-or-nothing receive,
    peer closure, and failure atomicity.
 4. **Jobs** — immutable hierarchy, non-relaxable membership, fork inheritance,
@@ -68,8 +94,8 @@ the lower layer is stable:
 
 ## Implementation relationship
 
-The model is a specification of permitted authority transitions, not a literal
-translation of Rust data structures.  The intended mapping is small and explicit:
+The models specify permitted security transitions rather than literal Rust data
+structures. The intended mapping remains small and explicit:
 
 | Formal action | Kernel concept |
 | --- | --- |
@@ -77,14 +103,16 @@ translation of Rust data structures.  The intended mapping is small and explicit
 | `Duplicate` | rights-reduced duplicate |
 | `Replace` | atomic rights replacement |
 | `MoveTransfer` | successful ownership-consuming transfer |
+| `Open` in `HandleGeneration` | install a new opaque handle in a free slot |
+| `Close` in `HandleGeneration` | retire the opaque handle before slot reuse |
 
-The current generic `kernel::capability` model already uses generation-checked
-slot handles, while the live userspace-platform capability table still uses
-reusable small integer handles.  Phase 1 does **not** silently claim those are
-already equivalent.  `HandleGeneration` is the next refinement step and should
-be completed before NullStar claims the stale-handle invariant for the live ABI.
+The host-testable generic `kernel::capability` registry keeps per-slot generation
+state. The live userspace-platform table uses globally unique per-allocation
+generations combined with bounded process-local slots. Both implementations obey
+the phase-two property: closing and later reusing a slot cannot recreate a stale
+opaque handle, and generation exhaustion fails closed instead of wrapping.
 
 The guiding rule is that the formal model should stay smaller than the
-implementation.  When a new feature cannot be described without pulling large
+implementation. When a new feature cannot be described without pulling large
 amounts of unrelated kernel state into a security model, that is a signal to
 reconsider the abstraction boundary rather than model the entire kernel.

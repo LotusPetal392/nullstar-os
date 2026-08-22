@@ -21,7 +21,7 @@ use userspace::{
     },
     nullfs_primary_volume, platform,
     process_start::{
-        PROCESS_START_BOOTSTRAP_HANDLE, StartupIdentity, StartupLaunch, StartupLaunchReason,
+        PROCESS_START_BOOTSTRAP_SLOT, StartupIdentity, StartupLaunch, StartupLaunchReason,
         StartupSectionId, StartupSectionPayload, encode_startup_arguments,
         encode_startup_environment, send_process_start_data,
     },
@@ -2615,10 +2615,9 @@ fn spawn_managed_capability_tool<const N: usize>(
         process_id,
         receiver,
         Rights::RECEIVE,
-        PROCESS_START_BOOTSTRAP_HANDLE,
+        PROCESS_START_BOOTSTRAP_SLOT,
     )
-    .ok()
-        == Some(PROCESS_START_BOOTSTRAP_HANDLE);
+    .is_ok();
     let startup_sent = bootstrap_granted
         && send_managed_tool_start_with_capabilities(
             sender,
@@ -3591,10 +3590,9 @@ fn start_definition_service(
             process_id,
             endpoint,
             Rights::RECEIVE,
-            PROCESS_START_BOOTSTRAP_HANDLE,
+            PROCESS_START_BOOTSTRAP_SLOT,
         )
-        .ok()
-            == Some(PROCESS_START_BOOTSTRAP_HANDLE)
+        .is_ok()
     });
     let startup_sent = bootstrap_granted
         && send_definition_process_start(&mut attempt, runtime, process_id, generation);
@@ -5562,10 +5560,9 @@ fn launch_logging_generation(
         process_id,
         bootstrap_receiver_source,
         Rights::RECEIVE,
-        PROCESS_START_BOOTSTRAP_HANDLE,
+        PROCESS_START_BOOTSTRAP_SLOT,
     )
-    .ok()
-        != Some(PROCESS_START_BOOTSTRAP_HANDLE)
+    .is_err()
     {
         fail_logging_activation(attempt, LOGGING_SERVICE_BOOTSTRAP_FAILED);
     }
@@ -6103,10 +6100,9 @@ fn start_contained_service(
             process_id,
             receiver,
             Rights::RECEIVE,
-            PROCESS_START_BOOTSTRAP_HANDLE,
+            PROCESS_START_BOOTSTRAP_SLOT,
         )
-        .ok()
-            != Some(PROCESS_START_BOOTSTRAP_HANDLE)
+        .is_err()
         {
             fail_contained_activation(attempt, messages, messages.bootstrap_failed);
         }

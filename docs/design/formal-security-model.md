@@ -10,7 +10,7 @@ The executable specifications live under [`formal/`](../../formal/).
 
 ## Security constitution
 
-The following invariants define the intended long-term security contract.  A
+The following invariants define the intended long-term security contract. A
 formal module may cover only a subset until its dependencies are modeled, but a
 later feature must not intentionally weaken an established invariant without an
 explicit architecture decision.
@@ -48,22 +48,50 @@ explicit architecture decision.
     authority grant must derive from an already authorized capability or an
     authorized broker/provider decision.
 
-## Phase 1 boundary
+## Phase 1: capability core
 
-The first executable model, `formal/CapabilityCore.tla`, covers only close,
-rights-reduced duplication, atomic rights replacement, and the authority effect
-of successful move-transfer.  It tracks each token's originating object and
-rights so TLC can exhaustively check the phase-one monotonicity and identity
-invariants over a deliberately small finite state space.
+`formal/CapabilityCore.tla` covers close, rights-reduced duplication, atomic
+rights replacement, and the authority effect of successful move-transfer. It
+tracks each token's originating object and rights so TLC can exhaustively check
+phase-one monotonicity and identity invariants over a deliberately small finite
+state space.
 
-This phase does not model endpoint queues, wait state, jobs, service generation,
-or the numeric representation of live syscall handles.  Those are separate
-refinement layers so a counterexample remains small enough to understand.
+Endpoint queues, wait state, jobs, service generation, and concrete syscall
+encoding remain outside this module so counterexamples stay small enough to
+understand.
+
+## Phase 2: handle generation
+
+`formal/HandleGeneration.tla` adds the lifecycle of an opaque userspace handle
+across capability-table slot reuse. A modeled handle is `<<slot, generation>>`.
+Closing it records that exact handle as retired and advances the slot generation.
+The final representable generation transitions to an exhausted state rather than
+wrapping to an earlier value.
+
+The model checks security-constitution invariant 8 directly: no retired handle
+may ever resolve as the current live handle for any slot. It also checks that
+retired generations remain strictly behind a slot's current generation, that an
+exhausted slot stays closed, and that every live handle is well formed.
+
+The live ABI now aligns with that contract while keeping the `u64` representation
+opaque. The kernel combines a bounded process-local slot with a nonzero generation
+allocated once for each new live handle. A same-process bounded slot-lookup
+operation supports managed bootstrap and capability cleanup without making the
+slot number itself authority or exposing the bit layout. Direct-child bootstrap
+therefore requests a deterministic child **slot** and receives the child's actual
+opaque handle.
+
+The host-testable `kernel::capability` registry retains its per-slot generation
+scheme. Generation exhaustion there now makes the slot permanently unavailable
+instead of wrapping back to generation 1. The live table uses a registry-wide
+monotonic allocation generation and likewise fails closed when that generation
+space is exhausted. These are implementation choices beneath the same formal
+non-revival property.
 
 ## Relationship to implementation
 
 Formal actions should map to narrow implementation operations rather than whole
-syscall handlers.  The preferred direction is to consolidate common capability
+syscall handlers. The preferred direction is to consolidate common capability
 table and rights logic so the correspondence remains obvious:
 
 ```text
@@ -73,19 +101,19 @@ Close                         close one handle
 Duplicate                     duplicate with attenuated rights
 Replace                       atomically replace with attenuated rights
 MoveTransfer                  commit an ownership-consuming transfer
+HandleGeneration.Open         install an opaque handle in a free slot
+HandleGeneration.Close        retire that handle before slot reuse
 ```
 
-The first known refinement obligation is stale-handle safety.  The generic
-`kernel::capability` registry already represents a handle as a slot plus
-generation.  The live userspace-platform capability table currently allocates
-reusable small integer handle values.  The formal model therefore does not claim
-invariant 8 for the live ABI yet.  A follow-up should unify or adapt the live
-representation so slot reuse advances a generation while preserving the opaque
-`u64` ABI.
+The phase-two model does not claim that the concrete Rust implementation has been
+formally proved to refine the TLA+ specification. The implementation is instead
+aligned by construction, unit and integration tested, and kept behind the same
+machine-checked architectural invariant. A later conformance layer can compare
+abstract implementation snapshots against model-generated traces.
 
 ## Verification levels
 
-NullStar should distinguish three different forms of assurance:
+NullStar distinguishes three different forms of assurance:
 
 1. **Architecture model checking:** TLA+/TLC explores permitted state transitions
    and checks the security constitution for the modeled layer.
@@ -96,14 +124,15 @@ NullStar should distinguish three different forms of assurance:
    operation traces and compare the implementation's abstract security state with
    the formal transition model.
 
-Passing one level is not described as passing another.  In particular, a TLC
+Passing one level is not described as passing another. In particular, a TLC
 success means the finite formal model satisfied its configured invariants; it is
 not a proof that the complete NullStar kernel implementation refines that model.
 
 ## Expansion order
 
-The intended expansion order is capability core, generation-checked handle reuse,
-endpoint IPC, jobs, service generations, and application sandboxing.  MMIO, IRQ,
-DMA, mapped shared memory, and richer driver authority should be added only after
-the lower-level capability and containment rules have stable machine-checked
-models.
+Capability core and generation-checked handle reuse are the first two formal
+layers. The next intended layer is endpoint IPC: bounded queues, move-send commit,
+all-or-nothing receive, peer closure, and failure atomicity. Jobs, service
+generations, and application sandboxing follow after that. MMIO, IRQ, DMA, mapped
+shared memory, and richer driver authority should be added only after the
+lower-level capability and containment rules have stable machine-checked models.

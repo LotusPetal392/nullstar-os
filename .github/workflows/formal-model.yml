@@ -54,3 +54,13 @@ jobs:
             -deadlock \
             -config formal/CapabilityCore.cfg \
             formal/CapabilityCore.tla
+
+      - name: Parse handle generation model
+        run: java -cp "$TLA_TOOLS_JAR" tla2sany.SANY formal/HandleGeneration.tla
+
+      - name: Check handle generation invariants
+        run: |
+          java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC \
+            -deadlock \
+            -config formal/HandleGeneration.cfg \
+            formal/HandleGeneration.tla
