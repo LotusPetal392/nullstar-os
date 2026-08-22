@@ -1,0 +1,56 @@
+name: Formal security model
+
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - ".github/workflows/formal-model.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "formal/**"
+      - ".github/workflows/formal-model.yml"
+
+concurrency:
+  group: formal-model-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  capability-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download pinned TLA+ tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl --fail --location --silent --show-error \
+            --output "$jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "bee4a54f3ee3d4afc347c3240ec2d9e93b075104  $jar" | sha1sum --check --strict
+          echo "TLA_TOOLS_JAR=$jar" >> "$GITHUB_ENV"
+
+      - name: Parse capability core model
+        run: java -cp "$TLA_TOOLS_JAR" tla2sany.SANY formal/CapabilityCore.tla
+
+      - name: Check capability core invariants
+        run: |
+          java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC \
+            -deadlock \
+            -config formal/CapabilityCore.cfg \
+            formal/CapabilityCore.tla
