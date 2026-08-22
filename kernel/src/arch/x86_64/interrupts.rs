@@ -345,11 +345,14 @@ pub fn init_application_processor() {
                 }
             };
             serial_println!(
-                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}, kernel_tasks={}",
+                "application processor scheduler lane initialized: cpu={}, timer_vector={:#x}, reschedule_vector={:#x}, kernel_tasks={}, lifecycle_process={}, lifecycle_threads={}, lifecycle_running={}",
                 cpu_index,
                 TIMER_VECTOR,
                 RESCHEDULE_VECTOR,
-                scheduler_snapshot.task_count
+                scheduler_snapshot.task_count,
+                scheduler_snapshot.lifecycle_process_id.unwrap_or(0),
+                scheduler_snapshot.lifecycle_thread_count,
+                scheduler_snapshot.lifecycle_running_thread_count
             );
             x86_64::instructions::interrupts::enable();
         }

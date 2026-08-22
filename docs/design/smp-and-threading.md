@@ -93,8 +93,11 @@ dispatch on another AP. An architecture-neutral `SmpExecution` coordinator now b
 `ProcessTable` lifecycle transitions to SMP admission, dispatch, blocking, wakeup, migration,
 rebalance, and exit effects. It owns both models, prevalidates fallible operations, and retains
 enough source/destination transition detail to keep running state synchronized across CPUs. The
-live workload still uses reserved probe thread identities; adopting this coordinator in the AP
-context store and wiring general event/wait-queue wakeups remain part of this milestone.
+live AP context store now registers its reserved probe identities in one bounded lifecycle process
+per AP and routes timer, migration, rebalance, block, and wake operations through the coordinator.
+Boot snapshots expose lifecycle process, thread, and running counts, while dispatch verification
+checks the authoritative thread state. General event/wait-queue wakeups and the userspace context
+store still need to adopt this path.
 
 ### 4. Synchronization and concurrent execution
 

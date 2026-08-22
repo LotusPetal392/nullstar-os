@@ -107,6 +107,7 @@ pub struct ProcessSnapshot {
 pub enum CreateError {
     ProcessLimitReached,
     ThreadLimitReached,
+    DuplicateThread,
     InvalidProcess,
     ProcessExited,
     ThreadLimitPerProcessReached,
@@ -264,17 +265,34 @@ impl ProcessTable {
         name: &'static str,
     ) -> Result<ThreadId, CreateError> {
         self.validate_thread_creation(process_id)?;
+        let id = self.allocate_thread_id()?;
+        self.insert_thread(process_id, id, name);
+        Ok(id)
+    }
+
+    pub(crate) fn create_thread_with_id(
+        &mut self,
+        process_id: ProcessId,
+        thread_id: ThreadId,
+        name: &'static str,
+    ) -> Result<ThreadId, CreateError> {
+        self.validate_thread_creation(process_id)?;
+        if self.thread(thread_id).is_some() {
+            return Err(CreateError::DuplicateThread);
+        }
+        self.insert_thread(process_id, thread_id, name);
+        Ok(thread_id)
+    }
+
+    fn insert_thread(&mut self, process_id: ProcessId, thread_id: ThreadId, name: &'static str) {
         let process_index = self
             .processes
             .iter()
             .position(|process| process.id == process_id)
             .expect("validated process disappeared");
-
-        let id = ThreadId(self.next_thread_id);
-        self.next_thread_id = self.next_thread_id.saturating_add(1);
         let process = &mut self.processes[process_index];
         process.threads.push(Thread {
-            id,
+            id: thread_id,
             process_id,
             name,
             state: ThreadState::Runnable,
@@ -283,7 +301,18 @@ impl ProcessTable {
         });
         process.state = ProcessState::Running;
         self.thread_count += 1;
-        Ok(id)
+    }
+
+    fn allocate_thread_id(&mut self) -> Result<ThreadId, CreateError> {
+        let mut raw = self.next_thread_id;
+        loop {
+            let id = ThreadId(raw);
+            if self.thread(id).is_none() {
+                self.next_thread_id = raw.checked_add(1).ok_or(CreateError::ThreadLimitReached)?;
+                return Ok(id);
+            }
+            raw = raw.checked_add(1).ok_or(CreateError::ThreadLimitReached)?;
+        }
     }
 
     pub(crate) fn validate_thread_creation(
@@ -355,6 +384,21 @@ impl ProcessTable {
             .process(process_id)
             .ok_or(LookupError::InvalidProcess)?;
         Ok(process.threads.iter().map(Thread::snapshot).collect())
+    }
+
+    pub fn thread_state_count(
+        &self,
+        process_id: ProcessId,
+        state: ThreadState,
+    ) -> Result<usize, LookupError> {
+        let process = self
+            .process(process_id)
+            .ok_or(LookupError::InvalidProcess)?;
+        Ok(process
+            .threads
+            .iter()
+            .filter(|thread| thread.state == state)
+            .count())
     }
 
     pub fn run_thread(&mut self, thread_id: ThreadId) -> Result<(), StateError> {

@@ -70,6 +70,7 @@ jobs:
           grep -F "application processor online: cpu=1" smp-qemu.log
           grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" smp-qemu.log
           grep -F "application processor scheduler lane initialized: cpu=1" smp-qemu.log
+          grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" smp-qemu.log
           grep -F "application processor timer verified: cpu=1" smp-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" smp-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" smp-qemu.log
@@ -84,24 +85,29 @@ jobs:
           grep -F "application processor online: cpu=1" smp-migration-qemu.log
           grep -F "application processor online: cpu=2" smp-migration-qemu.log
           grep -F "SMP application processors online: candidates=2, attempted=2, online=2, failed=0" smp-migration-qemu.log
+          grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" smp-migration-qemu.log
+          grep -F "lifecycle_process=2, lifecycle_threads=2, lifecycle_running=1" smp-migration-qemu.log
           grep -F "application processor kernel migration prepared:" smp-migration-qemu.log
           grep -F "from_cpu=1, to_cpu=2" smp-migration-qemu.log
           grep -F "application processor kernel migration verified:" smp-migration-qemu.log
           grep -F "application processor live migration requested:" smp-migration-qemu.log
           grep -F "from_cpu=2, to_cpu=1" smp-migration-qemu.log
           grep -F "application processor live migration verified:" smp-migration-qemu.log
+          grep -E "application processor live migration verified: .*lifecycle_state=running" smp-migration-qemu.log
           grep -F "application processor automatic rebalance requested:" smp-migration-qemu.log
           grep -F "trigger_cpu=1" smp-migration-qemu.log
           grep -F "requests=2" smp-migration-qemu.log
           grep -F "application processor automatic rebalance verified:" smp-migration-qemu.log
+          grep -E "application processor automatic rebalance verified: .*lifecycle_state=running" smp-migration-qemu.log
           grep -F "dispatch_cpu=2" smp-migration-qemu.log
           grep -F "rebalances=2" smp-migration-qemu.log
           test "$(grep -Fc 'application processor automatic rebalance requested:' smp-migration-qemu.log)" -eq 2
           test "$(grep -Fc 'application processor automatic rebalance verified:' smp-migration-qemu.log)" -eq 2
           grep -F "application processor probe block requested:" smp-migration-qemu.log
           grep -F "application processor probe blocked:" smp-migration-qemu.log
+          grep -E "application processor probe blocked: .*lifecycle_state=blocked" smp-migration-qemu.log
           grep -F "application processor probe wake requested:" smp-migration-qemu.log
-          grep -E "application processor probe wake verified: .*dispatch_cpu=2" smp-migration-qemu.log
+          grep -E "application processor probe wake verified: .*dispatch_cpu=2.*lifecycle_state=running" smp-migration-qemu.log
           test "$(grep -Fc 'application processor probe blocked:' smp-migration-qemu.log)" -eq 1
           test "$(grep -Fc 'application processor probe wake verified:' smp-migration-qemu.log)" -eq 1
 
@@ -113,6 +119,7 @@ jobs:
           grep -F "application processor online: cpu=1" partition-fat-qemu.log
           grep -F "SMP application processors online: candidates=1, attempted=1, online=1, failed=0" partition-fat-qemu.log
           grep -F "application processor scheduler lane initialized: cpu=1" partition-fat-qemu.log
+          grep -F "lifecycle_process=1, lifecycle_threads=7, lifecycle_running=1" partition-fat-qemu.log
           grep -F "application processor timer verified: cpu=1" partition-fat-qemu.log
           grep -F "application processor reschedule IPI verified: cpu=1" partition-fat-qemu.log
           grep -F "application processor kernel scheduling verified: cpu=1" partition-fat-qemu.log

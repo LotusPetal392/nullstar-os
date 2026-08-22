@@ -13,7 +13,8 @@ use crate::{
     },
     scheduling::{
         AdmissionResult, AssignmentSnapshot, CpuId, CpuMask, CpuSnapshot, MigrationResult,
-        QueueTransition, RebalancePlan, SmpError, SmpRoundRobin, SmpSnapshot, Switch, WakeResult,
+        Placement, QueueTransition, RebalancePlan, SmpError, SmpRoundRobin, SmpSnapshot, Switch,
+        WakeResult,
     },
 };
 
@@ -94,6 +95,31 @@ impl SmpExecution {
         Ok(admission)
     }
 
+    /// Admit an architecture-owned context with a preallocated nonzero identity.
+    pub fn create_thread_with_id(
+        &mut self,
+        process: ProcessId,
+        thread: ThreadId,
+        name: &'static str,
+        affinity: CpuMask,
+    ) -> Result<AdmissionResult, ExecutionError> {
+        self.processes.validate_thread_creation(process)?;
+        self.scheduler.validate_admission(affinity)?;
+        self.processes
+            .create_thread_with_id(process, thread, name)?;
+        let admission = match self.scheduler.admit_with_transition(thread, affinity) {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.processes
+                    .rollback_thread_creation(thread)
+                    .expect("newly created thread must be safe to roll back");
+                return Err(error.into());
+            }
+        };
+        self.activate(admission.switch);
+        Ok(admission)
+    }
+
     pub fn process_snapshot(&self, process: ProcessId) -> Result<ProcessSnapshot, LookupError> {
         self.processes.process_snapshot(process)
     }
@@ -112,6 +138,25 @@ impl SmpExecution {
 
     pub fn assignment_snapshot(&self, thread: ThreadId) -> Result<AssignmentSnapshot, SmpError> {
         self.scheduler.assignment_snapshot(thread)
+    }
+
+    pub fn placement(&self, thread: ThreadId) -> Result<Placement, SmpError> {
+        self.scheduler.placement(thread)
+    }
+
+    pub fn thread_state_count(
+        &self,
+        process: ProcessId,
+        state: ThreadState,
+    ) -> Result<usize, LookupError> {
+        self.processes.thread_state_count(process, state)
+    }
+
+    pub fn rebalance_plan(
+        &self,
+        eligible_cpus: CpuMask,
+    ) -> Result<Option<RebalancePlan>, SmpError> {
+        self.scheduler.rebalance_plan(eligible_cpus)
     }
 
     pub fn tick(&mut self, cpu: CpuId) -> Result<Option<Switch>, ExecutionError> {
@@ -577,5 +622,46 @@ mod tests {
             Err(ExecutionError::Create(CreateError::InvalidProcess))
         );
         assert_eq!(execution.scheduler_snapshot().assigned_thread_count, 0);
+    }
+
+    #[test]
+    fn explicit_thread_identity_is_authoritative_and_does_not_collide_with_allocation() {
+        let cpu0 = cpu(0);
+        let mut execution = SmpExecution::new(1, DEFAULT_QUANTUM_TICKS).unwrap();
+        let process = execution.create_process(None).unwrap();
+        let explicit = ThreadId::from_raw(1).unwrap();
+
+        let admission = execution
+            .create_thread_with_id(
+                process,
+                explicit,
+                "architecture-context",
+                CpuMask::single(cpu0),
+            )
+            .unwrap();
+        assert_eq!(admission.placement.thread, explicit);
+        assert_eq!(
+            execution.thread_snapshot(explicit).unwrap().state,
+            ThreadState::Running
+        );
+        assert_eq!(
+            execution
+                .thread_state_count(process, ThreadState::Running)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            execution.create_thread_with_id(process, explicit, "duplicate", CpuMask::single(cpu0),),
+            Err(ExecutionError::Create(CreateError::DuplicateThread))
+        );
+
+        let allocated = execution
+            .create_thread(process, "allocated", CpuMask::single(cpu0))
+            .unwrap()
+            .placement
+            .thread;
+        assert_ne!(allocated, explicit);
+        assert_eq!(allocated.raw(), 2);
+        assert_eq!(execution.scheduler_snapshot().assigned_thread_count, 2);
     }
 }

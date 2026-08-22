@@ -39,6 +39,8 @@ mod scheduling;
 mod shell;
 #[allow(dead_code)]
 mod smp;
+#[allow(dead_code)]
+mod smp_execution;
 mod storage;
 mod tmpfs_abi;
 mod vfs;
