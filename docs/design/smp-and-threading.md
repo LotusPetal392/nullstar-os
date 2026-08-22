@@ -98,12 +98,18 @@ per AP and routes timer, migration, rebalance, block, and wake operations throug
 A kernel-wide execution runtime now owns that coordinator independently of the x86 AP context store,
 initializes CPU 0 first, distinguishes 64-slot topology capacity from the actual online mask, and
 publishes each CPU's context group only after atomic admission succeeds. The shared bounds are 128
-processes and 256 threads/assignments; host coverage admits the full 64-CPU topology and all 131 AP
-probe contexts, then admits a low-range userspace identity without colliding with the reserved
-architecture namespace. Boot snapshots expose the online mask, registered CPU count, and lifecycle
-process/thread/running counts, while dispatch verification checks the authoritative thread state.
-General event/wait-queue wakeups and the userspace context store still need to adopt this shared
-path.
+processes and 256 threads/assignments; host coverage admits the full 64-CPU topology, all 131 AP
+probe contexts, three CPU 0 smoke-test contexts, and 64 low-range userspace identities for a total
+of 128 processes and 198 threads without colliding with the reserved architecture namespace. Boot
+snapshots expose the online mask, registered CPU count, and lifecycle process/thread/running counts,
+while dispatch verification checks the authoritative thread state.
+The CPU 0 context store now registers its bootstrap and smoke-test kernel tasks as one architecture
+context group, transactionally admits each userspace compatibility process/thread with shared
+parentage, and delegates timer, yield, block, wake, stop, continue, exit, and reap transitions to
+the same coordinator. A stopped blocked thread retains its deferred resume state, so an event can
+make it ready without dispatching it before a continue operation. Register contexts and address
+spaces remain architecture-owned. General event/wait-queue objects still need to invoke the shared
+wake path directly, and the userspace ABI still needs true multi-thread creation.
 
 ### 4. Synchronization and concurrent execution
 

@@ -105,12 +105,18 @@ admission and migration report their source and destination dispatch effects so 
 live coordinator shared by architecture context stores. It initializes with CPU 0 online, keeps
 fixed topology capacity separate from the actual online mask, assigns architecture-owned thread
 identities from one reserved namespace, and admits each CPU's context group transactionally.
-The bounded registry now retains 128 processes and 256 threads/queue assignments, which covers all
-131 current AP contexts at the 64-CPU topology limit while reserving process capacity for the next
-userspace integration stage. Automatically allocated userspace-facing thread identities remain in
-the low namespace and cannot collide with reserved high-range architecture identities.
-Application-processor kernel contexts use this runtime, while the existing single-thread-per-process
-userspace compatibility path and userspace thread creation still need to adopt it.
+The bounded registry now retains 128 processes and 256 threads/queue assignments. At the 64-CPU
+topology limit it covers 131 AP contexts, the three CPU 0 smoke-test contexts, and 64 userspace
+compatibility processes: 128 process identities and 198 thread assignments in total.
+Automatically allocated userspace-facing thread identities remain in the low namespace and cannot
+collide with reserved high-range architecture identities.
+Application-processor kernel contexts and the CPU 0 bootstrap scheduler now use this runtime. The
+bootstrap, smoke-test kernel contexts, and every single-thread-per-process userspace task retain
+their architecture register/address-space storage in the CPU 0 scheduler while all admission,
+timer rotation, yield, block, wake, stop, continue, exit, and reap transitions flow through the
+shared lifecycle and queue owner. Userspace admission is transactional, records shared parent/child
+identity separately from compatibility PIDs, and preserves deferred wake state when a blocked task
+is stopped. General multi-threaded userspace creation still needs an ABI and context-store path.
 
 The single-CPU scheduling milestone now shares that thread-state vocabulary and provides
 a bounded round-robin policy model. Timer ticks consume a configured quantum, rotate
@@ -137,8 +143,10 @@ admission rolls back its process, threads, and queue assignments before publicat
 records the incremental online CPU mask and registered context-group count alongside nonzero AP
 process identities and expected thread/running counts, blocks a live context, transfers it between
 CPU-local task stores during wakeup, and verifies both destination dispatch and lifecycle state.
-Ordinary userspace tasks remain on the bootstrap scheduler pending context and address-space
-integration.
+Ordinary userspace tasks remain physically hosted by the bootstrap context/address-space store, but
+their lifecycle identity and CPU 0 queue decisions now come from the same execution runtime as AP
+kernel contexts. This compatibility cutover deliberately leaves register storage CPU-local while
+removing the second independent source of scheduling truth.
 
 The synchronization/IPC layer adds an acquire/release `SmpMutex`, bounded FIFO channels with
 blocking and nonblocking operations, and fixed per-CPU mailboxes for reschedule, wake, address-space

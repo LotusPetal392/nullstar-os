@@ -17,7 +17,11 @@ use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
 };
 
-use crate::{gdt, preemption};
+use crate::{
+    execution_runtime::{self, ExecutionContext, KernelContextRegistration, RuntimeError},
+    gdt, preemption,
+    scheduling::{CpuId, Switch as ExecutionSwitch},
+};
 
 pub use crate::process_model::ThreadState as TaskState;
 
@@ -102,7 +106,9 @@ pub enum InitError {
     NotInitialized,
     StackLayoutInvalid,
     InvalidUserContext,
+    InvalidUserParent,
     TaskLimitReached,
+    Execution(RuntimeError),
 }
 
 impl InitError {
@@ -112,8 +118,16 @@ impl InitError {
             Self::NotInitialized => "scheduler is not initialized",
             Self::StackLayoutInvalid => "kernel-thread stack layout is invalid",
             Self::InvalidUserContext => "userspace task context is invalid",
+            Self::InvalidUserParent => "userspace parent task is not registered",
             Self::TaskLimitReached => "scheduler task limit was reached",
+            Self::Execution(_) => "shared execution runtime rejected the scheduler task",
         }
+    }
+}
+
+impl From<RuntimeError> for InitError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Execution(error)
     }
 }
 
@@ -148,6 +162,25 @@ pub struct ReapedProcessTask {
     pub runtime_ticks: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnedUserTask {
+    pub task_id: u64,
+    pub execution_process_id: u64,
+    pub execution_thread_id: u64,
+    pub cpu: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UserTaskRegistration {
+    pub name: &'static str,
+    pub process_id: u64,
+    pub parent_process_id: Option<u64>,
+    pub stack_pointer: usize,
+    pub kernel_stack_top: VirtAddr,
+    pub kernel_stack_bytes: usize,
+    pub page_table_address: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TaskSnapshot {
     pub id: u64,
@@ -155,6 +188,8 @@ pub struct TaskSnapshot {
     pub kind: TaskKind,
     pub state: TaskState,
     pub process_id: Option<u64>,
+    pub execution_process_id: Option<u64>,
+    pub execution_thread_id: Option<u64>,
     pub stack_bytes: usize,
     pub page_table_address: u64,
     pub scheduled_count: u64,
@@ -168,6 +203,8 @@ impl TaskSnapshot {
         kind: TaskKind::KernelThread,
         state: TaskState::Exited,
         process_id: None,
+        execution_process_id: None,
+        execution_thread_id: None,
         stack_bytes: 0,
         page_table_address: 0,
         scheduled_count: 0,
@@ -237,6 +274,7 @@ struct Task {
     state: TaskState,
     stopped_resume_state: Option<TaskState>,
     process_id: Option<u64>,
+    execution: Option<ExecutionContext>,
     stack_pointer: usize,
     // Owns kernel-thread stack storage for as long as the task is scheduled.
     _stack: Option<Box<[u128]>>,
@@ -256,6 +294,7 @@ impl Task {
             state: TaskState::Runnable,
             stopped_resume_state: None,
             process_id: None,
+            execution: None,
             stack_pointer: 0,
             _stack: None,
             stack_bytes: 0,
@@ -324,6 +363,7 @@ impl Task {
             state: TaskState::Runnable,
             stopped_resume_state: None,
             process_id: None,
+            execution: None,
             stack_pointer,
             _stack: Some(stack),
             stack_bytes,
@@ -358,6 +398,7 @@ impl Task {
             state: TaskState::Runnable,
             stopped_resume_state: None,
             process_id: Some(process_id),
+            execution: None,
             stack_pointer,
             _stack: None,
             stack_bytes: kernel_stack_bytes,
@@ -368,10 +409,6 @@ impl Task {
         })
     }
 
-    fn is_runnable(&self) -> bool {
-        self.state == TaskState::Runnable && self.stack_pointer != 0
-    }
-
     fn snapshot(&self) -> TaskSnapshot {
         TaskSnapshot {
             id: self.id,
@@ -379,6 +416,8 @@ impl Task {
             kind: self.kind,
             state: self.state,
             process_id: self.process_id,
+            execution_process_id: self.execution.map(|context| context.process.raw()),
+            execution_thread_id: self.execution.map(|context| context.thread.raw()),
             stack_bytes: self.stack_bytes,
             page_table_address: self.address_space.address(),
             scheduled_count: self.scheduled_count,
@@ -432,6 +471,28 @@ impl Scheduler {
             self.spawn_kernel("scheduler-probe-a", scheduler_probe_a)?;
             self.spawn_kernel("scheduler-probe-b", scheduler_probe_b)?;
         }
+        let cpu = bootstrap_cpu();
+        let registrations = self
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(slot, task)| {
+                let slot = u8::try_from(slot).map_err(|_| RuntimeError::InvalidContextSlot)?;
+                KernelContextRegistration::new(slot, task.name)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let execution_process = execution_runtime::with_mut(|runtime| {
+            runtime.register_cpu_contexts(cpu, &registrations)
+        })??;
+        for (slot, task) in self.tasks.iter_mut().enumerate() {
+            let slot = u8::try_from(slot).expect("bootstrap task slot is bounded");
+            task.execution = Some(ExecutionContext {
+                process: execution_process,
+                thread: execution_runtime::kernel_thread_id(cpu, slot)
+                    .expect("registered bootstrap task has a valid execution identity"),
+                cpu,
+            });
+        }
         self.running = true;
         gdt::reset_privilege_stack();
         Ok(())
@@ -450,13 +511,9 @@ impl Scheduler {
 
     fn spawn_user(
         &mut self,
-        name: &'static str,
-        process_id: u64,
-        stack_pointer: usize,
-        kernel_stack_top: VirtAddr,
-        kernel_stack_bytes: usize,
+        registration: UserTaskRegistration,
         page_table_frame: PhysFrame<Size4KiB>,
-    ) -> Result<u64, InitError> {
+    ) -> Result<SpawnedUserTask, InitError> {
         if !self.running {
             return Err(InitError::NotInitialized);
         }
@@ -464,16 +521,37 @@ impl Scheduler {
             return Err(InitError::TaskLimitReached);
         }
         let id = self.allocate_task_id();
-        self.tasks.push(Task::user_process(
+        let mut task = Task::user_process(
             id,
-            name,
-            process_id,
-            stack_pointer,
-            kernel_stack_top,
-            kernel_stack_bytes,
+            registration.name,
+            registration.process_id,
+            registration.stack_pointer,
+            registration.kernel_stack_top,
+            registration.kernel_stack_bytes,
             page_table_frame,
-        )?);
-        Ok(id)
+        )?;
+        let parent = match registration.parent_process_id {
+            Some(parent_process_id) => Some(
+                self.tasks
+                    .iter()
+                    .find(|task| task.process_id == Some(parent_process_id))
+                    .and_then(|task| task.execution)
+                    .map(|context| context.process)
+                    .ok_or(InitError::InvalidUserParent)?,
+            ),
+            None => None,
+        };
+        let execution = execution_runtime::with_mut(|runtime| {
+            runtime.register_userspace_context(parent, registration.name, bootstrap_cpu())
+        })??;
+        task.execution = Some(execution);
+        self.tasks.push(task);
+        Ok(SpawnedUserTask {
+            task_id: id,
+            execution_process_id: execution.process.raw(),
+            execution_thread_id: execution.thread.raw(),
+            cpu: execution.cpu.raw(),
+        })
     }
 
     fn allocate_task_id(&mut self) -> u64 {
@@ -492,12 +570,15 @@ impl Scheduler {
         self.tasks[current].runtime_ticks = self.tasks[current].runtime_ticks.saturating_add(1);
 
         self.ticks_in_quantum = self.ticks_in_quantum.saturating_add(1);
-        if self.ticks_in_quantum < self.quantum_ticks {
+        let execution_switch =
+            execution_runtime::with_mut(|runtime| runtime.execution_mut().tick(bootstrap_cpu()))
+                .expect("shared execution runtime must be available during timer scheduling")
+                .expect("CPU 0 execution tick must preserve scheduler invariants");
+        let Some(execution_switch) = execution_switch else {
             return current_stack_pointer;
-        }
+        };
         self.ticks_in_quantum = 0;
-
-        self.switch_to_next(current_stack_pointer, SwitchReason::Preempt)
+        self.switch_for_execution(execution_switch, SwitchReason::Preempt)
     }
 
     fn yield_now(&mut self, current_stack_pointer: usize) -> usize {
@@ -507,7 +588,14 @@ impl Scheduler {
 
         self.tasks[self.current_task].stack_pointer = current_stack_pointer;
         self.ticks_in_quantum = 0;
-        self.switch_to_next(current_stack_pointer, SwitchReason::Voluntary)
+        let execution_switch = execution_runtime::with_mut(|runtime| {
+            runtime.execution_mut().yield_current(bootstrap_cpu())
+        })
+        .expect("shared execution runtime must be available during yield")
+        .expect("CPU 0 execution yield must preserve scheduler invariants");
+        execution_switch.map_or(current_stack_pointer, |execution_switch| {
+            self.switch_for_execution(execution_switch, SwitchReason::Voluntary)
+        })
     }
 
     fn block_current(&mut self, current_stack_pointer: usize) -> usize {
@@ -519,14 +607,22 @@ impl Scheduler {
         if self.tasks[current].kind != TaskKind::UserProcess {
             return current_stack_pointer;
         }
+        let execution = self.tasks[current]
+            .execution
+            .expect("userspace task must have a shared execution identity");
+        let transition = execution_runtime::with_mut(|runtime| {
+            runtime.execution_mut().block_thread(execution.thread)
+        })
+        .expect("shared execution runtime must be available during blocking")
+        .expect("userspace block must preserve shared execution invariants");
         self.tasks[current].stack_pointer = current_stack_pointer;
         self.tasks[current].state = TaskState::Blocked;
         self.ticks_in_quantum = 0;
 
-        let next = self
-            .next_runnable_after(current)
+        let execution_switch = transition
+            .switch
             .expect("scheduler has no runnable task after userspace blocking");
-        self.switch_to(next, SwitchReason::Block)
+        self.switch_for_execution(execution_switch, SwitchReason::Block)
     }
 
     fn wake_process(&mut self, process_id: u64) -> bool {
@@ -540,10 +636,28 @@ impl Scheduler {
         match task.state {
             TaskState::Runnable => true,
             TaskState::Blocked => {
+                let execution = task
+                    .execution
+                    .expect("userspace task must have a shared execution identity");
+                execution_runtime::with_mut(|runtime| {
+                    runtime.execution_mut().wake_thread(execution.thread)
+                })
+                .expect("shared execution runtime must be available during wake")
+                .expect("userspace wake must preserve shared execution invariants")
+                .expect("direct blocked wake must make the task runnable");
                 task.state = TaskState::Runnable;
                 true
             }
             TaskState::Stopped if task.stopped_resume_state == Some(TaskState::Blocked) => {
+                let execution = task
+                    .execution
+                    .expect("userspace task must have a shared execution identity");
+                let wake = execution_runtime::with_mut(|runtime| {
+                    runtime.execution_mut().wake_thread(execution.thread)
+                })
+                .expect("shared execution runtime must be available during deferred wake")
+                .expect("deferred userspace wake must preserve shared execution invariants");
+                assert!(wake.is_none(), "stopped wake must remain deferred");
                 task.stopped_resume_state = Some(TaskState::Runnable);
                 true
             }
@@ -648,6 +762,14 @@ impl Scheduler {
         }
         match task.state {
             TaskState::Runnable | TaskState::Blocked => {
+                let execution = task
+                    .execution
+                    .expect("userspace task must have a shared execution identity");
+                execution_runtime::with_mut(|runtime| {
+                    runtime.execution_mut().stop_thread(execution.thread)
+                })
+                .expect("shared execution runtime must be available during stop")
+                .expect("userspace stop must preserve shared execution invariants");
                 task.stopped_resume_state = Some(task.state);
                 task.state = TaskState::Stopped;
                 true
@@ -669,6 +791,14 @@ impl Scheduler {
         if task.state != TaskState::Stopped {
             return false;
         }
+        let execution = task
+            .execution
+            .expect("userspace task must have a shared execution identity");
+        execution_runtime::with_mut(|runtime| {
+            runtime.execution_mut().continue_thread(execution.thread)
+        })
+        .expect("shared execution runtime must be available during continue")
+        .expect("userspace continue must preserve shared execution invariants");
         task.state = task
             .stopped_resume_state
             .take()
@@ -676,7 +806,7 @@ impl Scheduler {
         true
     }
 
-    fn terminate_process(&mut self, process_id: u64) -> bool {
+    fn terminate_process(&mut self, process_id: u64, status: u64) -> bool {
         let current = self.current_task;
         let Some((index, task)) = self
             .tasks
@@ -689,49 +819,78 @@ impl Scheduler {
         if index == current || task.state == TaskState::Exited {
             return false;
         }
+        let execution = task
+            .execution
+            .expect("userspace task must have a shared execution identity");
+        let exit = execution_runtime::with_mut(|runtime| {
+            runtime.exit_userspace_context(execution, status)
+        })
+        .expect("shared execution runtime must be available during termination")
+        .expect("userspace termination must preserve shared execution invariants");
+        assert!(
+            exit.queue.switch.is_none(),
+            "terminating a non-current task must not switch CPU 0"
+        );
         task.state = TaskState::Exited;
         task.stopped_resume_state = None;
         true
     }
 
-    fn terminate_current(&mut self, current_stack_pointer: usize) -> usize {
+    fn terminate_current(&mut self, current_stack_pointer: usize, status: u64) -> usize {
         if !self.running || self.tasks.is_empty() {
             return current_stack_pointer;
         }
 
         let current = self.current_task;
+        let execution = self.tasks[current]
+            .execution
+            .expect("userspace task must have a shared execution identity");
+        let exit = execution_runtime::with_mut(|runtime| {
+            runtime.exit_userspace_context(execution, status)
+        })
+        .expect("shared execution runtime must be available during current-task termination")
+        .expect("userspace exit must preserve shared execution invariants");
         self.tasks[current].stack_pointer = current_stack_pointer;
         self.tasks[current].state = TaskState::Exited;
         self.tasks[current].stopped_resume_state = None;
         self.ticks_in_quantum = 0;
 
-        let next = self
-            .next_runnable_after(current)
+        let execution_switch = exit
+            .queue
+            .switch
             .expect("scheduler has no runnable task after process termination");
-        self.switch_to(next, SwitchReason::Termination)
+        self.switch_for_execution(execution_switch, SwitchReason::Termination)
     }
 
-    fn switch_to_next(&mut self, current_stack_pointer: usize, reason: SwitchReason) -> usize {
-        let Some(next) = self.next_runnable_after(self.current_task) else {
-            return current_stack_pointer;
-        };
-        if next == self.current_task {
-            return current_stack_pointer;
+    fn switch_for_execution(
+        &mut self,
+        execution_switch: ExecutionSwitch,
+        reason: SwitchReason,
+    ) -> usize {
+        let current_execution = self.tasks[self.current_task]
+            .execution
+            .expect("current task must have a shared execution identity");
+        match reason {
+            SwitchReason::Preempt | SwitchReason::Voluntary => assert_eq!(
+                execution_switch.from,
+                Some(current_execution.thread),
+                "shared execution source diverged from the CPU 0 context store"
+            ),
+            SwitchReason::Block | SwitchReason::Termination => assert!(
+                execution_switch.from.is_none()
+                    || execution_switch.from == Some(current_execution.thread),
+                "shared execution removal source diverged from the CPU 0 context store"
+            ),
         }
+        let next = self
+            .tasks
+            .iter()
+            .position(|task| {
+                task.execution
+                    .is_some_and(|context| context.thread == execution_switch.to)
+            })
+            .expect("shared execution destination is missing its CPU 0 context");
         self.switch_to(next, reason)
-    }
-
-    fn next_runnable_after(&self, current: usize) -> Option<usize> {
-        if self.tasks.is_empty() {
-            return None;
-        }
-        for offset in 1..=self.tasks.len() {
-            let index = (current + offset) % self.tasks.len();
-            if self.tasks[index].is_runnable() {
-                return Some(index);
-            }
-        }
-        None
     }
 
     fn switch_to(&mut self, next: usize, reason: SwitchReason) -> usize {
@@ -779,6 +938,7 @@ impl Scheduler {
     fn reap_zombies(&mut self) -> Vec<ReapedProcessTask> {
         let current_id = self.tasks.get(self.current_task).map(|task| task.id);
         let mut process_tasks = Vec::new();
+        let mut execution_contexts = Vec::new();
         self.tasks.retain(|task| {
             if task.state == TaskState::Exited {
                 if let Some(process_id) = task.process_id {
@@ -788,6 +948,10 @@ impl Scheduler {
                         scheduled_count: task.scheduled_count,
                         runtime_ticks: task.runtime_ticks,
                     });
+                    execution_contexts.push(
+                        task.execution
+                            .expect("exited userspace task must have a shared execution identity"),
+                    );
                 }
                 false
             } else {
@@ -802,6 +966,11 @@ impl Scheduler {
                 .unwrap_or(0);
         } else {
             self.current_task = 0;
+        }
+        for context in execution_contexts {
+            execution_runtime::with_mut(|runtime| runtime.reap_userspace_context(context))
+                .expect("shared execution runtime must be available during process reaping")
+                .expect("userspace reap must preserve shared execution invariants");
         }
         process_tasks
     }
@@ -931,24 +1100,13 @@ pub fn current_task_kind() -> TaskKind {
 }
 
 pub fn spawn_user_process(
-    name: &'static str,
-    process_id: u64,
-    stack_pointer: usize,
-    kernel_stack_top: VirtAddr,
-    kernel_stack_bytes: usize,
-    page_table_address: u64,
-) -> Result<u64, InitError> {
-    let page_table_frame = PhysFrame::from_start_address(PhysAddr::new(page_table_address))
-        .map_err(|_| InitError::InvalidUserContext)?;
+    registration: UserTaskRegistration,
+) -> Result<SpawnedUserTask, InitError> {
+    let page_table_frame =
+        PhysFrame::from_start_address(PhysAddr::new(registration.page_table_address))
+            .map_err(|_| InitError::InvalidUserContext)?;
     cpu_interrupts::without_interrupts(|| {
-        SCHEDULER.lock().spawn_user(
-            name,
-            process_id,
-            stack_pointer,
-            kernel_stack_top,
-            kernel_stack_bytes,
-            page_table_frame,
-        )
+        SCHEDULER.lock().spawn_user(registration, page_table_frame)
     })
 }
 
@@ -1016,12 +1174,14 @@ pub fn continue_process(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().continue_process(process_id))
 }
 
-pub fn terminate_process(process_id: u64) -> bool {
-    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().terminate_process(process_id))
+pub fn terminate_process(process_id: u64, status: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().terminate_process(process_id, status))
 }
 
-pub fn terminate_current(current_stack_pointer: usize) -> usize {
-    SCHEDULER.lock().terminate_current(current_stack_pointer)
+pub fn terminate_current(current_stack_pointer: usize, status: u64) -> usize {
+    SCHEDULER
+        .lock()
+        .terminate_current(current_stack_pointer, status)
 }
 
 pub fn reap_zombie_processes() -> Vec<ReapedProcessTask> {
@@ -1034,6 +1194,10 @@ pub fn timer_interrupt_entry_address() -> VirtAddr {
 
 fn thread_entry_trampoline_address() -> VirtAddr {
     VirtAddr::new(galactic_thread_entry_trampoline as *const () as usize as u64)
+}
+
+fn bootstrap_cpu() -> CpuId {
+    CpuId::from_raw(0).expect("CPU 0 is always within the scheduler topology")
 }
 
 extern "C" fn scheduler_probe_a() -> ! {

@@ -572,11 +572,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             hlt_loop();
         }
     };
+    let execution_snapshot = execution_runtime::with(|runtime| runtime.snapshot())
+        .expect("execution runtime must remain available after scheduler initialization");
+    let bootstrap_execution = scheduler_initial
+        .tasks()
+        .first()
+        .expect("scheduler initialization must publish the bootstrap task");
     serial_println!(
-        "scheduler initialized: tasks={}, quantum_ticks={}, mode={}",
+        "scheduler initialized: tasks={}, quantum_ticks={}, mode={}, execution_process={}, execution_thread={}, execution_processes={}, execution_threads={}, execution_registered_cpus={}",
         scheduler_initial.task_count,
         scheduler_initial.quantum_ticks,
-        boot_mode.description()
+        boot_mode.description(),
+        bootstrap_execution.execution_process_id.unwrap_or(0),
+        bootstrap_execution.execution_thread_id.unwrap_or(0),
+        execution_snapshot.process_count,
+        execution_snapshot.thread_count,
+        execution_snapshot.registered_cpu_count
     );
     if let Ok(snapshot) = early_log::try_kernel_early_log_stats() {
         serial_println!(
@@ -706,9 +717,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
     serial_println!(
-        "userspace process spawned: pid={}, task={}, path={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, owned_frames={}",
+        "userspace process spawned: pid={}, task={}, execution_process={}, execution_thread={}, execution_cpu={}, path={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, owned_frames={}",
         process_probe_spawn.process_id,
         process_probe_spawn.task_id,
+        process_probe_spawn.execution_process_id,
+        process_probe_spawn.execution_thread_id,
+        process_probe_spawn.execution_cpu,
         process_probe_spawn.path,
         process_probe_spawn.entry_point,
         process_probe_spawn.page_table_address,
@@ -731,9 +745,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
     serial_println!(
-        "userspace process spawned: pid={}, task={}, path={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, owned_frames={}",
+        "userspace process spawned: pid={}, task={}, execution_process={}, execution_thread={}, execution_cpu={}, path={}, entry={:#018x}, page_table={:#x}, mapped_pages={}, owned_frames={}",
         fault_spawn.process_id,
         fault_spawn.task_id,
+        fault_spawn.execution_process_id,
+        fault_spawn.execution_thread_id,
+        fault_spawn.execution_cpu,
         fault_spawn.path,
         fault_spawn.entry_point,
         fault_spawn.page_table_address,
@@ -867,7 +884,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     let userspace_rust_runtime_verified = runtime_probe_result.exit_code() == Some(0)
         && runtime_probe_result.path == "/runtime-probe"
-        && runtime_probe_result.syscall_count == 107
+        && runtime_probe_result.syscall_count == 115
         && runtime_probe_result.write_count == 1
         && runtime_probe_result.bytes_written == USERSPACE_RUNTIME_PROBE_BYTES;
     if !userspace_rust_runtime_verified {

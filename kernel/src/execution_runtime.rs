@@ -7,9 +7,12 @@
 use spin::Mutex;
 
 use crate::{
-    process_model::{ProcessId, ThreadId, ThreadState},
+    process_model::{
+        JoinError, LookupError, ProcessExit, ProcessId, ProcessState, ReapError, ThreadId,
+        ThreadState,
+    },
     scheduling::{CpuId, CpuMask, DEFAULT_QUANTUM_TICKS, MAX_CPUS, SmpError, SmpSnapshot},
-    smp_execution::{ExecutionError, SmpExecution},
+    smp_execution::{ExecutionError, ExitResult, SmpExecution},
 };
 
 const KERNEL_THREAD_ID_BASE: u64 = 1_u64 << 63;
@@ -21,10 +24,14 @@ pub enum RuntimeError {
     AlreadyInitialized,
     Unavailable,
     InvalidContextSlot,
+    InvalidContextIdentity,
     CpuAlreadyRegistered,
     EmptyContextSet,
     Scheduling(SmpError),
     Execution(ExecutionError),
+    Lookup(LookupError),
+    Join(JoinError),
+    Reap(ReapError),
     Rollback(ExecutionError),
 }
 
@@ -40,10 +47,35 @@ impl From<ExecutionError> for RuntimeError {
     }
 }
 
+impl From<LookupError> for RuntimeError {
+    fn from(error: LookupError) -> Self {
+        Self::Lookup(error)
+    }
+}
+
+impl From<JoinError> for RuntimeError {
+    fn from(error: JoinError) -> Self {
+        Self::Join(error)
+    }
+}
+
+impl From<ReapError> for RuntimeError {
+    fn from(error: ReapError) -> Self {
+        Self::Reap(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelContextRegistration {
     slot: u8,
     name: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionContext {
+    pub process: ProcessId,
+    pub thread: ThreadId,
+    pub cpu: CpuId,
 }
 
 impl KernelContextRegistration {
@@ -154,6 +186,70 @@ impl ExecutionRuntime {
         }
     }
 
+    /// Atomically admit one userspace compatibility task as a lifecycle
+    /// process with one schedulable thread.
+    pub fn register_userspace_context(
+        &mut self,
+        parent: Option<ProcessId>,
+        name: &'static str,
+        cpu: CpuId,
+    ) -> Result<ExecutionContext, RuntimeError> {
+        let process = self
+            .execution
+            .create_process(parent)
+            .map_err(ExecutionError::from)?;
+        let admission = match self
+            .execution
+            .create_thread(process, name, CpuMask::single(cpu))
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Err(rollback) = self.execution.rollback_process_creation(process) {
+                    return Err(RuntimeError::Rollback(rollback));
+                }
+                return Err(error.into());
+            }
+        };
+        Ok(ExecutionContext {
+            process,
+            thread: admission.placement.thread,
+            cpu: admission.placement.cpu,
+        })
+    }
+
+    pub fn exit_userspace_context(
+        &mut self,
+        context: ExecutionContext,
+        status: u64,
+    ) -> Result<ExitResult, RuntimeError> {
+        self.validate_context_identity(context)?;
+        Ok(self.execution.exit_thread(context.thread, status)?)
+    }
+
+    pub fn reap_userspace_context(
+        &mut self,
+        context: ExecutionContext,
+    ) -> Result<ProcessExit, RuntimeError> {
+        self.validate_context_identity(context)?;
+        let thread = self.execution.thread_snapshot(context.thread)?;
+        if thread.detached {
+            return Err(RuntimeError::Join(JoinError::Detached));
+        }
+        if thread.state != ThreadState::Exited {
+            return Err(RuntimeError::Join(JoinError::NotExited));
+        }
+        let process = self.execution.process_snapshot(context.process)?;
+        if process.state != ProcessState::Exited {
+            return Err(RuntimeError::Reap(ReapError::NotExited));
+        }
+        self.execution.orphan_process_children(context.process)?;
+        let exit = self.execution.join_thread(context.thread)?;
+        if exit.process_id != context.process {
+            return Err(RuntimeError::InvalidContextIdentity);
+        }
+        Ok(self.execution.reap_process(context.process)?)
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             scheduler: self.execution.scheduler_snapshot(),
@@ -174,6 +270,14 @@ impl ExecutionRuntime {
     pub fn execution_mut(&mut self) -> &mut SmpExecution {
         &mut self.execution
     }
+
+    fn validate_context_identity(&self, context: ExecutionContext) -> Result<(), RuntimeError> {
+        let thread = self.execution.thread_snapshot(context.thread)?;
+        if thread.process_id != context.process {
+            return Err(RuntimeError::InvalidContextIdentity);
+        }
+        Ok(())
+    }
 }
 
 pub fn kernel_thread_id(cpu: CpuId, slot: u8) -> Option<ThreadId> {
@@ -186,38 +290,60 @@ pub fn kernel_thread_id(cpu: CpuId, slot: u8) -> Option<ThreadId> {
 }
 
 pub fn initialize_bootstrap() -> Result<(), RuntimeError> {
-    let mut runtime = EXECUTION_RUNTIME.lock();
-    if runtime.is_some() {
-        return Err(RuntimeError::AlreadyInitialized);
-    }
-    let cpu0 = CpuId::from_raw(0).expect("CPU 0 is valid");
-    *runtime = Some(ExecutionRuntime::new(
-        MAX_CPUS,
-        CpuMask::single(cpu0),
-        DEFAULT_QUANTUM_TICKS,
-    )?);
-    Ok(())
+    without_local_interrupts(|| {
+        let mut runtime = EXECUTION_RUNTIME.lock();
+        if runtime.is_some() {
+            return Err(RuntimeError::AlreadyInitialized);
+        }
+        let cpu0 = CpuId::from_raw(0).expect("CPU 0 is valid");
+        *runtime = Some(ExecutionRuntime::new(
+            MAX_CPUS,
+            CpuMask::single(cpu0),
+            DEFAULT_QUANTUM_TICKS,
+        )?);
+        Ok(())
+    })
 }
 
 pub fn with<R>(operation: impl FnOnce(&ExecutionRuntime) -> R) -> Result<R, RuntimeError> {
-    let runtime = EXECUTION_RUNTIME.lock();
-    runtime
-        .as_ref()
-        .map(operation)
-        .ok_or(RuntimeError::Unavailable)
+    without_local_interrupts(|| {
+        let runtime = EXECUTION_RUNTIME.lock();
+        runtime
+            .as_ref()
+            .map(operation)
+            .ok_or(RuntimeError::Unavailable)
+    })
 }
 
 pub fn with_mut<R>(operation: impl FnOnce(&mut ExecutionRuntime) -> R) -> Result<R, RuntimeError> {
-    let mut runtime = EXECUTION_RUNTIME.lock();
-    runtime
-        .as_mut()
-        .map(operation)
-        .ok_or(RuntimeError::Unavailable)
+    without_local_interrupts(|| {
+        let mut runtime = EXECUTION_RUNTIME.lock();
+        runtime
+            .as_mut()
+            .map(operation)
+            .ok_or(RuntimeError::Unavailable)
+    })
 }
 
 pub fn try_with_mut<R>(operation: impl FnOnce(&mut ExecutionRuntime) -> R) -> Option<R> {
-    let mut runtime = EXECUTION_RUNTIME.try_lock()?;
-    runtime.as_mut().map(operation)
+    without_local_interrupts(|| {
+        let mut runtime = EXECUTION_RUNTIME.try_lock()?;
+        runtime.as_mut().map(operation)
+    })
+}
+
+/// Prevent the local timer handler from re-entering the runtime while this
+/// CPU owns its global lock. Host policy tests cannot manipulate interrupt
+/// state, so they execute the same critical section directly.
+fn without_local_interrupts<R>(operation: impl FnOnce() -> R) -> R {
+    #[cfg(target_os = "none")]
+    {
+        x86_64::instructions::interrupts::without_interrupts(operation)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        operation()
+    }
 }
 
 #[cfg(test)]
@@ -344,6 +470,77 @@ mod tests {
     }
 
     #[test]
+    fn userspace_context_registration_preserves_parentage_and_reaps_atomically() {
+        let cpu0 = cpu(0);
+        let mut runtime =
+            ExecutionRuntime::new(1, CpuMask::single(cpu0), DEFAULT_QUANTUM_TICKS).unwrap();
+        let parent = runtime
+            .register_userspace_context(None, "parent", cpu0)
+            .unwrap();
+        let child = runtime
+            .register_userspace_context(Some(parent.process), "child", cpu0)
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .execution()
+                .process_snapshot(child.process)
+                .unwrap()
+                .parent,
+            Some(parent.process)
+        );
+        assert_eq!(
+            runtime.reap_userspace_context(parent),
+            Err(RuntimeError::Join(JoinError::NotExited))
+        );
+        assert_eq!(
+            runtime
+                .execution()
+                .process_snapshot(parent.process)
+                .unwrap()
+                .child_count,
+            1
+        );
+        assert_eq!(
+            runtime
+                .execution()
+                .process_snapshot(child.process)
+                .unwrap()
+                .parent,
+            Some(parent.process)
+        );
+        runtime.exit_userspace_context(parent, 17).unwrap();
+        assert_eq!(runtime.reap_userspace_context(parent).unwrap().status, 17);
+        assert_eq!(
+            runtime
+                .execution()
+                .process_snapshot(child.process)
+                .unwrap()
+                .parent,
+            None
+        );
+        assert_eq!(runtime.snapshot().process_count, 1);
+        assert_eq!(runtime.snapshot().thread_count, 1);
+    }
+
+    #[test]
+    fn failed_userspace_admission_rolls_back_the_process_identity() {
+        let cpu0 = cpu(0);
+        let cpu1 = cpu(1);
+        let mut runtime =
+            ExecutionRuntime::new(2, CpuMask::single(cpu0), DEFAULT_QUANTUM_TICKS).unwrap();
+
+        assert!(matches!(
+            runtime.register_userspace_context(None, "offline", cpu1),
+            Err(RuntimeError::Execution(ExecutionError::Scheduling(
+                SmpError::AffinityOutsideTopology
+            )))
+        ));
+        assert_eq!(runtime.snapshot().process_count, 0);
+        assert_eq!(runtime.snapshot().thread_count, 0);
+    }
+
+    #[test]
     fn full_topology_context_admission_stays_within_shared_capacity() {
         let cpu0 = cpu(0);
         let mut runtime =
@@ -358,6 +555,13 @@ mod tests {
             context(5, "block-wake"),
             context(6, "balance-c"),
         ];
+        let bootstrap = [
+            context(0, "bootstrap"),
+            context(1, "scheduler-a"),
+            context(2, "scheduler-b"),
+        ];
+
+        runtime.register_cpu_contexts(cpu0, &bootstrap).unwrap();
 
         for raw in 1..MAX_CPUS {
             let contexts = if raw == 1 {
@@ -372,24 +576,19 @@ mod tests {
         assert_eq!(snapshot.scheduler.cpu_capacity, MAX_CPUS);
         assert_eq!(snapshot.scheduler.cpu_count, MAX_CPUS);
         assert_eq!(snapshot.scheduler.online_mask.bits(), u64::MAX);
-        assert_eq!(snapshot.registered_cpu_count, MAX_CPUS - 1);
-        assert_eq!(snapshot.process_count, MAX_CPUS - 1);
-        assert_eq!(snapshot.thread_count, 131);
-        assert_eq!(snapshot.scheduler.assigned_thread_count, 131);
+        assert_eq!(snapshot.registered_cpu_count, MAX_CPUS);
+        assert_eq!(snapshot.process_count, MAX_CPUS);
+        assert_eq!(snapshot.thread_count, 134);
+        assert_eq!(snapshot.scheduler.assigned_thread_count, 134);
 
-        let userspace_process = runtime.execution_mut().create_process(None).unwrap();
-        let userspace_thread = runtime
-            .execution_mut()
-            .create_thread(
-                userspace_process,
-                "userspace-bootstrap",
-                CpuMask::single(cpu0),
-            )
-            .unwrap()
-            .placement
-            .thread;
-        assert_eq!(userspace_thread.raw() & KERNEL_THREAD_ID_BASE, 0);
-        assert_eq!(runtime.snapshot().process_count, MAX_CPUS);
-        assert_eq!(runtime.snapshot().thread_count, 132);
+        for _ in 0..64 {
+            let userspace = runtime
+                .register_userspace_context(None, "userspace", cpu0)
+                .unwrap();
+            assert_eq!(userspace.thread.raw() & KERNEL_THREAD_ID_BASE, 0);
+        }
+        assert_eq!(runtime.snapshot().process_count, 128);
+        assert_eq!(runtime.snapshot().thread_count, 198);
+        assert_eq!(runtime.snapshot().scheduler.assigned_thread_count, 198);
     }
 }
