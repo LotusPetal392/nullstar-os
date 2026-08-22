@@ -341,7 +341,7 @@ pub fn grant_child(
     child_process_id: u64,
     source_handle: CapabilityHandle,
     rights: Rights,
-    requested_child_handle: CapabilityHandle,
+    requested_child_slot: u64,
 ) -> Result<CapabilityHandle> {
     let mut result = phase1_protection_abi::syscall::GRANT_CHILD;
     unsafe {
@@ -351,10 +351,26 @@ pub fn grant_child(
             in("rdi") child_process_id,
             in("rsi") source_handle,
             in("rdx") rights.bits(),
-            in("r10") requested_child_handle,
+            in("r10") requested_child_slot,
         );
     }
     decode(result)
+}
+
+pub fn handle_at_slot(slot: u64) -> Result<CapabilityHandle> {
+    let mut result = syscall::CAPABILITY_HANDLE_AT_SLOT;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result, in("rdi") slot);
+    }
+    decode(result)
+}
+
+pub fn info_at_slot(slot: u64) -> Result<CapabilityInfo> {
+    info(handle_at_slot(slot)?)
+}
+
+pub fn close_at_slot(slot: u64) -> Result<()> {
+    close(handle_at_slot(slot)?)
 }
 
 pub fn close(handle: CapabilityHandle) -> Result<()> {

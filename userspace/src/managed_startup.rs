@@ -15,7 +15,7 @@ use crate::{
     ipc::{self, ObjectKind, Rights, Transfer},
     platform,
     process_start::{
-        PROCESS_START_BOOTSTRAP_HANDLE, StartupDataError, StartupIdentity, StartupLaunch,
+        PROCESS_START_BOOTSTRAP_SLOT, StartupDataError, StartupIdentity, StartupLaunch,
         StartupLaunchReason, StartupSectionId, StartupSectionPayload, StartupTransportError,
         ValidatedProcessStart, encode_startup_arguments, encode_startup_environment,
         receive_process_start_data, send_process_start_data,
@@ -159,10 +159,11 @@ pub fn receive_managed_service_start<const N: usize>(
     policies: &[StartupCapabilityPolicy],
     expected_identity: ManagedServiceIdentity,
 ) -> Result<ManagedServiceStart<N>, ManagedServiceStartError> {
-    if (2..=limits::MAX_CAPABILITIES_PER_PROCESS as u64).any(|handle| ipc::info(handle).is_ok()) {
+    if (2..=limits::MAX_CAPABILITIES_PER_PROCESS as u64).any(|slot| ipc::info_at_slot(slot).is_ok())
+    {
         return Err(ManagedServiceStartError::UnexpectedInitialCapability);
     }
-    let bootstrap = unsafe { OwnedHandle::<Endpoint>::from_raw(PROCESS_START_BOOTSTRAP_HANDLE) }
+    let bootstrap = unsafe { OwnedHandle::<Endpoint>::from_slot(PROCESS_START_BOOTSTRAP_SLOT) }
         .map_err(ManagedServiceStartError::Bootstrap)?;
     if !bootstrap
         .info()
@@ -450,7 +451,7 @@ fn receive_managed_tool_start_inner<const N: usize>(
     policies: &[StartupCapabilityPolicy],
     allow_legacy: bool,
 ) -> Result<Option<ManagedToolStart<N>>, ManagedToolStartError> {
-    let bootstrap_info = match ipc::info(PROCESS_START_BOOTSTRAP_HANDLE) {
+    let bootstrap_info = match ipc::info_at_slot(PROCESS_START_BOOTSTRAP_SLOT) {
         Ok(info) => info,
         Err(_) if allow_legacy => return Ok(None),
         Err(_) => return Err(ManagedToolStartError::InvalidBootstrap),
@@ -458,10 +459,11 @@ fn receive_managed_tool_start_inner<const N: usize>(
     if bootstrap_info.kind != ObjectKind::Endpoint || bootstrap_info.rights != Rights::RECEIVE {
         return Err(ManagedToolStartError::InvalidBootstrap);
     }
-    if (2..=limits::MAX_CAPABILITIES_PER_PROCESS as u64).any(|handle| ipc::info(handle).is_ok()) {
+    if (2..=limits::MAX_CAPABILITIES_PER_PROCESS as u64).any(|slot| ipc::info_at_slot(slot).is_ok())
+    {
         return Err(ManagedToolStartError::UnexpectedInitialCapability);
     }
-    let bootstrap = unsafe { OwnedHandle::<Endpoint>::from_raw(PROCESS_START_BOOTSTRAP_HANDLE) }
+    let bootstrap = unsafe { OwnedHandle::<Endpoint>::from_slot(PROCESS_START_BOOTSTRAP_SLOT) }
         .map_err(ManagedToolStartError::Bootstrap)?;
     let process_id = syscall::getpid().map_err(|_| ManagedToolStartError::ProcessIdentity)?;
     let parent_process_id =

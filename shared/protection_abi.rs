@@ -7,6 +7,7 @@ pub mod syscall {
     /// Copy a restricted capability into a live direct child's handle table.
     ///
     /// Arguments: target PID, source handle, rights mask, requested child
-    /// handle. A requested handle of zero asks the kernel to allocate a slot.
+    /// slot. A requested slot of zero asks the kernel to allocate any free slot.
+    /// The return value is the child's opaque generation-checked handle.
     pub const GRANT_CHILD: u64 = 48;
 }

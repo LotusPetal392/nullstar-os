@@ -311,7 +311,7 @@ impl CapabilityRegistry {
         if slot.entry.take().is_none() {
             return Err(CapabilityError::InvalidHandle);
         }
-        slot.generation = slot.generation.checked_add(1).unwrap_or(1);
+        slot.generation = slot.generation.checked_add(1).unwrap_or(0);
         self.collect_revoked_objects();
         Ok(())
     }
@@ -396,7 +396,7 @@ impl CapabilityRegistry {
             .slots
             .iter_mut()
             .enumerate()
-            .find(|(_, slot)| slot.entry.is_none())
+            .find(|(_, slot)| slot.entry.is_none() && slot.generation != 0)
         {
             (index, slot.generation)
         } else {
@@ -620,6 +620,36 @@ mod tests {
         registry.close(process(1), second.handle).unwrap();
         registry.close(process(1), duplicate.handle).unwrap();
         assert_eq!(registry.object_count(), 0);
+    }
+
+    #[test]
+    fn exhausted_generation_is_never_reused() {
+        let mut registry = CapabilityRegistry::new();
+        let original = registry
+            .create_object(process(1), ObjectType::Channel, channel_rights())
+            .unwrap();
+        let process_index = registry.process_index(process(1)).unwrap();
+        let slot_index = original.handle.slot();
+        registry.processes[process_index].slots[slot_index].generation = u32::MAX;
+        let maximal = CapabilityHandle {
+            slot: slot_index as u16,
+            generation: u32::MAX,
+        };
+
+        registry.close(process(1), maximal).unwrap();
+        assert_eq!(
+            registry.processes[process_index].slots[slot_index].generation,
+            0
+        );
+        assert_eq!(
+            registry.lookup(process(1), maximal),
+            Err(CapabilityError::StaleHandle)
+        );
+
+        let replacement = registry
+            .create_object(process(1), ObjectType::Event, Rights::BASIC)
+            .unwrap();
+        assert_ne!(replacement.handle.slot(), slot_index);
     }
 
     #[test]
