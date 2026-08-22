@@ -290,38 +290,60 @@ pub fn kernel_thread_id(cpu: CpuId, slot: u8) -> Option<ThreadId> {
 }
 
 pub fn initialize_bootstrap() -> Result<(), RuntimeError> {
-    let mut runtime = EXECUTION_RUNTIME.lock();
-    if runtime.is_some() {
-        return Err(RuntimeError::AlreadyInitialized);
-    }
-    let cpu0 = CpuId::from_raw(0).expect("CPU 0 is valid");
-    *runtime = Some(ExecutionRuntime::new(
-        MAX_CPUS,
-        CpuMask::single(cpu0),
-        DEFAULT_QUANTUM_TICKS,
-    )?);
-    Ok(())
+    without_local_interrupts(|| {
+        let mut runtime = EXECUTION_RUNTIME.lock();
+        if runtime.is_some() {
+            return Err(RuntimeError::AlreadyInitialized);
+        }
+        let cpu0 = CpuId::from_raw(0).expect("CPU 0 is valid");
+        *runtime = Some(ExecutionRuntime::new(
+            MAX_CPUS,
+            CpuMask::single(cpu0),
+            DEFAULT_QUANTUM_TICKS,
+        )?);
+        Ok(())
+    })
 }
 
 pub fn with<R>(operation: impl FnOnce(&ExecutionRuntime) -> R) -> Result<R, RuntimeError> {
-    let runtime = EXECUTION_RUNTIME.lock();
-    runtime
-        .as_ref()
-        .map(operation)
-        .ok_or(RuntimeError::Unavailable)
+    without_local_interrupts(|| {
+        let runtime = EXECUTION_RUNTIME.lock();
+        runtime
+            .as_ref()
+            .map(operation)
+            .ok_or(RuntimeError::Unavailable)
+    })
 }
 
 pub fn with_mut<R>(operation: impl FnOnce(&mut ExecutionRuntime) -> R) -> Result<R, RuntimeError> {
-    let mut runtime = EXECUTION_RUNTIME.lock();
-    runtime
-        .as_mut()
-        .map(operation)
-        .ok_or(RuntimeError::Unavailable)
+    without_local_interrupts(|| {
+        let mut runtime = EXECUTION_RUNTIME.lock();
+        runtime
+            .as_mut()
+            .map(operation)
+            .ok_or(RuntimeError::Unavailable)
+    })
 }
 
 pub fn try_with_mut<R>(operation: impl FnOnce(&mut ExecutionRuntime) -> R) -> Option<R> {
-    let mut runtime = EXECUTION_RUNTIME.try_lock()?;
-    runtime.as_mut().map(operation)
+    without_local_interrupts(|| {
+        let mut runtime = EXECUTION_RUNTIME.try_lock()?;
+        runtime.as_mut().map(operation)
+    })
+}
+
+/// Prevent the local timer handler from re-entering the runtime while this
+/// CPU owns its global lock. Host policy tests cannot manipulate interrupt
+/// state, so they execute the same critical section directly.
+fn without_local_interrupts<R>(operation: impl FnOnce() -> R) -> R {
+    #[cfg(target_os = "none")]
+    {
+        x86_64::instructions::interrupts::without_interrupts(operation)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        operation()
+    }
 }
 
 #[cfg(test)]
