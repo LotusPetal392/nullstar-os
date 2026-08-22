@@ -226,6 +226,17 @@ impl ExecutionRuntime {
         Ok(self.execution.exit_thread(context.thread, status)?)
     }
 
+    /// Wake one architecture-owned userspace context by its shared thread
+    /// identity. The architecture scheduler remains responsible for making
+    /// the corresponding saved register context runnable locally.
+    pub fn wake_context(
+        &mut self,
+        context: ExecutionContext,
+    ) -> Result<Option<crate::scheduling::WakeResult>, RuntimeError> {
+        self.validate_context_identity(context)?;
+        Ok(self.execution.wake_thread(context.thread)?)
+    }
+
     pub fn reap_userspace_context(
         &mut self,
         context: ExecutionContext,
@@ -521,6 +532,60 @@ mod tests {
         );
         assert_eq!(runtime.snapshot().process_count, 1);
         assert_eq!(runtime.snapshot().thread_count, 1);
+    }
+
+    #[test]
+    fn userspace_wake_targets_the_captured_execution_identity() {
+        let cpu0 = cpu(0);
+        let mut runtime =
+            ExecutionRuntime::new(1, CpuMask::single(cpu0), DEFAULT_QUANTUM_TICKS).unwrap();
+        let blocked = runtime
+            .register_userspace_context(None, "blocked", cpu0)
+            .unwrap();
+        let other = runtime
+            .register_userspace_context(None, "other", cpu0)
+            .unwrap();
+
+        runtime
+            .execution_mut()
+            .block_thread(blocked.thread)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .execution()
+                .thread_snapshot(blocked.thread)
+                .unwrap()
+                .state,
+            ThreadState::Blocked
+        );
+        assert_eq!(
+            runtime.wake_context(ExecutionContext {
+                process: other.process,
+                ..blocked
+            }),
+            Err(RuntimeError::InvalidContextIdentity)
+        );
+        let wake = runtime
+            .wake_context(blocked)
+            .unwrap()
+            .expect("blocked userspace context must become runnable");
+        assert_eq!(wake.placement.thread, blocked.thread);
+        assert_eq!(
+            runtime
+                .execution()
+                .thread_snapshot(blocked.thread)
+                .unwrap()
+                .state,
+            ThreadState::Runnable
+        );
+        assert_eq!(
+            runtime
+                .execution()
+                .thread_snapshot(other.thread)
+                .unwrap()
+                .state,
+            ThreadState::Running
+        );
     }
 
     #[test]

@@ -170,6 +170,17 @@ pub struct SpawnedUserTask {
     pub cpu: usize,
 }
 
+/// Exact execution identity captured when a userspace thread enters a wait.
+///
+/// The compatibility process ID remains the capability-ownership key, while
+/// `execution` identifies the one schedulable thread that must be woken. This
+/// avoids baking a one-thread-per-process lookup into wait queues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserExecutionTarget {
+    pub process_id: u64,
+    pub execution: ExecutionContext,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UserTaskRegistration {
     pub name: &'static str,
@@ -625,44 +636,56 @@ impl Scheduler {
         self.switch_for_execution(execution_switch, SwitchReason::Block)
     }
 
-    fn wake_process(&mut self, process_id: u64) -> bool {
-        let Some(task) = self
-            .tasks
-            .iter_mut()
-            .find(|task| task.process_id == Some(process_id))
-        else {
+    fn wake_execution(&mut self, execution: ExecutionContext) -> bool {
+        let Some(task) = self.tasks.iter_mut().find(|task| {
+            task.kind == TaskKind::UserProcess
+                && task.execution.is_some_and(|candidate| {
+                    candidate.process == execution.process && candidate.thread == execution.thread
+                })
+        }) else {
             return false;
         };
         match task.state {
             TaskState::Runnable => true,
             TaskState::Blocked => {
-                let execution = task
+                let task_execution = task
                     .execution
                     .expect("userspace task must have a shared execution identity");
-                execution_runtime::with_mut(|runtime| {
-                    runtime.execution_mut().wake_thread(execution.thread)
-                })
-                .expect("shared execution runtime must be available during wake")
-                .expect("userspace wake must preserve shared execution invariants")
-                .expect("direct blocked wake must make the task runnable");
+                execution_runtime::with_mut(|runtime| runtime.wake_context(task_execution))
+                    .expect("shared execution runtime must be available during wake")
+                    .expect("userspace wake must preserve shared execution invariants")
+                    .expect("direct blocked wake must make the task runnable");
                 task.state = TaskState::Runnable;
                 true
             }
             TaskState::Stopped if task.stopped_resume_state == Some(TaskState::Blocked) => {
-                let execution = task
+                let task_execution = task
                     .execution
                     .expect("userspace task must have a shared execution identity");
-                let wake = execution_runtime::with_mut(|runtime| {
-                    runtime.execution_mut().wake_thread(execution.thread)
-                })
-                .expect("shared execution runtime must be available during deferred wake")
-                .expect("deferred userspace wake must preserve shared execution invariants");
+                let wake =
+                    execution_runtime::with_mut(|runtime| runtime.wake_context(task_execution))
+                        .expect("shared execution runtime must be available during deferred wake")
+                        .expect(
+                            "deferred userspace wake must preserve shared execution invariants",
+                        );
                 assert!(wake.is_none(), "stopped wake must remain deferred");
                 task.stopped_resume_state = Some(TaskState::Runnable);
                 true
             }
             _ => false,
         }
+    }
+
+    fn wake_process(&mut self, process_id: u64) -> bool {
+        let Some(execution) = self
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::UserProcess && task.process_id == Some(process_id))
+            .and_then(|task| task.execution)
+        else {
+            return false;
+        };
+        self.wake_execution(execution)
     }
 
     fn process_stack_pointer(&self, process_id: u64) -> Option<usize> {
@@ -928,6 +951,17 @@ impl Scheduler {
             .and_then(|task| task.process_id)
     }
 
+    fn current_user_execution_target(&self) -> Option<UserExecutionTarget> {
+        let task = self.tasks.get(self.current_task)?;
+        if task.kind != TaskKind::UserProcess {
+            return None;
+        }
+        Some(UserExecutionTarget {
+            process_id: task.process_id?,
+            execution: task.execution?,
+        })
+    }
+
     fn current_task_kind(&self) -> TaskKind {
         self.tasks
             .get(self.current_task)
@@ -1095,6 +1129,10 @@ pub fn current_process_id() -> Option<u64> {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().current_process_id())
 }
 
+pub fn current_user_execution_target() -> Option<UserExecutionTarget> {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().current_user_execution_target())
+}
+
 pub fn current_task_kind() -> TaskKind {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().current_task_kind())
 }
@@ -1128,6 +1166,10 @@ pub fn block_current(current_stack_pointer: usize) -> usize {
 
 pub fn wake_process(process_id: u64) -> bool {
     cpu_interrupts::without_interrupts(|| SCHEDULER.lock().wake_process(process_id))
+}
+
+pub fn wake_execution(execution: ExecutionContext) -> bool {
+    cpu_interrupts::without_interrupts(|| SCHEDULER.lock().wake_execution(execution))
 }
 
 pub fn process_stack_pointer(process_id: u64) -> Option<usize> {

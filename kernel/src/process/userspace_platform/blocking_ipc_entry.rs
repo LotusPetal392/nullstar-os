@@ -4,7 +4,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EndpointWaiter {
     object: CapabilityObjectRef,
-    process_id: u64,
+    target: scheduler::UserExecutionTarget,
 }
 
 static ENDPOINT_WAITERS: PreemptMutex<Vec<EndpointWaiter>> = PreemptMutex::new(Vec::new());
@@ -28,7 +28,7 @@ enum ObjectWaitReturn {
 struct ObjectWaiter {
     registrations: Vec<ObjectWaitRegistration>,
     return_kind: ObjectWaitReturn,
-    process_id: u64,
+    target: scheduler::UserExecutionTarget,
     deadline_ns: u64,
     registers_pointer: usize,
 }
@@ -295,10 +295,11 @@ fn object_wait_one(
     current_stack_pointer: usize,
     registers_pointer: *mut SavedRegisters,
 ) -> usize {
-    let Some(process_id) = scheduler::current_process_id() else {
+    let Some(target) = scheduler::current_user_execution_target() else {
         unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
         return current_stack_pointer;
     };
+    let process_id = target.process_id;
     let handle = unsafe { (*registers_pointer).rdi };
     let requested_bits = unsafe { (*registers_pointer).rsi };
     let deadline_ns = unsafe { (*registers_pointer).rdx };
@@ -306,7 +307,7 @@ fn object_wait_one(
     // scheduler blocking. Mutation paths publish their state before taking
     // this lock, which prevents a readiness transition from being lost.
     let mut waiters = OBJECT_WAITERS.lock();
-    waiters.retain(|waiter| waiter.process_id != process_id);
+    waiters.retain(|waiter| waiter.target.execution.thread != target.execution.thread);
     let registry = CAPABILITY_REGISTRY.lock();
     let registration = match resolve_object_wait_registration(
         &registry,
@@ -344,7 +345,7 @@ fn object_wait_one(
     waiters.push(ObjectWaiter {
         registrations: vec![registration],
         return_kind: ObjectWaitReturn::Signals,
-        process_id,
+        target,
         deadline_ns,
         registers_pointer: registers_pointer as usize,
     });
@@ -359,10 +360,11 @@ fn object_wait_many(
     current_stack_pointer: usize,
     registers_pointer: *mut SavedRegisters,
 ) -> usize {
-    let Some(process_id) = scheduler::current_process_id() else {
+    let Some(target) = scheduler::current_user_execution_target() else {
         unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
         return current_stack_pointer;
     };
+    let process_id = target.process_id;
     let items_address = unsafe { (*registers_pointer).rdi };
     let item_count = match usize::try_from(unsafe { (*registers_pointer).rsi }) {
         Ok(0) => {
@@ -393,7 +395,7 @@ fn object_wait_many(
     }
 
     let mut waiters = OBJECT_WAITERS.lock();
-    waiters.retain(|waiter| waiter.process_id != process_id);
+    waiters.retain(|waiter| waiter.target.execution.thread != target.execution.thread);
     let registry = CAPABILITY_REGISTRY.lock();
     let mut registrations = Vec::with_capacity(item_count);
     for (index, item) in items.into_iter().enumerate() {
@@ -433,7 +435,7 @@ fn object_wait_many(
     waiters.push(ObjectWaiter {
         registrations,
         return_kind: ObjectWaitReturn::Index,
-        process_id,
+        target,
         deadline_ns,
         registers_pointer: registers_pointer as usize,
     });
@@ -448,15 +450,16 @@ fn wait_set_wait(
     current_stack_pointer: usize,
     registers_pointer: *mut SavedRegisters,
 ) -> usize {
-    let Some(process_id) = scheduler::current_process_id() else {
+    let Some(target) = scheduler::current_user_execution_target() else {
         unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
         return current_stack_pointer;
     };
+    let process_id = target.process_id;
     let wait_set_handle = unsafe { (*registers_pointer).rdi };
     let deadline_ns = unsafe { (*registers_pointer).rsi };
 
     let mut waiters = OBJECT_WAITERS.lock();
-    waiters.retain(|waiter| waiter.process_id != process_id);
+    waiters.retain(|waiter| waiter.target.execution.thread != target.execution.thread);
     let registry = CAPABILITY_REGISTRY.lock();
     let entry = match registry.entry(process_id, wait_set_handle) {
         Some(entry) => entry,
@@ -521,7 +524,7 @@ fn wait_set_wait(
     waiters.push(ObjectWaiter {
         registrations,
         return_kind: ObjectWaitReturn::WaitSetEvent,
-        process_id,
+        target,
         deadline_ns,
         registers_pointer: registers_pointer as usize,
     });
@@ -536,15 +539,16 @@ fn event_port_wait(
     current_stack_pointer: usize,
     registers_pointer: *mut SavedRegisters,
 ) -> usize {
-    let Some(process_id) = scheduler::current_process_id() else {
+    let Some(target) = scheduler::current_user_execution_target() else {
         unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
         return current_stack_pointer;
     };
+    let process_id = target.process_id;
     let event_port_handle = unsafe { (*registers_pointer).rdi };
     let deadline_ns = unsafe { (*registers_pointer).rsi };
 
     let mut waiters = OBJECT_WAITERS.lock();
-    waiters.retain(|waiter| waiter.process_id != process_id);
+    waiters.retain(|waiter| waiter.target.execution.thread != target.execution.thread);
     let mut registry = CAPABILITY_REGISTRY.lock();
     if let Err(error) = refresh_event_ports(&mut registry) {
         unsafe { (*registers_pointer).rax = error_return(error) };
@@ -595,7 +599,7 @@ fn event_port_wait(
             key: 0,
         }],
         return_kind: ObjectWaitReturn::EventPortEvent,
-        process_id,
+        target,
         deadline_ns,
         registers_pointer: registers_pointer as usize,
     });
@@ -706,12 +710,12 @@ fn wake_satisfied_object_waiters() {
         let waiter = waiters.remove(index);
         let registers = unsafe { &mut *(waiter.registers_pointer as *mut SavedRegisters) };
         registers.rax = return_value;
-        wakeups.push(waiter.process_id);
+        wakeups.push(waiter.target.execution);
     }
     drop(registry);
     drop(waiters);
-    for process_id in wakeups {
-        let _ = scheduler::wake_process(process_id);
+    for execution in wakeups {
+        let _ = scheduler::wake_execution(execution);
     }
 }
 
@@ -732,41 +736,48 @@ pub fn service_object_wait_deadlines(now_ns: u64) {
         let waiter = waiters.remove(index);
         let registers = unsafe { &mut *(waiter.registers_pointer as *mut SavedRegisters) };
         registers.rax = error_return(abi::errno::TIMED_OUT);
-        wakeups.push(waiter.process_id);
+        wakeups.push(waiter.target.execution);
     }
     drop(waiters);
-    for process_id in wakeups {
-        let _ = scheduler::wake_process(process_id);
+    for execution in wakeups {
+        let _ = scheduler::wake_execution(execution);
     }
 }
 
-fn remove_object_waiter(process_id: u64) {
+fn remove_blocking_waiters(process_id: u64) {
     OBJECT_WAITERS
         .lock()
-        .retain(|waiter| waiter.process_id != process_id);
+        .retain(|waiter| waiter.target.process_id != process_id);
+    ENDPOINT_WAITERS
+        .lock()
+        .retain(|waiter| waiter.target.process_id != process_id);
 }
 
-fn retain_live_object_waiters(live_processes: &[u64]) {
+fn retain_live_blocking_waiters(live_processes: &[u64]) {
     OBJECT_WAITERS
         .lock()
-        .retain(|waiter| live_processes.contains(&waiter.process_id));
+        .retain(|waiter| live_processes.contains(&waiter.target.process_id));
+    ENDPOINT_WAITERS
+        .lock()
+        .retain(|waiter| live_processes.contains(&waiter.target.process_id));
 }
 
 fn blocking_endpoint_wait(
     current_stack_pointer: usize,
     registers_pointer: *mut SavedRegisters,
 ) -> usize {
-    let Some(process_id) = scheduler::current_process_id() else {
+    let Some(target) = scheduler::current_user_execution_target() else {
         unsafe { (*registers_pointer).rax = error_return(ERR_NOT_IMPLEMENTED) };
         return current_stack_pointer;
     };
+    let process_id = target.process_id;
     let endpoint_handle = unsafe { (*registers_pointer).rdi };
 
     // This lock is held through waiter registration and scheduler blocking.
     // A successful sender acquires it only after its message has been queued,
     // so it cannot miss the transition from runnable to blocked.
     let mut waiters = ENDPOINT_WAITERS.lock();
-    waiters.retain(|waiter| waiter.process_id != process_id);
+    waiters.retain(|waiter| waiter.target.execution.thread != target.execution.thread);
 
     let endpoint_object = match endpoint_object_for_handle(
         process_id,
@@ -787,7 +798,7 @@ fn blocking_endpoint_wait(
         Ok(false) => {
             waiters.push(EndpointWaiter {
                 object: endpoint_object,
-                process_id,
+                target,
             });
             unsafe { (*registers_pointer).rax = 0 };
             let next_stack_pointer = scheduler::block_current(current_stack_pointer);
@@ -806,7 +817,7 @@ fn wake_endpoint_waiter(object: CapabilityObjectRef) {
         let mut waiters = ENDPOINT_WAITERS.lock();
         while let Some(index) = waiters.iter().position(|waiter| waiter.object == object) {
             let waiter = waiters.remove(index);
-            if scheduler::wake_process(waiter.process_id) {
+            if scheduler::wake_execution(waiter.target.execution) {
                 break;
             }
         }
