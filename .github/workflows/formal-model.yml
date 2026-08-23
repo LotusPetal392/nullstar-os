@@ -64,3 +64,13 @@ jobs:
             -deadlock \
             -config formal/HandleGeneration.cfg \
             formal/HandleGeneration.tla
+
+      - name: Parse endpoint IPC model
+        run: java -cp "$TLA_TOOLS_JAR" tla2sany.SANY formal/EndpointIPC.tla
+
+      - name: Check endpoint IPC invariants
+        run: |
+          java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC \
+            -deadlock \
+            -config formal/EndpointIPC.cfg \
+            formal/EndpointIPC.tla
