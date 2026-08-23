@@ -84,3 +84,13 @@ jobs:
             -deadlock \
             -config formal/JobContainment.cfg \
             formal/JobContainment.tla
+
+      - name: Parse job lifecycle model
+        run: java -cp "$TLA_TOOLS_JAR" tla2sany.SANY formal/JobLifecycle.tla
+
+      - name: Check job lifecycle invariants
+        run: |
+          java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC \
+            -deadlock \
+            -config formal/JobLifecycle.cfg \
+            formal/JobLifecycle.tla

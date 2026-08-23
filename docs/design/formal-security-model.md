@@ -4,7 +4,7 @@ NullStar uses formal modeling to constrain security-relevant kernel semantics
 without making whole-kernel formal verification a prerequisite for development.
 The model is intentionally much smaller than the Rust implementation: it records
 only the state required to answer who has authority over which object and which
-transitions may change that authority.
+transitions may change that authority or containment.
 
 The executable specifications live under [`formal/`](../../formal/).
 
@@ -52,9 +52,8 @@ explicit architecture decision.
 
 `formal/CapabilityCore.tla` covers close, rights-reduced duplication, atomic
 rights replacement, and the authority effect of successful move-transfer. It
-tracks each token's originating object and rights so TLC can exhaustively check
-phase-one monotonicity and identity invariants over a deliberately small finite
-state space.
+checks rights monotonicity, stable object identity, bounded authority, and failure
+atomicity over a deliberately small state machine.
 
 ## Phase 2: handle generation
 
@@ -72,41 +71,66 @@ partially mutate authority or queue state.
 ## Phase 4: job containment
 
 `formal/JobContainment.tla` models the containment rules that must remain true
-independently of job termination and exit-observation machinery. It directly
-refines security-constitution invariants 9 and 10.
-
-The modeled rules are:
-
-- the root job remains rooted and every child job is created once beneath an
-  already-live parent;
-- a live job's full ancestor closure is immutable and acyclic;
-- a live direct child may transition only from no job to one job; there is no
-  modeled move or unassign operation after containment is established;
-- a contained fork inherits the parent's exact current job and therefore its
-  complete ancestor containment;
-- historical containment requirements are remembered explicitly, so any later
-  state that provides less containment violates `ContainmentNeverRelaxes`;
-- every new assignment or contained fork must pass the target job's process
-  admission check and every ancestor's check over its complete subtree;
-- a job's process limit may stay equal or decrease, never increase.
+independently of job termination and exit-observation machinery. It checks
+immutable acyclic ancestry, one-way assignment, inherited containment on fork,
+historical non-escape, ancestor-scoped admission, and tightening-only process
+limits.
 
 The process limit is deliberately modeled as an **admission limit**, matching the
 live implementation. Tightening a limit below the number of processes already in
 the subtree does not retroactively eject them; instead it prevents later
 assignment or fork until all ancestor checks have capacity again.
 
-This phase does not model process exit, completion-record retention, job
-termination, drainage, retirement, final-handle closure, or kernel-root lifetime.
-Those are the boundary of a later `JobLifecycle` refinement. Keeping them separate
-means a containment counterexample does not need to include unrelated cleanup and
-observation state.
+## Phase 5: job lifecycle
 
-The live implementation already has the corresponding structural rules:
-`kernel::job::State` accepts its parent only once and rejects process-limit
-relaxation, while the capability registry checks admission through the complete
-ancestor chain. Existing host and runtime tests exercise hierarchy, tightening,
-assignment, and fork/job behavior; this phase formalizes the architecture rather
-than changing the syscall ABI.
+`formal/JobLifecycle.tla` starts from a fixed root/child hierarchy whose
+containment properties are supplied by phase 4 and adds lifetime, observation,
+and cleanup behavior.
+
+The model checks the following properties:
+
+- active members and unconsumed exit records share a fixed capacity, so pressure
+  prevents later admission instead of dropping an exit record;
+- each active member contributes one modeled kernel lifetime root and process
+  exit removes that root only in the same abstract transition that appends the
+  retained completion record;
+- closing the final userspace handle does not alter membership, completion state,
+  or member roots, matching the kernel's explicit cleanup rather than
+  kill-on-close semantics;
+- every exited process is represented exactly once as either a pending completion
+  or an already drained completion, so no modeled exit can disappear or be
+  duplicated;
+- each individual job's completion queue is FIFO. Selection between separate
+  descendant jobs during subtree drainage is intentionally abstract because no
+  global cross-job completion ordering is part of this layer;
+- `JOB_TERMINATE` is modeled as a request against the current subtree member
+  snapshot. It does not create a sticky terminating state or automatically cover
+  later admissions;
+- retirement is permitted only for the empty child leaf, permanently detaches its
+  hierarchy edge, and leaves the retired object inert;
+- reclamation of that child requires prior retirement and final handle closure,
+  after membership and completion state are already empty.
+
+This phase directly strengthens the practical consequences of constitution
+invariants 9, 11, and 13: handle closure cannot dissolve active containment,
+process completion is kernel-owned state, and bounded pressure cannot be resolved
+by silently discarding exit information.
+
+The model intentionally leaves signal-9 delivery mechanics, scheduler wakeups,
+completion status payloads, process-ID reuse, generic collection of inaccessible
+non-retired root jobs, and PID 1 cleanup budgets/retry loops outside its state
+space. Those details are implementation behavior rather than necessary state for
+the lifecycle safety properties above.
+
+The live implementation aligns with this abstraction. `kernel::job::State`
+reserves one bounded slot across each live member or unconsumed completion,
+records completions FIFO, restricts retirement to an empty child leaf, and makes
+retirement permanent. The capability registry adds a kernel object root when a
+process becomes a member and removes the matching root after recording that
+process's completion. Subtree wait drains retained records, while
+`JOB_TERMINATE` signals the current subtree membership snapshot. These mappings
+are implementation-alignment evidence, not a proof that the Rust implementation
+formally refines the TLA+ module.
 
 ## Relationship to implementation
 
@@ -130,13 +154,14 @@ JobContainment.CreateChildJob       create one immutable child-parent edge
 JobContainment.AssignDirectChild    assign an uncontained live direct child
 JobContainment.ForkProcess          inherit the parent's existing job containment
 JobContainment.TightenLimit         lower or retain subtree admission policy
+JobLifecycle.Admit                  accept already-authorized job membership
+JobLifecycle.Exit                   record completion, then release the member root
+JobLifecycle.TerminateSnapshot      request termination of the current subtree snapshot
+JobLifecycle.DrainSubtree           consume one retained subtree completion
+JobLifecycle.CloseFinalHandle       close authority without implicit member termination
+JobLifecycle.RetireChild            retire and detach an empty child leaf
+JobLifecycle.ReclaimRetiredChild    reclaim a detached retired child after final close
 ```
-
-The formal models do not claim that the concrete Rust implementation has been
-formally proved to refine the TLA+ specifications. The implementation is instead
-aligned by construction, unit and integration tested, and kept behind the same
-machine-checked architectural invariants. A later conformance layer can compare
-abstract implementation snapshots against model-generated traces.
 
 ## Verification levels
 
@@ -163,7 +188,7 @@ The formal layers are intentionally incremental:
 2. generation-checked handles;
 3. endpoint transfer atomicity;
 4. job containment and non-escape;
-5. job lifecycle, termination, and drainage;
+5. job lifecycle, termination snapshots, drainage, and retirement;
 6. service-generation isolation;
 7. application sandbox containment.
 

@@ -26,33 +26,38 @@ ownership-consuming move-send, all-or-nothing receive, bounded queue/receiver
 capacity, and explicit authority provenance. Queue-full and insufficient receive
 capacity failures are stuttering transitions with no partial authority mutation.
 
-The current runtime probe exercises the corresponding live-kernel edge cases:
-queue-full move-send failure retains sources, successful move invalidates sources,
-duplicate move sources are rejected, and insufficient receive handle capacity
-leaves the queued message available for retry.
-
 ## Phase 4: job containment
 
-`JobContainment.tla` models the security-sensitive containment rules that apply
-before job lifecycle and exit-observation details:
+`JobContainment.tla` models immutable job ancestry, one-way direct-child
+assignment, contained fork inheritance, historical non-escape, ancestor-scoped
+admission, and tightening-only process limits. Process limits are admission
+policy: tightening below the current population blocks future admissions rather
+than retroactively ejecting existing members.
 
-- a child job is created once beneath an already-live parent and cannot be
-  reparented;
-- each live job carries an immutable full ancestor closure;
-- a live direct child may move only from no job into one job;
-- a contained `fork` inherits the parent's exact current job;
-- historical containment requirements never disappear;
-- process admission is checked against the target job and every ancestor's
-  subtree process limit;
-- process limits may stay equal or tighten, but cannot be relaxed.
+## Phase 5: job lifecycle
 
-A process limit is an admission policy, not retroactive eviction. The model
-therefore permits a limit to be tightened below the current subtree population;
-subsequent assignment or fork is blocked until every ancestor again has capacity.
+`JobLifecycle.tla` refines the already-established containment model with the
+security-sensitive lifetime and observation rules used by live jobs:
 
-Termination, completion records, drainage, retirement, last-handle lifetime,
-scheduler behavior, and service cleanup are deliberately deferred to a later
-`JobLifecycle` refinement.
+- active members and unconsumed completion records share one bounded capacity;
+- every active member contributes one kernel lifetime root, so final userspace
+  handle closure is not implicit kill-on-close and cannot release a live job;
+- process exit moves one member into that job's retained completion FIFO before
+  the corresponding kernel root disappears;
+- subtree termination records the current member snapshot rather than creating a
+  permanent terminating/sealed state;
+- subtree drainage may select among descendant jobs, while each individual job's
+  completion queue remains FIFO;
+- every exited process is accounted for exactly once as either pending or already
+  drained, so the modeled lifecycle cannot silently drop or duplicate an exit;
+- only an empty child leaf can retire, retirement detaches the hierarchy edge and
+  makes the child inert, and reclamation requires retirement plus final handle
+  closure.
+
+The model deliberately does not claim a global ordering between completions from
+different jobs in a subtree. It also leaves scheduler signal delivery, status
+payload contents, generic collection of abandoned non-retired roots, process-ID
+reuse, and PID 1 retry/budget policy outside this layer.
 
 These are architecture properties and implementation-alignment checks, not a
 claim that the complete kernel has been formally verified.
@@ -78,6 +83,10 @@ java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
   tlc2.TLC -deadlock \
   -config formal/JobContainment.cfg formal/JobContainment.tla
+
+java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
+  tlc2.TLC -deadlock \
+  -config formal/JobLifecycle.cfg formal/JobLifecycle.tla
 ```
 
 `-deadlock` disables TLC's deadlock error because intentional terminal states are
@@ -98,9 +107,10 @@ the lower layer is stable:
 3. **EndpointIPC** — bounded FIFO queues, copy/move authority transfer,
    all-or-nothing receive, and failure atomicity. Implemented and machine-checked.
 4. **JobContainment** — immutable hierarchy, one-way membership, fork inheritance,
-   ancestor-scoped admission, and tightening-only process limits.
-5. **JobLifecycle** — subtree termination, completion retention/drainage,
-   retirement, and containment-preserving object lifetime.
+   ancestor-scoped admission, and tightening-only process limits. Implemented and
+   machine-checked.
+5. **JobLifecycle** — member rooting, snapshot termination, completion retention
+   and drainage, empty-leaf retirement, and post-retirement reclamation.
 6. **ServiceGeneration** — fresh provider ingress and the guarantee that authority
    for generation N never silently rebinds to generation N+1.
 7. **ApplicationSandbox** — explicit bootstrap authority, broker-issued grants,
@@ -127,13 +137,21 @@ structures. The intended mapping remains small and explicit:
 | `AssignDirectChild` | assign an uncontained live direct child once |
 | `ForkProcess` | inherit the parent's current job and ancestor containment |
 | `TightenLimit` | lower or retain a job's subtree process-admission limit |
+| `JobLifecycle.Admit` | accepted job membership after containment checks |
+| `JobLifecycle.Exit` | member-to-retained-completion transition and root release |
+| `JobLifecycle.TerminateSnapshot` | signal the current selected subtree membership |
+| `JobLifecycle.DrainSubtree` | consume one retained descendant completion |
+| `JobLifecycle.CloseFinalHandle` | surrender userspace authority without killing members |
+| `JobLifecycle.RetireChild` | retire and detach an empty child leaf |
+| `JobLifecycle.ReclaimRetiredChild` | reclaim a detached retired child after final close |
 
-The live job implementation keeps hierarchy and membership state in
-`kernel::job::State`. Parent assignment is one-shot, process limits reject
-relaxation, and the capability registry checks subtree population against every
-ancestor before accepting new membership. The formal model captures those
-security semantics without pulling completion queues or termination machinery
-into this layer.
+The live job implementation keeps hierarchy, membership, completion, and
+retirement state in `kernel::job::State`. Live membership adds kernel capability
+roots, exit records completion before removing the matching root, and pending
+completions share the membership bound so pressure rejects new membership instead
+of dropping exit information. `JOB_TERMINATE` signals the current subtree
+snapshot, while `JOB_TRY_WAIT` drains retained completion records. Retirement is
+restricted to an empty child leaf and is permanent.
 
 The guiding rule is that the formal model should stay smaller than the
 implementation. When a new feature cannot be described without pulling large
