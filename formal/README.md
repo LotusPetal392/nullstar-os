@@ -8,80 +8,51 @@ more kernel objects and services.
 
 ## Phase 1: capability core
 
-`CapabilityCore.tla` models only the authority effects of:
-
-- closing a capability;
-- rights-reduced duplication;
-- atomic rights replacement;
-- successful move-transfer between processes.
-
-The model deliberately abstracts away syscall numbers, numeric handle encoding,
-kernel pointers, object payloads, scheduling, endpoint queues, and failure codes.
-A failed operation is represented by stuttering: there is no partial state
-transition.
-
-The first checked invariants are:
-
-- every live authority token is well typed;
-- live capabilities never carry an empty rights set;
-- rights never exceed the authority from which a token originated;
-- capability operations never change the referenced object identity;
-- live authority remains bounded by the finite handle universe.
+`CapabilityCore.tla` models closing, rights-reduced duplication, atomic rights
+replacement, and successful move-transfer between processes. It checks type
+safety, nonempty authority, rights monotonicity, stable object identity, and
+bounded live authority.
 
 ## Phase 2: handle generation
 
-`HandleGeneration.tla` refines capability identity across table-slot reuse. A
-modeled userspace handle is the pair `<<slot, generation>>`. Closing a handle
-retires that exact pair and advances the slot generation. When the final modeled
-generation is consumed, the slot enters an exhausted state rather than wrapping.
-
-The phase-two invariants check that:
-
-- a retired opaque handle never resolves as a live handle again;
-- a slot's current generation always remains beyond every retired generation for
-  that slot, unless the generation space has been exhausted;
-- an exhausted slot cannot become active again;
-- every live handle contains a valid nonzero generation.
-
-The live ABI follows the same security rule while keeping `u64` handles opaque.
-The current implementation uses a bounded slot plus a registry-wide nonzero
-generation allocated for each new live handle. Userspace may ask the kernel which
-opaque handle is currently installed at one of its own bounded table slots, but
-the slot number itself is not authority and the ABI does not expose the handle
-bit layout.
+`HandleGeneration.tla` refines capability identity across table-slot reuse. It
+checks that retired opaque handles never revive, generations never move backward,
+exhausted slots remain closed, and every live handle is well formed.
 
 ## Phase 3: endpoint IPC atomicity
 
-`EndpointIPC.tla` models the security-sensitive portion of bounded endpoint IPC:
+`EndpointIPC.tla` models FIFO enqueue/dequeue, plain send, copy-send,
+ownership-consuming move-send, all-or-nothing receive, bounded queue/receiver
+capacity, and explicit authority provenance. Queue-full and insufficient receive
+capacity failures are stuttering transitions with no partial authority mutation.
 
-- FIFO enqueue and dequeue;
-- plain messages without transferred authority;
-- copy-send, where the sender retains its source authority;
-- move-send, where successful enqueue consumes the sender's source authority;
-- all-or-nothing receive of attached capabilities;
-- bounded queue and receiver handle capacity;
-- explicit authority provenance across copy, move, queueing, and receive.
+The current runtime probe exercises the corresponding live-kernel edge cases:
+queue-full move-send failure retains sources, successful move invalidates sources,
+duplicate move sources are rejected, and insufficient receive handle capacity
+leaves the queued message available for retry.
 
-Byte payload contents, peer closure, scheduler blocking, wakeups, deadlines,
-event ports, and concrete handle encoding remain outside this refinement. Queue
-full and insufficient receive-capacity failures are modeled as stuttering: no
-partial authority or queue mutation is permitted.
+## Phase 4: job containment
 
-The phase-three invariants check that:
+`JobContainment.tla` models the security-sensitive containment rules that apply
+before job lifecycle and exit-observation details:
 
-- the endpoint queue never exceeds its configured bound;
-- successful receives preserve FIFO order;
-- move-send cannot leave moved source authority installed at the sender;
-- receive capability accounting is exact and therefore cannot partially install
-  an attached set;
-- every live unit of authority derives either from the initial source or an
-  explicitly recorded successful copy-send.
+- a child job is created once beneath an already-live parent and cannot be
+  reparented;
+- each live job carries an immutable full ancestor closure;
+- a live direct child may move only from no job into one job;
+- a contained `fork` inherits the parent's exact current job;
+- historical containment requirements never disappear;
+- process admission is checked against the target job and every ancestor's
+  subtree process limit;
+- process limits may stay equal or tighten, but cannot be relaxed.
 
-The current runtime probe already exercises the corresponding live-kernel edge
-cases: queue-full move-send failure retains its source handles, successful
-move-send invalidates the moved source handles, duplicate move sources are
-rejected, and insufficient receive handle capacity leaves the queued message
-available for a later successful receive.
+A process limit is an admission policy, not retroactive eviction. The model
+therefore permits a limit to be tightened below the current subtree population;
+subsequent assignment or fork is blocked until every ancestor again has capacity.
+
+Termination, completion records, drainage, retirement, last-handle lifetime,
+scheduler behavior, and service cleanup are deliberately deferred to a later
+`JobLifecycle` refinement.
 
 These are architecture properties and implementation-alignment checks, not a
 claim that the complete kernel has been formally verified.
@@ -103,6 +74,10 @@ java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
   tlc2.TLC -deadlock \
   -config formal/EndpointIPC.cfg formal/EndpointIPC.tla
+
+java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
+  tlc2.TLC -deadlock \
+  -config formal/JobContainment.cfg formal/JobContainment.tla
 ```
 
 `-deadlock` disables TLC's deadlock error because intentional terminal states are
@@ -121,13 +96,14 @@ the lower layer is stable:
 2. **HandleGeneration** — slot reuse, generation checks, explicit exhaustion, and
    stale-handle non-revival. Implemented and machine-checked.
 3. **EndpointIPC** — bounded FIFO queues, copy/move authority transfer,
-   all-or-nothing receive, and failure atomicity. This phase intentionally leaves
-   peer closure and blocking/wakeup semantics for a later IPC refinement.
-4. **Jobs** — immutable hierarchy, non-relaxable membership, fork inheritance,
-   subtree termination, and tightening-only policy.
-5. **ServiceGeneration** — fresh provider ingress and the guarantee that authority
+   all-or-nothing receive, and failure atomicity. Implemented and machine-checked.
+4. **JobContainment** — immutable hierarchy, one-way membership, fork inheritance,
+   ancestor-scoped admission, and tightening-only process limits.
+5. **JobLifecycle** — subtree termination, completion retention/drainage,
+   retirement, and containment-preserving object lifetime.
+6. **ServiceGeneration** — fresh provider ingress and the guarantee that authority
    for generation N never silently rebinds to generation N+1.
-6. **ApplicationSandbox** — explicit bootstrap authority, broker-issued grants,
+7. **ApplicationSandbox** — explicit bootstrap authority, broker-issued grants,
    delegation limits, and sandbox containment.
 
 ## Implementation relationship
@@ -147,18 +123,17 @@ structures. The intended mapping remains small and explicit:
 | `CopySend` | append transferred authority while retaining the source |
 | `MoveSend` | validate capacity, consume sources, then append one message |
 | `Receive` | reserve/install every attachment and dequeue exactly the FIFO head |
+| `CreateChildJob` | create a child job with a permanent parent edge |
+| `AssignDirectChild` | assign an uncontained live direct child once |
+| `ForkProcess` | inherit the parent's current job and ancestor containment |
+| `TightenLimit` | lower or retain a job's subtree process-admission limit |
 
-The host-testable generic `kernel::capability` registry keeps per-slot generation
-state. The live userspace-platform table uses globally unique per-allocation
-generations combined with bounded process-local slots. Both implementations obey
-the phase-two property: closing and later reusing a slot cannot recreate a stale
-opaque handle, and generation exhaustion fails closed instead of wrapping.
-
-For endpoint IPC, the live kernel performs source validation and queue-capacity
-checks before removing move sources. Receive checks byte/handle capacity and
-installs the complete attached capability set before removing the FIFO head. The
-formal model captures the resulting atomic state transition rather than the
-individual Rust statements used to implement it.
+The live job implementation keeps hierarchy and membership state in
+`kernel::job::State`. Parent assignment is one-shot, process limits reject
+relaxation, and the capability registry checks subtree population against every
+ancestor before accepting new membership. The formal model captures those
+security semantics without pulling completion queues or termination machinery
+into this layer.
 
 The guiding rule is that the formal model should stay smaller than the
 implementation. When a new feature cannot be described without pulling large
