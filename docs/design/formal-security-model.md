@@ -73,7 +73,7 @@ may ever resolve as the current live handle for any slot. It also checks that
 retired generations remain strictly behind a slot's current generation, that an
 exhausted slot stays closed, and that every live handle is well formed.
 
-The live ABI now aligns with that contract while keeping the `u64` representation
+The live ABI aligns with that contract while keeping the `u64` representation
 opaque. The kernel combines a bounded process-local slot with a nonzero generation
 allocated once for each new live handle. A same-process bounded slot-lookup
 operation supports managed bootstrap and capability cleanup without making the
@@ -82,11 +82,47 @@ therefore requests a deterministic child **slot** and receives the child's actua
 opaque handle.
 
 The host-testable `kernel::capability` registry retains its per-slot generation
-scheme. Generation exhaustion there now makes the slot permanently unavailable
+scheme. Generation exhaustion there makes the slot permanently unavailable
 instead of wrapping back to generation 1. The live table uses a registry-wide
 monotonic allocation generation and likewise fails closed when that generation
 space is exhausted. These are implementation choices beneath the same formal
 non-revival property.
+
+## Phase 3: endpoint IPC atomicity
+
+`formal/EndpointIPC.tla` adds the bounded authority transitions that occur when
+capabilities travel through an endpoint queue. The model intentionally ignores
+message-byte contents and models only the security-sensitive state needed for
+copy-send, move-send, and receive.
+
+The model checks security-constitution invariants 5, 6, 7, 13, and 14 across a
+finite FIFO queue:
+
+- successful copy-send records one explicit new authority grant while retaining
+  the sender's source;
+- successful move-send transfers authority into the queue and removes the source
+  from the sender in the same modeled transition;
+- receive moves every attached capability from the FIFO head into receiver
+  accounting together;
+- full-queue and insufficient-receive-capacity attempts are stuttering failures
+  and therefore cannot consume sources, dequeue messages, or partially install
+  authority;
+- total authority is conserved except for explicitly recorded copy grants, giving
+  every additional authority instance machine-checkable provenance;
+- the sequence of received message IDs followed by the live queue always equals
+  the successful-send sequence, checking FIFO delivery.
+
+Peer closure, blocking and wakeup behavior, wait registration, deadlines, and
+event-port integration remain outside this phase. Those lifecycle/scheduling
+concerns can be added as a later IPC refinement without inflating the atomic
+transfer model.
+
+The current live endpoint implementation already follows this boundary: source
+and queue validation precede move-source removal, and receive checks output and
+handle capacity before installing the complete attachment set and removing the
+FIFO head. The userspace runtime probe independently exercises queue-full
+move-send failure, successful source consumption, duplicate-source rejection,
+and receive-capacity failure followed by successful retry.
 
 ## Relationship to implementation
 
@@ -103,12 +139,16 @@ Replace                       atomically replace with attenuated rights
 MoveTransfer                  commit an ownership-consuming transfer
 HandleGeneration.Open         install an opaque handle in a free slot
 HandleGeneration.Close        retire that handle before slot reuse
+EndpointIPC.PlainSend         append a message without authority
+EndpointIPC.CopySend          append a rights-checked copied capability
+EndpointIPC.MoveSend          consume validated sources and append one message
+EndpointIPC.Receive           install all attachments and remove the FIFO head
 ```
 
-The phase-two model does not claim that the concrete Rust implementation has been
-formally proved to refine the TLA+ specification. The implementation is instead
+The formal models do not claim that the concrete Rust implementation has been
+formally proved to refine the TLA+ specifications. The implementation is instead
 aligned by construction, unit and integration tested, and kept behind the same
-machine-checked architectural invariant. A later conformance layer can compare
+machine-checked architectural invariants. A later conformance layer can compare
 abstract implementation snapshots against model-generated traces.
 
 ## Verification levels
@@ -130,9 +170,11 @@ not a proof that the complete NullStar kernel implementation refines that model.
 
 ## Expansion order
 
-Capability core and generation-checked handle reuse are the first two formal
-layers. The next intended layer is endpoint IPC: bounded queues, move-send commit,
-all-or-nothing receive, peer closure, and failure atomicity. Jobs, service
-generations, and application sandboxing follow after that. MMIO, IRQ, DMA, mapped
-shared memory, and richer driver authority should be added only after the
-lower-level capability and containment rules have stable machine-checked models.
+Capability core, generation-checked handle reuse, and endpoint transfer atomicity
+are the first three formal layers. The next intended layer is jobs: immutable
+hierarchy, non-relaxable membership, fork inheritance, subtree termination, and
+tightening-only resource policy. A later endpoint refinement can separately add
+peer closure and blocking/wakeup lifecycle semantics. Service generations and
+application sandboxing follow after jobs. MMIO, IRQ, DMA, mapped shared memory,
+and richer driver authority should be added only after the lower-level capability
+and containment rules have stable machine-checked models.
