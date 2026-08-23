@@ -94,3 +94,13 @@ jobs:
             -deadlock \
             -config formal/JobLifecycle.cfg \
             formal/JobLifecycle.tla
+
+      - name: Parse service generation model
+        run: java -cp "$TLA_TOOLS_JAR" tla2sany.SANY formal/ServiceGeneration.tla
+
+      - name: Check service generation invariants
+        run: |
+          java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC \
+            -deadlock \
+            -config formal/ServiceGeneration.cfg \
+            formal/ServiceGeneration.tla

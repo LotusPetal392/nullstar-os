@@ -1,10 +1,10 @@
 # NullStar formal security models
 
 This directory contains small executable specifications for security-relevant
-NullStar kernel semantics. These models are intentionally not a formal model of
-the whole operating system. They isolate authority and lifecycle transitions so
-important invariants can be machine-checked before those semantics spread across
-more kernel objects and services.
+NullStar kernel and userspace-service semantics. These models are intentionally
+not a formal model of the whole operating system. They isolate authority and
+lifecycle transitions so important invariants can be machine-checked before
+those semantics spread across more kernel objects and services.
 
 ## Phase 1: capability core
 
@@ -54,13 +54,36 @@ security-sensitive lifetime and observation rules used by live jobs:
   makes the child inert, and reclamation requires retirement plus final handle
   closure.
 
-The model deliberately does not claim a global ordering between completions from
-different jobs in a subtree. It also leaves scheduler signal delivery, status
-payload contents, generic collection of abandoned non-retired roots, process-ID
-reuse, and PID 1 retry/budget policy outside this layer.
+## Phase 6: service-generation isolation
+
+`ServiceGeneration.tla` models the boundary between stable route authority and
+provider-generation-specific authority:
+
+- provider publication generations only move forward;
+- withdrawal retains a generation tombstone, so an equal or older generation
+  cannot later become current again;
+- every provider generation consumes a fresh ingress object;
+- stable route requests do not acquire provider authority when they are queued;
+- a request may therefore cross a provider replacement and resolve to whichever
+  generation is current when the broker completes it;
+- a successful response binds one provider grant to the exact current generation
+  and ingress object;
+- later replacement cannot mutate that grant into authority for the new ingress;
+- closing a grant removes only that holder's live authority and does not alter the
+  historical generation/object binding used by the model.
+
+The central phase-six invariant is `OldAuthorityNeverRebinds`: if an issued live
+provider grant belongs to a generation different from the current provider, its
+ingress object must also differ from the current provider's object.
+
+The model deliberately does not claim global revocation. Old-generation endpoint
+objects can remain alive while clients or queued transfers retain them. It also
+leaves application-protocol session semantics, authorization policy, broker PID
+identity, endpoint queue contents, process restart mechanics, and cross-boot
+generation persistence outside this layer.
 
 These are architecture properties and implementation-alignment checks, not a
-claim that the complete kernel has been formally verified.
+claim that the complete kernel or service manager has been formally verified.
 
 ## Running TLC
 
@@ -87,6 +110,10 @@ java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
   tlc2.TLC -deadlock \
   -config formal/JobLifecycle.cfg formal/JobLifecycle.tla
+
+java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
+  tlc2.TLC -deadlock \
+  -config formal/ServiceGeneration.cfg formal/ServiceGeneration.tla
 ```
 
 `-deadlock` disables TLC's deadlock error because intentional terminal states are
@@ -111,8 +138,9 @@ the lower layer is stable:
    machine-checked.
 5. **JobLifecycle** — member rooting, snapshot termination, completion retention
    and drainage, empty-leaf retirement, and post-retirement reclamation.
-6. **ServiceGeneration** — fresh provider ingress and the guarantee that authority
-   for generation N never silently rebinds to generation N+1.
+   Implemented and machine-checked.
+6. **ServiceGeneration** — monotonic publication, fresh provider ingress,
+   generation-bound issuance, and non-rebinding old authority.
 7. **ApplicationSandbox** — explicit bootstrap authority, broker-issued grants,
    delegation limits, and sandbox containment.
 
@@ -121,7 +149,7 @@ the lower layer is stable:
 The models specify permitted security transitions rather than literal Rust data
 structures. The intended mapping remains small and explicit:
 
-| Formal action | Kernel concept |
+| Formal action | Kernel/userspace concept |
 | --- | --- |
 | `Close` | capability close |
 | `Duplicate` | rights-reduced duplicate |
@@ -144,16 +172,25 @@ structures. The intended mapping remains small and explicit:
 | `JobLifecycle.CloseFinalHandle` | surrender userspace authority without killing members |
 | `JobLifecycle.RetireChild` | retire and detach an empty child leaf |
 | `JobLifecycle.ReclaimRetiredChild` | reclaim a detached retired child after final close |
+| `ServiceGeneration.Publish` | publish a strictly newer generation with a fresh ingress source |
+| `ServiceGeneration.Withdraw` | withdraw the exact active generation while retaining its tombstone |
+| `ServiceGeneration.BeginRequest` | queue a generation-neutral request through stable route authority |
+| `ServiceGeneration.CompleteRequestSuccess` | issue exact provider authority for the current generation |
+| `ServiceGeneration.CompleteRequestUnavailable` | return unavailable without provider authority |
+| `ServiceGeneration.CloseGrant` | release one old or current provider handle without rebinding it |
 
-The live job implementation keeps hierarchy, membership, completion, and
-retirement state in `kernel::job::State`. Live membership adds kernel capability
-roots, exit records completion before removing the matching root, and pending
-completions share the membership bound so pressure rejects new membership instead
-of dropping exit information. `JOB_TERMINATE` signals the current subtree
-snapshot, while `JOB_TRY_WAIT` drains retained completion records. Retirement is
-restricted to an empty child leaf and is permanent.
+The live service-route implementation matches this boundary. `RouteTable::publish`
+requires a generation strictly greater than the retained generation and keeps the
+latest generation after withdrawal. `RouteBroker::connect` authorizes first,
+resolves the currently published route, and passes that exact generation into the
+issuer. The native adapter duplicates the current stable provider source and
+returns exact `SEND` authority plus the same generation in the accepted response.
+Each replacement provider generation uses fresh ingress endpoint objects, so old
+exact-`SEND` handles retain old-object identity rather than reaching the
+replacement.
 
 The guiding rule is that the formal model should stay smaller than the
 implementation. When a new feature cannot be described without pulling large
-amounts of unrelated kernel state into a security model, that is a signal to
-reconsider the abstraction boundary rather than model the entire kernel.
+amounts of unrelated kernel or service-manager state into a security model, that
+is a signal to reconsider the abstraction boundary rather than model the entire
+system.
