@@ -1,10 +1,10 @@
 # Formal security model
 
-NullStar uses formal modeling to constrain security-relevant kernel semantics
-without making whole-kernel formal verification a prerequisite for development.
-The model is intentionally much smaller than the Rust implementation: it records
-only the state required to answer who has authority over which object and which
-transitions may change that authority or containment.
+NullStar uses formal modeling to constrain security-relevant kernel and service
+semantics without making whole-system formal verification a prerequisite for
+development. The model is intentionally much smaller than the implementation: it
+records only the state required to answer who has authority over which object,
+which containment applies, and which transitions may change those relationships.
 
 The executable specifications live under [`formal/`](../../formal/).
 
@@ -70,97 +70,117 @@ partially mutate authority or queue state.
 
 ## Phase 4: job containment
 
-`formal/JobContainment.tla` models the containment rules that must remain true
-independently of job termination and exit-observation machinery. It checks
-immutable acyclic ancestry, one-way assignment, inherited containment on fork,
-historical non-escape, ancestor-scoped admission, and tightening-only process
-limits.
+`formal/JobContainment.tla` models immutable acyclic ancestry, one-way assignment,
+inherited containment on fork, historical non-escape, ancestor-scoped admission,
+and tightening-only process limits.
 
-The process limit is deliberately modeled as an **admission limit**, matching the
-live implementation. Tightening a limit below the number of processes already in
-the subtree does not retroactively eject them; instead it prevents later
-assignment or fork until all ancestor checks have capacity again.
+The process limit is an **admission limit**, matching the live implementation.
+Tightening below the current subtree population does not eject existing members;
+it prevents later assignment or fork until ancestor admission checks have
+capacity again.
 
 ## Phase 5: job lifecycle
 
-`formal/JobLifecycle.tla` starts from a fixed root/child hierarchy whose
-containment properties are supplied by phase 4 and adds lifetime, observation,
-and cleanup behavior.
+`formal/JobLifecycle.tla` starts from the containment properties supplied by
+phase 4 and adds lifetime, observation, and cleanup behavior. It checks bounded
+lossless completion retention, one kernel lifetime root per active member,
+non-kill-on-close semantics, snapshot termination, per-job FIFO completion
+drainage, empty-child-leaf retirement, and reclamation only after retirement plus
+final handle closure.
 
-The model checks the following properties:
+Every exited process is represented exactly once as either pending or already
+drained, so no modeled lifecycle transition may silently drop or duplicate an
+exit record. Signal delivery mechanics, scheduler wakeups, status payloads,
+process-ID reuse, and PID 1 retry policy remain outside that model.
 
-- active members and unconsumed exit records share a fixed capacity, so pressure
-  prevents later admission instead of dropping an exit record;
-- each active member contributes one modeled kernel lifetime root and process
-  exit removes that root only in the same abstract transition that appends the
-  retained completion record;
-- closing the final userspace handle does not alter membership, completion state,
-  or member roots, matching the kernel's explicit cleanup rather than
-  kill-on-close semantics;
-- every exited process is represented exactly once as either a pending completion
-  or an already drained completion, so no modeled exit can disappear or be
-  duplicated;
-- each individual job's completion queue is FIFO. Selection between separate
-  descendant jobs during subtree drainage is intentionally abstract because no
-  global cross-job completion ordering is part of this layer;
-- `JOB_TERMINATE` is modeled as a request against the current subtree member
-  snapshot. It does not create a sticky terminating state or automatically cover
-  later admissions;
-- retirement is permitted only for the empty child leaf, permanently detaches its
-  hierarchy edge, and leaves the retired object inert;
-- reclamation of that child requires prior retirement and final handle closure,
-  after membership and completion state are already empty.
+## Phase 6: service-generation isolation
 
-This phase directly strengthens the practical consequences of constitution
-invariants 9, 11, and 13: handle closure cannot dissolve active containment,
-process completion is kernel-owned state, and bounded pressure cannot be resolved
-by silently discarding exit information.
+`formal/ServiceGeneration.tla` directly checks security-constitution invariant 12
+and strengthens invariant 14 for service routing. It models one stable route over
+multiple provider incarnations while keeping stable route authority separate from
+provider authority.
 
-The model intentionally leaves signal-9 delivery mechanics, scheduler wakeups,
-completion status payloads, process-ID reuse, generic collection of inaccessible
-non-retired root jobs, and PID 1 cleanup budgets/retry loops outside its state
-space. Those details are implementation behavior rather than necessary state for
-the lifecycle safety properties above.
+The model establishes these rules:
 
-The live implementation aligns with this abstraction. `kernel::job::State`
-reserves one bounded slot across each live member or unconsumed completion,
-records completions FIFO, restricts retirement to an empty child leaf, and makes
-retirement permanent. The capability registry adds a kernel object root when a
-process becomes a member and removes the matching root after recording that
-process's completion. Subtree wait drains retained records, while
-`JOB_TERMINATE` signals the current subtree membership snapshot. These mappings
-are implementation-alignment evidence, not a proof that the Rust implementation
-formally refines the TLA+ module.
+- the retained publication generation is monotonic: a new publication must be
+  strictly newer than the route's retained generation;
+- withdrawal removes active availability but keeps the generation tombstone, so
+  an equal or older incarnation can never become current later;
+- every published provider generation is associated with a fresh ingress object;
+- a stable route request is generation-neutral while it is pending. It may be
+  queued under generation N and legitimately resolve after replacement to
+  generation N+1 because no provider authority existed at request enqueue time;
+- successful resolution binds one never-reused abstract grant to the exact
+  generation and ingress object that are current when the broker completes the
+  request;
+- every issued grant retains provenance through the immutable
+  generation-to-ingress mapping;
+- if a live grant's generation differs from the currently active generation, its
+  ingress object must differ from the current provider's ingress. This is the
+  `OldAuthorityNeverRebinds` invariant;
+- closing a provider grant releases that holder's authority but does not mutate
+  its historical binding.
+
+This model intentionally does **not** claim global revocation. An old-generation
+endpoint object may remain reachable while delegated handles or queued transfers
+retain it. Replacement prevents future route resolution from selecting the old
+provider and prevents the new provider from receiving packets sent to the old
+ingress; it does not make every old handle disappear.
+
+Authorization policy is also outside this phase. The live broker authorizes
+before consulting availability, but provider-generation isolation is independent
+of which callers policy admits. Likewise, application-protocol sessions, replay
+semantics, endpoint message contents, broker process identity, process restart
+mechanics, and durable cross-boot generation storage are left to their own
+protocol or lifecycle layers.
+
+The live implementation already matches this abstraction. The fixed-capacity
+`RouteTable` permanently associates each slot with its first route key, requires a
+strictly newer `ProviderGeneration` on publish, and retains the latest generation
+as a tombstone after withdrawal. `RouteBroker::connect` resolves the current
+publication and passes its exact generation to the issuer. The native
+`userspace::service_route` adapter duplicates a stable provider source and returns
+an exact-`SEND` provider ingress handle together with that same generation. Each
+provider generation creates fresh ingress endpoint objects.
+
+These mappings are implementation-alignment evidence, not a proof that the Rust
+implementation formally refines the TLA+ model.
 
 ## Relationship to implementation
 
 Formal actions should map to narrow implementation operations rather than whole
-syscall handlers:
+syscall handlers or complete service-manager loops:
 
 ```text
-formal action                       implementation concept
--------------                       ----------------------
-Close                               close one capability handle
-Duplicate                           duplicate with attenuated rights
-Replace                             atomically replace with attenuated rights
-MoveTransfer                        commit an ownership-consuming transfer
-HandleGeneration.Open               install an opaque handle in a free slot
-HandleGeneration.Close              retire the opaque handle before slot reuse
-EndpointIPC.PlainSend               append a message without authority
-EndpointIPC.CopySend                append a rights-checked copied capability
-EndpointIPC.MoveSend                consume validated sources and append one message
-EndpointIPC.Receive                 install all attachments and remove the FIFO head
-JobContainment.CreateChildJob       create one immutable child-parent edge
-JobContainment.AssignDirectChild    assign an uncontained live direct child
-JobContainment.ForkProcess          inherit the parent's existing job containment
-JobContainment.TightenLimit         lower or retain subtree admission policy
-JobLifecycle.Admit                  accept already-authorized job membership
-JobLifecycle.Exit                   record completion, then release the member root
-JobLifecycle.TerminateSnapshot      request termination of the current subtree snapshot
-JobLifecycle.DrainSubtree           consume one retained subtree completion
-JobLifecycle.CloseFinalHandle       close authority without implicit member termination
-JobLifecycle.RetireChild            retire and detach an empty child leaf
-JobLifecycle.ReclaimRetiredChild    reclaim a detached retired child after final close
+formal action                            implementation concept
+-------------                            ----------------------
+Close                                    close one capability handle
+Duplicate                                duplicate with attenuated rights
+Replace                                  atomically replace with attenuated rights
+MoveTransfer                             commit an ownership-consuming transfer
+HandleGeneration.Open                    install an opaque handle in a free slot
+HandleGeneration.Close                   retire the opaque handle before slot reuse
+EndpointIPC.PlainSend                    append a message without authority
+EndpointIPC.CopySend                     append a rights-checked copied capability
+EndpointIPC.MoveSend                     consume validated sources and append one message
+EndpointIPC.Receive                      install all attachments and remove the FIFO head
+JobContainment.CreateChildJob            create one immutable child-parent edge
+JobContainment.AssignDirectChild         assign an uncontained live direct child
+JobContainment.ForkProcess               inherit the parent's existing job containment
+JobContainment.TightenLimit              lower or retain subtree admission policy
+JobLifecycle.Admit                       accept already-authorized job membership
+JobLifecycle.Exit                        record completion, then release the member root
+JobLifecycle.TerminateSnapshot           request termination of the current subtree snapshot
+JobLifecycle.DrainSubtree                consume one retained subtree completion
+JobLifecycle.CloseFinalHandle            close authority without implicit member termination
+JobLifecycle.RetireChild                 retire and detach an empty child leaf
+JobLifecycle.ReclaimRetiredChild         reclaim a detached retired child after final close
+ServiceGeneration.Publish                publish a newer generation with fresh ingress authority
+ServiceGeneration.Withdraw               remove active availability but retain its tombstone
+ServiceGeneration.BeginRequest           queue a generation-neutral stable-route request
+ServiceGeneration.CompleteRequestSuccess issue exact current-generation provider authority
+ServiceGeneration.CompleteRequestUnavailable complete without provider authority
+ServiceGeneration.CloseGrant             close one provider grant without rebinding it
 ```
 
 ## Verification levels
@@ -178,7 +198,7 @@ NullStar distinguishes three forms of assurance:
 
 Passing one level is not described as passing another. In particular, a TLC
 success means the finite formal model satisfied its configured invariants; it is
-not a proof that the complete NullStar kernel implementation refines that model.
+not a proof that the complete NullStar kernel or service stack refines that model.
 
 ## Expansion order
 
@@ -193,6 +213,7 @@ The formal layers are intentionally incremental:
 7. application sandbox containment.
 
 A later endpoint refinement can separately add peer closure and blocking/wakeup
-lifecycle semantics. MMIO, IRQ, DMA, mapped shared memory, and richer driver
-authority should be added only after the lower-level capability and containment
-rules have stable machine-checked models.
+lifecycle semantics. MMIO, IRQ, DMA, mapped shared memory, richer driver
+authority, and service-manager persistence should be added only after the lower
+capability, containment, and service-generation rules remain stable under their
+machine-checked models.
