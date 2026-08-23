@@ -265,6 +265,21 @@ impl<T: ObjectType> OwnedHandle<T> {
         Ok(Self::from_nonzero(raw))
     }
 
+    /// Adopts the current capability installed in one process-local table slot.
+    ///
+    /// The slot number is a discovery coordinate, not authority. The kernel
+    /// returns the current opaque generation-checked handle, which remains the
+    /// value used for all subsequent operations.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the capability installed at `slot`, must not adopt it
+    /// more than once, and for a typed marker must know the object's kind.
+    pub unsafe fn from_slot(slot: u64) -> ipc::Result<Self> {
+        let raw = ipc::handle_at_slot(slot)?;
+        unsafe { Self::from_raw(raw) }
+    }
+
     fn from_nonzero(raw: NonZeroU64) -> Self {
         Self {
             raw: Some(raw),

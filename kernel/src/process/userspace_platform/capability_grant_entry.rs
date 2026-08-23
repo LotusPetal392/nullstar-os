@@ -16,9 +16,9 @@ impl CapabilityRegistry {
         process_id: u64,
         object: CapabilityObjectRef,
         rights: u64,
-        requested_handle: u64,
+        requested_slot: u64,
     ) -> Result<u64, i64> {
-        if requested_handle == abi::capability::INVALID_HANDLE {
+        if requested_slot == abi::capability::INVALID_HANDLE {
             return self.insert_entry(process_id, object, rights);
         }
         if rights == 0 || rights & !capability_allowed_rights(object.kind) != 0 {
@@ -27,27 +27,25 @@ impl CapabilityRegistry {
         if self.object_index(object).is_none() {
             return Err(abi::errno::NO_ENTRY);
         }
-        if requested_handle > abi::limits::MAX_CAPABILITIES_PER_PROCESS as u64 {
+        let slot = u16::try_from(requested_slot).map_err(|_| abi::errno::INVALID_ARGUMENT)?;
+        if slot == 0 || usize::from(slot) > abi::limits::MAX_CAPABILITIES_PER_PROCESS {
             return Err(abi::errno::INVALID_ARGUMENT);
         }
         let table_index = self.ensure_table(process_id)?;
-        let table = &mut self.tables[table_index];
-        if table.entries.len() >= abi::limits::MAX_CAPABILITIES_PER_PROCESS {
+        if self.tables[table_index].entries.len() >= abi::limits::MAX_CAPABILITIES_PER_PROCESS {
             return Err(abi::errno::NO_SPACE);
         }
-        if table
-            .entries
-            .iter()
-            .any(|entry| entry.handle == requested_handle)
-        {
+        if self.tables[table_index].slot_in_use(slot) {
             return Err(abi::errno::NO_SPACE);
         }
-        table.entries.push(CapabilityEntry {
-            handle: requested_handle,
+        let generation = self.take_handle_generations(1)?[0];
+        let handle = capability_handle(slot, generation).ok_or(abi::errno::NO_SPACE)?;
+        self.tables[table_index].entries.push(CapabilityEntry {
+            handle,
             object,
             rights,
         });
-        Ok(requested_handle)
+        Ok(handle)
     }
 }
 
@@ -140,7 +138,7 @@ fn capability_grant_child(
     child_process_id: u64,
     source_handle: u64,
     rights: u64,
-    requested_child_handle: u64,
+    requested_child_slot: u64,
 ) -> u64 {
     let direct_live_child = {
         let manager = PROCESS_MANAGER.lock();
@@ -172,7 +170,7 @@ fn capability_grant_child(
         child_process_id,
         source.object,
         rights,
-        requested_child_handle,
+        requested_child_slot,
     ) {
         Ok(handle) => handle,
         Err(error) => error_return(error),

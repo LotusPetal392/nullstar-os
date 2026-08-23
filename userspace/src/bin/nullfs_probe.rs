@@ -13,7 +13,7 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const SERVICE_HANDLE: u64 = 1;
+const SERVICE_SLOT: u64 = 1;
 const READINESS_MODE: &[u8] = b"readiness";
 const FULL_MODE: &[u8] = b"full";
 const BUFFER_ID: u64 = 1;
@@ -46,14 +46,14 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if !readiness && !full {
         syscall::exit(57);
     }
-    if !matches!(
-        ipc::wait_for_handle(SERVICE_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) {
-        syscall::exit(1);
-    }
+    let service = match ipc::wait_for_handle_at_slot(SERVICE_SLOT) {
+        Ok((handle, info)) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND => {
+            handle
+        }
+        _ => syscall::exit(1),
+    };
 
-    let session = match filesystem::connect_service(SERVICE_HANDLE, 1) {
+    let session = match filesystem::connect_service(service, 1) {
         Ok(session) => session,
         Err(_) => syscall::exit(2),
     };
@@ -199,7 +199,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         syscall::exit(22);
     }
 
-    let writable_session = match filesystem::connect_writable_service(SERVICE_HANDLE, 25) {
+    let writable_session = match filesystem::connect_writable_service(service, 25) {
         Ok(session) => session,
         Err(_) => syscall::exit(23),
     };

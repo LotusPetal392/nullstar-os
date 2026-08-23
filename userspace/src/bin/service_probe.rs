@@ -10,7 +10,7 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const BOOTSTRAP_HANDLE: u64 = 1;
+const BOOTSTRAP_SLOT: u64 = 1;
 const FIRST_START_MARKER: &[u8] = b"/tmp/service-probe.started";
 const READY_MESSAGE: &[u8] = b"service-ready: probe";
 
@@ -31,14 +31,14 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(75);
     }
 
-    let info = match ipc::wait_for_handle(BOOTSTRAP_HANDLE) {
-        Ok(info) => info,
+    let (bootstrap, info) = match ipc::wait_for_handle_at_slot(BOOTSTRAP_SLOT) {
+        Ok(capability) => capability,
         Err(_) => syscall::exit(72),
     };
     if info.kind != ObjectKind::Endpoint || info.rights != Rights::SEND {
         syscall::exit(73);
     }
-    if ipc::send(BOOTSTRAP_HANDLE, READY_MESSAGE, None).is_err() {
+    if ipc::send(bootstrap, READY_MESSAGE, None).is_err() {
         syscall::exit(74);
     }
 

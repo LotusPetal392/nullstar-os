@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 30;
+pub const ABI_VERSION_MINOR: u64 = 31;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -110,6 +110,7 @@ pub mod syscall {
     pub const EVENT_CREATE: u64 = 88;
     pub const EVENT_SET: u64 = 89;
     pub const EVENT_RESET: u64 = 90;
+    pub const CAPABILITY_HANDLE_AT_SLOT: u64 = 91;
 }
 
 pub mod filesystem_provider {
@@ -148,6 +149,7 @@ pub mod capability {
     pub const EVENT_PORTS: u64 = 1 << 26;
     pub const TIMER_OBJECTS: u64 = 1 << 27;
     pub const EVENT_OBJECTS: u64 = 1 << 28;
+    pub const GENERATION_CHECKED_HANDLES: u64 = 1 << 29;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -178,7 +180,8 @@ pub mod capability {
         | WAIT_SETS
         | EVENT_PORTS
         | TIMER_OBJECTS
-        | EVENT_OBJECTS;
+        | EVENT_OBJECTS
+        | GENERATION_CHECKED_HANDLES;
 
     pub const INVALID_HANDLE: u64 = 0;
 

@@ -46,6 +46,17 @@ const SUCCESS: &[u8] = b"userspace Rust runtime probe passed\n";
 const DIRECTORY_PAGE: usize = 8;
 const JOB_WAIT_YIELDS: usize = 4096;
 
+fn wait_for_child_slot(
+    slot: u64,
+    kind: ObjectKind,
+    rights: Rights,
+) -> Option<ipc::CapabilityHandle> {
+    match ipc::wait_for_handle_at_slot(slot) {
+        Ok((handle, info)) if info.kind == kind && info.rights == rights => Some(handle),
+        _ => None,
+    }
+}
+
 const PROBE_CLIENT_RIGHTS: Rights =
     match Rights::from_bits(Rights::SEND.bits() | Rights::WAIT.bits() | Rights::TRANSFER.bits()) {
         Some(rights) => rights,
@@ -544,7 +555,7 @@ fn wait_set_probe() -> bool {
 }
 
 fn wait_set_waiter_probe() -> bool {
-    const CHILD_WAIT_SET_HANDLE: ipc::CapabilityHandle = 1;
+    const CHILD_WAIT_SET_SLOT: u64 = 1;
     const NOTIFICATION_KEY: u64 = 73;
 
     let Ok(notification) = OwnedHandle::<Notification>::create() else {
@@ -569,31 +580,27 @@ fn wait_set_waiter_probe() -> bool {
     };
     if child == 0 {
         let _ = syscall::close(barrier.reader);
-        if !ipc::wait_for_handle(CHILD_WAIT_SET_HANDLE)
-            .is_ok_and(|info| info.kind == ObjectKind::WaitSet && info.rights == Rights::WAIT)
-            || syscall::write_all(barrier.writer, &[1]).is_err()
+        let Some(child_wait_set) =
+            wait_for_child_slot(CHILD_WAIT_SET_SLOT, ObjectKind::WaitSet, Rights::WAIT)
+        else {
+            syscall::exit(76);
+        };
+        if syscall::write_all(barrier.writer, &[1]).is_err()
             || syscall::close(barrier.writer).is_err()
         {
             syscall::exit(76);
         }
-        let woke = ipc::wait_set_wait(CHILD_WAIT_SET_HANDLE, Deadline::INFINITE).ok()
+        let woke = ipc::wait_set_wait(child_wait_set, Deadline::INFINITE).ok()
             == Some(ipc::WaitSetEvent {
                 key: NOTIFICATION_KEY,
                 signals: Signals::SIGNALED,
             });
-        let closed = ipc::close(CHILD_WAIT_SET_HANDLE).is_ok();
+        let closed = ipc::close(child_wait_set).is_ok();
         syscall::exit(if woke && closed { 0 } else { 77 });
     }
 
     let setup = syscall::close(barrier.writer).is_ok()
-        && ipc::grant_child(
-            child,
-            wait_set.as_raw(),
-            Rights::WAIT,
-            CHILD_WAIT_SET_HANDLE,
-        )
-        .ok()
-            == Some(CHILD_WAIT_SET_HANDLE);
+        && ipc::grant_child(child, wait_set.as_raw(), Rights::WAIT, CHILD_WAIT_SET_SLOT).is_ok();
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
@@ -876,7 +883,7 @@ fn event_probe() -> bool {
 }
 
 fn event_port_waiter_probe() -> bool {
-    const CHILD_EVENT_PORT_HANDLE: ipc::CapabilityHandle = 1;
+    const CHILD_EVENT_PORT_SLOT: u64 = 1;
     const NOTIFICATION_KEY: u64 = 131;
 
     let Ok(notification) = OwnedHandle::<Notification>::create() else {
@@ -901,19 +908,22 @@ fn event_port_waiter_probe() -> bool {
     };
     if child == 0 {
         let _ = syscall::close(barrier.reader);
-        if !ipc::wait_for_handle(CHILD_EVENT_PORT_HANDLE)
-            .is_ok_and(|info| info.kind == ObjectKind::EventPort && info.rights == Rights::WAIT)
-            || syscall::write_all(barrier.writer, &[1]).is_err()
+        let Some(child_event_port) =
+            wait_for_child_slot(CHILD_EVENT_PORT_SLOT, ObjectKind::EventPort, Rights::WAIT)
+        else {
+            syscall::exit(78);
+        };
+        if syscall::write_all(barrier.writer, &[1]).is_err()
             || syscall::close(barrier.writer).is_err()
         {
             syscall::exit(78);
         }
-        let woke = ipc::event_port_wait(CHILD_EVENT_PORT_HANDLE, Deadline::INFINITE).ok()
+        let woke = ipc::event_port_wait(child_event_port, Deadline::INFINITE).ok()
             == Some(ipc::EventPortEvent {
                 key: NOTIFICATION_KEY,
                 signals: Signals::SIGNALED,
             });
-        let closed = ipc::close(CHILD_EVENT_PORT_HANDLE).is_ok();
+        let closed = ipc::close(child_event_port).is_ok();
         syscall::exit(if woke && closed { 0 } else { 79 });
     }
 
@@ -922,10 +932,9 @@ fn event_port_waiter_probe() -> bool {
             child,
             event_port.as_raw(),
             Rights::WAIT,
-            CHILD_EVENT_PORT_HANDLE,
+            CHILD_EVENT_PORT_SLOT,
         )
-        .ok()
-            == Some(CHILD_EVENT_PORT_HANDLE);
+        .is_ok();
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
@@ -1160,7 +1169,7 @@ fn channel_pair_probe(current_process: u64) -> bool {
 }
 
 fn channel_pair_process_exit_probe() -> bool {
-    const CHILD_ENDPOINT_HANDLE: ipc::CapabilityHandle = 1;
+    const CHILD_ENDPOINT_SLOT: u64 = 1;
 
     let Ok((first, second)) = OwnedHandle::<Endpoint>::create_pair() else {
         return false;
@@ -1175,10 +1184,12 @@ fn channel_pair_process_exit_probe() -> bool {
     };
     if child == 0 {
         let _ = syscall::close(barrier.reader);
-        let ready = ipc::wait_for_handle(CHILD_ENDPOINT_HANDLE)
-            .is_ok_and(|info| info.kind == ObjectKind::Endpoint)
-            && syscall::write_all(barrier.writer, &[1]).is_ok()
-            && syscall::close(barrier.writer).is_ok();
+        let ready =
+            wait_for_child_slot(CHILD_ENDPOINT_SLOT, ObjectKind::Endpoint, Rights::ENDPOINT)
+                .is_some_and(|_| {
+                    syscall::write_all(barrier.writer, &[1]).is_ok()
+                        && syscall::close(barrier.writer).is_ok()
+                });
         syscall::exit(if ready { 0 } else { 79 });
     }
 
@@ -1187,10 +1198,9 @@ fn channel_pair_process_exit_probe() -> bool {
             child,
             second.as_raw(),
             Rights::ENDPOINT,
-            CHILD_ENDPOINT_HANDLE,
+            CHILD_ENDPOINT_SLOT,
         )
-        .ok()
-            == Some(CHILD_ENDPOINT_HANDLE);
+        .is_ok();
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
@@ -1212,8 +1222,8 @@ fn channel_pair_process_exit_probe() -> bool {
 }
 
 fn async_ipc_probe(current_process: u64) -> bool {
-    const CHILD_ENDPOINT_HANDLE: ipc::CapabilityHandle = 1;
-    const CHILD_NOTIFICATION_HANDLE: ipc::CapabilityHandle = 2;
+    const CHILD_ENDPOINT_SLOT: u64 = 1;
+    const CHILD_NOTIFICATION_SLOT: u64 = 2;
     const NOTIFICATION_COUNT: u64 = 3;
     const EXPECTED_NOTIFICATION_REMAINING: u64 = NOTIFICATION_COUNT - 1;
     const CHILD_MESSAGE: &[u8] = b"async-wakeup";
@@ -1236,12 +1246,18 @@ fn async_ipc_probe(current_process: u64) -> bool {
     };
     if child == 0 {
         let _ = syscall::close(barrier.reader);
-        let ready = ipc::wait_for_handle(CHILD_ENDPOINT_HANDLE)
-            .is_ok_and(|info| info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND)
-            && ipc::wait_for_handle(CHILD_NOTIFICATION_HANDLE).is_ok_and(|info| {
-                info.kind == ObjectKind::Notification && info.rights == Rights::SIGNAL
-            })
-            && syscall::write_all(barrier.writer, &[1]).is_ok()
+        let child_endpoint =
+            wait_for_child_slot(CHILD_ENDPOINT_SLOT, ObjectKind::Endpoint, Rights::SEND);
+        let child_notification = wait_for_child_slot(
+            CHILD_NOTIFICATION_SLOT,
+            ObjectKind::Notification,
+            Rights::SIGNAL,
+        );
+        let (Some(child_endpoint), Some(child_notification)) = (child_endpoint, child_notification)
+        else {
+            syscall::exit(80);
+        };
+        let ready = syscall::write_all(barrier.writer, &[1]).is_ok()
             && syscall::close(barrier.writer).is_ok();
         if ready {
             for _ in 0..4 {
@@ -1249,31 +1265,23 @@ fn async_ipc_probe(current_process: u64) -> bool {
             }
         }
         let sent = ready
-            && ipc::notification_signal(CHILD_NOTIFICATION_HANDLE, NOTIFICATION_COUNT).ok()
+            && ipc::notification_signal(child_notification, NOTIFICATION_COUNT).ok()
                 == Some(NOTIFICATION_COUNT)
-            && ipc::send(CHILD_ENDPOINT_HANDLE, CHILD_MESSAGE, None).is_ok()
-            && ipc::close(CHILD_NOTIFICATION_HANDLE).is_ok()
-            && ipc::close(CHILD_ENDPOINT_HANDLE).is_ok();
+            && ipc::send(child_endpoint, CHILD_MESSAGE, None).is_ok()
+            && ipc::close(child_notification).is_ok()
+            && ipc::close(child_endpoint).is_ok();
         syscall::exit(if sent { 0 } else { 80 });
     }
 
     let setup = syscall::close(barrier.writer).is_ok()
-        && ipc::grant_child(
-            child,
-            endpoint.as_raw(),
-            Rights::SEND,
-            CHILD_ENDPOINT_HANDLE,
-        )
-        .ok()
-            == Some(CHILD_ENDPOINT_HANDLE)
+        && ipc::grant_child(child, endpoint.as_raw(), Rights::SEND, CHILD_ENDPOINT_SLOT).is_ok()
         && ipc::grant_child(
             child,
             notification.as_raw(),
             Rights::SIGNAL,
-            CHILD_NOTIFICATION_HANDLE,
+            CHILD_NOTIFICATION_SLOT,
         )
-        .ok()
-            == Some(CHILD_NOTIFICATION_HANDLE);
+        .is_ok();
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
@@ -2060,8 +2068,8 @@ fn capability_probe(current_process: u64) -> bool {
 }
 
 fn notification_waiter_probe() -> bool {
-    const FIRST_NOTIFICATION_HANDLE: ipc::CapabilityHandle = 1;
-    const SECOND_NOTIFICATION_HANDLE: ipc::CapabilityHandle = 2;
+    const FIRST_NOTIFICATION_SLOT: u64 = 1;
+    const SECOND_NOTIFICATION_SLOT: u64 = 2;
 
     let Ok(first_notification) = ipc::notification_create() else {
         return false;
@@ -2084,30 +2092,38 @@ fn notification_waiter_probe() -> bool {
     };
     if child == 0 {
         let _ = syscall::close(barrier.reader);
-        if !ipc::wait_for_handle(FIRST_NOTIFICATION_HANDLE)
-            .is_ok_and(|info| info.kind == ObjectKind::Notification && info.rights == Rights::WAIT)
-            || !ipc::wait_for_handle(SECOND_NOTIFICATION_HANDLE).is_ok_and(|info| {
-                info.kind == ObjectKind::Notification && info.rights == Rights::WAIT
-            })
-            || syscall::write_all(barrier.writer, &[1]).is_err()
+        let Some(first_notification) = wait_for_child_slot(
+            FIRST_NOTIFICATION_SLOT,
+            ObjectKind::Notification,
+            Rights::WAIT,
+        ) else {
+            syscall::exit(74);
+        };
+        let Some(second_notification) = wait_for_child_slot(
+            SECOND_NOTIFICATION_SLOT,
+            ObjectKind::Notification,
+            Rights::WAIT,
+        ) else {
+            syscall::exit(74);
+        };
+        if syscall::write_all(barrier.writer, &[1]).is_err()
             || syscall::close(barrier.writer).is_err()
         {
             syscall::exit(74);
         }
         let woke = ipc::wait_many(
             &[
-                WaitItem::new(FIRST_NOTIFICATION_HANDLE, Signals::SIGNALED),
-                WaitItem::new(SECOND_NOTIFICATION_HANDLE, Signals::SIGNALED),
+                WaitItem::new(first_notification, Signals::SIGNALED),
+                WaitItem::new(second_notification, Signals::SIGNALED),
             ],
             Deadline::INFINITE,
         )
         .ok()
             == Some(1);
-        let consumed = ipc::notification_try_wait(SECOND_NOTIFICATION_HANDLE).ok() == Some(0)
-            && ipc::notification_try_wait(FIRST_NOTIFICATION_HANDLE).err()
-                == Some(ipc::Error::TRY_AGAIN);
-        let closed = ipc::close(FIRST_NOTIFICATION_HANDLE).is_ok()
-            && ipc::close(SECOND_NOTIFICATION_HANDLE).is_ok();
+        let consumed = ipc::notification_try_wait(second_notification).ok() == Some(0)
+            && ipc::notification_try_wait(first_notification).err() == Some(ipc::Error::TRY_AGAIN);
+        let closed =
+            ipc::close(first_notification).is_ok() && ipc::close(second_notification).is_ok();
         syscall::exit(if woke && consumed && closed { 0 } else { 75 });
     }
 
@@ -2116,18 +2132,16 @@ fn notification_waiter_probe() -> bool {
             child,
             first_notification,
             Rights::WAIT,
-            FIRST_NOTIFICATION_HANDLE,
+            FIRST_NOTIFICATION_SLOT,
         )
-        .ok()
-            == Some(FIRST_NOTIFICATION_HANDLE)
+        .is_ok()
         && ipc::grant_child(
             child,
             second_notification,
             Rights::WAIT,
-            SECOND_NOTIFICATION_HANDLE,
+            SECOND_NOTIFICATION_SLOT,
         )
-        .ok()
-            == Some(SECOND_NOTIFICATION_HANDLE);
+        .is_ok();
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)
@@ -2379,7 +2393,7 @@ fn endpoint_multi_handle_duplicate_probe() -> bool {
 }
 
 fn endpoint_move_waiter_probe(current_process: u64) -> bool {
-    const ENDPOINT_HANDLE: ipc::CapabilityHandle = 1;
+    const ENDPOINT_SLOT: u64 = 1;
     const MESSAGE: &[u8] = b"move-wakes-waiter";
 
     let Ok(endpoint) = ipc::endpoint_create() else {
@@ -2403,15 +2417,18 @@ fn endpoint_move_waiter_probe(current_process: u64) -> bool {
     };
     if child == 0 {
         let _ = syscall::close(barrier.reader);
-        if !ipc::wait_for_handle(ENDPOINT_HANDLE)
-            .is_ok_and(|info| info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE)
-            || syscall::write_all(barrier.writer, &[1]).is_err()
+        let Some(child_endpoint) =
+            wait_for_child_slot(ENDPOINT_SLOT, ObjectKind::Endpoint, Rights::RECEIVE)
+        else {
+            syscall::exit(70);
+        };
+        if syscall::write_all(barrier.writer, &[1]).is_err()
             || syscall::close(barrier.writer).is_err()
         {
             syscall::exit(70);
         }
         let mut bytes = [0_u8; MESSAGE.len()];
-        let Ok(message) = blocking_ipc::receive(ENDPOINT_HANDLE, &mut bytes) else {
+        let Ok(message) = blocking_ipc::receive(child_endpoint, &mut bytes) else {
             syscall::exit(71);
         };
         let Some(received) = message.capability else {
@@ -2424,13 +2441,12 @@ fn endpoint_move_waiter_probe(current_process: u64) -> bool {
             && ipc::info(received.handle).is_ok_and(|info| {
                 info.kind == ObjectKind::Notification && info.rights == Rights::WAIT
             });
-        let closed = ipc::close(received.handle).is_ok() && ipc::close(ENDPOINT_HANDLE).is_ok();
+        let closed = ipc::close(received.handle).is_ok() && ipc::close(child_endpoint).is_ok();
         syscall::exit(if valid && closed { 0 } else { 73 });
     }
 
     let setup = syscall::close(barrier.writer).is_ok()
-        && ipc::grant_child(child, endpoint, Rights::RECEIVE, ENDPOINT_HANDLE).ok()
-            == Some(ENDPOINT_HANDLE);
+        && ipc::grant_child(child, endpoint, Rights::RECEIVE, ENDPOINT_SLOT).is_ok();
     let mut ready = [0_u8; 1];
     let synchronized = setup
         && syscall::read(barrier.reader, &mut ready).ok() == Some(1)

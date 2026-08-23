@@ -30,6 +30,11 @@ message, with duplicate-source rejection and required receive-capacity reporting
 ABI 1.29 adds bounded one-shot monotonic timers with independently delegable wait and management
 authority.
 ABI 1.30 adds bounded manual-reset events with independently delegable signal and wait authority.
+ABI 1.31 makes live capability values opaque generation-checked handles. Each newly installed
+handle receives a fresh nonzero generation combined with its bounded process-local table slot;
+generation exhaustion fails closed rather than wrapping. A caller may resolve the current opaque
+handle installed at one of its own slots for managed bootstrap and bounded cleanup, but the slot
+number itself is not authority and the handle bit layout is not a userspace contract.
 
 Userspace now also has an initial ownership-safe layer over the unchanged raw ABI. A non-cloneable
 owned handle closes on drop, produces only lifetime-bound borrowed handles, and can be explicitly
@@ -81,9 +86,10 @@ The implemented model establishes these properties:
 6. A process assigned to a job cannot escape by forking or being moved into a different
    job.
 
-The capability namespace is separate from the file-descriptor namespace. Both use small
-integers today, but handles are valid only for capability operations and descriptors are
-valid only for descriptor and filesystem I/O.
+The capability namespace is separate from the file-descriptor namespace. Capability handles
+are opaque generation-checked `u64` values; process-local table slots are bounded discovery
+coordinates rather than authority. File descriptors remain small integers and are valid only
+for descriptor and filesystem I/O.
 
 ## Implemented kernel objects
 
@@ -188,8 +194,9 @@ reservation against a future receiving process and per-job queued-resource accou
 Endpoint transfer assumes both peers already share an endpoint. The current bootstrap
 operation therefore permits a process to copy a capability only into a live direct
 child. The source must carry `TRANSFER`, and the child receives only a requested subset
-of rights. A deterministic child slot can be requested so parent and child agree on the
-initial handle across `fork` and `exec`.
+of rights. A deterministic child slot can be requested for managed bootstrap. The grant
+returns the child's actual opaque generation-checked handle; the child resolves that handle
+from the agreed slot rather than treating the slot number as authority.
 
 This is intentionally not a general operation for opening another process. It cannot
 grant directly to siblings, unrelated processes, or arbitrary process identifiers.

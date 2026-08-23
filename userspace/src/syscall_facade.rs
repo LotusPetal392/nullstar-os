@@ -11,7 +11,7 @@ use crate::{
     ipc::{self, Rights},
     managed_startup::{self, ManagedToolCommand, ManagedToolStartOrigin},
     platform,
-    process_start::PROCESS_START_BOOTSTRAP_HANDLE,
+    process_start::PROCESS_START_BOOTSTRAP_SLOT,
 };
 
 pub use crate::syscall_legacy::{
@@ -233,15 +233,15 @@ pub fn spawn_managed_command_with_barrier(
 }
 
 /// Replaces the current image after staging a capability-empty managed startup
-/// stream on bootstrap handle 1. A failed replacement removes the staged
+/// stream on bootstrap slot 1. A failed replacement removes the staged
 /// endpoint so the caller retains transactional exec semantics.
 pub fn exec_managed_command(command: ManagedToolCommand<'_>) -> Result<()> {
     let process_id = getpid()?;
-    if ipc::info(PROCESS_START_BOOTSTRAP_HANDLE).is_ok() {
+    if ipc::info_at_slot(PROCESS_START_BOOTSTRAP_SLOT).is_ok() {
         return Err(Errno::INVALID_ARGUMENT);
     }
     let (receiver, sender) = ipc::endpoint_create_pair().map_err(|_| Errno::IO)?;
-    let receiver_ready = receiver == PROCESS_START_BOOTSTRAP_HANDLE
+    let receiver_ready = ipc::handle_at_slot(PROCESS_START_BOOTSTRAP_SLOT).ok() == Some(receiver)
         && ipc::replace(receiver, Rights::RECEIVE).ok() == Some(receiver);
     let sent = receiver_ready
         && managed_startup::send_managed_tool_start(
@@ -274,9 +274,11 @@ pub fn exec_managed_command(command: ManagedToolCommand<'_>) -> Result<()> {
 /// longer need inherited authority. File descriptors are a separate table and
 /// are unaffected.
 pub fn close_all_capabilities() -> Result<()> {
-    for handle in 1..=limits::MAX_CAPABILITIES_PER_PROCESS as u64 {
-        if ipc::info(handle).is_ok() && ipc::close(handle).is_err() {
-            return Err(Errno::IO);
+    for slot in 1..=limits::MAX_CAPABILITIES_PER_PROCESS as u64 {
+        match ipc::handle_at_slot(slot) {
+            Ok(handle) if ipc::close(handle).is_err() => return Err(Errno::IO),
+            Ok(_) | Err(ipc::Error::NO_ENTRY) => {}
+            Err(_) => return Err(Errno::IO),
         }
     }
     Ok(())
@@ -446,10 +448,9 @@ fn install_managed_tool_start(process_id: ProcessId, command: ManagedToolCommand
         process_id,
         receiver,
         Rights::RECEIVE,
-        PROCESS_START_BOOTSTRAP_HANDLE,
+        PROCESS_START_BOOTSTRAP_SLOT,
     )
-    .ok()
-        == Some(PROCESS_START_BOOTSTRAP_HANDLE);
+    .is_ok();
     let sent = granted
         && managed_startup::send_managed_tool_start(
             sender,

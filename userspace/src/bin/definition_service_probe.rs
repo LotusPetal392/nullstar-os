@@ -9,8 +9,8 @@ use userspace::{
     ipc::{self, ObjectKind, Rights},
     platform,
     process_start::{
-        PROCESS_START_BOOTSTRAP_HANDLE, StartupLaunchReason, StartupSectionId,
-        ValidatedProcessStart, receive_process_start_data,
+        PROCESS_START_BOOTSTRAP_SLOT, StartupLaunchReason, StartupSectionId, ValidatedProcessStart,
+        receive_process_start_data,
     },
     runtime_context::{CapabilityRole, ProcessContext, ServiceProcess, StartupCapabilityPolicy},
     service_route::receive_service_generation,
@@ -27,12 +27,12 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
     if [2, 3, 4, 5, 6]
         .into_iter()
-        .any(|handle| ipc::info(handle).is_ok())
+        .any(|slot| ipc::info_at_slot(slot).is_ok())
     {
         syscall::exit(3);
     }
     let bootstrap =
-        match unsafe { OwnedHandle::<Endpoint>::from_raw(PROCESS_START_BOOTSTRAP_HANDLE) } {
+        match unsafe { OwnedHandle::<Endpoint>::from_slot(PROCESS_START_BOOTSTRAP_SLOT) } {
             Ok(handle)
                 if handle.info().is_ok_and(|info| {
                     info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE

@@ -28,8 +28,11 @@ const LAUNCH_BYTES: usize = 40;
 /// First supported version of the process-start data-frame format.
 pub const STARTUP_DATA_VERSION: u16 = 1;
 
-/// Well-known handle used by the managed-launch bootstrap pilot.
-pub const PROCESS_START_BOOTSTRAP_HANDLE: u64 = 1;
+/// Well-known capability-table slot used by managed-launch bootstrap.
+///
+/// The slot is stable; the opaque handle installed there carries a generation
+/// and must be resolved with `ipc::handle_at_slot` or `OwnedHandle::from_slot`.
+pub const PROCESS_START_BOOTSTRAP_SLOT: u64 = 1;
 
 /// Maximum payload carried by one process-start data frame.
 pub const STARTUP_DATA_FRAME_PAYLOAD_BYTES: usize =

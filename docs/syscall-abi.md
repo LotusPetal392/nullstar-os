@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.30, and a
+The ABI is experimental, but callers can query the current version, 1.31, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -63,15 +63,16 @@ of directory records accepted by one call, and process-group control support.
 | 45 | `shared_memory_read` | handle, offset, buffer address, byte count | copied byte count |
 | 46 | `shared_memory_write` | handle, offset, byte address, byte count | copied byte count |
 | 47 | `endpoint_wait` | endpoint handle | zero once the endpoint is readable |
-| 48 | `capability_grant_child` | child PID, source handle, reduced rights, requested child handle | child handle |
+| 48 | `capability_grant_child` | child PID, source handle, reduced rights, requested child slot | child opaque handle |
 
 `SystemInfo.capabilities` reports `capability::PROTECTION_V1` when the handle
 table, endpoints, notifications, and shared-memory objects are available.
 
 Capability handles occupy a namespace separate from file descriptors. Handles
-are process local, begin at one, and refer to an object plus an explicit rights
-mask. Duplication and delegation require the corresponding authority and accept
-only a nonempty subset of the source rights.
+are process-local opaque `u64` values and refer to an object plus an explicit
+rights mask. ABI 1.31 generation-checks those values so later reuse of the same
+bounded table slot cannot revive a stale handle. Duplication and delegation require
+the corresponding authority and accept only a nonempty subset of the source rights.
 
 Endpoint send and receive are non-blocking data-movement calls. A full send
 queue or an empty receive queue returns `EAGAIN`. Receiving into a buffer smaller
@@ -87,14 +88,32 @@ memory mappings.
 
 `capability_grant_child` is a narrow bootstrap operation. The target must be a
 live direct child, the source handle must carry `TRANSFER`, and the granted
-rights must be a subset of the source rights. A requested child handle of zero
-allocates the lowest free slot; a nonzero value requests that exact slot. This
-allows recently forked processes to agree on a bootstrap endpoint without a
-global service namespace. Capability tables are not implicitly cloned by
-`fork`, but they remain attached to a process across `exec`.
+rights must be a subset of the source rights. A requested child slot of zero
+allocates the lowest free slot; a nonzero value requests that exact slot. The
+return value is the child's opaque generation-checked handle, not the slot number.
+This lets recently forked processes agree on a bootstrap slot without a global
+service namespace. Capability tables are not implicitly cloned by `fork`, but
+they remain attached to a process across `exec`.
 
 See [Capability and IPC protection model](protection-model.md) for lifetime,
 security-boundary, testing, and migration details.
+
+## Version 1.31 generation-checked capability handles
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 91 | `capability_handle_at_slot` | caller-local capability slot | current opaque handle |
+
+ABI 1.31 advertises `capability::GENERATION_CHECKED_HANDLES`. Every newly installed
+live capability receives a nonzero generation. Closing or moving a handle makes that
+exact opaque value stale; later reuse of its table slot receives a different generation.
+Generation exhaustion fails with `ENOSPC` rather than wrapping to an earlier value.
+
+`capability_handle_at_slot` is intentionally process-local and bounded. It resolves the
+opaque handle currently installed at one of the caller's own slots and returns `ENOENT`
+when that slot is empty. The slot is a discovery coordinate used by managed bootstrap
+and cleanup code; knowing a slot does not grant authority, and the packed handle layout
+is not part of the public ABI contract.
 
 ## Version 1.4 tmpfs registration
 

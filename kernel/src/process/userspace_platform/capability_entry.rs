@@ -5,6 +5,34 @@
 static CAPABILITY_REGISTRY: PreemptMutex<CapabilityRegistry> =
     PreemptMutex::new(CapabilityRegistry::new());
 
+const CAPABILITY_HANDLE_SLOT_BITS: u32 = 16;
+const CAPABILITY_HANDLE_SLOT_MASK: u64 = (1_u64 << CAPABILITY_HANDLE_SLOT_BITS) - 1;
+const _: () = assert!(abi::limits::MAX_CAPABILITIES_PER_PROCESS <= u16::MAX as usize);
+
+fn capability_handle(slot: u16, generation: u32) -> Option<u64> {
+    if slot == 0
+        || usize::from(slot) > abi::limits::MAX_CAPABILITIES_PER_PROCESS
+        || generation == 0
+    {
+        return None;
+    }
+    Some((u64::from(generation) << CAPABILITY_HANDLE_SLOT_BITS) | u64::from(slot))
+}
+
+fn capability_handle_slot(handle: u64) -> Option<u16> {
+    let slot = (handle & CAPABILITY_HANDLE_SLOT_MASK) as u16;
+    let generation = handle >> CAPABILITY_HANDLE_SLOT_BITS;
+    if slot == 0
+        || usize::from(slot) > abi::limits::MAX_CAPABILITIES_PER_PROCESS
+        || generation == 0
+        || generation > u64::from(u32::MAX)
+    {
+        None
+    } else {
+        Some(slot)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapabilityObjectRef {
     id: u64,
@@ -89,15 +117,31 @@ impl ProcessCapabilityTable {
         }
     }
 
-    fn allocate_handle(&self) -> Option<u64> {
-        (1..=abi::limits::MAX_CAPABILITIES_PER_PROCESS as u64)
-            .find(|candidate| !self.entries.iter().any(|entry| entry.handle == *candidate))
+    fn slot_in_use(&self, slot: u16) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| capability_handle_slot(entry.handle) == Some(slot))
+    }
+
+    fn free_slots(&self, count: usize) -> Vec<u16> {
+        (1..=abi::limits::MAX_CAPABILITIES_PER_PROCESS as u16)
+            .filter(|slot| !self.slot_in_use(*slot))
+            .take(count)
+            .collect()
+    }
+
+    fn handle_at_slot(&self, slot: u16) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|entry| capability_handle_slot(entry.handle) == Some(slot))
+            .map(|entry| entry.handle)
     }
 }
 
 #[derive(Debug)]
 struct CapabilityRegistry {
     next_object_id: u64,
+    next_handle_generation: u32,
     tables: Vec<ProcessCapabilityTable>,
     objects: Vec<CapabilityObjectRecord>,
 }
@@ -106,6 +150,7 @@ impl CapabilityRegistry {
     const fn new() -> Self {
         Self {
             next_object_id: 1,
+            next_handle_generation: 1,
             tables: Vec::new(),
             objects: Vec::new(),
         }
@@ -138,6 +183,27 @@ impl CapabilityRegistry {
         })
     }
 
+    fn handle_at_slot(&self, process_id: u64, slot: u16) -> Option<u64> {
+        self.table_index(process_id)
+            .and_then(|index| self.tables[index].handle_at_slot(slot))
+    }
+
+    fn take_handle_generations(&mut self, count: usize) -> Result<Vec<u32>, i64> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let count = u32::try_from(count).map_err(|_| abi::errno::NO_SPACE)?;
+        let start = self.next_handle_generation;
+        if start == 0 {
+            return Err(abi::errno::NO_SPACE);
+        }
+        let last = start
+            .checked_add(count.saturating_sub(1))
+            .ok_or(abi::errno::NO_SPACE)?;
+        self.next_handle_generation = last.checked_add(1).unwrap_or(0);
+        Ok((start..=last).collect())
+    }
+
     fn insert_entry(
         &mut self,
         process_id: u64,
@@ -151,12 +217,17 @@ impl CapabilityRegistry {
             return Err(abi::errno::NO_ENTRY);
         }
         let table_index = self.ensure_table(process_id)?;
-        let table = &mut self.tables[table_index];
-        if table.entries.len() >= abi::limits::MAX_CAPABILITIES_PER_PROCESS {
+        if self.tables[table_index].entries.len() >= abi::limits::MAX_CAPABILITIES_PER_PROCESS {
             return Err(abi::errno::NO_SPACE);
         }
-        let handle = table.allocate_handle().ok_or(abi::errno::NO_SPACE)?;
-        table.entries.push(CapabilityEntry {
+        let slot = self.tables[table_index]
+            .free_slots(1)
+            .into_iter()
+            .next()
+            .ok_or(abi::errno::NO_SPACE)?;
+        let generation = self.take_handle_generations(1)?[0];
+        let handle = capability_handle(slot, generation).ok_or(abi::errno::NO_SPACE)?;
+        self.tables[table_index].entries.push(CapabilityEntry {
             handle,
             object,
             rights,
@@ -223,18 +294,16 @@ impl CapabilityRegistry {
         {
             return Err(abi::errno::NO_SPACE);
         }
-        let handles = (1..=abi::limits::MAX_CAPABILITIES_PER_PROCESS as u64)
-            .filter(|candidate| {
-                !self.tables[table_index]
-                    .entries
-                    .iter()
-                    .any(|entry| entry.handle == *candidate)
-            })
-            .take(capabilities.len())
-            .collect::<Vec<_>>();
-        if handles.len() != capabilities.len() {
+        let slots = self.tables[table_index].free_slots(capabilities.len());
+        if slots.len() != capabilities.len() {
             return Err(abi::errno::NO_SPACE);
         }
+        let generations = self.take_handle_generations(capabilities.len())?;
+        let handles = slots
+            .into_iter()
+            .zip(generations)
+            .map(|(slot, generation)| capability_handle(slot, generation).ok_or(abi::errno::NO_SPACE))
+            .collect::<Result<Vec<_>, _>>()?;
         for (handle, capability) in handles.iter().copied().zip(capabilities.iter().copied()) {
             self.tables[table_index].entries.push(CapabilityEntry {
                 handle,
@@ -327,18 +396,16 @@ impl CapabilityRegistry {
         {
             return Err(abi::errno::NO_SPACE);
         }
-        let handles = (1..=abi::limits::MAX_CAPABILITIES_PER_PROCESS as u64)
-            .filter(|candidate| {
-                !self.tables[table_index]
-                    .entries
-                    .iter()
-                    .any(|entry| entry.handle == *candidate)
-            })
-            .take(2)
-            .collect::<Vec<_>>();
-        if handles.len() != 2 {
+        let slots = self.tables[table_index].free_slots(2);
+        if slots.len() != 2 {
             return Err(abi::errno::NO_SPACE);
         }
+        let generations = self.take_handle_generations(2)?;
+        let handles = slots
+            .into_iter()
+            .zip(generations)
+            .map(|(slot, generation)| capability_handle(slot, generation).ok_or(abi::errno::NO_SPACE))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let first_id = self.next_object_id;
         let second_id = first_id.checked_add(1).ok_or(abi::errno::NO_SPACE)?;
@@ -770,6 +837,7 @@ fn capability_syscall_number(number: u64) -> bool {
             | abi::syscall::CAPABILITY_INFO
             | abi::syscall::CAPABILITY_REPLACE
             | abi::syscall::CAPABILITY_SIGNAL_STATE
+            | abi::syscall::CAPABILITY_HANDLE_AT_SLOT
             | abi::syscall::ENDPOINT_CREATE
             | abi::syscall::ENDPOINT_CREATE_PAIR
             | abi::syscall::ENDPOINT_SEND
@@ -838,6 +906,9 @@ pub extern "C" fn nullstar_capability_syscall_dispatch(current_stack_pointer: us
         abi::syscall::CAPABILITY_CLOSE => capability_close(process_id, registers.rdi),
         abi::syscall::CAPABILITY_INFO => {
             capability_info(process_id, registers.rdi, registers.rsi, registers.rdx)
+        }
+        abi::syscall::CAPABILITY_HANDLE_AT_SLOT => {
+            capability_handle_at_slot(process_id, registers.rdi)
         }
         abi::syscall::CAPABILITY_REPLACE => {
             capability_replace(process_id, registers.rdi, registers.rsi)
@@ -1049,6 +1120,20 @@ fn capability_close(process_id: u64, handle: u64) -> u64 {
         wake_endpoint_waiter(object);
     }
     0
+}
+
+fn capability_handle_at_slot(process_id: u64, slot: u64) -> u64 {
+    let Ok(slot) = u16::try_from(slot) else {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    };
+    if slot == 0 || usize::from(slot) > abi::limits::MAX_CAPABILITIES_PER_PROCESS {
+        return error_return(abi::errno::INVALID_ARGUMENT);
+    }
+    let registry = CAPABILITY_REGISTRY.lock();
+    match registry.handle_at_slot(process_id, slot) {
+        Some(handle) => handle,
+        None => error_return(abi::errno::NO_ENTRY),
+    }
 }
 
 fn capability_info(process_id: u64, handle: u64, address: u64, length: u64) -> u64 {

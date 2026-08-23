@@ -341,7 +341,7 @@ pub fn grant_child(
     child_process_id: u64,
     source_handle: CapabilityHandle,
     rights: Rights,
-    requested_child_handle: CapabilityHandle,
+    requested_child_slot: u64,
 ) -> Result<CapabilityHandle> {
     let mut result = phase1_protection_abi::syscall::GRANT_CHILD;
     unsafe {
@@ -351,10 +351,26 @@ pub fn grant_child(
             in("rdi") child_process_id,
             in("rsi") source_handle,
             in("rdx") rights.bits(),
-            in("r10") requested_child_handle,
+            in("r10") requested_child_slot,
         );
     }
     decode(result)
+}
+
+pub fn handle_at_slot(slot: u64) -> Result<CapabilityHandle> {
+    let mut result = syscall::CAPABILITY_HANDLE_AT_SLOT;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result, in("rdi") slot);
+    }
+    decode(result)
+}
+
+pub fn info_at_slot(slot: u64) -> Result<CapabilityInfo> {
+    info(handle_at_slot(slot)?)
+}
+
+pub fn close_at_slot(slot: u64) -> Result<()> {
+    close(handle_at_slot(slot)?)
 }
 
 pub fn close(handle: CapabilityHandle) -> Result<()> {
@@ -622,6 +638,26 @@ pub fn wait_for_handle(handle: CapabilityHandle) -> Result<CapabilityInfo> {
     loop {
         match info(handle) {
             Ok(info) => return Ok(info),
+            Err(error) if error == Error::BAD_FILE_DESCRIPTOR || error == Error::TRY_AGAIN => {
+                if crate::syscall::yield_now().is_err() {
+                    return Err(Error::IO);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Waits for a capability to be installed at `slot` and returns its current
+/// opaque handle together with its metadata.
+///
+/// Slots are process-local discovery coordinates used by bootstrap protocols;
+/// callers must use the returned generation-checked handle for subsequent
+/// capability operations.
+pub fn wait_for_handle_at_slot(slot: u64) -> Result<(CapabilityHandle, CapabilityInfo)> {
+    loop {
+        match handle_at_slot(slot).and_then(|handle| info(handle).map(|info| (handle, info))) {
+            Ok(capability) => return Ok(capability),
             Err(error) if error == Error::BAD_FILE_DESCRIPTOR || error == Error::TRY_AGAIN => {
                 if crate::syscall::yield_now().is_err() {
                     return Err(Error::IO);
