@@ -11,7 +11,7 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const SERVICE_HANDLE: u64 = 1;
+const SERVICE_SLOT: u64 = 1;
 const NAME: &[u8] = b"phase4.txt";
 const PAYLOAD: &[u8] = b"restart-aware userspace tmpfs";
 const GENERIC_PAYLOAD: &[u8] = b"generic shared-memory filesystem service payload";
@@ -21,14 +21,14 @@ const DIRECTORY_BUFFER_OFFSET: usize = 128;
 const CREATED_NAME: &[u8] = b"generic-created.txt";
 
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
-    let info = match ipc::wait_for_handle(SERVICE_HANDLE) {
-        Ok(info) => info,
+    let (service, info) = match ipc::wait_for_handle_at_slot(SERVICE_SLOT) {
+        Ok(capability) => capability,
         Err(_) => syscall::exit(1),
     };
     if info.kind != ObjectKind::Endpoint || info.rights != Rights::SEND {
         syscall::exit(2);
     }
-    let mount = match Mount::connect(SERVICE_HANDLE) {
+    let mount = match Mount::connect(service) {
         Ok(mount) => mount,
         Err(_) => syscall::exit(3),
     };
@@ -54,7 +54,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     if &listing[..listed] != NAME {
         syscall::exit(9);
     }
-    let session = match connect_service(SERVICE_HANDLE, 1) {
+    let session = match connect_service(service, 1) {
         Ok(session) => session,
         Err(_) => syscall::exit(10),
     };

@@ -12,7 +12,7 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const SERVICE_HANDLE: u64 = 1;
+const SERVICE_SLOT: u64 = 1;
 const FAT_PARTITION_INDEX: u32 = 2;
 const NULLFS_PARTITION_INDEX: u32 = 3;
 const NULLFS_SUPERBLOCK_SECTOR: u64 = 128;
@@ -35,12 +35,12 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     } else {
         FAT_PARTITION_INDEX
     };
-    if !matches!(
-        ipc::wait_for_handle(SERVICE_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) {
-        syscall::exit(1);
-    }
+    let service = match ipc::wait_for_handle_at_slot(SERVICE_SLOT) {
+        Ok((handle, info)) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND => {
+            handle
+        }
+        _ => syscall::exit(1),
+    };
     if platform::open_block_device_endpoint(partition_index).err()
         != Some(platform::Errno::PERMISSION)
     {
@@ -56,7 +56,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         syscall::exit(20);
     }
 
-    let mut session = match block_device::connect_service(SERVICE_HANDLE, 1) {
+    let mut session = match block_device::connect_service(service, 1) {
         Ok(session) => session,
         Err(_) => syscall::exit(3),
     };

@@ -24,10 +24,10 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const PRODUCER_ROUTE_HANDLE: u64 = 1;
-const OBSERVER_ROUTE_HANDLE: u64 = 2;
-const STATUS_HANDLE: u64 = 3;
-const CONTROL_HANDLE: u64 = 4;
+const PRODUCER_ROUTE_SLOT: u64 = 1;
+const OBSERVER_ROUTE_SLOT: u64 = 2;
+const STATUS_SLOT: u64 = 3;
+const CONTROL_SLOT: u64 = 4;
 const MAX_YIELDS: u32 = 65_536;
 const QUERY_NOW_NS: u64 = 0;
 const QUERY_DEADLINE_NS: u64 = 1_000_000;
@@ -134,15 +134,20 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     if early_log::open_reader() != Err(early_log::Error::PERMISSION) {
         syscall::exit(4);
     }
-    if matches!(mode, ProbeMode::CollectorStress) {
-        validate_stress_handles();
-    }
+    let producer_route = required_handle(PRODUCER_ROUTE_SLOT, ObjectKind::Endpoint, Rights::SEND);
+    let observer_route = required_handle(OBSERVER_ROUTE_SLOT, ObjectKind::Endpoint, Rights::SEND);
+    let stress_handles = matches!(mode, ProbeMode::CollectorStress).then(|| {
+        (
+            required_handle(STATUS_SLOT, ObjectKind::Endpoint, Rights::SEND),
+            required_handle(CONTROL_SLOT, ObjectKind::Endpoint, Rights::RECEIVE),
+        )
+    });
     let (producer_transport, producer_generation, producer_object_id) = connect_route(
-        PRODUCER_ROUTE_HANDLE,
+        producer_route,
         RouteKey::new(LOGGING_SERVICE_ID, LOGGING_PRODUCER_ROLE),
     );
     let (observer_transport, observer_generation, observer_object_id) = connect_route(
-        OBSERVER_ROUTE_HANDLE,
+        observer_route,
         RouteKey::new(LOGGING_SERVICE_ID, LOGGING_OBSERVER_ROLE),
     );
     if producer_transport.service_process_id() != observer_transport.service_process_id()
@@ -160,11 +165,19 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     match mode {
         ProbeMode::Basic => run_basic(&mut producer, &mut observer, process_id),
         ProbeMode::CollectorStress => {
-            run_collector_stress(&mut producer, &mut observer, process_id)
+            let (status, control) = stress_handles.expect("collector stress handles were resolved");
+            run_collector_stress(&mut producer, &mut observer, process_id, status, control)
         }
         ProbeMode::AfterRestart => run_after_restart(&mut producer, &mut observer, process_id),
     }
     syscall::exit(0)
+}
+
+fn required_handle(slot: u64, kind: ObjectKind, rights: Rights) -> ipc::CapabilityHandle {
+    match ipc::wait_for_handle_at_slot(slot) {
+        Ok((handle, info)) if info.kind == kind && info.rights == rights => handle,
+        _ => syscall::exit(4),
+    }
 }
 
 fn connect_route(route_grant: u64, key: RouteKey) -> (ClientTransport, ProviderGeneration, u64) {
@@ -432,12 +445,18 @@ fn run_basic(producer: &mut Producer, observer: &mut Observer, process_id: u64) 
     expect_history(observer, second, None, 16);
 }
 
-fn run_collector_stress(producer: &mut Producer, observer: &mut Observer, process_id: u64) {
+fn run_collector_stress(
+    producer: &mut Producer,
+    observer: &mut Observer,
+    process_id: u64,
+    status: ipc::CapabilityHandle,
+    control: ipc::CapabilityHandle,
+) {
     let _baseline_last = verify_kernel_baseline(observer, 20);
-    if ipc::send(STATUS_HANDLE, BOUND_MARKER, None).is_err() {
+    if ipc::send(status, BOUND_MARKER, None).is_err() {
         syscall::exit(20);
     }
-    wait_for_fill_control();
+    wait_for_fill_control(control);
 
     for sequence in 1..=8 {
         match producer.try_log(stress_record(sequence), LogDelivery::Reliable, [0x33; 16]) {
@@ -453,7 +472,7 @@ fn run_collector_stress(producer: &mut Producer, observer: &mut Observer, proces
     {
         syscall::exit(22);
     }
-    if ipc::send(STATUS_HANDLE, BACKPRESSURE_MARKER, None).is_err() {
+    if ipc::send(status, BACKPRESSURE_MARKER, None).is_err() {
         syscall::exit(23);
     }
 
@@ -746,23 +765,11 @@ fn history_matches(actual: HistoryRecordView<'_>, expected: ExpectedHistory<'_>)
         && actual.message == expected.message
 }
 
-fn validate_stress_handles() {
-    if !matches!(
-        ipc::info(STATUS_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) || !matches!(
-        ipc::info(CONTROL_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
-    ) {
-        syscall::exit(50);
-    }
-}
-
-fn wait_for_fill_control() {
+fn wait_for_fill_control(control: ipc::CapabilityHandle) {
     let mut remaining = MAX_YIELDS;
     let mut buffer = [0_u8; 64];
     loop {
-        match ipc::try_receive(CONTROL_HANDLE, &mut buffer) {
+        match ipc::try_receive(control, &mut buffer) {
             Ok(message)
                 if message.sender_process_id == INIT_PROCESS_ID
                     && message.capability.is_none()

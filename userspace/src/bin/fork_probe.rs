@@ -16,6 +16,7 @@ const CHILD_EXEC: &[u8] = b"/fork-target inherited";
 const CAPABILITY_MESSAGE: &[u8] = b"child-capability-channel";
 const PARENT_VALUE: u64 = 0x1122_3344_5566_7788;
 const CHILD_VALUE: u64 = 0x8877_6655_4433_2211;
+const CHILD_ENDPOINT_SLOT: u64 = 1;
 
 static FORK_CELL: AtomicU64 = AtomicU64::new(0);
 
@@ -46,14 +47,15 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     };
 
     if child == 0 {
-        let endpoint_info = match ipc::wait_for_handle(endpoint) {
-            Ok(info) => info,
-            Err(_) => syscall::exit(13),
-        };
+        let (child_endpoint, endpoint_info) =
+            match ipc::wait_for_handle_at_slot(CHILD_ENDPOINT_SLOT) {
+                Ok(capability) => capability,
+                Err(_) => syscall::exit(13),
+            };
         if endpoint_info.kind != ObjectKind::Endpoint || endpoint_info.rights != Rights::SEND {
             syscall::exit(14);
         }
-        if ipc::send(endpoint, CAPABILITY_MESSAGE, None).is_err() {
+        if ipc::send(child_endpoint, CAPABILITY_MESSAGE, None).is_err() {
             syscall::exit(15);
         }
 
@@ -77,7 +79,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         syscall::exit(7)
     }
 
-    if ipc::grant_child(child, endpoint, Rights::SEND, endpoint).ok() != Some(endpoint) {
+    if ipc::grant_child(child, endpoint, Rights::SEND, CHILD_ENDPOINT_SLOT).is_err() {
         syscall::exit(16);
     }
     let mut capability_message = [0_u8; 32];

@@ -29,9 +29,6 @@ const MAX_JOBS: usize = 4;
 const MAX_VARIABLES: usize = limits::MAX_ENVIRONMENT_VARIABLES;
 const VARIABLE_NAME_BYTES: usize = limits::MAX_ENVIRONMENT_NAME_BYTES;
 const VARIABLE_VALUE_BYTES: usize = COMMAND_BYTES;
-const OBSERVER_ROUTE_HANDLE: u64 = 2;
-const SERVICE_CONTROL_OBSERVER_HANDLE: u64 = 3;
-const SERVICE_CONTROL_MUTATION_HANDLE: u64 = 4;
 const SHELL_GRANT_RIGHTS: Rights =
     match Rights::from_bits(Rights::SEND.bits() | Rights::DUPLICATE.bits()) {
         Some(rights) => rights,
@@ -374,9 +371,17 @@ struct Shell {
     children: [ProcessId; MAX_STAGES],
     jobs: [Job; MAX_JOBS],
     variables: [Variable; MAX_VARIABLES],
+    observer_route: ipc::CapabilityHandle,
+    service_control_observer: ipc::CapabilityHandle,
+    service_control_mutation: ipc::CapabilityHandle,
 }
 impl Shell {
-    fn new(initial_stack: *const usize) -> Self {
+    fn new(
+        initial_stack: *const usize,
+        observer_route: ipc::CapabilityHandle,
+        service_control_observer: ipc::CapabilityHandle,
+        service_control_mutation: ipc::CapabilityHandle,
+    ) -> Self {
         let mut shell = Self {
             command: [0; COMMAND_BYTES],
             pipes: [PipePair {
@@ -386,6 +391,9 @@ impl Shell {
             children: [0; MAX_STAGES],
             jobs: [Job::EMPTY; MAX_JOBS],
             variables: [Variable::EMPTY; MAX_VARIABLES],
+            observer_route,
+            service_control_observer,
+            service_control_mutation,
         };
         shell.import_environment(initial_stack);
         shell
@@ -506,7 +514,7 @@ impl Shell {
             Builtin::Unset => self.unset_variable(command_arguments(command)),
             Builtin::Environment => self.print_environment(),
             Builtin::LogShow => {
-                let succeeded = match ipc::duplicate(OBSERVER_ROUTE_HANDLE, Rights::SEND) {
+                let succeeded = match ipc::duplicate(self.observer_route, Rights::SEND) {
                     Ok(observer_route) => {
                         let show_result = logctl::show(observer_route);
                         let close_result = ipc::close(observer_route);
@@ -536,7 +544,7 @@ impl Shell {
         }
     }
     fn run_service_observation(&mut self, service: Option<ServiceId>) {
-        let succeeded = match ipc::duplicate(SERVICE_CONTROL_OBSERVER_HANDLE, Rights::SEND) {
+        let succeeded = match ipc::duplicate(self.service_control_observer, Rights::SEND) {
             Ok(observer) => {
                 let result = match service {
                     Some(service) => sv::status(observer, service),
@@ -558,7 +566,7 @@ impl Shell {
         }
     }
     fn run_service_mutation(&mut self, operation: ServiceMutation, service: ServiceId) {
-        let Ok(mutation) = ipc::duplicate(SERVICE_CONTROL_MUTATION_HANDLE, Rights::SEND) else {
+        let Ok(mutation) = ipc::duplicate(self.service_control_mutation, Rights::SEND) else {
             self.error(SV_FAILURE);
             return;
         };
@@ -1770,7 +1778,7 @@ const fn is_line_trailing(byte: u8) -> bool {
 }
 
 fn rust_main(initial_stack: *const usize, start: Option<ManagedToolStart<3>>) -> ! {
-    if let Some(mut start) = start {
+    let handles = if let Some(mut start) = start {
         let observer = start
             .context
             .take::<Endpoint>(CapabilityRole::LOGGING_OBSERVER_INGRESS, SHELL_GRANT_RIGHTS);
@@ -1781,18 +1789,21 @@ fn rust_main(initial_stack: *const usize, start: Option<ManagedToolStart<3>>) ->
         let service_mutation = start
             .context
             .take::<Endpoint>(CapabilityRole::SERVICE_CONTROL_MUTATION, SHELL_GRANT_RIGHTS);
-        let handles_valid = match (observer, service_observer, service_mutation) {
-            (Ok(observer), Ok(service_observer), Ok(service_mutation)) => {
-                observer.into_raw() == OBSERVER_ROUTE_HANDLE
-                    && service_observer.into_raw() == SERVICE_CONTROL_OBSERVER_HANDLE
-                    && service_mutation.into_raw() == SERVICE_CONTROL_MUTATION_HANDLE
-            }
-            _ => false,
+        let handles = match (observer, service_observer, service_mutation) {
+            (Ok(observer), Ok(service_observer), Ok(service_mutation)) => Some((
+                observer.into_raw(),
+                service_observer.into_raw(),
+                service_mutation.into_raw(),
+            )),
+            _ => None,
         };
-        if !handles_valid || !start.context.is_empty() {
+        if handles.is_none() || !start.context.is_empty() {
             syscall::exit(125);
         }
-    }
-    let mut shell = Shell::new(initial_stack);
+        handles.expect("managed shell handles were validated")
+    } else {
+        (0, 0, 0)
+    };
+    let mut shell = Shell::new(initial_stack, handles.0, handles.1, handles.2);
     shell.run()
 }

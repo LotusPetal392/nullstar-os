@@ -17,8 +17,8 @@ use userspace::{
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
-const SERVICE_HANDLE: u64 = 1;
-const RESTART_CONTROL_HANDLE: u64 = 2;
+const SERVICE_SLOT: u64 = 1;
+const RESTART_CONTROL_SLOT: u64 = 2;
 const READINESS_MODE: &[u8] = b"readiness";
 const FULL_MODE: &[u8] = b"full";
 const BOOTSTRAP_MODE: &[u8] = b"bootstrap";
@@ -36,8 +36,8 @@ const NULLFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED: &[u8] =
     b"block-device-loss: uncertain mutation failed";
 const NULLFS_BLOCK_DEVICE_LOSS_FILESYSTEM_OFFLINED: &[u8] =
     b"block-device-loss: filesystem generation offlined";
-const NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE: u64 = 2;
-const NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE: u64 = 3;
+const NULLFS_BLOCK_DEVICE_LOSS_READY_SLOT: u64 = 2;
+const NULLFS_BLOCK_DEVICE_LOSS_CONTROL_SLOT: u64 = 3;
 const NULLFS_RESTART_READY: &[u8] =
     b"nullfs-restart: live descriptor and persistent mutation ready";
 
@@ -223,8 +223,8 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         syscall::exit(57);
     }
     if !matches!(
-        ipc::wait_for_handle(SERVICE_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
+        ipc::wait_for_handle_at_slot(SERVICE_SLOT),
+        Ok((_, info)) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
     ) {
         syscall::exit(1);
     }
@@ -845,15 +845,8 @@ fn probe_user_namespace_mutation() {
 }
 
 fn probe_nullfs_crash_recovery() -> ! {
-    if !matches!(
-        ipc::wait_for_handle(SERVICE_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) || !matches!(
-        ipc::wait_for_handle(RESTART_CONTROL_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
-    ) {
-        syscall::exit(150);
-    }
+    let service = required_slot_handle(SERVICE_SLOT, Rights::SEND, 150);
+    let restart_control = required_slot_handle(RESTART_CONTROL_SLOT, Rights::RECEIVE, 150);
     match platform::stat(NULLFS_CRASH_RECOVERY_PATH) {
         Err(error) if error == platform::Errno::NO_ENTRY => {}
         Ok(stat) if stat.kind == file::KIND_FILE => {
@@ -879,14 +872,14 @@ fn probe_nullfs_crash_recovery() -> ! {
     .unwrap_or_else(|| syscall::exit(152));
     if !write_all_with_retry(stale, NULLFS_CRASH_RECOVERY_BASELINE)
         || !descriptor_stat_matches(stale, NULLFS_CRASH_RECOVERY_BASELINE.len() as u64)
-        || ipc::send(SERVICE_HANDLE, NULLFS_CRASH_RECOVERY_READY, None).is_err()
+        || ipc::send(service, NULLFS_CRASH_RECOVERY_READY, None).is_err()
     {
         syscall::exit(153);
     }
 
     let mut control = [0_u8; 64];
     let message =
-        ipc::receive(RESTART_CONTROL_HANDLE, &mut control).unwrap_or_else(|_| syscall::exit(154));
+        ipc::receive(restart_control, &mut control).unwrap_or_else(|_| syscall::exit(154));
     if message.sender_process_id != 1
         || message.capability.is_some()
         || message.bytes != NULLFS_CRASH_RECOVERY_GO.len()
@@ -896,14 +889,14 @@ fn probe_nullfs_crash_recovery() -> ! {
     }
 
     if syscall::write(stale, NULLFS_CRASH_RECOVERY_SUFFIX) != Err(syscall::Errno::IO)
-        || ipc::send(SERVICE_HANDLE, NULLFS_CRASH_RECOVERY_MUTATION_FAILED, None).is_err()
+        || ipc::send(service, NULLFS_CRASH_RECOVERY_MUTATION_FAILED, None).is_err()
     {
         syscall::exit(156);
     }
 
     control.fill(0);
     let message =
-        ipc::receive(RESTART_CONTROL_HANDLE, &mut control).unwrap_or_else(|_| syscall::exit(157));
+        ipc::receive(restart_control, &mut control).unwrap_or_else(|_| syscall::exit(157));
     if message.sender_process_id != 1
         || message.capability.is_some()
         || message.bytes != NULLFS_CRASH_RECOVERY_REPLACEMENT.len()
@@ -947,18 +940,10 @@ fn probe_nullfs_crash_recovery() -> ! {
 }
 
 fn probe_nullfs_block_device_loss() -> ! {
-    if !matches!(
-        ipc::wait_for_handle(SERVICE_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) || !matches!(
-        ipc::wait_for_handle(NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) || !matches!(
-        ipc::wait_for_handle(NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
-    ) {
-        syscall::exit(140);
-    }
+    let _service = required_slot_handle(SERVICE_SLOT, Rights::SEND, 140);
+    let ready = required_slot_handle(NULLFS_BLOCK_DEVICE_LOSS_READY_SLOT, Rights::SEND, 140);
+    let control_handle =
+        required_slot_handle(NULLFS_BLOCK_DEVICE_LOSS_CONTROL_SLOT, Rights::RECEIVE, 140);
     if platform::offline_writable_nullfs_block_device_endpoint(
         &nullfs_primary_volume::FILESYSTEM_UUID,
         1,
@@ -979,19 +964,13 @@ fn probe_nullfs_block_device_loss() -> ! {
     .unwrap_or_else(|| syscall::exit(142));
     if !write_all_with_retry(descriptor, NULLFS_BLOCK_DEVICE_LOSS_BASELINE)
         || !descriptor_stat_matches(descriptor, NULLFS_BLOCK_DEVICE_LOSS_BASELINE.len() as u64)
-        || ipc::send(
-            NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE,
-            NULLFS_BLOCK_DEVICE_LOSS_READY,
-            None,
-        )
-        .is_err()
+        || ipc::send(ready, NULLFS_BLOCK_DEVICE_LOSS_READY, None).is_err()
     {
         syscall::exit(143);
     }
 
     let mut control = [0_u8; 64];
-    let message = ipc::receive(NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE, &mut control)
-        .unwrap_or_else(|_| syscall::exit(144));
+    let message = ipc::receive(control_handle, &mut control).unwrap_or_else(|_| syscall::exit(144));
     if message.sender_process_id != 1
         || message.capability.is_some()
         || message.bytes != NULLFS_BLOCK_DEVICE_LOSS_OFFLINED.len()
@@ -1000,19 +979,13 @@ fn probe_nullfs_block_device_loss() -> ! {
         syscall::exit(145);
     }
     if !write_fails_with_retry(descriptor, b" after", syscall::Errno::IO)
-        || ipc::send(
-            NULLFS_BLOCK_DEVICE_LOSS_READY_HANDLE,
-            NULLFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED,
-            None,
-        )
-        .is_err()
+        || ipc::send(ready, NULLFS_BLOCK_DEVICE_LOSS_MUTATION_FAILED, None).is_err()
     {
         syscall::exit(146);
     }
 
     control.fill(0);
-    let message = ipc::receive(NULLFS_BLOCK_DEVICE_LOSS_CONTROL_HANDLE, &mut control)
-        .unwrap_or_else(|_| syscall::exit(147));
+    let message = ipc::receive(control_handle, &mut control).unwrap_or_else(|_| syscall::exit(147));
     if message.sender_process_id != 1
         || message.capability.is_some()
         || message.bytes != NULLFS_BLOCK_DEVICE_LOSS_FILESYSTEM_OFFLINED.len()
@@ -1032,8 +1005,8 @@ fn probe_nullfs_block_device_loss() -> ! {
 
 fn probe_nullfs_out_of_space() -> ! {
     if !matches!(
-        ipc::wait_for_handle(SERVICE_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
+        ipc::wait_for_handle_at_slot(SERVICE_SLOT),
+        Ok((_, info)) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
     ) {
         syscall::exit(130);
     }
@@ -1101,15 +1074,8 @@ fn probe_nullfs_out_of_space() -> ! {
 }
 
 fn probe_nullfs_restart(environment: &[(&[u8], &[u8])]) -> ! {
-    if !matches!(
-        ipc::wait_for_handle(SERVICE_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) || !matches!(
-        ipc::wait_for_handle(RESTART_CONTROL_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::RECEIVE
-    ) {
-        syscall::exit(90);
-    }
+    let service = required_slot_handle(SERVICE_SLOT, Rights::SEND, 90);
+    let restart_control = required_slot_handle(RESTART_CONTROL_SLOT, Rights::RECEIVE, 90);
     if !recover_public_probe_artifact() {
         syscall::exit(91);
     }
@@ -1146,12 +1112,12 @@ fn probe_nullfs_restart(environment: &[(&[u8], &[u8])]) -> ! {
     {
         syscall::exit(110);
     }
-    if ipc::send(SERVICE_HANDLE, NULLFS_RESTART_READY, None).is_err() {
+    if ipc::send(service, NULLFS_RESTART_READY, None).is_err() {
         syscall::exit(95);
     }
 
     let mut control = [0_u8; 64];
-    let message = match ipc::receive(RESTART_CONTROL_HANDLE, &mut control) {
+    let message = match ipc::receive(restart_control, &mut control) {
         Ok(message) => message,
         Err(_) => syscall::exit(96),
     };
@@ -1976,6 +1942,7 @@ fn reply_binding_matches(reply: &protocol::Reply, route_id: u32) -> bool {
 }
 
 fn query(path: &[u8], request_id: u32) -> Option<protocol::Reply> {
+    let service = ipc::handle_at_slot(SERVICE_SLOT).ok()?;
     let reply_endpoint = ipc::endpoint_create().ok()?;
     let mut request = protocol::Request {
         operation: protocol::operation::RESOLVE,
@@ -1991,7 +1958,7 @@ fn query(path: &[u8], request_id: u32) -> Option<protocol::Reply> {
         )
     };
     if ipc::send(
-        SERVICE_HANDLE,
+        service,
         request_bytes,
         Some(Transfer {
             handle: reply_endpoint,
@@ -2017,4 +1984,11 @@ fn query(path: &[u8], request_id: u32) -> Option<protocol::Reply> {
         && reply.reserved == [0; 8]
         && reply_binding_is_canonical(&reply))
     .then_some(reply)
+}
+
+fn required_slot_handle(slot: u64, rights: Rights, exit_code: u64) -> ipc::CapabilityHandle {
+    match ipc::wait_for_handle_at_slot(slot) {
+        Ok((handle, info)) if info.kind == ObjectKind::Endpoint && info.rights == rights => handle,
+        _ => syscall::exit(exit_code),
+    }
 }

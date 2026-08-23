@@ -23,7 +23,7 @@ use userspace::{
 
 userspace::entry!(rust_main);
 
-const BLOCK_HANDLE: u64 = 1;
+const BLOCK_SLOT: u64 = 1;
 const SHARED_BUFFER_BYTES: usize = 4096;
 const SHARED_BUFFER_ID: u64 = 1;
 const FILE_BUFFER_BYTES: usize = 128;
@@ -36,15 +36,15 @@ const VERIFIED_MARKER: &[u8] =
 extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     allocator::init();
 
-    if !matches!(
-        ipc::wait_for_handle(BLOCK_HANDLE),
-        Ok(info) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND
-    ) {
-        fail(
+    let block = match ipc::wait_for_handle_at_slot(BLOCK_SLOT) {
+        Ok((handle, info)) if info.kind == ObjectKind::Endpoint && info.rights == Rights::SEND => {
+            handle
+        }
+        _ => fail(
             10,
-            b"boot-generation-probe: handle 1 must be Endpoint SEND\n",
-        );
-    }
+            b"boot-generation-probe: slot 1 must contain Endpoint SEND\n",
+        ),
+    };
     if platform::open_writable_nullfs_block_device_endpoint(&nullfs_primary_volume::FILESYSTEM_UUID)
         .err()
         != Some(platform::Errno::PERMISSION)
@@ -55,7 +55,7 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
         );
     }
 
-    let mut session = block_device::connect_service(BLOCK_HANDLE, 1)
+    let mut session = block_device::connect_service(block, 1)
         .unwrap_or_else(|_| fail(20, b"boot-generation-probe: block connect failed\n"));
     let info = session
         .info(2)

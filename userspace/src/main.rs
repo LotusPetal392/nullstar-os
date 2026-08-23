@@ -245,8 +245,8 @@ const SHELL_WAIT_FAILED: &[u8] = b"userspace init: failed while waiting for /ush
 const SHELL_FOREGROUND_FAILED: &[u8] =
     b"userspace init: failed to restore /ush to the foreground\n";
 
-const READY_HANDLE: u64 = 1;
-const REQUEST_HANDLE: u64 = 2;
+const READY_SLOT: u64 = 1;
+const REQUEST_SLOT: u64 = 2;
 const MAX_BOOTSTRAP_ROUTES: usize = 2;
 const ROUTE_PUMP_BUDGET: usize = 4;
 const SERVICE_CONTROL_PUMP_BUDGET: usize = 4;
@@ -258,8 +258,8 @@ const SERVICE_JOB_CLEANUP_YIELDS: u32 = 64;
 const NULLFS_QUIESCE_GRACE_YIELDS: u32 = 2_048;
 const NULLFS_TEST_QUIESCE_GRACE_YIELDS: u32 = 8;
 const NULLFS_FORCE_TERMINATION_ATTEMPTS: u32 = 64;
-const LOGGING_PROBE_STATUS_HANDLE: u64 = 3;
-const LOGGING_PROBE_CONTROL_HANDLE: u64 = 4;
+const LOGGING_PROBE_STATUS_SLOT: u64 = 3;
+const LOGGING_PROBE_CONTROL_SLOT: u64 = 4;
 const LOGGING_EXECUTABLE_ID: u64 = 1;
 const NULLFS_EXECUTABLE_ID: u64 = 2;
 const TMPFS_EXECUTABLE_ID: u64 = 3;
@@ -269,7 +269,7 @@ const LOGGING_SERVICE: ServiceSpec = ServiceSpec {
     name: b"logging",
     command: LOGGING_SERVICE_COMMAND,
     ready_message: LOGGING_SERVICE_READY_MESSAGE,
-    bootstrap_handle: READY_HANDLE,
+    bootstrap_slot: READY_SLOT,
     restart_limit: 3,
     restart_backoff_yields: 32,
     fatal_startup_exit_status: Some(early_log::IMPORT_FAILURE_EXIT_STATUS),
@@ -278,7 +278,7 @@ const NULLFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"nullfs",
     command: NULLFS_SERVICE_COMMAND,
     ready_message: NULLFS_SERVICE_READY_MESSAGE,
-    bootstrap_handle: READY_HANDLE,
+    bootstrap_slot: READY_SLOT,
     restart_limit: 3,
     restart_backoff_yields: 32,
     fatal_startup_exit_status: None,
@@ -295,7 +295,7 @@ const TMPFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"tmpfs",
     command: SERVICE_COMMAND,
     ready_message: SERVICE_READY_MESSAGE,
-    bootstrap_handle: READY_HANDLE,
+    bootstrap_slot: READY_SLOT,
     restart_limit: 3,
     restart_backoff_yields: 32,
     fatal_startup_exit_status: None,
@@ -308,7 +308,7 @@ const VFS_SERVICE: ServiceSpec = ServiceSpec {
     name: b"vfs",
     command: VFS_SERVICE_COMMAND,
     ready_message: VFS_SERVICE_READY_MESSAGE,
-    bootstrap_handle: READY_HANDLE,
+    bootstrap_slot: READY_SLOT,
     restart_limit: 3,
     restart_backoff_yields: 32,
     fatal_startup_exit_status: None,
@@ -4645,16 +4645,14 @@ fn run_nullfs_crash_recovery_probe(
         &barrier,
     )
     .unwrap_or_else(|_| fail(VFS_CRASH_RECOVERY_PROBE_FAILED));
-    if ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, READY_HANDLE).ok()
-        != Some(READY_HANDLE)
+    if ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, READY_SLOT).is_err()
         || ipc::grant_child(
             probe_process_id,
             control_endpoint,
             Rights::RECEIVE,
-            REQUEST_HANDLE,
+            REQUEST_SLOT,
         )
-        .ok()
-            != Some(REQUEST_HANDLE)
+        .is_err()
     {
         fail(VFS_CRASH_RECOVERY_PROBE_FAILED);
     }
@@ -4835,9 +4833,9 @@ fn run_nullfs_block_device_loss_probe(
         &barrier,
     )
     .unwrap_or_else(|_| fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED));
-    if ipc::grant_child(probe_process_id, vfs_request_endpoint, Rights::SEND, 1).ok() != Some(1)
-        || ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, 2).ok() != Some(2)
-        || ipc::grant_child(probe_process_id, control_endpoint, Rights::RECEIVE, 3).ok() != Some(3)
+    if ipc::grant_child(probe_process_id, vfs_request_endpoint, Rights::SEND, 1).is_err()
+        || ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, 2).is_err()
+        || ipc::grant_child(probe_process_id, control_endpoint, Rights::RECEIVE, 3).is_err()
     {
         fail(VFS_BLOCK_DEVICE_LOSS_PROBE_FAILED);
     }
@@ -4995,16 +4993,14 @@ fn run_nullfs_restart_probe(
         &barrier,
     )
     .unwrap_or_else(|_| fail(NULLFS_RESTART_PROBE_FAILED));
-    if ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, READY_HANDLE).ok()
-        != Some(READY_HANDLE)
+    if ipc::grant_child(probe_process_id, ready_endpoint, Rights::SEND, READY_SLOT).is_err()
         || ipc::grant_child(
             probe_process_id,
             control_endpoint,
             Rights::RECEIVE,
-            REQUEST_HANDLE,
+            REQUEST_SLOT,
         )
-        .ok()
-            != Some(REQUEST_HANDLE)
+        .is_err()
     {
         fail(NULLFS_RESTART_PROBE_FAILED);
     }
@@ -6272,18 +6268,16 @@ fn run_logging_collector_restart_test(
         probe_process_id,
         status_endpoint,
         Rights::SEND,
-        LOGGING_PROBE_STATUS_HANDLE,
+        LOGGING_PROBE_STATUS_SLOT,
     )
-    .ok()
-        != Some(LOGGING_PROBE_STATUS_HANDLE)
+    .is_err()
         || ipc::grant_child(
             probe_process_id,
             control_endpoint,
             Rights::RECEIVE,
-            LOGGING_PROBE_CONTROL_HANDLE,
+            LOGGING_PROBE_CONTROL_SLOT,
         )
-        .ok()
-            != Some(LOGGING_PROBE_CONTROL_HANDLE)
+        .is_err()
     {
         fail(LOGGING_PROBE_FAILED);
     }
@@ -6377,18 +6371,16 @@ fn grant_logging_probe_routes(probe_process_id: ProcessId, route_broker: &RouteB
         probe_process_id,
         route_broker.producer_grant_source,
         Rights::SEND,
-        READY_HANDLE,
+        READY_SLOT,
     )
-    .ok()
-        != Some(READY_HANDLE)
+    .is_err()
         || ipc::grant_child(
             probe_process_id,
             route_broker.observer_grant_source,
             Rights::SEND,
-            REQUEST_HANDLE,
+            REQUEST_SLOT,
         )
-        .ok()
-            != Some(REQUEST_HANDLE)
+        .is_err()
     {
         fail(LOGGING_PROBE_FAILED);
     }
@@ -6600,7 +6592,7 @@ fn run_probe(
         &barrier,
     )
     .unwrap_or_else(|_| fail(failed_message));
-    if ipc::grant_child(process_id, request_endpoint, Rights::SEND, 1).ok() != Some(1) {
+    if ipc::grant_child(process_id, request_endpoint, Rights::SEND, 1).is_err() {
         fail(failed_message);
     }
     barrier.release().unwrap_or_else(|_| fail(failed_message));
