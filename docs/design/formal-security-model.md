@@ -1,10 +1,11 @@
 # Formal security model
 
-NullStar uses formal modeling to constrain security-relevant kernel and service
-semantics without making whole-system formal verification a prerequisite for
-development. The model is intentionally much smaller than the implementation: it
-records only the state required to answer who has authority over which object,
-which containment applies, and which transitions may change those relationships.
+NullStar uses formal modeling to constrain security-relevant kernel, service, and
+selected target application-policy semantics without making whole-system formal
+verification a prerequisite for development. The model is intentionally much
+smaller than the implementation: it records only the state required to answer who
+has authority over which object, which containment applies, and which transitions
+may change those relationships.
 
 The executable specifications live under [`formal/`](../../formal/).
 
@@ -146,10 +147,65 @@ provider generation creates fresh ingress endpoint objects.
 These mappings are implementation-alignment evidence, not a proof that the Rust
 implementation formally refines the TLA+ model.
 
+## Phase 7: application sandbox target state
+
+`formal/ApplicationSandbox.tla` checks the accepted application sandbox contract
+at a deliberately small policy boundary. This phase is different from phases 1
+through 6: it is explicitly a **target-state architecture model**. The current
+kernel has many of the mechanisms the future sandbox will build on, but the full
+application manager, stable signed application principal, permission database,
+portal suite, and component allowlist launcher are not yet implemented.
+
+The model uses two application identities and three process roles: one main
+component and reduced child for application A, plus one main component for
+application B. Four abstract resource classes are enough to exercise the security
+rules: private baseline storage, a trusted portal endpoint, a broker-issued
+sensitive resource, and a portal-selected document.
+
+The model checks the following properties:
+
+- **identity remains descriptive:** fixed application identity never creates a
+  resource capability by itself;
+- **bootstrap is explicit and narrow:** only trusted root launch installs the
+  configured baseline, while the reduced child starts from an explicit allowlist;
+- **policy input is not authority:** manifest/runtime declaration and independent
+  approval may make a sensitive request eligible, but authority appears only
+  after the modeled broker issues it;
+- **profile ceilings do not relax:** every acquisition path is intersected with a
+  fixed per-process ceiling. The reduced child and the second application's main
+  component cannot self-expand those ceilings;
+- **new authority has provenance:** every non-baseline live resource is traced to
+  broker issuance, portal mediation, or explicit same-application delegation;
+- **child creation does not clone ambient authority:** direct delegation is
+  restricted to a transfer-policy-approved private resource, so the reduced child
+  does not automatically inherit portal or sensitive handles from the main
+  component;
+- **documents are portal-mediated:** acquisition and cross-component or
+  cross-application transfer of the selected document class always produce portal
+  provenance. There is no direct arbitrary-process transfer action for that
+  resource;
+- **restricted authority cannot be self-granted:** application B's ceiling excludes
+  the sensitive class, so identity, declaration, approval, or possession by some
+  other process cannot manufacture that authority for it.
+
+This phase composes rather than duplicates the lower models. It assumes the
+non-escape and fork/job properties already checked by `JobContainment.tla`, the
+capability-transfer properties checked by `EndpointIPC.tla`, and the broker
+provenance pattern checked by `ServiceGeneration.tla`. It therefore models
+mediated application component creation instead of attempting to restate the
+current raw `fork` ABI.
+
+The model does not yet include package-signing lineage, installation provenance,
+permission persistence, trusted prompt UI, lease expiration/revocation, concrete
+filesystem subtree semantics, network socket factories, device sessions,
+background leases, or administrative entitlements. Those should become separate
+implementation-backed refinements as the application runtime and desktop services
+are built.
+
 ## Relationship to implementation
 
 Formal actions should map to narrow implementation operations rather than whole
-syscall handlers or complete service-manager loops:
+syscall handlers or complete service-manager/application-manager loops:
 
 ```text
 formal action                            implementation concept
@@ -181,7 +237,21 @@ ServiceGeneration.BeginRequest           queue a generation-neutral stable-route
 ServiceGeneration.CompleteRequestSuccess issue exact current-generation provider authority
 ServiceGeneration.CompleteRequestUnavailable complete without provider authority
 ServiceGeneration.CloseGrant             close one provider grant without rebinding it
+ApplicationSandbox.LaunchRoot            install trusted narrow launch baseline
+ApplicationSandbox.SpawnChild            construct reduced component from explicit allowlist
+ApplicationSandbox.DeclareSensitive      record permission metadata without authority
+ApplicationSandbox.ApproveSensitive      record policy/user approval without authority
+ApplicationSandbox.BrokerGrant           issue eligible approved provider authority
+ApplicationSandbox.PortalAcquire         issue one exact user-selected scoped resource
+ApplicationSandbox.PortalTransfer        mediate scoped transfer to another component/application
+ApplicationSandbox.DelegateSameApplication directly delegate only an allowed reduced resource
+ApplicationSandbox.DropAuthority         close live authority while identity/policy remain
 ```
+
+For phase seven, these mappings describe the accepted future application-manager
+architecture rather than a current end-to-end implementation. Existing process-
+local capabilities, direct-child bootstrap, jobs, rights attenuation, and service
+routing provide the lower-level mechanisms that architecture will use.
 
 ## Verification levels
 
@@ -198,11 +268,12 @@ NullStar distinguishes three forms of assurance:
 
 Passing one level is not described as passing another. In particular, a TLC
 success means the finite formal model satisfied its configured invariants; it is
-not a proof that the complete NullStar kernel or service stack refines that model.
+not a proof that the complete NullStar kernel, service stack, or future
+application runtime refines that model.
 
 ## Expansion order
 
-The formal layers are intentionally incremental:
+The initial formal-security sequence is:
 
 1. capability core;
 2. generation-checked handles;
@@ -210,10 +281,10 @@ The formal layers are intentionally incremental:
 4. job containment and non-escape;
 5. job lifecycle, termination snapshots, drainage, and retirement;
 6. service-generation isolation;
-7. application sandbox containment.
+7. application sandbox target-state containment.
 
-A later endpoint refinement can separately add peer closure and blocking/wakeup
-lifecycle semantics. MMIO, IRQ, DMA, mapped shared memory, richer driver
-authority, and service-manager persistence should be added only after the lower
-capability, containment, and service-generation rules remain stable under their
-machine-checked models.
+After phase seven, formalization should track implementation milestones rather
+than expanding this sequence indefinitely. Candidate follow-ons include endpoint
+peer-closure and wakeup lifecycle, mapped shared-memory protection and W^X,
+application-manager trace conformance after that runtime exists, and later
+MMIO/IRQ/DMA authority when userspace driver work reaches those primitives.
