@@ -56,93 +56,80 @@ tracks each token's originating object and rights so TLC can exhaustively check
 phase-one monotonicity and identity invariants over a deliberately small finite
 state space.
 
-Endpoint queues, wait state, jobs, service generation, and concrete syscall
-encoding remain outside this module so counterexamples stay small enough to
-understand.
-
 ## Phase 2: handle generation
 
 `formal/HandleGeneration.tla` adds the lifecycle of an opaque userspace handle
-across capability-table slot reuse. A modeled handle is `<<slot, generation>>`.
-Closing it records that exact handle as retired and advances the slot generation.
-The final representable generation transitions to an exhausted state rather than
-wrapping to an earlier value.
-
-The model checks security-constitution invariant 8 directly: no retired handle
-may ever resolve as the current live handle for any slot. It also checks that
-retired generations remain strictly behind a slot's current generation, that an
-exhausted slot stays closed, and that every live handle is well formed.
-
-The live ABI aligns with that contract while keeping the `u64` representation
-opaque. The kernel combines a bounded process-local slot with a nonzero generation
-allocated once for each new live handle. A same-process bounded slot-lookup
-operation supports managed bootstrap and capability cleanup without making the
-slot number itself authority or exposing the bit layout. Direct-child bootstrap
-therefore requests a deterministic child **slot** and receives the child's actual
-opaque handle.
-
-The host-testable `kernel::capability` registry retains its per-slot generation
-scheme. Generation exhaustion there makes the slot permanently unavailable
-instead of wrapping back to generation 1. The live table uses a registry-wide
-monotonic allocation generation and likewise fails closed when that generation
-space is exhausted. These are implementation choices beneath the same formal
-non-revival property.
+across capability-table slot reuse. The model checks that retired handles cannot
+revive, generation exhaustion fails closed, and live handles remain well formed.
 
 ## Phase 3: endpoint IPC atomicity
 
-`formal/EndpointIPC.tla` adds the bounded authority transitions that occur when
-capabilities travel through an endpoint queue. The model intentionally ignores
-message-byte contents and models only the security-sensitive state needed for
-copy-send, move-send, and receive.
+`formal/EndpointIPC.tla` adds bounded FIFO authority transitions for plain send,
+copy-send, move-send, and all-or-nothing receive. Full-queue and insufficient
+receive-capacity attempts are modeled as stuttering failures so they cannot
+partially mutate authority or queue state.
 
-The model checks security-constitution invariants 5, 6, 7, 13, and 14 across a
-finite FIFO queue:
+## Phase 4: job containment
 
-- successful copy-send records one explicit new authority grant while retaining
-  the sender's source;
-- successful move-send transfers authority into the queue and removes the source
-  from the sender in the same modeled transition;
-- receive moves every attached capability from the FIFO head into receiver
-  accounting together;
-- full-queue and insufficient-receive-capacity attempts are stuttering failures
-  and therefore cannot consume sources, dequeue messages, or partially install
-  authority;
-- total authority is conserved except for explicitly recorded copy grants, giving
-  every additional authority instance machine-checkable provenance;
-- the sequence of received message IDs followed by the live queue always equals
-  the successful-send sequence, checking FIFO delivery.
+`formal/JobContainment.tla` models the containment rules that must remain true
+independently of job termination and exit-observation machinery. It directly
+refines security-constitution invariants 9 and 10.
 
-Peer closure, blocking and wakeup behavior, wait registration, deadlines, and
-event-port integration remain outside this phase. Those lifecycle/scheduling
-concerns can be added as a later IPC refinement without inflating the atomic
-transfer model.
+The modeled rules are:
 
-The current live endpoint implementation already follows this boundary: source
-and queue validation precede move-source removal, and receive checks output and
-handle capacity before installing the complete attachment set and removing the
-FIFO head. The userspace runtime probe independently exercises queue-full
-move-send failure, successful source consumption, duplicate-source rejection,
-and receive-capacity failure followed by successful retry.
+- the root job remains rooted and every child job is created once beneath an
+  already-live parent;
+- a live job's full ancestor closure is immutable and acyclic;
+- a live direct child may transition only from no job to one job; there is no
+  modeled move or unassign operation after containment is established;
+- a contained fork inherits the parent's exact current job and therefore its
+  complete ancestor containment;
+- historical containment requirements are remembered explicitly, so any later
+  state that provides less containment violates `ContainmentNeverRelaxes`;
+- every new assignment or contained fork must pass the target job's process
+  admission check and every ancestor's check over its complete subtree;
+- a job's process limit may stay equal or decrease, never increase.
+
+The process limit is deliberately modeled as an **admission limit**, matching the
+live implementation. Tightening a limit below the number of processes already in
+the subtree does not retroactively eject them; instead it prevents later
+assignment or fork until all ancestor checks have capacity again.
+
+This phase does not model process exit, completion-record retention, job
+termination, drainage, retirement, final-handle closure, or kernel-root lifetime.
+Those are the boundary of a later `JobLifecycle` refinement. Keeping them separate
+means a containment counterexample does not need to include unrelated cleanup and
+observation state.
+
+The live implementation already has the corresponding structural rules:
+`kernel::job::State` accepts its parent only once and rejects process-limit
+relaxation, while the capability registry checks admission through the complete
+ancestor chain. Existing host and runtime tests exercise hierarchy, tightening,
+assignment, and fork/job behavior; this phase formalizes the architecture rather
+than changing the syscall ABI.
 
 ## Relationship to implementation
 
 Formal actions should map to narrow implementation operations rather than whole
-syscall handlers. The preferred direction is to consolidate common capability
-table and rights logic so the correspondence remains obvious:
+syscall handlers:
 
 ```text
-formal action                 implementation concept
--------------                 ----------------------
-Close                         close one handle
-Duplicate                     duplicate with attenuated rights
-Replace                       atomically replace with attenuated rights
-MoveTransfer                  commit an ownership-consuming transfer
-HandleGeneration.Open         install an opaque handle in a free slot
-HandleGeneration.Close        retire that handle before slot reuse
-EndpointIPC.PlainSend         append a message without authority
-EndpointIPC.CopySend          append a rights-checked copied capability
-EndpointIPC.MoveSend          consume validated sources and append one message
-EndpointIPC.Receive           install all attachments and remove the FIFO head
+formal action                       implementation concept
+-------------                       ----------------------
+Close                               close one capability handle
+Duplicate                           duplicate with attenuated rights
+Replace                             atomically replace with attenuated rights
+MoveTransfer                        commit an ownership-consuming transfer
+HandleGeneration.Open               install an opaque handle in a free slot
+HandleGeneration.Close              retire the opaque handle before slot reuse
+EndpointIPC.PlainSend               append a message without authority
+EndpointIPC.CopySend                append a rights-checked copied capability
+EndpointIPC.MoveSend                consume validated sources and append one message
+EndpointIPC.Receive                 install all attachments and remove the FIFO head
+JobContainment.CreateChildJob       create one immutable child-parent edge
+JobContainment.AssignDirectChild    assign an uncontained live direct child
+JobContainment.ForkProcess          inherit the parent's existing job containment
+JobContainment.TightenLimit         lower or retain subtree admission policy
 ```
 
 The formal models do not claim that the concrete Rust implementation has been
@@ -153,7 +140,7 @@ abstract implementation snapshots against model-generated traces.
 
 ## Verification levels
 
-NullStar distinguishes three different forms of assurance:
+NullStar distinguishes three forms of assurance:
 
 1. **Architecture model checking:** TLA+/TLC explores permitted state transitions
    and checks the security constitution for the modeled layer.
@@ -170,11 +157,17 @@ not a proof that the complete NullStar kernel implementation refines that model.
 
 ## Expansion order
 
-Capability core, generation-checked handle reuse, and endpoint transfer atomicity
-are the first three formal layers. The next intended layer is jobs: immutable
-hierarchy, non-relaxable membership, fork inheritance, subtree termination, and
-tightening-only resource policy. A later endpoint refinement can separately add
-peer closure and blocking/wakeup lifecycle semantics. Service generations and
-application sandboxing follow after jobs. MMIO, IRQ, DMA, mapped shared memory,
-and richer driver authority should be added only after the lower-level capability
-and containment rules have stable machine-checked models.
+The formal layers are intentionally incremental:
+
+1. capability core;
+2. generation-checked handles;
+3. endpoint transfer atomicity;
+4. job containment and non-escape;
+5. job lifecycle, termination, and drainage;
+6. service-generation isolation;
+7. application sandbox containment.
+
+A later endpoint refinement can separately add peer closure and blocking/wakeup
+lifecycle semantics. MMIO, IRQ, DMA, mapped shared memory, and richer driver
+authority should be added only after the lower-level capability and containment
+rules have stable machine-checked models.
