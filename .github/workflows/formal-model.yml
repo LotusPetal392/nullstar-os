@@ -74,3 +74,13 @@ jobs:
             -deadlock \
             -config formal/EndpointIPC.cfg \
             formal/EndpointIPC.tla
+
+      - name: Parse job containment model
+        run: java -cp "$TLA_TOOLS_JAR" tla2sany.SANY formal/JobContainment.tla
+
+      - name: Check job containment invariants
+        run: |
+          java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC \
+            -deadlock \
+            -config formal/JobContainment.cfg \
+            formal/JobContainment.tla
