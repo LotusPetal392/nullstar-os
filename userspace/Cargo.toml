@@ -149,6 +149,18 @@ test = false
 bench = false
 
 [[bin]]
+name = "application_component_target"
+path = "src/bin/application_component_target.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "application_launch_probe"
+path = "src/bin/application_launch_probe.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "stderr_probe"
 path = "src/bin/stderr_probe.rs"
 test = false

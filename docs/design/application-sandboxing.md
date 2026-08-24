@@ -986,6 +986,11 @@ a system generation is activated.
 
 ## Implementation sequence
 
+The native implementation currently provides the launch-boundary and reduced-component portions of
+Milestone 1: clean descriptor/capability tables, bounded application jobs, typed root startup, and
+explicit rights-monotonic `desktop-child`/`worker` allowlists. Stable verified identity, private
+storage, restricted namespaces, and general application-manager routing remain outstanding.
+
 ### Milestone 1: mandatory application isolation
 
 - stable application identity;

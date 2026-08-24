@@ -197,6 +197,7 @@ fn platform_probe(argument: &[u8], process_id: u64) -> bool {
         || !event_probe()
         || !runtime_context_probe()
         || !process_start_data_probe()
+        || !application_component_probe()
         || !async_ipc_probe(process_id)
         || !job_probe()
     {
@@ -494,6 +495,19 @@ fn process_start_data_probe() -> bool {
         && decoded.environment.find(b"LANG") == Some(&b"C.UTF-8"[..])
         && decoded.environment.find(b"MODE") == Some(&b"probe"[..])
         && decoded.launch == launch
+}
+
+fn application_component_probe() -> bool {
+    let Ok(child) = syscall::fork() else {
+        return false;
+    };
+    if child == 0 {
+        if syscall::execve(b"/application-launch-probe").is_err() {
+            syscall::exit(126);
+        }
+        syscall::exit(127)
+    }
+    syscall::wait_child(child).is_ok_and(|status| status.success())
 }
 
 fn wait_set_probe() -> bool {

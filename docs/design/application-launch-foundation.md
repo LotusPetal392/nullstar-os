@@ -2,8 +2,8 @@
 
 ## Status
 
-This document describes the **implemented first step** toward the application-sandbox architecture.
-It is intentionally narrower than the complete design in
+This document describes the **implemented launch and reduced-component foundation** for the
+application-sandbox architecture. It is intentionally narrower than the complete design in
 [`application-sandboxing.md`](application-sandboxing.md).
 
 The current implementation provides a native mediated launch primitive with:
@@ -14,7 +14,9 @@ The current implementation provides a native mediated launch primitive with:
 - one receive-only bootstrap capability installed at process-local slot 1;
 - typed `NSPC` startup capabilities with receiver-side kind and rights ceilings;
 - authenticated `NSPD` descriptive application identity and launch metadata;
-- distinct `desktop`, `desktop-child`, and `worker` profile identities; and
+- distinct `desktop`, `desktop-child`, and `worker` profile identities;
+- manager-mediated `desktop-child` and `worker` spawning from explicit, rights-monotonic
+  capability allowlists; and
 - a mandatory application entry wrapper that validates startup before application code executes.
 
 It does **not** yet provide a complete desktop application manager, package verifier, private storage
@@ -69,6 +71,11 @@ non-relaxable under the existing kernel job model, and later `fork` descendants 
 containment.
 
 The returned `ApplicationInstance` retains the manager's job authority together with the process ID.
+Reduced components are assigned to that same job before release, so a component request cannot
+relax the root application's containment or process limit. Each component still repeats the complete
+descriptor/capability scrub and receives a fresh bootstrap endpoint rather than inheriting the root
+process's tables.
+
 Dropping the job handle is not an implicit application kill: the kernel roots a job while members are
 alive. A future application-manager lifecycle layer must retain the handle when it needs explicit
 termination, completion drainage, and supervision.
@@ -102,6 +109,32 @@ The kernel IPC message limit currently bounds one startup envelope to four attac
 Larger application baselines will require either multiple authenticated startup records or a
 restricted namespace/provider endpoint rather than increasing ambient launch authority without a
 protocol.
+
+## Reduced component spawning
+
+The manager-owned `ApplicationInstance` retains an immutable description of the root launch's
+authority ceiling plus rights-bounded duplicates of sources opted into component delegation. The
+duplicates keep those source objects stable even if the caller later closes its original handle.
+Each root capability is non-delegable by default. The manager must opt it into the `desktop-child`,
+`worker`, or both reduced profiles, and each component launch supplies an explicit allowlist.
+
+Before creating a process, `spawn_component` verifies that:
+
+- the existing root uses the `desktop` profile and the requested profile is `desktop-child` or
+  `worker`;
+- package, application, user, session, package-generation, and manager-generation identity remain
+  fixed while the component identifier changes;
+- each requested role names the exact manager-owned source capability retained in the root ceiling;
+- the source capability was explicitly marked delegable to the requested component profile;
+- requested rights are equal to or narrower than the root's rights;
+- roles are unique and all handles and rights descriptions are nonempty; and
+- the component does not reproduce the complete root authority set unchanged.
+
+Successful components run in the existing application job. The manager duplicates only the listed
+sources into the component's typed startup envelope, and the component runtime applies its own policy
+ceiling before application code runs. A rejected request creates no process. A failure after creation
+terminates and reaps only that candidate component; it does not implicitly terminate healthy members
+of the existing application job.
 
 ## Descriptive identity is not authority
 
@@ -146,8 +179,8 @@ The launch path fails closed around the security boundary:
 - descriptor or capability scrubbing failure terminates the child before acknowledgment;
 - the parent does not grant bootstrap authority before receiving the isolation acknowledgment;
 - job-assignment failure terminates and reaps the child;
-- startup-message or process-start-data failure terminates the application job and child;
-- release-barrier failure terminates the application job and child;
+- startup-message, process-start-data, or release-barrier failure terminates and reaps the candidate
+  child;
 - malformed bootstrap authority, unexpected initial capability slots, invalid typed authority, or
   invalid descriptive launch data causes the application entry wrapper to exit before application
   code runs.
@@ -161,6 +194,8 @@ receiver cannot continue from a partially observed authority or descriptive stat
 refining several of its assumptions:
 
 - `Launch` -> descriptor/capability scrub, job assignment, and one bootstrap channel;
+- `SpawnChild` -> explicit same-application component allowlists intersected with a retained root
+  authority ceiling and profile-specific delegation policy;
 - `BootstrapGrant` -> explicit typed `NSPC` capability attachments;
 - `AuthorityWithinCeiling` -> receiver-side `StartupCapabilityPolicy` rights reduction;
 - `IdentityIsNotAuthority` -> separate `NSPD` descriptive identity and capability-bearing `NSPC`
@@ -175,15 +210,13 @@ refines the TLA+ module.
 The launch foundation is intentionally small enough to become the common mechanism beneath a future
 application manager. The next useful layers are:
 
-1. **Reduced component spawning** — construct `desktop-child` and `worker` children from explicit
-   capability allowlists instead of inheriting the main component's complete context.
-2. **Stable verified application identity** — package/application identity, signing lineage,
+1. **Stable verified application identity** — package/application identity, signing lineage,
    installation provenance, and authorized profile selection.
-3. **Private storage and restricted namespace construction** — bundle/data/cache/temp/runtime roots
+2. **Private storage and restricted namespace construction** — bundle/data/cache/temp/runtime roots
    and removal of ambient global-path authority for native applications.
-4. **Baseline service routing** — restricted display, lifecycle, settings, logging, audio playback,
+3. **Baseline service routing** — restricted display, lifecycle, settings, logging, audio playback,
    portal, and service-namespace endpoints.
-5. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
+4. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
    relaunch policy, and user/session teardown.
-6. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
+5. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
    resource and device policy.
