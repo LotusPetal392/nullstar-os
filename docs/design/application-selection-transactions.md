@@ -76,9 +76,8 @@ send-only application-to-broker channel.
 
 ## Remaining work
 
-1. Add the live forwarding adapter with canonical request validation and a rooted node map.
-2. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
-3. Close active brokers on grant revocation, session expiry, provider replacement, or resource
+1. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
+2. Close active brokers on grant revocation, session expiry, provider replacement, or resource
    removal.
-4. Implement crash-safe transactional permission persistence.
-5. Implement the portal/compositor transport and trusted picker UI.
+3. Implement crash-safe transactional permission persistence.
+4. Implement the portal/compositor transport and trusted picker UI.

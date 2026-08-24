@@ -266,6 +266,13 @@ impl ApplicationResourceBroker {
         self.endpoint.borrow()
     }
 
+    pub(crate) fn try_receive(
+        &self,
+        output: &mut [u8],
+    ) -> ipc::Result<crate::handle::ReceivedMessage> {
+        self.endpoint.try_receive(output)
+    }
+
     pub fn authorize_operation(
         &self,
         operation: u16,

@@ -356,8 +356,8 @@ node IDs separate from persistent resource identity. Its exact application-facin
 
 Application file and directory capabilities reuse this protocol behind a fresh per-authorization
 send-only ingress. The broker applies a grant-right operation ceiling before translating its rooted,
-broker-local node namespace to provider sessions. The endpoint ownership and incomplete forwarding
-boundary are documented in
+broker-local node namespace and private shared-memory mirrors to provider sessions. The endpoint
+ownership and live forwarding boundary are documented in
 [Application resource capability adapter](design/application-resource-capabilities.md).
 
 ## Migration sequence

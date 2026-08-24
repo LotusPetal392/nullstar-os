@@ -4,11 +4,23 @@
 use core::mem::size_of;
 
 use userspace::{
+    application_identity::{
+        ApplicationInstallScope, ApplicationInstallation, ApplicationLaunchSelection,
+        ApplicationProfile, ApplicationProfileSet, ApplicationTrustClass, AuthorizedApplication,
+        InstalledApplicationComponent, PackageVerification, authorize_application_launch,
+    },
     application_permission::{
-        ApplicationResourceKind, ApplicationResourceResolveError, ApplicationResourceResolver,
+        ApplicationGrantRights, ApplicationGrantScope, ApplicationPermissionStore,
+        ApplicationResourceIdentity, ApplicationResourceKind, ApplicationResourceResolveError,
+        ApplicationResourceResolver,
+    },
+    application_resource::ApplicationResourceBroker,
+    application_resource_forwarding::{
+        ApplicationResourceForwardOutcome, ApplicationResourceForwarder,
     },
     args::Args,
     filesystem::{self, Error, Node, protocol},
+    handle::{Endpoint, OwnedHandle, SharedMemory},
     ipc::{self, ObjectKind, Rights},
     nullfs_primary_volume, syscall,
 };
@@ -231,6 +243,9 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     {
         syscall::exit(21);
     }
+    if !application_resource_forwarding_probe(service, welcome_identity) {
+        syscall::exit(63);
+    }
 
     if session.detach_shared_buffer(23, BUFFER_ID).is_err() || session.disconnect(24).is_err() {
         syscall::exit(22);
@@ -429,6 +444,189 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
     }
 
     syscall::exit(0)
+}
+
+fn application_resource_forwarding_probe(
+    service: u64,
+    resource: ApplicationResourceIdentity,
+) -> bool {
+    let Some(application) = forwarding_application() else {
+        return false;
+    };
+    let mut store = ApplicationPermissionStore::new();
+    if store
+        .issue(
+            application,
+            resource,
+            ApplicationGrantRights::READ,
+            ApplicationGrantScope::Session,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(grant) = store.authorize(application, resource, ApplicationGrantRights::READ) else {
+        return false;
+    };
+    let Ok((broker, client)) = ApplicationResourceBroker::mint(grant) else {
+        return false;
+    };
+    let Ok(provider_session) = filesystem::connect_service(service, 200) else {
+        return false;
+    };
+    let provider_root = Node::root(provider_session);
+    let Ok(provider_file) = provider_session.lookup_node(201, provider_root, b"welcome.txt") else {
+        return false;
+    };
+    let Ok(mut forwarder) =
+        ApplicationResourceForwarder::new(broker, provider_session, provider_file)
+    else {
+        return false;
+    };
+
+    let Ok((reply_endpoint, reply_sender)) = OwnedHandle::<Endpoint>::create_pair() else {
+        return false;
+    };
+    let Ok(connect) = filesystem::connect(202) else {
+        return false;
+    };
+    if client
+        .endpoint()
+        .send_move(bytes_of(&connect), reply_sender, Rights::SEND)
+        .is_err()
+        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+    {
+        return false;
+    }
+    let Some((client_session, connect_reply)) = receive_forwarded_reply(&reply_endpoint, &connect)
+        .and_then(|reply| filesystem::Session::from_reply(&reply).map(|session| (session, reply)))
+    else {
+        return false;
+    };
+    if connect_reply.node_id != protocol::ROOT_NODE_ID || client_session.is_writable() {
+        return false;
+    }
+
+    let Ok(shared) = OwnedHandle::<SharedMemory>::create(BUFFER_BYTES) else {
+        return false;
+    };
+    let Ok(retained) = shared.duplicate(Rights::READ.union(Rights::WRITE)) else {
+        return false;
+    };
+    let Ok(attach) = client_session.attach_buffer(203, BUFFER_ID, BUFFER_BYTES) else {
+        return false;
+    };
+    if client
+        .endpoint()
+        .send_move(bytes_of(&attach), shared, Rights::READ.union(Rights::WRITE))
+        .is_err()
+        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+        || receive_forwarded_reply(&reply_endpoint, &attach).is_none()
+    {
+        return false;
+    }
+
+    let client_file = Node::root(client_session);
+    let bulk = protocol::BulkBuffer {
+        buffer_id: BUFFER_ID,
+        offset: 0,
+        length: 128,
+    };
+    let Ok(read) = client_session.read(204, client_file, 0, bulk) else {
+        return false;
+    };
+    if client.endpoint().send(bytes_of(&read)).is_err()
+        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+        || receive_forwarded_reply(&reply_endpoint, &read)
+            .is_none_or(|reply| reply.value != WELCOME.len() as u64)
+    {
+        return false;
+    }
+    let mut bytes = [0_u8; WELCOME.len()];
+    if retained.read(0, &mut bytes).ok() != Some(bytes.len()) || bytes != WELCOME {
+        return false;
+    }
+
+    let Ok(attributes) = client_session.request(protocol::operation::GET_ATTRIBUTES, 205) else {
+        return false;
+    };
+    let mut attributes = attributes;
+    attributes.node_id = client_file.id();
+    if client.endpoint().send(bytes_of(&attributes)).is_err()
+        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+        || receive_forwarded_reply(&reply_endpoint, &attributes)
+            .is_none_or(|reply| reply.node_id != protocol::ROOT_NODE_ID)
+    {
+        return false;
+    }
+
+    let Ok(disconnect) = client_session.request(protocol::operation::DISCONNECT, 206) else {
+        return false;
+    };
+    client.endpoint().send(bytes_of(&disconnect)).is_ok()
+        && forwarder.forward_one() == Ok(ApplicationResourceForwardOutcome::Disconnected)
+        && receive_forwarded_reply(&reply_endpoint, &disconnect).is_some()
+        && forwarder.disconnected()
+}
+
+fn receive_forwarded_reply(
+    endpoint: &OwnedHandle<Endpoint>,
+    request: &protocol::Request,
+) -> Option<protocol::Reply> {
+    let mut bytes = [0_u8; size_of::<protocol::Reply>()];
+    let message = ipc::receive(endpoint.as_raw(), &mut bytes).ok()?;
+    if message.bytes != bytes.len() || message.capability.is_some() {
+        return None;
+    }
+    let reply = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const protocol::Reply) };
+    filesystem::valid_reply(request, &reply).then_some(reply)
+}
+
+fn forwarding_application() -> Option<AuthorizedApplication> {
+    const COMPONENT: u64 = 301;
+    let components = [InstalledApplicationComponent::new(
+        COMPONENT,
+        b"/nullfs-probe",
+        ApplicationProfileSet::DESKTOP,
+        true,
+    )];
+    authorize_application_launch(
+        PackageVerification {
+            package: 302,
+            package_generation: 303,
+            application: 304,
+            publisher: 305,
+            signing_lineage: 306,
+            trust_class: ApplicationTrustClass::Repository,
+            system_application: false,
+            components: &components,
+        },
+        ApplicationInstallation {
+            installation: 307,
+            package: 302,
+            package_generation: 303,
+            application: 304,
+            publisher: 305,
+            signing_lineage: 306,
+            trust_class: ApplicationTrustClass::Repository,
+            scope: ApplicationInstallScope::User,
+            owner_user: 308,
+            system_application: false,
+        },
+        ApplicationLaunchSelection {
+            component: COMPONENT,
+            user: 308,
+            session: 309,
+            profile: ApplicationProfile::Desktop,
+        },
+    )
+    .ok()
+}
+
+fn bytes_of<T>(value: &T) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+    }
 }
 
 #[derive(Clone, Copy)]
