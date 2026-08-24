@@ -417,11 +417,32 @@ impl Session {
         request: &protocol::Request,
         transfer: Option<Transfer>,
     ) -> Result<protocol::Reply, Error> {
+        let reply = self.exchange_protocol(request, transfer, false)?;
+        reply_result(reply)
+    }
+
+    /// Exchanges one already-canonical protocol request for broker adapters that must preserve
+    /// provider status values while rewriting session and node identities.
+    pub(crate) fn exchange_protocol(
+        self,
+        request: &protocol::Request,
+        transfer: Option<Transfer>,
+        mutation: bool,
+    ) -> Result<protocol::Reply, Error> {
         if self.service == 0 || self.reply_endpoint == 0 {
             return Err(Error::Transport);
         }
-        ipc::send(self.service, bytes_of(request), transfer).map_err(|_| Error::Transport)?;
-        receive_reply(self.reply_endpoint, request)
+        if ipc::send(self.service, bytes_of(request), transfer).is_err() {
+            return Err(if mutation {
+                Error::OutcomeUnknown
+            } else {
+                Error::Transport
+            });
+        }
+        match receive_protocol_reply(self.reply_endpoint, request) {
+            Err(Error::Transport) if mutation => Err(Error::OutcomeUnknown),
+            result => result,
+        }
     }
 
     fn mutation_exchange(
@@ -432,8 +453,10 @@ impl Session {
         if self.service == 0 || self.reply_endpoint == 0 {
             return Err(Error::Transport);
         }
-        ipc::send(self.service, bytes_of(request), transfer).map_err(|_| Error::Transport)?;
-        mutation_reply_result(receive_reply(self.reply_endpoint, request))
+        mutation_reply_result(
+            self.exchange_protocol(request, transfer, false)
+                .and_then(reply_result),
+        )
     }
 
     pub fn request(self, operation: u16, request_id: u64) -> Result<protocol::Request, Error> {
@@ -626,11 +649,23 @@ impl Node {
         }
     }
 
+    pub(crate) const fn from_id(session: Session, id: u64) -> Option<Self> {
+        if id == protocol::INVALID_ID {
+            None
+        } else {
+            Some(Self {
+                id,
+                session_id: session.id,
+                generation: session.generation,
+            })
+        }
+    }
+
     pub const fn id(self) -> u64 {
         self.id
     }
 
-    fn id_for(self, session: Session) -> Result<u64, Error> {
+    pub(crate) fn id_for(self, session: Session) -> Result<u64, Error> {
         if self.id == protocol::INVALID_ID {
             Err(Error::InvalidNode)
         } else if self.session_id != session.id || self.generation != session.generation {
@@ -965,6 +1000,13 @@ fn receive_reply(
     endpoint: CapabilityHandle,
     request: &protocol::Request,
 ) -> Result<protocol::Reply, Error> {
+    reply_result(receive_protocol_reply(endpoint, request)?)
+}
+
+fn receive_protocol_reply(
+    endpoint: CapabilityHandle,
+    request: &protocol::Request,
+) -> Result<protocol::Reply, Error> {
     let mut bytes = [0_u8; size_of::<protocol::Reply>()];
     let message = ipc::receive(endpoint, &mut bytes).map_err(|_| Error::Transport)?;
     if message.capability.is_some() || message.bytes != bytes.len() {
@@ -974,6 +1016,10 @@ fn receive_reply(
     if !valid_reply(request, &reply) {
         return Err(Error::Transport);
     }
+    Ok(reply)
+}
+
+fn reply_result(reply: protocol::Reply) -> Result<protocol::Reply, Error> {
     match reply.status {
         protocol::status::OK => Ok(reply),
         protocol::status::NOT_FOUND => Err(Error::NotFound),

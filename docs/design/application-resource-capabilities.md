@@ -8,10 +8,10 @@ channel pair with distinct endpoint identities for every authorization. The brok
 `RECEIVE | WAIT`; the portal stages one non-duplicable `SEND | TRANSFER` peer and moves it to the
 application with exact `SEND`.
 
-The adapter currently defines endpoint ownership, portal binding, and the generic-filesystem
-operation ceiling. It does not yet forward requests to a live filesystem session, restore a stored
-identity to a current node, run a standalone broker process, or tear down a live endpoint when its
-grant is revoked.
+The adapter now defines endpoint ownership, portal binding, the generic-filesystem operation ceiling,
+and live forwarding to a dedicated provider session. It does not yet restore a stored identity to a
+current node, run a standalone broker process, or tear down a live endpoint when its grant is
+revoked.
 
 ## Capability topology
 
@@ -65,12 +65,30 @@ to a terminal response fails validation.
 Unknown operations and `RESOLVE_IDENTITY` are denied. No operation maps to execute authority.
 Malformed or contradictory operation flags fail before rights are considered.
 
-This gate is one layer of the broker, not a complete request validator. The forwarding adapter must
-also enforce the generic protocol's canonical wire shape, session generation, attached-buffer
-ownership and bounds, and a broker-local opaque node namespace. For a selected file, that namespace
-contains only the selected file. For a selected directory, every child node must originate from a
-relative lookup beneath the selected root; caller-supplied provider node IDs, absolute paths, `.` and
-`..` cannot enter the mapping.
+The live forwarding layer additionally enforces the generic protocol's canonical wire shape, grant-
+scoped session generation, attached-buffer ownership and bounds, and a broker-local opaque node
+namespace. For a selected file, that namespace begins with only the selected file. For a selected
+directory, every child node must originate from a relative lookup or directory entry beneath the
+selected root; caller-supplied provider node IDs, absolute paths, `.` and `..` cannot enter the
+mapping. Symbolic-link nodes are rejected at this boundary until a provider-independent rooted-link
+policy exists.
+
+## Live forwarding boundary
+
+`ApplicationResourceForwarder` binds one immutable grant, one broker ingress, one selected provider
+node, and one dedicated provider session. It validates each complete 184-byte request before policy
+authorization, translates only node IDs found in its 64-entry table, preserves canonical provider
+statuses, and rewrites returned node IDs and inline attributes into the grant-local namespace.
+
+Application shared memory is not retransferred to the provider. The application transfers exact
+`READ | WRITE` authority to the broker, which allocates one same-sized private mirror, attaches that
+mirror to the provider session, and copies only the validated request range. Four mirrors of at most
+4096 bytes are allowed. Writes and rename names copy inward before dispatch; reads and rewritten
+directory entries copy outward only after a canonical successful provider reply. Mutation transport
+failure becomes `OUTCOME_UNKNOWN`.
+
+The generic `RESOLVE_IDENTITY` operation remains unavailable through application endpoints. Stable
+identity is portal policy metadata, not an application-visible escape from the rooted node map.
 
 ## Grant and endpoint lifetime
 
@@ -89,18 +107,20 @@ policy operation.
 
 ## Coverage
 
-Host tests exercise file and directory operation matrices, writable-session denial, unsupported
-stable-identity queries, and open-flag escalation. Portal tests validate missing, unexpected,
-wrong-kind, and over-righted attachments. The freestanding application probe creates a real endpoint,
+Host tests exercise file and directory operation matrices, canonical request/name/buffer validation,
+writable-session denial, unsupported stable-identity queries, and open-flag escalation. Portal tests
+validate missing, unexpected, wrong-kind, and over-righted attachments. The freestanding application probe creates a real endpoint,
 checks both local rights sets and object identity, move-transfers the application side with exact
 `SEND`, rejects receive authority on the application side and send authority on the broker side, and
 delivers a message through the resulting one-way channel. It first forces transfer failure through a
 closed portal peer and verifies that grant records and counters remain unchanged before retrying.
+The full NullFS probe additionally binds a read grant to `welcome.txt`, connects through the broker,
+attaches mirrored shared memory, reads live bytes, verifies broker-root attribute rewriting, and
+disconnects both sessions.
 
 ## Next steps
 
-1. Add the live forwarding adapter with canonical request validation and a rooted node map.
-2. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
-3. Close active brokers on grant revocation, session expiry, provider replacement, or resource
+1. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
+2. Close active brokers on grant revocation, session expiry, provider replacement, or resource
    removal.
-4. Implement the portal/compositor transport and trusted picker UI.
+3. Implement the portal/compositor transport and trusted picker UI.

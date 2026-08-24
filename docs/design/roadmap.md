@@ -167,8 +167,10 @@ authority to `RECEIVE | WAIT`, application authority to exact `SEND`, bind selec
 minted grant, validate transferred kernel kind/rights, and gate generic filesystem operations against
 the grant ceiling. Selection completion now preflights grant issuance or authorization, owns it with
 the endpoint pair and response, commits only after a successful atomic move-transfer, and leaves no
-record, counter, or one-shot consumption behind on failure. Rooted live-I/O forwarding,
-stored-identity restoration, active revocation, compositor and portal transports, the picker UI, and
+record, counter, or one-shot consumption behind on failure. Grant-local live I/O now validates the
+canonical generic filesystem wire shape, forwards through private shared-memory mirrors, and rewrites
+all provider nodes through a bounded rooted map. Stored-identity restoration, active revocation,
+compositor and portal transports, the picker UI, and
 transactional persistence are the next portal increments.
 
 1. require every graphical bundle to launch through the application manager regardless
