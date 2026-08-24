@@ -8,6 +8,7 @@ use crate::application_identity::{
     ApplicationInstallScope, ApplicationProfile, ApplicationTrustClass, AuthorizedApplication,
     StableApplicationPrincipal,
 };
+use crate::filesystem::{self, Node, Session};
 
 pub const MAX_APPLICATION_GRANTS: usize = 64;
 pub const APPLICATION_GRANT_RECORD_BYTES: usize = 128;
@@ -76,6 +77,82 @@ impl ApplicationResourceIdentity {
     pub const fn kind(self) -> ApplicationResourceKind {
         self.kind
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationResourceResolveError {
+    Filesystem(filesystem::Error),
+    InvalidIdentity,
+    FilesystemMismatch,
+    UnsupportedKind,
+    KindMismatch,
+}
+
+/// Resolves generation-scoped provider nodes into persistent application resource identities.
+///
+/// Authority comes from the live filesystem session. The expected UUID must come from trusted mount
+/// selection rather than from the provider reply being validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationResourceResolver {
+    session: Session,
+    expected_filesystem_uuid: [u8; 16],
+}
+
+impl ApplicationResourceResolver {
+    pub fn new(session: Session, expected_filesystem_uuid: [u8; 16]) -> Option<Self> {
+        if expected_filesystem_uuid == [0; 16] {
+            return None;
+        }
+        Some(Self {
+            session,
+            expected_filesystem_uuid,
+        })
+    }
+
+    pub const fn expected_filesystem_uuid(self) -> [u8; 16] {
+        self.expected_filesystem_uuid
+    }
+
+    pub fn resolve(
+        self,
+        request_id: u64,
+        node: Node,
+        expected_kind: ApplicationResourceKind,
+    ) -> Result<ApplicationResourceIdentity, ApplicationResourceResolveError> {
+        let identity = self
+            .session
+            .stable_identity(request_id, node)
+            .map_err(ApplicationResourceResolveError::Filesystem)?;
+        validate_resolved_identity(self.expected_filesystem_uuid, identity, expected_kind)
+    }
+}
+
+fn validate_resolved_identity(
+    expected_filesystem_uuid: [u8; 16],
+    identity: filesystem::protocol::StableNodeIdentity,
+    expected_kind: ApplicationResourceKind,
+) -> Result<ApplicationResourceIdentity, ApplicationResourceResolveError> {
+    if !identity.canonical() {
+        return Err(ApplicationResourceResolveError::InvalidIdentity);
+    }
+    if identity.filesystem_uuid != expected_filesystem_uuid {
+        return Err(ApplicationResourceResolveError::FilesystemMismatch);
+    }
+    let kind = match identity.kind {
+        filesystem::protocol::node_kind::FILE => ApplicationResourceKind::File,
+        filesystem::protocol::node_kind::DIRECTORY => ApplicationResourceKind::Directory,
+        _ => return Err(ApplicationResourceResolveError::UnsupportedKind),
+    };
+    if kind != expected_kind {
+        return Err(ApplicationResourceResolveError::KindMismatch);
+    }
+    ApplicationResourceIdentity::new(
+        identity.filesystem_uuid,
+        identity.object_id,
+        identity.object_generation,
+        kind,
+    )
+    .ok_or(ApplicationResourceResolveError::InvalidIdentity)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,6 +1026,55 @@ mod tests {
                 .valid_for(ApplicationResourceKind::Directory)
         );
         assert!(!ApplicationGrantRights::EMPTY.valid_for(ApplicationResourceKind::Directory));
+    }
+
+    #[test]
+    fn resource_resolution_pins_volume_generation_and_kind() {
+        let filesystem_uuid = [0x51; 16];
+        let stable = filesystem::protocol::StableNodeIdentity::new(
+            filesystem_uuid,
+            41,
+            43,
+            filesystem::protocol::node_kind::FILE,
+        )
+        .unwrap();
+        let resolved =
+            validate_resolved_identity(filesystem_uuid, stable, ApplicationResourceKind::File)
+                .unwrap();
+        assert_eq!(resolved.filesystem_uuid(), filesystem_uuid);
+        assert_eq!(resolved.object_id(), 41);
+        assert_eq!(resolved.object_generation(), 43);
+        assert_eq!(resolved.kind(), ApplicationResourceKind::File);
+
+        assert_eq!(
+            validate_resolved_identity([0x52; 16], stable, ApplicationResourceKind::File),
+            Err(ApplicationResourceResolveError::FilesystemMismatch)
+        );
+        assert_eq!(
+            validate_resolved_identity(filesystem_uuid, stable, ApplicationResourceKind::Directory),
+            Err(ApplicationResourceResolveError::KindMismatch)
+        );
+        let symlink = filesystem::protocol::StableNodeIdentity::new(
+            filesystem_uuid,
+            41,
+            43,
+            filesystem::protocol::node_kind::SYMBOLIC_LINK,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_resolved_identity(filesystem_uuid, symlink, ApplicationResourceKind::File),
+            Err(ApplicationResourceResolveError::UnsupportedKind)
+        );
+        let mut noncanonical = stable;
+        noncanonical.reserved[0] = 1;
+        assert_eq!(
+            validate_resolved_identity(
+                filesystem_uuid,
+                noncanonical,
+                ApplicationResourceKind::File,
+            ),
+            Err(ApplicationResourceResolveError::InvalidIdentity)
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub mod operation {
     pub const TRUNCATE: u16 = 17;
     pub const RMDIR: u16 = 18;
     pub const SYNC: u16 = 19;
+    pub const RESOLVE_IDENTITY: u16 = 20;
 }
 
 pub mod lifecycle {
@@ -406,4 +407,65 @@ impl NodeAttributes {
         link_count: 0,
         flags: 0,
     };
+}
+
+/// Stable provider-owned identity for one generation-scoped node.
+///
+/// `node_id` values in requests and replies are session/provider-generation opaque. This record is
+/// the explicit bridge to persistent resource identity and must be returned only by a provider that
+/// owns the named filesystem UUID and object namespace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StableNodeIdentity {
+    pub filesystem_uuid: [u8; 16],
+    pub object_id: u64,
+    pub object_generation: u64,
+    pub kind: u16,
+    pub reserved: [u16; 3],
+}
+
+impl StableNodeIdentity {
+    pub const EMPTY: Self = Self {
+        filesystem_uuid: [0; 16],
+        object_id: INVALID_ID,
+        object_generation: 0,
+        kind: node_kind::UNKNOWN,
+        reserved: [0; 3],
+    };
+
+    pub fn new(
+        filesystem_uuid: [u8; 16],
+        object_id: u64,
+        object_generation: u64,
+        kind: u16,
+    ) -> Option<Self> {
+        if filesystem_uuid == [0; 16]
+            || object_id == INVALID_ID
+            || object_generation == 0
+            || !matches!(
+                kind,
+                node_kind::FILE | node_kind::DIRECTORY | node_kind::SYMBOLIC_LINK
+            )
+        {
+            return None;
+        }
+        Some(Self {
+            filesystem_uuid,
+            object_id,
+            object_generation,
+            kind,
+            reserved: [0; 3],
+        })
+    }
+
+    pub fn canonical(self) -> bool {
+        self.reserved == [0; 3]
+            && Self::new(
+                self.filesystem_uuid,
+                self.object_id,
+                self.object_generation,
+                self.kind,
+            )
+            .is_some()
+    }
 }

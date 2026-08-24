@@ -89,15 +89,14 @@ application subject, resource kind, rights, and scope as the admitted request. T
 implementation from accidentally returning another application's grant, a directory for a file
 operation, broadened/reduced rights, or a differently scoped authorization.
 
-Capability cardinality does not yet validate the transferred object's type, rights, provider
-generation, or stable resource identity. Those checks belong to the filesystem resource resolver and
-endpoint adapter in the next increment.
+Capability cardinality does not yet validate the transferred object's type or rights. Stable
+filesystem identity resolution is now implemented, but the resource endpoint adapter remains the
+next increment.
 
 ## Next steps
 
-1. Expose NullFS object generation through an authenticated filesystem resolver.
-2. Resolve a picker selection to the exact filesystem UUID, object ID, generation, and kind.
-3. Issue the grant and mint one rights-reduced resource endpoint with failure-atomic cleanup.
-4. Implement the portal service transport using kernel-stamped sender identities and authenticated
+1. Issue the grant and mint one rights-reduced resource endpoint with failure-atomic cleanup.
+2. Resolve stored identities back to current live nodes without accepting pathname or inode reuse.
+3. Implement the portal service transport using kernel-stamped sender identities and authenticated
    compositor startup authority.
-5. Add a trusted picker UI and transactional permission persistence.
+4. Add a trusted picker UI and transactional permission persistence.

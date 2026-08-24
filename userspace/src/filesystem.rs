@@ -211,6 +211,22 @@ impl Session {
         })
     }
 
+    pub fn stable_identity(
+        self,
+        request_id: u64,
+        node: Node,
+    ) -> Result<protocol::StableNodeIdentity, Error> {
+        let mut request = self.request(protocol::operation::RESOLVE_IDENTITY, request_id)?;
+        request.node_id = node.id_for(self)?;
+        let reply = self.exchange(&request, None)?;
+        if usize::from(reply.data_length) != size_of::<protocol::StableNodeIdentity>() {
+            return Err(Error::Transport);
+        }
+        Ok(unsafe {
+            core::ptr::read_unaligned(reply.data.as_ptr() as *const protocol::StableNodeIdentity)
+        })
+    }
+
     pub fn attach_shared_buffer(
         self,
         request_id: u64,
@@ -739,6 +755,7 @@ pub fn valid_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool
             canonical_node_reply(reply, None)
         }
         protocol::operation::GET_ATTRIBUTES => canonical_attributes_reply(request, reply),
+        protocol::operation::RESOLVE_IDENTITY => canonical_stable_identity_reply(request, reply),
         protocol::operation::READ => canonical_count_reply(request, reply),
         protocol::operation::WRITE => canonical_write_reply(request, reply),
         protocol::operation::READ_DIRECTORY => canonical_directory_reply(request, reply),
@@ -828,6 +845,25 @@ fn canonical_attributes_reply(request: &protocol::Request, reply: &protocol::Rep
         core::ptr::read_unaligned(reply.data.as_ptr() as *const protocol::NodeAttributes)
     };
     attributes.node_id == reply.node_id && attributes.kind == reply.node_kind
+}
+
+fn canonical_stable_identity_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
+    if reply.flags != 0
+        || reply.node_id == protocol::INVALID_ID
+        || reply.node_id != request.node_id
+        || reply.value != 0
+        || usize::from(reply.data_length) != size_of::<protocol::StableNodeIdentity>()
+        || !defined_node_kind(reply.node_kind)
+        || reply.data[size_of::<protocol::StableNodeIdentity>()..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return false;
+    }
+    let identity = unsafe {
+        core::ptr::read_unaligned(reply.data.as_ptr() as *const protocol::StableNodeIdentity)
+    };
+    identity.canonical() && identity.kind == reply.node_kind
 }
 
 fn canonical_count_reply(request: &protocol::Request, reply: &protocol::Reply) -> bool {
@@ -1000,6 +1036,7 @@ mod tests {
         assert_eq!(size_of::<protocol::Request>(), 184);
         assert_eq!(size_of::<protocol::Reply>(), 136);
         assert_eq!(size_of::<protocol::NodeAttributes>(), 64);
+        assert_eq!(size_of::<protocol::StableNodeIdentity>(), 40);
         assert_eq!(size_of::<protocol::DirectoryEntry>(), 120);
     }
 
@@ -1544,6 +1581,33 @@ mod tests {
         assert!(!valid_reply(&request, &reply));
         reply.node_kind = attributes.kind;
         reply.data_length -= 1;
+        assert!(!valid_reply(&request, &reply));
+    }
+
+    #[test]
+    fn stable_identity_success_is_canonical_and_bound_to_the_requested_node() {
+        let session = session();
+        let mut request = session
+            .request(protocol::operation::RESOLVE_IDENTITY, 51)
+            .unwrap();
+        request.node_id = 42;
+        let identity =
+            protocol::StableNodeIdentity::new([0x51; 16], 7, 9, protocol::node_kind::FILE).unwrap();
+        let mut reply = reply_for(&request);
+        reply.node_id = request.node_id;
+        reply.node_kind = identity.kind;
+        reply.data_length = size_of::<protocol::StableNodeIdentity>() as u16;
+        reply.data[..size_of::<protocol::StableNodeIdentity>()]
+            .copy_from_slice(super::bytes_of(&identity));
+        assert!(valid_reply(&request, &reply));
+
+        reply.node_id += 1;
+        assert!(!valid_reply(&request, &reply));
+        reply.node_id = request.node_id;
+        reply.data[size_of::<protocol::StableNodeIdentity>()] = 1;
+        assert!(!valid_reply(&request, &reply));
+        reply.data[size_of::<protocol::StableNodeIdentity>()] = 0;
+        reply.data[16..24].fill(0);
         assert!(!valid_reply(&request, &reply));
     }
 

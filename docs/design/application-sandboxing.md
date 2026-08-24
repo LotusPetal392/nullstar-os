@@ -1028,10 +1028,10 @@ portal mediation remain outstanding.
 ### Milestone 2: file portal and permission store
 
 The stable resource-identity, canonical grant-record, bounded restoration, revocation, and reset
-foundation is implemented. Canonical open/save/directory requests and trusted gesture admission are
-also implemented. Compositor and portal transports, the picker UI, live resource resolution,
-authority issuance, transactional persistence, and compatibility projection remain future
-increments.
+foundation is implemented. Canonical open/save/directory requests, trusted gesture admission, and
+authenticated NullFS UUID/inode/generation resolution are also implemented. Compositor and portal
+transports, the picker UI, rights-reduced authority issuance, transactional persistence, restoration
+of stored identities, and compatibility projection remain future increments.
 
 - trusted window and user-gesture tokens;
 - open, save, directory-selection, drag-and-drop, and share portals;

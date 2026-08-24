@@ -5,7 +5,9 @@
 This document describes the implemented allocation-free policy foundation for application file and
 directory grants. Canonical portal requests and trusted user-gesture admission are now defined by the
 [application portal admission foundation](application-portal-admission.md). A trusted picker, live
-file/directory broker endpoint, and durable permission-store service remain outstanding.
+file/directory broker endpoint, and durable permission-store service remain outstanding. The
+[application filesystem resource resolver](application-resource-resolution.md) now supplies the
+stable UUID/object/generation identity required before grant issuance.
 
 The implementation provides:
 
@@ -62,10 +64,11 @@ changes. The object generation prevents a deleted inode number from retargeting 
 number is reused. Provider-process generation is deliberately excluded because restarting the same
 filesystem service must not invalidate the underlying resource.
 
-NullFS already maintains per-inode generations internally. The public filesystem protocol currently
-does not expose that generation in `NodeAttributes`; therefore a future portal broker must add an
-authenticated provider resolver before it can turn a stored identity back into live authority. It
-must fail closed if the UUID, object ID, object generation, or resource kind differs.
+NullFS exposes this tuple through the optional authenticated `RESOLVE_IDENTITY` filesystem operation.
+`ApplicationResourceResolver` pins the provider response to an independently expected volume UUID,
+rejects symbolic links, and requires the exact file/directory kind admitted by the portal. The
+resolver produces policy identity only; restoring the tuple to a live node and minting resource
+authority remain future work.
 
 ## Rights and scopes
 
@@ -103,9 +106,9 @@ atomically and compact tombstones only while preserving rollback/replay protecti
 
 ## Next steps
 
-1. Add authenticated filesystem resource resolution including UUID and inode generation.
-2. Mint rights-reduced file and directory broker endpoints from successful selections or restored
+1. Mint rights-reduced file and directory broker endpoints from successful selections or restored
    grants.
+2. Resolve stored identities back to current live nodes without accepting pathname or inode reuse.
 3. Implement the portal/compositor transports and trusted picker UI around the admission protocol.
 4. Persist checkpoint state transactionally and expose permission inspection, revocation, and reset.
 5. Extend the same policy foundation to drag-and-drop and share transfers.
