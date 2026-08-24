@@ -655,6 +655,7 @@ pub enum ApplicationPermissionLoadError {
 pub struct ApplicationGrantAuthorization {
     grant_id: u64,
     grant_revision: u64,
+    application_session: u64,
     subject: ApplicationGrantSubject,
     resource: ApplicationResourceIdentity,
     rights: ApplicationGrantRights,
@@ -668,6 +669,12 @@ impl ApplicationGrantAuthorization {
 
     pub const fn grant_revision(self) -> u64 {
         self.grant_revision
+    }
+
+    /// Launch session that received this live authorization. Persistent policy survives the
+    /// session, but an endpoint minted from it does not.
+    pub const fn application_session(self) -> u64 {
+        self.application_session
     }
 
     pub const fn subject(self) -> ApplicationGrantSubject {
@@ -929,6 +936,7 @@ impl ApplicationPermissionStore {
         let authorization = ApplicationGrantAuthorization {
             grant_id: record.id,
             grant_revision: record.revision,
+            application_session: authorization.identity().session,
             subject: record.subject,
             resource,
             rights: requested_rights,
@@ -1011,6 +1019,7 @@ impl ApplicationPermissionStore {
         let grant = ApplicationGrantAuthorization {
             grant_id: id,
             grant_revision: revision,
+            application_session: authorization.identity().session,
             subject,
             resource,
             rights,
@@ -1514,6 +1523,7 @@ mod tests {
         assert!(record.active());
         assert_eq!(record.id(), authorized.grant_id());
         assert_eq!(record.revision(), authorized.grant_revision());
+        assert_eq!(authorized.application_session(), 18);
         assert_eq!(record.rights(), authorized.rights());
         assert_eq!(record.scope(), ApplicationGrantScope::Session);
     }
@@ -1556,11 +1566,10 @@ mod tests {
             ApplicationTrustClass::Repository,
             ApplicationInstallScope::User,
         );
-        assert!(
-            persistent
-                .authorize(updated, selected, ApplicationGrantRights::ENUMERATE)
-                .is_ok()
-        );
+        let authorization = persistent
+            .authorize(updated, selected, ApplicationGrantRights::ENUMERATE)
+            .unwrap();
+        assert_eq!(authorization.application_session(), 20);
         let reused_inode = ApplicationResourceIdentity::new(
             selected.filesystem_uuid(),
             selected.object_id(),

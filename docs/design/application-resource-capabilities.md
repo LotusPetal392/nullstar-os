@@ -9,9 +9,9 @@ channel pair with distinct endpoint identities for every authorization. The brok
 application with exact `SEND`.
 
 The adapter now defines endpoint ownership, portal binding, the generic-filesystem operation ceiling,
-live forwarding to a dedicated provider session, and restoration of its root from stable identity.
-It does not yet run a standalone broker process or tear down a live endpoint when its grant is
-revoked.
+live forwarding to a dedicated provider session, restoration of its root from stable identity, and
+active teardown from authoritative lifecycle events. It does not yet run a standalone broker
+process.
 
 ## Capability topology
 
@@ -40,9 +40,10 @@ attachments carry their own transfer authority; the ingress itself does not need
 
 The portal's selected-response constructor now accepts the staged endpoint only when its immutable
 authority copy matches the exact grant ID, revision, subject, stable resource, rights, and scope used
-for the response. Receiver-side envelope validation additionally requires one kernel `Endpoint` with
-exact `SEND` rights. A notification, a broader endpoint, a missing endpoint, or a capability attached
-to a terminal response fails validation.
+for the response, including the launch session that receives the live endpoint. Receiver-side
+envelope validation additionally requires one kernel `Endpoint` with exact `SEND` rights. A
+notification, a broader endpoint, a missing endpoint, or a capability attached to a terminal
+response fails validation.
 
 ## Filesystem operation ceiling
 
@@ -95,10 +96,18 @@ identity is portal policy metadata, not an application-visible escape from the r
 ## Grant and endpoint lifetime
 
 The endpoint is live authority and the `NSPG` record is policy. A process cannot manufacture an
-endpoint by copying grant metadata. Conversely, revoking a stored record does not retroactively
-remove an immutable kernel handle. The future broker lifecycle must observe the exact grant revision,
-stop accepting new work, fail or safely drain pending work, close its ingress, and make the
-application observe peer closure. Reauthorization creates a fresh endpoint pair.
+endpoint by copying grant metadata. `ApplicationResourceForwarderRegistry` owns up to eight active
+forwarders and consumes committed grant-revocation, application-session-end, provider-replacement,
+and resource-removal events. It matches the immutable grant revision, launch session, stable resource
+identity, filesystem UUID, and provider generation as appropriate. Matching entries are removed and
+their broker ingress, application reply endpoint, and private buffers are dropped before a
+best-effort provider disconnect. The application therefore observes peer closure even when the old
+provider is unavailable. Reauthorization creates a fresh endpoint pair.
+
+A live authorization always records the launch session that received it. That runtime field is
+separate from persisted grant scope: persistent policy can authorize a later launch, but an endpoint
+from an ended launch session is still closed. A one-shot grant's `Consumed` tombstone deliberately
+does not invalidate the endpoint whose successful transfer consumed it.
 
 The [application selection transaction](application-selection-transactions.md) now preflights grant
 issuance or authorization without changing the store, then owns that deferred mutation with both
@@ -117,11 +126,11 @@ checks both local rights sets and object identity, move-transfers the applicatio
 delivers a message through the resulting one-way channel. It first forces transfer failure through a
 closed portal peer and verifies that grant records and counters remain unchanged before retrying.
 The full NullFS probe additionally binds a read grant to `welcome.txt`, connects through the broker,
-attaches mirrored shared memory, reads live bytes, verifies broker-root attribute rewriting, and
-disconnects both sessions.
+attaches mirrored shared memory, reads live bytes, verifies broker-root attribute rewriting, commits
+a user revocation, and confirms both provider disconnect and peer closure on the old application
+endpoint. Host tests cover exact lifecycle matching and malformed lifecycle identifiers.
 
 ## Next steps
 
-1. Close active brokers on grant revocation, session expiry, provider replacement, or resource
-   removal.
-2. Implement the portal/compositor transport and trusted picker UI.
+1. Implement the portal/compositor transport and trusted picker UI.
+2. Persist grants and revocation state transactionally.

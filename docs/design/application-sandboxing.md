@@ -519,7 +519,8 @@ event-bound trusted gesture policy are detailed in
 The implemented [Application resource capability adapter](application-resource-capabilities.md)
 creates one fresh endpoint per grant authorization, gives the application exact send-only authority,
 applies the grant's file/directory rights as a generic-filesystem operation ceiling, and forwards
-through a private rooted provider session. Revocation-driven endpoint teardown remains outstanding.
+through a private rooted provider session. A bounded live-forwarder registry closes that authority
+on grant revocation, launch-session end, provider replacement, or resource removal.
 
 ### Drag and drop and sharing
 

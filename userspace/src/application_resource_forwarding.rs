@@ -8,8 +8,9 @@ use core::{array, mem::size_of, slice};
 
 use crate::{
     application_permission::{
-        ApplicationGrantRights, ApplicationResourceKind, ApplicationResourceRestoreError,
-        ApplicationResourceRestorer,
+        ApplicationGrantAuthorization, ApplicationGrantRecord, ApplicationGrantRevocation,
+        ApplicationGrantRights, ApplicationGrantState, ApplicationResourceIdentity,
+        ApplicationResourceKind, ApplicationResourceRestoreError, ApplicationResourceRestorer,
     },
     application_resource::{
         ApplicationResourceAccess, ApplicationResourceAuthorizationError, ApplicationResourceBroker,
@@ -22,6 +23,104 @@ use crate::{
 pub const MAX_APPLICATION_RESOURCE_NODES: usize = 64;
 pub const MAX_APPLICATION_RESOURCE_BUFFERS: usize = 4;
 pub const MAX_APPLICATION_RESOURCE_BUFFER_BYTES: usize = 4096;
+pub const MAX_ACTIVE_APPLICATION_RESOURCE_FORWARDERS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationResourceForwarderId(u64);
+
+impl ApplicationResourceForwarderId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Authoritative change that makes one or more live resource endpoints stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationResourceLifecycleEvent {
+    GrantRevoked {
+        grant_id: u64,
+        revocation_revision: u64,
+    },
+    ApplicationSessionEnded {
+        application_session: u64,
+    },
+    ProviderReplaced {
+        filesystem_uuid: [u8; 16],
+        retired_generation: u64,
+    },
+    ResourceRemoved(ApplicationResourceIdentity),
+}
+
+impl ApplicationResourceLifecycleEvent {
+    /// Converts the committed result of `ApplicationPermissionStore::revoke` into a lifecycle
+    /// event. Consuming a one-shot grant does not close the endpoint that consumption created.
+    pub const fn grant_revoked(record: ApplicationGrantRecord) -> Option<Self> {
+        match record.state() {
+            ApplicationGrantState::Revoked(reason)
+                if !matches!(reason, ApplicationGrantRevocation::Consumed) =>
+            {
+                Some(Self::GrantRevoked {
+                    grant_id: record.id(),
+                    revocation_revision: record.revision(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub const fn application_session_ended(application_session: u64) -> Option<Self> {
+        if application_session == 0 {
+            None
+        } else {
+            Some(Self::ApplicationSessionEnded {
+                application_session,
+            })
+        }
+    }
+
+    pub fn provider_replaced(filesystem_uuid: [u8; 16], retired_generation: u64) -> Option<Self> {
+        if filesystem_uuid == [0; 16] || retired_generation == 0 {
+            None
+        } else {
+            Some(Self::ProviderReplaced {
+                filesystem_uuid,
+                retired_generation,
+            })
+        }
+    }
+
+    pub const fn resource_removed(resource: ApplicationResourceIdentity) -> Self {
+        Self::ResourceRemoved(resource)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationResourceForwarderRegistrationError {
+    Full,
+    IdExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationResourceRegistryForwardError {
+    UnknownForwarder,
+    Forward(ApplicationResourceForwardError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationResourceTeardownReport {
+    brokers_closed: usize,
+    provider_disconnect_failures: usize,
+}
+
+impl ApplicationResourceTeardownReport {
+    pub const fn brokers_closed(self) -> usize {
+        self.brokers_closed
+    }
+
+    pub const fn provider_disconnect_failures(self) -> usize {
+        self.provider_disconnect_failures
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationResourceForwardError {
@@ -38,6 +137,208 @@ pub enum ApplicationResourceForwardOutcome {
     Replied,
     Disconnected,
     DroppedMalformedMessage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplicationResourceForwarderBinding {
+    grant_id: u64,
+    grant_revision: u64,
+    application_session: u64,
+    resource: ApplicationResourceIdentity,
+    provider_generation: u64,
+}
+
+impl ApplicationResourceForwarderBinding {
+    const fn new(grant: ApplicationGrantAuthorization, provider_generation: u64) -> Self {
+        Self {
+            grant_id: grant.grant_id(),
+            grant_revision: grant.grant_revision(),
+            application_session: grant.application_session(),
+            resource: grant.resource(),
+            provider_generation,
+        }
+    }
+
+    fn invalidated_by(self, event: ApplicationResourceLifecycleEvent) -> bool {
+        match event {
+            ApplicationResourceLifecycleEvent::GrantRevoked {
+                grant_id,
+                revocation_revision,
+            } => self.grant_id == grant_id && self.grant_revision < revocation_revision,
+            ApplicationResourceLifecycleEvent::ApplicationSessionEnded {
+                application_session,
+            } => self.application_session == application_session,
+            ApplicationResourceLifecycleEvent::ProviderReplaced {
+                filesystem_uuid,
+                retired_generation,
+            } => {
+                self.resource.filesystem_uuid() == filesystem_uuid
+                    && self.provider_generation == retired_generation
+            }
+            ApplicationResourceLifecycleEvent::ResourceRemoved(resource) => {
+                self.resource == resource
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveApplicationResourceForwarder {
+    id: ApplicationResourceForwarderId,
+    binding: ApplicationResourceForwarderBinding,
+    forwarder: ApplicationResourceForwarder,
+}
+
+/// Bounded owner of all application resource brokers in one broker process.
+///
+/// Lifecycle changes remove matching entries before attempting provider cleanup, so application
+/// sends observe peer closure even when the retired provider no longer replies.
+#[derive(Debug)]
+pub struct ApplicationResourceForwarderRegistry {
+    entries:
+        [Option<ActiveApplicationResourceForwarder>; MAX_ACTIVE_APPLICATION_RESOURCE_FORWARDERS],
+    next_id: u64,
+    next_teardown_request_id: u64,
+}
+
+impl ApplicationResourceForwarderRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: array::from_fn(|_| None),
+            next_id: 1,
+            next_teardown_request_id: 1,
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        forwarder: ApplicationResourceForwarder,
+    ) -> Result<ApplicationResourceForwarderId, ApplicationResourceForwarderRegistrationError> {
+        let Some(slot) = self.entries.iter().position(Option::is_none) else {
+            let _ = self.close_forwarder(forwarder);
+            return Err(ApplicationResourceForwarderRegistrationError::Full);
+        };
+        let Some(next_id) = self.next_id.checked_add(1) else {
+            let _ = self.close_forwarder(forwarder);
+            return Err(ApplicationResourceForwarderRegistrationError::IdExhausted);
+        };
+        let id = ApplicationResourceForwarderId(self.next_id);
+        let binding = forwarder.binding();
+        self.entries[slot] = Some(ActiveApplicationResourceForwarder {
+            id,
+            binding,
+            forwarder,
+        });
+        self.next_id = next_id;
+        Ok(id)
+    }
+
+    pub fn forward_one(
+        &mut self,
+        id: ApplicationResourceForwarderId,
+    ) -> Result<ApplicationResourceForwardOutcome, ApplicationResourceRegistryForwardError> {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|entry| entry.id == id))
+        else {
+            return Err(ApplicationResourceRegistryForwardError::UnknownForwarder);
+        };
+        let result = self.entries[index]
+            .as_mut()
+            .expect("matched forwarder exists")
+            .forwarder
+            .forward_one();
+        match result {
+            Ok(ApplicationResourceForwardOutcome::Disconnected) => {
+                self.entries[index] = None;
+                Ok(ApplicationResourceForwardOutcome::Disconnected)
+            }
+            Ok(outcome) => Ok(outcome),
+            Err(ApplicationResourceForwardError::TryAgain) => {
+                Err(ApplicationResourceRegistryForwardError::Forward(
+                    ApplicationResourceForwardError::TryAgain,
+                ))
+            }
+            Err(error) => {
+                let _ = self.close_entry(index);
+                Err(ApplicationResourceRegistryForwardError::Forward(error))
+            }
+        }
+    }
+
+    pub fn invalidate(
+        &mut self,
+        event: ApplicationResourceLifecycleEvent,
+    ) -> ApplicationResourceTeardownReport {
+        let mut report = ApplicationResourceTeardownReport {
+            brokers_closed: 0,
+            provider_disconnect_failures: 0,
+        };
+        for index in 0..self.entries.len() {
+            if self.entries[index]
+                .as_ref()
+                .is_some_and(|entry| entry.binding.invalidated_by(event))
+            {
+                report.brokers_closed += 1;
+                if self.close_entry(index).is_err() {
+                    report.provider_disconnect_failures += 1;
+                }
+            }
+        }
+        report
+    }
+
+    pub fn shutdown(&mut self) -> ApplicationResourceTeardownReport {
+        let mut report = ApplicationResourceTeardownReport {
+            brokers_closed: 0,
+            provider_disconnect_failures: 0,
+        };
+        for index in 0..self.entries.len() {
+            if self.entries[index].is_some() {
+                report.brokers_closed += 1;
+                if self.close_entry(index).is_err() {
+                    report.provider_disconnect_failures += 1;
+                }
+            }
+        }
+        report
+    }
+
+    pub fn contains(&self, id: ApplicationResourceForwarderId) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.as_ref().is_some_and(|entry| entry.id == id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn close_entry(&mut self, index: usize) -> Result<(), filesystem::Error> {
+        let entry = self.entries[index].take().expect("active entry exists");
+        self.close_forwarder(entry.forwarder)
+    }
+
+    fn close_forwarder(
+        &mut self,
+        forwarder: ApplicationResourceForwarder,
+    ) -> Result<(), filesystem::Error> {
+        let provider_session = forwarder.close_broker();
+        let request_id = self.next_teardown_request_id;
+        self.next_teardown_request_id = request_id.wrapping_add(1).max(1);
+        provider_session.disconnect(request_id)
+    }
+}
+
+impl Default for ApplicationResourceForwarderRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +441,29 @@ impl ApplicationResourceForwarder {
 
     pub const fn disconnected(&self) -> bool {
         self.disconnected
+    }
+
+    fn binding(&self) -> ApplicationResourceForwarderBinding {
+        ApplicationResourceForwarderBinding::new(
+            self.broker.authority().grant(),
+            self.provider_session.generation(),
+        )
+    }
+
+    /// Drops application-facing authority and broker-owned memory before returning the provider
+    /// session for best-effort disconnect.
+    fn close_broker(self) -> Session {
+        let Self {
+            broker,
+            provider_session,
+            reply_endpoint,
+            buffers,
+            ..
+        } = self;
+        drop(broker);
+        drop(reply_endpoint);
+        drop(buffers);
+        provider_session
     }
 
     /// Receives, validates, forwards, rewrites, and replies to one queued application request.
@@ -947,6 +1271,16 @@ fn bytes_of<T>(value: &T) -> &[u8] {
 mod tests {
     use super::*;
 
+    fn resource(filesystem_uuid: [u8; 16], object_id: u64) -> ApplicationResourceIdentity {
+        ApplicationResourceIdentity::new(
+            filesystem_uuid,
+            object_id,
+            7,
+            ApplicationResourceKind::File,
+        )
+        .unwrap()
+    }
+
     fn request(operation: u16) -> protocol::Request {
         let mut request = protocol::Request::EMPTY;
         request.operation = operation;
@@ -1040,5 +1374,69 @@ mod tests {
         let mut attributes = request(protocol::operation::GET_ATTRIBUTES);
         attributes.node_id = 1;
         assert!(!requires_writable_session(&attributes));
+    }
+
+    #[test]
+    fn lifecycle_events_match_only_the_retired_live_authority() {
+        let filesystem_uuid = [0x71; 16];
+        let selected = resource(filesystem_uuid, 9);
+        let binding = ApplicationResourceForwarderBinding {
+            grant_id: 11,
+            grant_revision: 13,
+            application_session: 17,
+            resource: selected,
+            provider_generation: 19,
+        };
+
+        assert!(
+            binding.invalidated_by(ApplicationResourceLifecycleEvent::GrantRevoked {
+                grant_id: 11,
+                revocation_revision: 14,
+            })
+        );
+        assert!(
+            !binding.invalidated_by(ApplicationResourceLifecycleEvent::GrantRevoked {
+                grant_id: 11,
+                revocation_revision: 13,
+            })
+        );
+        assert!(binding.invalidated_by(
+            ApplicationResourceLifecycleEvent::application_session_ended(17).unwrap()
+        ));
+        assert!(!binding.invalidated_by(
+            ApplicationResourceLifecycleEvent::application_session_ended(18).unwrap()
+        ));
+        assert!(binding.invalidated_by(
+            ApplicationResourceLifecycleEvent::provider_replaced(filesystem_uuid, 19).unwrap()
+        ));
+        assert!(!binding.invalidated_by(
+            ApplicationResourceLifecycleEvent::provider_replaced(filesystem_uuid, 20).unwrap()
+        ));
+        assert!(
+            binding.invalidated_by(ApplicationResourceLifecycleEvent::resource_removed(
+                selected
+            ))
+        );
+        assert!(
+            !binding.invalidated_by(ApplicationResourceLifecycleEvent::resource_removed(
+                resource(filesystem_uuid, 10)
+            ))
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_reject_ambiguous_zero_identifiers() {
+        assert_eq!(
+            ApplicationResourceLifecycleEvent::application_session_ended(0),
+            None
+        );
+        assert_eq!(
+            ApplicationResourceLifecycleEvent::provider_replaced([0; 16], 1),
+            None
+        );
+        assert_eq!(
+            ApplicationResourceLifecycleEvent::provider_replaced([1; 16], 0),
+            None
+        );
     }
 }

@@ -331,7 +331,9 @@ one fresh generic-filesystem ingress for an exact grant authorization. The broke
 `SEND`. Portal construction binds that endpoint to the response's grant and receiver validation pins
 the kernel object kind and rights. The adapter denies application-facing stable-identity operations,
 maps lookup, I/O, enumeration, create, remove, rename, and sync to exact grant rights, and forwards
-through private buffers and a bounded rooted node map. Active revocation remains a future layer.
+through private buffers and a bounded rooted node map. A fixed-capacity registry owns active
+forwarders and closes matching broker authority on grant revocation, application-session end,
+provider replacement, or resource removal before attempting provider cleanup.
 
 The [application selection transaction](design/application-selection-transactions.md) preflights a
 new grant or existing authorization without changing the permission store, then owns that mutation

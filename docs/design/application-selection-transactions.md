@@ -76,7 +76,5 @@ send-only application-to-broker channel.
 
 ## Remaining work
 
-1. Close active brokers on grant revocation, session expiry, provider replacement, or resource
-   removal.
-2. Implement crash-safe transactional permission persistence.
-3. Implement the portal/compositor transport and trusted picker UI.
+1. Implement crash-safe transactional permission persistence.
+2. Implement the portal/compositor transport and trusted picker UI.
