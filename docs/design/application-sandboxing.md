@@ -512,6 +512,10 @@ needed to recreate authority, not a serialized live handle.
 The implemented record and restoration rules are detailed in
 [Application permission-store foundation](application-permission-store.md).
 
+Canonical request/response records and the process-, application-, session-, surface-, and
+event-bound trusted gesture policy are detailed in
+[Application portal admission foundation](application-portal-admission.md).
+
 ### Drag and drop and sharing
 
 Drag and drop is a user-mediated capability transfer. A file-transfer or share portal
@@ -1024,8 +1028,10 @@ portal mediation remain outstanding.
 ### Milestone 2: file portal and permission store
 
 The stable resource-identity, canonical grant-record, bounded restoration, revocation, and reset
-foundation is implemented. Trusted gesture admission, live resource resolution, authority issuance,
-transactional persistence, and compatibility projection remain future increments.
+foundation is implemented. Canonical open/save/directory requests and trusted gesture admission are
+also implemented. Compositor and portal transports, the picker UI, live resource resolution,
+authority issuance, transactional persistence, and compatibility projection remain future
+increments.
 
 - trusted window and user-gesture tokens;
 - open, save, directory-selection, drag-and-drop, and share portals;
