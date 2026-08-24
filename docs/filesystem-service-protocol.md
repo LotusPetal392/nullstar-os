@@ -354,6 +354,12 @@ The first such extension is `RESOLVE_IDENTITY`. It deliberately keeps provider-g
 node IDs separate from persistent resource identity. Its exact application-facing trust model is in
 [Application filesystem resource resolution](design/application-resource-resolution.md).
 
+Application file and directory capabilities reuse this protocol behind a fresh per-authorization
+send-only ingress. The broker applies a grant-right operation ceiling before translating its rooted,
+broker-local node namespace to provider sessions. The endpoint ownership and incomplete forwarding
+boundary are documented in
+[Application resource capability adapter](design/application-resource-capabilities.md).
+
 ## Migration sequence
 
 1. Implement the session and node table in `/tmpfs-service`. (complete)

@@ -323,7 +323,16 @@ open, save, and directory-selection messages plus authenticated one-shot gesture
 is accepted only from the configured kernel-stamped gesture issuer and binds the client process,
 verified installation, user session, parent surface, seat event, and a bounded lifetime. Selected
 responses must match the admitted subject, resource kind, rights, and scope and carry exactly one
-capability. The compositor transport, picker, and endpoint adapter remain future layers.
+capability.
+
+The [application resource capability adapter](design/application-resource-capabilities.md) now mints
+one fresh generic-filesystem ingress for an exact grant authorization. The broker retains only
+`RECEIVE | WAIT`; the transfer source has `SEND | TRANSFER`; and the application receives exact
+`SEND`. Portal construction binds that endpoint to the response's grant and receiver validation pins
+the kernel object kind and rights. The adapter denies unsupported and stable-identity operations and
+maps lookup, I/O, enumeration, create, remove, rename, and sync to exact grant rights. Rooted live-I/O
+forwarding, active revocation, failure-atomic selection completion, compositor transport, and picker
+UI remain future layers.
 
 PID 1 is the temporary broker for the logging service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable

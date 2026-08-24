@@ -162,9 +162,12 @@ scopes, canonical checksummed records, strict checkpoint restoration, and revisi
 tombstones. Canonical open/save/directory requests and process-, application-, session-, surface-,
 and event-bound gesture admission are now implemented as well. Authenticated NullFS stable-resource
 resolution now pins the volume UUID, inode number, inode generation, and kind independently of
-provider-process generations. Rights-reduced authority issuance, stored-identity restoration,
-compositor and portal transports, the picker UI, and transactional persistence are the next portal
-increments.
+provider-process generations. Fresh grant-bound resource ingress endpoints now reduce broker
+authority to `RECEIVE | WAIT`, application authority to exact `SEND`, bind selected responses to the
+minted grant, validate transferred kernel kind/rights, and gate generic filesystem operations against
+the grant ceiling. Failure-atomic selection completion, rooted live-I/O forwarding, stored-identity
+restoration, active revocation, compositor and portal transports, the picker UI, and transactional
+persistence are the next portal increments.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

@@ -28,6 +28,11 @@ use userspace::{
         ApplicationPortalRequest, ApplicationPortalResponse, PortalAdmissionError,
         TrustedUserGestureTicket,
     },
+    application_resource::{
+        APPLICATION_RESOURCE_BROKER_RIGHTS, APPLICATION_RESOURCE_CLIENT_RIGHTS,
+        APPLICATION_RESOURCE_CLIENT_SOURCE_RIGHTS, ApplicationResourceAccess,
+        ApplicationResourceAuthorizationError, ApplicationResourceBroker,
+    },
     application_service::{BASELINE_DESKTOP_ROUTES, DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     handle::{Endpoint, OwnedHandle},
     ipc::{self, CapabilityHandle, Rights, Signals},
@@ -591,12 +596,83 @@ fn application_portal_probe() -> bool {
     let Ok(grant) = store.authorize(authorization, resource, request.rights()) else {
         return false;
     };
-    let Ok(response) = ApplicationPortalResponse::selected(admitted, grant) else {
+    let Ok((broker, client)) = ApplicationResourceBroker::mint(grant) else {
         return false;
     };
-    ApplicationPortalResponse::decode(&response.encode()) == Ok(response)
-        && response.validate_envelope(1).is_ok()
-        && response.validate_envelope(0).is_err()
+    let Ok(broker_info) = broker.endpoint().info() else {
+        return false;
+    };
+    let Ok(client_info) = client.endpoint().info() else {
+        return false;
+    };
+    if broker_info.kind != ipc::ObjectKind::Endpoint
+        || broker_info.rights != APPLICATION_RESOURCE_BROKER_RIGHTS
+        || client_info.object_id == broker_info.object_id
+        || client_info.rights != APPLICATION_RESOURCE_CLIENT_SOURCE_RIGHTS
+        || broker.authorize_operation(userspace::filesystem::protocol::operation::READ, 0)
+            != Ok(ApplicationResourceAccess::Read)
+        || broker.authorize_operation(userspace::filesystem::protocol::operation::WRITE, 0)
+            != Err(ApplicationResourceAuthorizationError::RightsDenied)
+    {
+        return false;
+    }
+    let Ok(response) =
+        ApplicationPortalResponse::selected_with_resource_endpoint(admitted, grant, &client)
+    else {
+        return false;
+    };
+    let Ok((portal_sender, portal_receiver)) = OwnedHandle::<Endpoint>::create_pair() else {
+        return false;
+    };
+    let encoded = response.encode();
+    if portal_sender
+        .send_move(
+            &encoded,
+            client.into_endpoint(),
+            APPLICATION_RESOURCE_CLIENT_RIGHTS,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut received = [0_u8; 64];
+    let Ok(message) = portal_receiver.try_receive(&mut received) else {
+        return false;
+    };
+    let Some(capability) = message.capability else {
+        return false;
+    };
+    let Ok(info) = capability.handle.info() else {
+        return false;
+    };
+    if message.bytes != encoded.len()
+        || received != encoded
+        || capability.rights != APPLICATION_RESOURCE_CLIENT_RIGHTS
+        || info.object_id != client_info.object_id
+        || response.validate_capability_envelope(Some(info)).is_err()
+        || ApplicationPortalResponse::decode(&received) != Ok(response)
+        || response.validate_envelope(1).is_err()
+        || response.validate_envelope(0).is_ok()
+    {
+        return false;
+    }
+    let Ok(client_endpoint) = capability.handle.try_cast::<Endpoint>() else {
+        return false;
+    };
+    let mut denied_receive = [0_u8; 1];
+    if !matches!(
+        client_endpoint.try_receive(&mut denied_receive),
+        Err(error) if error == ipc::Error::PERMISSION
+    ) || broker.endpoint().send(b"denied") != Err(ipc::Error::PERMISSION)
+        || client_endpoint.send(b"NSRC").is_err()
+    {
+        return false;
+    }
+    let mut broker_request = [0_u8; 4];
+    broker
+        .endpoint()
+        .try_receive(&mut broker_request)
+        .is_ok_and(|message| message.bytes == 4 && broker_request == *b"NSRC")
 }
 
 fn admit_portal_request(

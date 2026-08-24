@@ -311,9 +311,10 @@ refines the TLA+ module.
 The launch foundation is intentionally small enough to become the common mechanism beneath a future
 application manager. The next useful layers are:
 
-1. **Portal mediation and grant-backed authority** — implement the compositor and portal transports,
-   stored-identity restoration, and rights-reduced file/directory broker endpoints around the
-   implemented gesture admission, live resource resolver, and permission-store records.
+1. **Portal mediation and grant-backed authority** — make selection completion failure-atomic, add
+   rooted live-I/O forwarding and stored-identity restoration behind the implemented rights-reduced
+   resource endpoints, then implement compositor and portal transports around the gesture admission,
+   live resource resolver, and permission-store records.
 2. **Production package and registry services** — cryptographic bundle verification, authenticated
    verifier routing, immutable generation selection, revocation, and durable installation records.
 3. **Standalone application-manager integration** — event-driven launch ownership, namespace and
