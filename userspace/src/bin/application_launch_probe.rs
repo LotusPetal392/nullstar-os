@@ -4,8 +4,11 @@
 use userspace::{
     application_launch::{
         ApplicationCapability, ApplicationComponentCapability, ApplicationComponentLaunch,
-        ApplicationComponentLaunchError, ApplicationIdentity, ApplicationLaunch,
-        ApplicationProfile, ComponentProfileSet, spawn_application,
+        ApplicationComponentLaunchError, ApplicationIdentityError, ApplicationInstallScope,
+        ApplicationInstallation, ApplicationLaunch, ApplicationLaunchSelection, ApplicationProfile,
+        ApplicationProfileSet, ApplicationTrustClass, ComponentProfileSet,
+        InstalledApplicationComponent, PackageVerification, authorize_application_launch,
+        spawn_application,
     },
     handle::{Endpoint, OwnedHandle},
     ipc::{self, Rights, Signals},
@@ -14,6 +17,15 @@ use userspace::{
 };
 
 const JOB_WAIT_YIELDS: usize = 4096;
+const IDENTITY_PACKAGE: u64 = 11;
+const IDENTITY_PACKAGE_GENERATION: u64 = 12;
+const IDENTITY_APPLICATION: u64 = 13;
+const IDENTITY_USER: u64 = 14;
+const IDENTITY_SESSION: u64 = 15;
+const MANAGER_GENERATION: u64 = 16;
+const IDENTITY_PUBLISHER: u64 = 17;
+const IDENTITY_SIGNING_LINEAGE: u64 = 18;
+const IDENTITY_INSTALLATION: u64 = 19;
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
@@ -29,6 +41,73 @@ fn application_component_probe() -> bool {
     const ROOT_REPORT: u8 = ROOT_COMPONENT as u8;
     const DESKTOP_CHILD_REPORT: u8 = DESKTOP_CHILD_COMPONENT as u8;
     const WORKER_REPORT: u8 = WORKER_COMPONENT as u8;
+
+    let components = [
+        InstalledApplicationComponent::new(
+            ROOT_COMPONENT,
+            b"/application-component-target",
+            ApplicationProfileSet::DESKTOP,
+            true,
+        ),
+        InstalledApplicationComponent::new(
+            DESKTOP_CHILD_COMPONENT,
+            b"/application-component-target",
+            ApplicationProfileSet::DESKTOP_CHILD,
+            false,
+        ),
+        InstalledApplicationComponent::new(
+            WORKER_COMPONENT,
+            b"/application-component-target",
+            ApplicationProfileSet::WORKER,
+            false,
+        ),
+    ];
+    let verification = PackageVerification {
+        package: IDENTITY_PACKAGE,
+        package_generation: IDENTITY_PACKAGE_GENERATION,
+        application: IDENTITY_APPLICATION,
+        publisher: IDENTITY_PUBLISHER,
+        signing_lineage: IDENTITY_SIGNING_LINEAGE,
+        trust_class: ApplicationTrustClass::Repository,
+        system_application: false,
+        components: &components,
+    };
+    let installation = ApplicationInstallation {
+        installation: IDENTITY_INSTALLATION,
+        package: IDENTITY_PACKAGE,
+        package_generation: IDENTITY_PACKAGE_GENERATION,
+        application: IDENTITY_APPLICATION,
+        publisher: IDENTITY_PUBLISHER,
+        signing_lineage: IDENTITY_SIGNING_LINEAGE,
+        trust_class: ApplicationTrustClass::Repository,
+        scope: ApplicationInstallScope::User,
+        owner_user: IDENTITY_USER,
+        system_application: false,
+    };
+    let selection = ApplicationLaunchSelection {
+        component: ROOT_COMPONENT,
+        user: IDENTITY_USER,
+        session: IDENTITY_SESSION,
+        profile: ApplicationProfile::Desktop,
+    };
+    let mut wrong_lineage = verification;
+    wrong_lineage.signing_lineage += 1;
+    if authorize_application_launch(wrong_lineage, installation, selection)
+        != Err(ApplicationIdentityError::SigningLineageMismatch)
+    {
+        return false;
+    }
+    let mut wrong_user = selection;
+    wrong_user.user += 1;
+    if authorize_application_launch(verification, installation, wrong_user)
+        != Err(ApplicationIdentityError::UserScopeMismatch)
+    {
+        return false;
+    }
+    let Ok(authorization) = authorize_application_launch(verification, installation, selection)
+    else {
+        return false;
+    };
 
     let Ok(status) = OwnedHandle::<Endpoint>::create() else {
         return false;
@@ -47,22 +126,21 @@ fn application_component_probe() -> bool {
     ];
     let root_launch = ApplicationLaunch::new(
         b"/application-component-target root",
-        ApplicationIdentity {
-            package: 11,
-            package_generation: 12,
-            application: 13,
-            component: ROOT_COMPONENT,
-            user: 14,
-            session: 15,
-        },
-        ApplicationProfile::Desktop,
-        16,
+        authorization,
+        MANAGER_GENERATION,
         &root_capabilities,
     )
     .with_process_limit(4);
     let Ok(application) = spawn_application(root_launch) else {
         return false;
     };
+    if application.principal().publisher != IDENTITY_PUBLISHER
+        || application.principal().signing_lineage != IDENTITY_SIGNING_LINEAGE
+        || application.provenance().installation != IDENTITY_INSTALLATION
+        || application.provenance().scope != ApplicationInstallScope::User
+    {
+        return false;
+    }
     let mut process_ids = [application.process_id, 0, 0];
 
     let forbidden_capabilities = [ApplicationComponentCapability::new(
@@ -87,6 +165,23 @@ fn application_component_probe() -> bool {
         ApplicationProfile::Worker,
         &escalating_capabilities,
     ));
+    let identity_capabilities = [ApplicationComponentCapability::new(
+        status.as_raw(),
+        Rights::SEND,
+        CapabilityRole::READINESS,
+    )];
+    let undeclared = application.spawn_component(ApplicationComponentLaunch::new(
+        b"/application-component-target worker",
+        99,
+        ApplicationProfile::Worker,
+        &identity_capabilities,
+    ));
+    let wrong_profile = application.spawn_component(ApplicationComponentLaunch::new(
+        b"/application-component-target desktop-child",
+        WORKER_COMPONENT,
+        ApplicationProfile::DesktopChild,
+        &identity_capabilities,
+    ));
     let mut result = forbidden
         == Err(ApplicationComponentLaunchError::AuthorityNotDelegable(
             CapabilityRole::SERVICE_NAMESPACE,
@@ -94,6 +189,14 @@ fn application_component_probe() -> bool {
         && escalating
             == Err(ApplicationComponentLaunchError::AuthorityEscalation(
                 CapabilityRole::READINESS,
+            ))
+        && undeclared
+            == Err(ApplicationComponentLaunchError::Identity(
+                ApplicationIdentityError::ComponentNotAuthorized,
+            ))
+        && wrong_profile
+            == Err(ApplicationComponentLaunchError::Identity(
+                ApplicationIdentityError::ProfileNotAuthorized,
             ));
 
     let component_capabilities = [ApplicationComponentCapability::new(

@@ -3,7 +3,9 @@
 
 use userspace::{
     abi::limits,
-    application_launch::{ApplicationProfile, ApplicationStart},
+    application_launch::{
+        ApplicationInstallScope, ApplicationProfile, ApplicationStart, ApplicationTrustClass,
+    },
     args::Args,
     handle::Endpoint,
     ipc::{self, ObjectKind, Rights},
@@ -17,6 +19,9 @@ const IDENTITY_APPLICATION: u64 = 13;
 const IDENTITY_USER: u64 = 14;
 const IDENTITY_SESSION: u64 = 15;
 const MANAGER_GENERATION: u64 = 16;
+const IDENTITY_PUBLISHER: u64 = 17;
+const IDENTITY_SIGNING_LINEAGE: u64 = 18;
+const IDENTITY_INSTALLATION: u64 = 19;
 const ROOT_COMPONENT: u64 = 21;
 const DESKTOP_CHILD_COMPONENT: u64 = 22;
 const WORKER_COMPONENT: u64 = 23;
@@ -66,6 +71,13 @@ fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<2>) -> ! {
         || start.identity.user != IDENTITY_USER
         || start.identity.session != IDENTITY_SESSION
         || start.manager_generation != MANAGER_GENERATION
+        || start.principal.application != IDENTITY_APPLICATION
+        || start.principal.publisher != IDENTITY_PUBLISHER
+        || start.principal.signing_lineage != IDENTITY_SIGNING_LINEAGE
+        || start.principal.trust_class != ApplicationTrustClass::Repository
+        || start.principal.system_application
+        || start.provenance.installation != IDENTITY_INSTALLATION
+        || start.provenance.scope != ApplicationInstallScope::User
         || start.context.contains(CapabilityRole::SERVICE_NAMESPACE) != expected.2
     {
         syscall::exit(2);

@@ -2,7 +2,8 @@
 
 ## Status
 
-This document describes the **implemented launch and reduced-component foundation** for the
+This document describes the **implemented launch, verified-identity admission, and reduced-component
+foundation** for the
 application-sandbox architecture. It is intentionally narrower than the complete design in
 [`application-sandboxing.md`](application-sandboxing.md).
 
@@ -14,13 +15,18 @@ The current implementation provides a native mediated launch primitive with:
 - one receive-only bootstrap capability installed at process-local slot 1;
 - typed `NSPC` startup capabilities with receiver-side kind and rights ceilings;
 - authenticated `NSPD` descriptive application identity and launch metadata;
+- a stable application principal bound to publisher lineage, trust class, and installation
+  provenance before launch;
+- verified-manifest authorization of the entry component, executable, user scope, and sandbox
+  profile;
 - distinct `desktop`, `desktop-child`, and `worker` profile identities;
 - manager-mediated `desktop-child` and `worker` spawning from explicit, rights-monotonic
   capability allowlists; and
 - a mandatory application entry wrapper that validates startup before application code executes.
 
-It does **not** yet provide a complete desktop application manager, package verifier, private storage
-builder, restricted service namespace, portal suite, permission database, or compatibility namespace.
+It does **not** yet provide a complete desktop application manager, cryptographic package verifier,
+application registry service, private storage builder, restricted service namespace, portal suite,
+permission database, or compatibility namespace.
 
 ## Why both authority tables are scrubbed
 
@@ -136,11 +142,26 @@ ceiling before application code runs. A rejected request creates no process. A f
 terminates and reaps only that candidate component; it does not implicitly terminate healthy members
 of the existing application job.
 
-## Descriptive identity is not authority
+## Verified identity admission is not authority
 
-The process-start stream carries an `ApplicationIdentity` containing provisional package,
-package-generation, application, component, user, and session identifiers. The launch record also
-carries a nonzero manager generation and one of the application namespace/profile identifiers:
+The launcher no longer accepts freely assembled application identity and profile fields. A trusted
+manager first passes a package-verifier result and selected installation record through
+`authorize_application_launch`. The admission check requires exact agreement on package generation,
+application identifier, publisher identity, accepted signing lineage, trust class, and system-app
+designation. It also enforces installation ownership, one declared entry component, the declared
+executable identity, and the ordinary `desktop` profile. A mismatch produces no launch
+authorization.
+
+The resulting `AuthorizedApplication` is opaque. It carries a fixed copy of at most eight verified
+component declarations, so later `desktop-child` and `worker` requests must also match a declared
+component, executable, and profile before process creation. This check is independent of the
+rights-monotonic capability allowlist; both policies must pass.
+
+The authenticated process-start stream carries an `ApplicationIdentity` containing package,
+package-generation, application, component, user, and session identifiers plus a mandatory stable
+identity record containing publisher lineage, package trust class, system designation, installation
+record, and installation scope. The launch record also carries a nonzero manager generation and one
+of the application namespace/profile identifiers:
 
 | Profile | Current descriptive namespace/profile ID |
 | --- | ---: |
@@ -148,9 +169,17 @@ carries a nonzero manager generation and one of the application namespace/profil
 | `desktop-child` | 3 |
 | `worker` | 4 |
 
-These numeric values are provisional descriptive metadata. They do not grant filesystem, device,
-service, or other authority. The accepted long-term stable identity remains the signed application
-principal described by the sandbox architecture.
+These numeric values are manager/package-service identifiers and remain descriptive metadata. They
+do not grant filesystem, device, service, or other authority. The stable security principal is the
+tuple of application identifier, publisher identity, accepted signing lineage, trust class, and
+system designation; package generation and installation provenance select the immutable deployment
+used for this launch.
+
+`PackageVerification` is explicitly the bounded output of a trusted package verifier and carries the
+component declarations authenticated with that package manifest. Constructing the Rust record does
+not verify a signature. Authentication of a future package-verifier service, canonical bundle
+parsing, content hashing, signature algorithms, revocation, and persistent registry storage remain
+outside this launch-layer implementation.
 
 The application runtime pins the startup sender to its direct parent, validates its own PID and
 executable identity, requires the service identity to be zero, verifies application identity fields,
@@ -199,7 +228,7 @@ refining several of its assumptions:
 - `BootstrapGrant` -> explicit typed `NSPC` capability attachments;
 - `AuthorityWithinCeiling` -> receiver-side `StartupCapabilityPolicy` rights reduction;
 - `IdentityIsNotAuthority` -> separate `NSPD` descriptive identity and capability-bearing `NSPC`
-  records; and
+  records, with verified principal/provenance metadata still unable to create authority; and
 - containment assumptions -> existing non-relaxable job membership and inherited fork containment.
 
 This is implementation-alignment evidence, not a proof that the Rust implementation formally
@@ -210,13 +239,13 @@ refines the TLA+ module.
 The launch foundation is intentionally small enough to become the common mechanism beneath a future
 application manager. The next useful layers are:
 
-1. **Stable verified application identity** — package/application identity, signing lineage,
-   installation provenance, and authorized profile selection.
-2. **Private storage and restricted namespace construction** — bundle/data/cache/temp/runtime roots
+1. **Private storage and restricted namespace construction** — bundle/data/cache/temp/runtime roots
    and removal of ambient global-path authority for native applications.
-3. **Baseline service routing** — restricted display, lifecycle, settings, logging, audio playback,
+2. **Baseline service routing** — restricted display, lifecycle, settings, logging, audio playback,
    portal, and service-namespace endpoints.
-4. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
+3. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
    relaunch policy, and user/session teardown.
-5. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
+4. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
    resource and device policy.
+5. **Production package and registry services** — cryptographic bundle verification, authenticated
+   verifier routing, immutable generation selection, revocation, and durable installation records.
