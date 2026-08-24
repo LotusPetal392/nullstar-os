@@ -88,6 +88,12 @@ pub enum ApplicationResourceResolveError {
     KindMismatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationResourceRestoreError {
+    Filesystem(filesystem::Error),
+    FilesystemMismatch,
+}
+
 /// Resolves generation-scoped provider nodes into persistent application resource identities.
 ///
 /// Authority comes from the live filesystem session. The expected UUID must come from trusted mount
@@ -125,6 +131,58 @@ impl ApplicationResourceResolver {
             .map_err(ApplicationResourceResolveError::Filesystem)?;
         validate_resolved_identity(self.expected_filesystem_uuid, identity, expected_kind)
     }
+}
+
+/// Restores persistent application resource identities through one authenticated mounted volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationResourceRestorer {
+    session: Session,
+    expected_filesystem_uuid: [u8; 16],
+}
+
+impl ApplicationResourceRestorer {
+    pub fn new(session: Session, expected_filesystem_uuid: [u8; 16]) -> Option<Self> {
+        if expected_filesystem_uuid == [0; 16] {
+            return None;
+        }
+        Some(Self {
+            session,
+            expected_filesystem_uuid,
+        })
+    }
+
+    pub const fn expected_filesystem_uuid(self) -> [u8; 16] {
+        self.expected_filesystem_uuid
+    }
+
+    pub fn restore(
+        self,
+        request_id: u64,
+        resource: ApplicationResourceIdentity,
+    ) -> Result<Node, ApplicationResourceRestoreError> {
+        if resource.filesystem_uuid() != self.expected_filesystem_uuid {
+            return Err(ApplicationResourceRestoreError::FilesystemMismatch);
+        }
+        self.session
+            .restore_identity(request_id, stable_identity_for_resource(resource))
+            .map_err(ApplicationResourceRestoreError::Filesystem)
+    }
+}
+
+fn stable_identity_for_resource(
+    resource: ApplicationResourceIdentity,
+) -> filesystem::protocol::StableNodeIdentity {
+    let kind = match resource.kind() {
+        ApplicationResourceKind::File => filesystem::protocol::node_kind::FILE,
+        ApplicationResourceKind::Directory => filesystem::protocol::node_kind::DIRECTORY,
+    };
+    filesystem::protocol::StableNodeIdentity::new(
+        resource.filesystem_uuid(),
+        resource.object_id(),
+        resource.object_generation(),
+        kind,
+    )
+    .expect("application resource identities are canonical")
 }
 
 fn validate_resolved_identity(
@@ -1203,6 +1261,27 @@ mod tests {
                 .valid_for(ApplicationResourceKind::Directory)
         );
         assert!(!ApplicationGrantRights::EMPTY.valid_for(ApplicationResourceKind::Directory));
+    }
+
+    #[test]
+    fn resource_restoration_pins_the_selected_volume_before_transport() {
+        let mut reply = filesystem::protocol::Reply::EMPTY;
+        reply.session_id = 7;
+        reply.generation = 11;
+        let session = Session::from_reply(&reply).unwrap();
+        let selected = resource(41, ApplicationResourceKind::Directory);
+        let stable = stable_identity_for_resource(selected);
+        assert_eq!(stable.filesystem_uuid, selected.filesystem_uuid());
+        assert_eq!(stable.object_id, selected.object_id());
+        assert_eq!(stable.object_generation, selected.object_generation());
+        assert_eq!(stable.kind, filesystem::protocol::node_kind::DIRECTORY);
+
+        let restorer = ApplicationResourceRestorer::new(session, [0x52; 16]).unwrap();
+        assert_eq!(
+            restorer.restore(1, selected),
+            Err(ApplicationResourceRestoreError::FilesystemMismatch)
+        );
+        assert!(ApplicationResourceRestorer::new(session, [0; 16]).is_none());
     }
 
     #[test]

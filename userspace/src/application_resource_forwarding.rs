@@ -7,7 +7,10 @@
 use core::{array, mem::size_of, slice};
 
 use crate::{
-    application_permission::{ApplicationGrantRights, ApplicationResourceKind},
+    application_permission::{
+        ApplicationGrantRights, ApplicationResourceKind, ApplicationResourceRestoreError,
+        ApplicationResourceRestorer,
+    },
     application_resource::{
         ApplicationResourceAccess, ApplicationResourceAuthorizationError, ApplicationResourceBroker,
     },
@@ -26,6 +29,7 @@ pub enum ApplicationResourceForwardError {
     BrokerTransport,
     ReplyTransport,
     InvalidProviderRoot,
+    ProviderIdentity(ApplicationResourceRestoreError),
     ProviderReadOnly,
 }
 
@@ -69,6 +73,23 @@ pub struct ApplicationResourceForwarder {
 }
 
 impl ApplicationResourceForwarder {
+    /// Restores the exact resource identity carried by the broker grant and uses that node as the
+    /// forwarding root. The expected UUID must come from trusted mount selection.
+    pub fn restore(
+        broker: ApplicationResourceBroker,
+        provider_session: Session,
+        expected_filesystem_uuid: [u8; 16],
+        request_id: u64,
+    ) -> Result<Self, ApplicationResourceForwardError> {
+        let resource = broker.authority().grant().resource();
+        let restorer = ApplicationResourceRestorer::new(provider_session, expected_filesystem_uuid)
+            .ok_or(ApplicationResourceForwardError::InvalidProviderRoot)?;
+        let provider_root = restorer
+            .restore(request_id, resource)
+            .map_err(ApplicationResourceForwardError::ProviderIdentity)?;
+        Self::new(broker, provider_session, provider_root)
+    }
+
     pub fn new(
         broker: ApplicationResourceBroker,
         provider_session: Session,
@@ -244,7 +265,7 @@ impl ApplicationResourceForwarder {
             protocol::operation::CANCEL => {
                 self.status_reply(request, protocol::status::NOT_SUPPORTED)
             }
-            protocol::operation::RESOLVE_IDENTITY => {
+            protocol::operation::RESOLVE_IDENTITY | protocol::operation::RESTORE_IDENTITY => {
                 self.status_reply(request, protocol::status::NOT_SUPPORTED)
             }
             _ => self.forward_provider(request, access),
@@ -812,11 +833,27 @@ fn canonical_request(request: &protocol::Request) -> bool {
                 && request.bulk.length <= protocol::MAX_NAME_BYTES as u64
         }
         protocol::operation::RESOLVE_IDENTITY => one_node && no_file_offset && no_bulk && no_name,
+        protocol::operation::RESTORE_IDENTITY => {
+            no_nodes && no_file_offset && no_bulk && canonical_inline_identity(request)
+        }
         protocol::operation::CANCEL
         | protocol::operation::DISCONNECT
         | protocol::operation::SYNC => no_nodes && no_file_offset && no_bulk && no_name,
         _ => no_nodes && no_file_offset && no_bulk && no_name,
     }
+}
+
+fn canonical_inline_identity(request: &protocol::Request) -> bool {
+    let identity_bytes = size_of::<protocol::StableNodeIdentity>();
+    if usize::from(request.name_length) != identity_bytes
+        || request.name[identity_bytes..].iter().any(|byte| *byte != 0)
+    {
+        return false;
+    }
+    let identity = unsafe {
+        core::ptr::read_unaligned(request.name.as_ptr() as *const protocol::StableNodeIdentity)
+    };
+    identity.canonical()
 }
 
 fn canonical_directory_entry(entry: &protocol::DirectoryEntry) -> bool {
@@ -946,6 +983,19 @@ mod tests {
         assert!(canonical_request(&lookup));
         lookup.name[5] = 1;
         assert!(!canonical_request(&lookup));
+    }
+
+    #[test]
+    fn canonical_identity_restoration_requires_one_complete_stable_tuple() {
+        let identity =
+            protocol::StableNodeIdentity::new([0x71; 16], 3, 5, protocol::node_kind::FILE).unwrap();
+        let mut restore = request(protocol::operation::RESTORE_IDENTITY);
+        restore.name_length = size_of::<protocol::StableNodeIdentity>() as u16;
+        restore.name[..size_of::<protocol::StableNodeIdentity>()]
+            .copy_from_slice(bytes_of(&identity));
+        assert!(canonical_request(&restore));
+        restore.name[16..24].fill(0);
+        assert!(!canonical_request(&restore));
     }
 
     #[test]

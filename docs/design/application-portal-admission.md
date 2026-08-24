@@ -106,8 +106,6 @@ atomic payload-and-capability transfer.
 
 ## Next steps
 
-1. Forward the broker protocol to rooted live nodes and restore stored identities without accepting
-   pathname or inode reuse.
-2. Implement the portal service transport using kernel-stamped sender identities and authenticated
+1. Implement the portal service transport using kernel-stamped sender identities and authenticated
    compositor startup authority.
-3. Add a trusted picker UI and transactional permission persistence.
+2. Add a trusted picker UI and transactional permission persistence.

@@ -9,8 +9,8 @@ channel pair with distinct endpoint identities for every authorization. The brok
 application with exact `SEND`.
 
 The adapter now defines endpoint ownership, portal binding, the generic-filesystem operation ceiling,
-and live forwarding to a dedicated provider session. It does not yet restore a stored identity to a
-current node, run a standalone broker process, or tear down a live endpoint when its grant is
+live forwarding to a dedicated provider session, and restoration of its root from stable identity.
+It does not yet run a standalone broker process or tear down a live endpoint when its grant is
 revoked.
 
 ## Capability topology
@@ -75,10 +75,12 @@ policy exists.
 
 ## Live forwarding boundary
 
-`ApplicationResourceForwarder` binds one immutable grant, one broker ingress, one selected provider
-node, and one dedicated provider session. It validates each complete 184-byte request before policy
-authorization, translates only node IDs found in its 64-entry table, preserves canonical provider
-statuses, and rewrites returned node IDs and inline attributes into the grant-local namespace.
+`ApplicationResourceForwarder` binds one immutable grant, one broker ingress, one exact selected or
+restored provider node, and one dedicated provider session. Its restoration constructor reads the
+identity from the immutable grant itself, so orchestration cannot substitute another same-kind node.
+It validates each complete 184-byte request before policy authorization, translates only node IDs
+found in its 64-entry table, preserves canonical provider statuses, and rewrites returned node IDs
+and inline attributes into the grant-local namespace.
 
 Application shared memory is not retransferred to the provider. The application transfers exact
 `READ | WRITE` authority to the broker, which allocates one same-sized private mirror, attaches that
@@ -120,7 +122,6 @@ disconnects both sessions.
 
 ## Next steps
 
-1. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
-2. Close active brokers on grant revocation, session expiry, provider replacement, or resource
+1. Close active brokers on grant revocation, session expiry, provider replacement, or resource
    removal.
-3. Implement the portal/compositor transport and trusted picker UI.
+2. Implement the portal/compositor transport and trusted picker UI.

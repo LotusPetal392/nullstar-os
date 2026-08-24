@@ -169,9 +169,10 @@ the grant ceiling. Selection completion now preflights grant issuance or authori
 the endpoint pair and response, commits only after a successful atomic move-transfer, and leaves no
 record, counter, or one-shot consumption behind on failure. Grant-local live I/O now validates the
 canonical generic filesystem wire shape, forwards through private shared-memory mirrors, and rewrites
-all provider nodes through a bounded rooted map. Stored-identity restoration, active revocation,
-compositor and portal transports, the picker UI, and
-transactional persistence are the next portal increments.
+all provider nodes through a bounded rooted map. Stored identities now restore to fresh live NullFS
+nodes by revalidating the complete volume/object/generation/kind tuple without a pathname, and the
+grant forwarder accepts that restored node as its root. Active revocation, compositor and portal
+transports, the picker UI, and transactional persistence are the next portal increments.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

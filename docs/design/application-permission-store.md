@@ -5,7 +5,7 @@
 This document describes the implemented allocation-free policy foundation for application file and
 directory grants. Canonical portal requests and trusted user-gesture admission are now defined by the
 [application portal admission foundation](application-portal-admission.md). A trusted picker, live
-file/directory forwarding service, and durable permission-store service remain outstanding. The
+broker revocation integration, and durable permission-store service remain outstanding. The
 [application filesystem resource resolver](application-resource-resolution.md) now supplies the
 stable UUID/object/generation identity required before grant issuance, and the
 [application resource capability adapter](application-resource-capabilities.md) mints a fresh
@@ -68,11 +68,11 @@ changes. The object generation prevents a deleted inode number from retargeting 
 number is reused. Provider-process generation is deliberately excluded because restarting the same
 filesystem service must not invalidate the underlying resource.
 
-NullFS exposes this tuple through the optional authenticated `RESOLVE_IDENTITY` filesystem operation.
-`ApplicationResourceResolver` pins the provider response to an independently expected volume UUID,
-rejects symbolic links, and requires the exact file/directory kind admitted by the portal. The
-resolver produces policy identity only; restoring a stored tuple to a new live node remains future
-work.
+NullFS exposes this tuple through optional authenticated `RESOLVE_IDENTITY` and `RESTORE_IDENTITY`
+filesystem operations. `ApplicationResourceResolver` pins the provider response to an independently
+expected volume UUID, rejects symbolic links, and requires the exact file/directory kind admitted by
+the portal. `ApplicationResourceRestorer` pins the selected mount to that same UUID before NullFS
+revalidates the stored object ID, generation, kind, and link count and returns a fresh live node.
 
 ## Rights and scopes
 
@@ -117,8 +117,7 @@ atomically and compact tombstones only while preserving rollback/replay protecti
 
 ## Next steps
 
-1. Forward broker requests to rooted live nodes and resolve stored identities without accepting
-   pathname or inode reuse.
+1. Close live brokers immediately when grants, sessions, providers, or resources become invalid.
 2. Implement the portal/compositor transports and trusted picker UI around the admission protocol.
 3. Persist checkpoint state transactionally and expose permission inspection, revocation, and reset.
 4. Extend the same policy foundation to drag-and-drop and share transfers.
