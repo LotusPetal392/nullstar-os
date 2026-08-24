@@ -146,6 +146,14 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_runtime_probe")
             .expect("userspace runtime-probe artifact path was not set"),
     );
+    let userspace_application_component_target = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_application_component_target")
+            .expect("userspace application-component target artifact path was not set"),
+    );
+    let userspace_application_launch_probe = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_application_launch_probe")
+            .expect("userspace application-launch probe artifact path was not set"),
+    );
     let userspace_stderr_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_stderr_probe")
             .expect("userspace stderr-probe artifact path was not set"),
@@ -272,6 +280,14 @@ fn main() {
         image.set_file(
             String::from("runtime-probe"),
             userspace_runtime_probe.clone(),
+        );
+        image.set_file(
+            String::from("application-component-target"),
+            userspace_application_component_target.clone(),
+        );
+        image.set_file(
+            String::from("application-launch-probe"),
+            userspace_application_launch_probe.clone(),
         );
         image.set_file(String::from("stderr-probe"), userspace_stderr_probe.clone());
         image.set_file(String::from("exec"), userspace_exec.clone());

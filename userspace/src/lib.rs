@@ -135,10 +135,14 @@ macro_rules! managed_capability_tool_entry {
 macro_rules! application_entry {
     ($entry:path, $capacity:expr, $policies:expr) => {
         extern "C" fn __nullstar_application_entry(initial_stack: *const usize) -> ! {
-            let start = match $crate::application_launch::receive_application_start::<$capacity>(
-                initial_stack,
-                $policies,
-            ) {
+            // SAFETY: this generated entry point receives the untouched initial
+            // stack pointer directly from the process-loader entry trampoline.
+            let start = match unsafe {
+                $crate::application_launch::receive_application_start::<$capacity>(
+                    initial_stack,
+                    $policies,
+                )
+            } {
                 Ok(start) => start,
                 Err(_) => $crate::syscall::exit(125),
             };

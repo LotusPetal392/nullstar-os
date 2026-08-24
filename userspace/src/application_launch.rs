@@ -1,8 +1,8 @@
 //! Native application-launch foundation.
 //!
-//! This module is the first implementation step behind the application-sandbox
-//! architecture. It deliberately composes existing mechanisms instead of adding
-//! a second authority model:
+//! This module implements the native root-launch and reduced-component
+//! foundation behind the application-sandbox architecture. It deliberately
+//! composes existing mechanisms instead of adding a second authority model:
 //!
 //! - `fork` creates the direct child;
 //! - the child scrubs its inherited descriptor and capability tables before it
@@ -11,7 +11,10 @@
 //! - exactly one receive-only bootstrap endpoint is installed in slot 1;
 //! - application capabilities are carried inside the typed `NSPC` startup
 //!   envelope and are rights-reduced by receiver policy;
-//! - `NSPD` data carries trusted descriptive application identity and profile.
+//! - `NSPD` data carries trusted descriptive application identity and profile;
+//! - reduced components reuse the root job and derive identity from the root;
+//! - component capabilities require explicit profile opt-in and monotonic
+//!   rights reduction.
 //!
 //! Package signature verification, persistent grants, private directory
 //! construction, service-namespace construction, and portal policy remain
@@ -20,7 +23,7 @@
 use crate::{
     abi::{limits, signal},
     args::Args,
-    handle::{Endpoint, Job, OwnedHandle},
+    handle::{AnyObject, Endpoint, Job, OwnedHandle},
     ipc::{self, ObjectKind, Rights, Transfer},
     platform,
     process_start::{
@@ -79,6 +82,37 @@ impl ApplicationProfile {
             _ => None,
         }
     }
+
+    pub const fn is_reduced_component(self) -> bool {
+        matches!(self, Self::DesktopChild | Self::Worker)
+    }
+}
+
+/// Component profiles to which one root capability may be delegated.
+///
+/// The empty default is fail-closed: a capability supplied to the desktop root
+/// is not eligible for component startup unless the trusted manager opts it in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentProfileSet(u8);
+
+impl ComponentProfileSet {
+    pub const EMPTY: Self = Self(0);
+    pub const DESKTOP_CHILD: Self = Self(1 << 0);
+    pub const WORKER: Self = Self(1 << 1);
+    pub const ALL_REDUCED: Self = Self(Self::DESKTOP_CHILD.0 | Self::WORKER.0);
+
+    pub const fn contains(self, profile: ApplicationProfile) -> bool {
+        let required = match profile {
+            ApplicationProfile::Desktop => return false,
+            ApplicationProfile::DesktopChild => Self::DESKTOP_CHILD.0,
+            ApplicationProfile::Worker => Self::WORKER.0,
+        };
+        self.0 & required == required
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 /// Trusted descriptive identity attached to one application process launch.
@@ -113,6 +147,7 @@ pub struct ApplicationCapability {
     pub source_handle: u64,
     pub rights: Rights,
     pub role: CapabilityRole,
+    component_profiles: ComponentProfileSet,
 }
 
 impl ApplicationCapability {
@@ -121,7 +156,41 @@ impl ApplicationCapability {
             source_handle,
             rights,
             role,
+            component_profiles: ComponentProfileSet::EMPTY,
         }
+    }
+
+    /// Allows reduced components in `profiles` to request this exact source
+    /// capability with equal or narrower rights.
+    pub const fn delegable_to(mut self, profiles: ComponentProfileSet) -> Self {
+        self.component_profiles = profiles;
+        self
+    }
+
+    pub const fn component_profiles(self) -> ComponentProfileSet {
+        self.component_profiles
+    }
+}
+
+/// One explicit capability requested for a reduced component.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplicationComponentCapability {
+    pub source_handle: u64,
+    pub rights: Rights,
+    pub role: CapabilityRole,
+}
+
+impl ApplicationComponentCapability {
+    pub const fn new(source_handle: u64, rights: Rights, role: CapabilityRole) -> Self {
+        Self {
+            source_handle,
+            rights,
+            role,
+        }
+    }
+
+    const fn as_application_capability(self) -> ApplicationCapability {
+        ApplicationCapability::new(self.source_handle, self.rights, self.role)
     }
 }
 
@@ -135,6 +204,32 @@ pub struct ApplicationLaunch<'a, const N: usize> {
     pub manager_generation: u64,
     pub process_limit: usize,
     pub capabilities: &'a [ApplicationCapability; N],
+}
+
+/// Immutable inputs for one reduced component launched inside an existing
+/// application job and identity boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplicationComponentLaunch<'a, const N: usize> {
+    pub command: &'a [u8],
+    pub component: u64,
+    pub profile: ApplicationProfile,
+    pub capabilities: &'a [ApplicationComponentCapability; N],
+}
+
+impl<'a, const N: usize> ApplicationComponentLaunch<'a, N> {
+    pub const fn new(
+        command: &'a [u8],
+        component: u64,
+        profile: ApplicationProfile,
+        capabilities: &'a [ApplicationComponentCapability; N],
+    ) -> Self {
+        Self {
+            command,
+            component,
+            profile,
+            capabilities,
+        }
+    }
 }
 
 impl<'a, const N: usize> ApplicationLaunch<'a, N> {
@@ -161,12 +256,26 @@ impl<'a, const N: usize> ApplicationLaunch<'a, N> {
     }
 }
 
-/// A successfully released application process and the job authority retained by
-/// its manager.
+/// A successfully released application process, its job authority, and
+/// rights-bounded duplicates of component-delegable sources retained by its
+/// manager.
 #[derive(Debug)]
-pub struct ApplicationInstance {
+pub struct ApplicationInstance<const N: usize> {
     pub process_id: ProcessId,
     pub job: OwnedHandle<Job>,
+    identity: ApplicationIdentity,
+    profile: ApplicationProfile,
+    manager_generation: u64,
+    authority_ceiling: [ApplicationCapability; N],
+    authority_sources: [Option<OwnedHandle<AnyObject>>; N],
+}
+
+/// A reduced component released into its application's existing job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationComponentInstance {
+    pub process_id: ProcessId,
+    pub identity: ApplicationIdentity,
+    pub profile: ApplicationProfile,
 }
 
 /// Validated application startup state delivered before application entry.
@@ -181,6 +290,18 @@ pub struct ApplicationStart<const N: usize> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationLaunchError {
     InvalidDescription,
+    Descriptor(syscall::Errno),
+    Capability(ipc::Error),
+    Startup(ApplicationStartupSendError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationComponentLaunchError {
+    InvalidDescription,
+    RootProfileRequired,
+    AuthorityNotDelegable(CapabilityRole),
+    AuthorityEscalation(CapabilityRole),
+    AuthorityNotReduced,
     Descriptor(syscall::Errno),
     Capability(ipc::Error),
     Startup(ApplicationStartupSendError),
@@ -217,52 +338,148 @@ pub enum ApplicationStartError {
 /// explicitly.
 pub fn spawn_application<const N: usize>(
     launch: ApplicationLaunch<'_, N>,
-) -> Result<ApplicationInstance, ApplicationLaunchError> {
+) -> Result<ApplicationInstance<N>, ApplicationLaunchError> {
     validate_launch(&launch).map_err(|_| ApplicationLaunchError::InvalidDescription)?;
+    let authority_sources = retain_component_sources(launch.profile, launch.capabilities)?;
 
     let job = OwnedHandle::<Job>::create().map_err(ApplicationLaunchError::Capability)?;
     ipc::job_set_process_limit(job.as_raw(), launch.process_limit)
         .map_err(ApplicationLaunchError::Capability)?;
 
-    let mut release = LaunchReleaseBarrier::new().map_err(ApplicationLaunchError::Descriptor)?;
-    let mut isolated =
-        CapabilityDescriptorIsolation::new().map_err(ApplicationLaunchError::Descriptor)?;
-    let child = syscall::fork().map_err(ApplicationLaunchError::Descriptor)?;
-    if child == 0 {
-        launch_isolated_child(launch.command, release.pair, isolated.pair)
-    }
-
-    if platform::set_process_group(child, child).is_err()
-        || isolated.wait_for_child().is_err()
-        || ipc::job_assign(job.as_raw(), child).is_err()
-    {
-        terminate_and_reap(child);
-        return Err(ApplicationLaunchError::InvalidDescription);
-    }
-
-    if let Err(error) = install_application_start(child, launch) {
-        let _ = ipc::job_terminate(job.as_raw());
-        terminate_and_reap(child);
-        return Err(ApplicationLaunchError::Startup(error));
-    }
-
-    if release.release().is_err() {
-        let _ = ipc::job_terminate(job.as_raw());
-        terminate_and_reap(child);
-        return Err(ApplicationLaunchError::InvalidDescription);
-    }
+    let child = spawn_application_in_job(launch, job.as_raw())?;
 
     Ok(ApplicationInstance {
         process_id: child,
         job,
+        identity: launch.identity,
+        profile: launch.profile,
+        manager_generation: launch.manager_generation,
+        authority_ceiling: *launch.capabilities,
+        authority_sources,
     })
+}
+
+impl<const N: usize> ApplicationInstance<N> {
+    pub const fn identity(&self) -> ApplicationIdentity {
+        self.identity
+    }
+
+    pub const fn profile(&self) -> ApplicationProfile {
+        self.profile
+    }
+
+    pub const fn manager_generation(&self) -> u64 {
+        self.manager_generation
+    }
+
+    /// Launches a reduced child component inside this application's existing
+    /// job, identity, user, session, and manager-generation boundary.
+    ///
+    /// Every requested capability must name the exact manager-owned source and
+    /// role retained in the root launch ceiling, be opted into the selected
+    /// component profile, and request no broader rights. The complete root
+    /// authority set cannot be reproduced unchanged.
+    pub fn spawn_component<const M: usize>(
+        &self,
+        launch: ApplicationComponentLaunch<'_, M>,
+    ) -> Result<ApplicationComponentInstance, ApplicationComponentLaunchError> {
+        if self.profile != ApplicationProfile::Desktop {
+            return Err(ApplicationComponentLaunchError::RootProfileRequired);
+        }
+        if launch.component == self.identity.component {
+            return Err(ApplicationComponentLaunchError::InvalidDescription);
+        }
+        validate_component_launch(&self.authority_ceiling, &launch)?;
+        let identity = ApplicationIdentity {
+            component: launch.component,
+            ..self.identity
+        };
+        let mut capabilities = launch
+            .capabilities
+            .map(ApplicationComponentCapability::as_application_capability);
+        for capability in &mut capabilities {
+            let Some(index) = self
+                .authority_ceiling
+                .iter()
+                .position(|allowed| allowed.role == capability.role)
+            else {
+                return Err(ApplicationComponentLaunchError::InvalidDescription);
+            };
+            let Some(source) = self.authority_sources[index].as_ref() else {
+                return Err(ApplicationComponentLaunchError::InvalidDescription);
+            };
+            capability.source_handle = source.as_raw();
+        }
+        let application_launch = ApplicationLaunch::new(
+            launch.command,
+            identity,
+            launch.profile,
+            self.manager_generation,
+            &capabilities,
+        );
+        let process_id =
+            spawn_application_in_job(application_launch, self.job.as_raw()).map_err(|error| {
+                match error {
+                    ApplicationLaunchError::InvalidDescription => {
+                        ApplicationComponentLaunchError::InvalidDescription
+                    }
+                    ApplicationLaunchError::Descriptor(error) => {
+                        ApplicationComponentLaunchError::Descriptor(error)
+                    }
+                    ApplicationLaunchError::Capability(error) => {
+                        ApplicationComponentLaunchError::Capability(error)
+                    }
+                    ApplicationLaunchError::Startup(error) => {
+                        ApplicationComponentLaunchError::Startup(error)
+                    }
+                }
+            })?;
+        Ok(ApplicationComponentInstance {
+            process_id,
+            identity,
+            profile: launch.profile,
+        })
+    }
+}
+
+fn retain_component_sources<const N: usize>(
+    profile: ApplicationProfile,
+    capabilities: &[ApplicationCapability; N],
+) -> Result<[Option<OwnedHandle<AnyObject>>; N], ApplicationLaunchError> {
+    let mut sources = [const { None }; N];
+    if profile != ApplicationProfile::Desktop {
+        return Ok(sources);
+    }
+    for (index, capability) in capabilities.iter().enumerate() {
+        if capability.component_profiles.is_empty() {
+            continue;
+        }
+        let retained = ipc::duplicate(
+            capability.source_handle,
+            capability.rights | Rights::DUPLICATE | Rights::TRANSFER,
+        )
+        .map_err(ApplicationLaunchError::Capability)?;
+        sources[index] = Some(
+            // SAFETY: `duplicate` returned a new, manager-owned untyped handle,
+            // which this array adopts exactly once and closes on drop.
+            unsafe { OwnedHandle::<AnyObject>::from_raw(retained) }
+                .map_err(ApplicationLaunchError::Capability)?,
+        );
+    }
+    Ok(sources)
 }
 
 /// Receives and validates a mandatory native-application startup stream.
 ///
 /// Before adoption, bootstrap slot 1 must be the only live capability. The
 /// trusted sender is the direct parent that mediated this application launch.
-pub fn receive_application_start<const N: usize>(
+///
+/// # Safety
+///
+/// `initial_stack` must identify the untouched initial stack layout constructed
+/// by the process loader and remain mapped while the returned startup state is
+/// validated.
+pub unsafe fn receive_application_start<const N: usize>(
     initial_stack: *const usize,
     policies: &[StartupCapabilityPolicy],
 ) -> Result<ApplicationStart<N>, ApplicationStartError> {
@@ -341,11 +558,84 @@ fn validate_launch<const N: usize>(launch: &ApplicationLaunch<'_, N>) -> Result<
         || launch.process_limit == 0
         || launch.process_limit > limits::MAX_JOB_PROCESSES
         || N > limits::MAX_IPC_MESSAGE_HANDLES
+        || !capability_descriptions_valid(launch.capabilities)
     {
         return Err(());
     }
+    validate_command(launch.command)
+}
+
+fn validate_component_launch<const N: usize, const M: usize>(
+    authority_ceiling: &[ApplicationCapability; N],
+    launch: &ApplicationComponentLaunch<'_, M>,
+) -> Result<(), ApplicationComponentLaunchError> {
+    if launch.component == 0
+        || !launch.profile.is_reduced_component()
+        || M > limits::MAX_IPC_MESSAGE_HANDLES
+        || !component_capability_descriptions_valid(launch.capabilities)
+        || validate_command(launch.command).is_err()
+    {
+        return Err(ApplicationComponentLaunchError::InvalidDescription);
+    }
+
+    let mut strictly_reduced = authority_ceiling.is_empty();
+    for requested in launch.capabilities {
+        let Some(allowed) = authority_ceiling
+            .iter()
+            .find(|allowed| allowed.role == requested.role)
+        else {
+            return Err(ApplicationComponentLaunchError::AuthorityNotDelegable(
+                requested.role,
+            ));
+        };
+        if allowed.source_handle != requested.source_handle
+            || !allowed.component_profiles.contains(launch.profile)
+        {
+            return Err(ApplicationComponentLaunchError::AuthorityNotDelegable(
+                requested.role,
+            ));
+        }
+        if !allowed.rights.contains(requested.rights) {
+            return Err(ApplicationComponentLaunchError::AuthorityEscalation(
+                requested.role,
+            ));
+        }
+        strictly_reduced |= allowed.rights != requested.rights;
+    }
+    strictly_reduced |= M < N;
+    if !strictly_reduced {
+        return Err(ApplicationComponentLaunchError::AuthorityNotReduced);
+    }
+    Ok(())
+}
+
+fn capability_descriptions_valid<const N: usize>(
+    capabilities: &[ApplicationCapability; N],
+) -> bool {
+    capabilities.iter().enumerate().all(|(index, capability)| {
+        capability.source_handle != 0
+            && capability.rights != Rights::EMPTY
+            && !capabilities[..index]
+                .iter()
+                .any(|other| other.role == capability.role)
+    })
+}
+
+fn component_capability_descriptions_valid<const N: usize>(
+    capabilities: &[ApplicationComponentCapability; N],
+) -> bool {
+    capabilities.iter().enumerate().all(|(index, capability)| {
+        capability.source_handle != 0
+            && capability.rights != Rights::EMPTY
+            && !capabilities[..index]
+                .iter()
+                .any(|other| other.role == capability.role)
+    })
+}
+
+fn validate_command(command: &[u8]) -> Result<(), ()> {
     let mut arguments = [&[][..]; limits::MAX_ARGUMENTS];
-    let count = split_command(launch.command, &mut arguments).ok_or(())?;
+    let count = split_command(command, &mut arguments).ok_or(())?;
     if !is_absolute_canonical_executable(arguments[0])
         || arguments[..count]
             .iter()
@@ -354,6 +644,41 @@ fn validate_launch<const N: usize>(launch: &ApplicationLaunch<'_, N>) -> Result<
         return Err(());
     }
     Ok(())
+}
+
+fn spawn_application_in_job<const N: usize>(
+    launch: ApplicationLaunch<'_, N>,
+    job: ipc::CapabilityHandle,
+) -> Result<ProcessId, ApplicationLaunchError> {
+    let mut release = LaunchReleaseBarrier::new().map_err(ApplicationLaunchError::Descriptor)?;
+    let mut isolated =
+        CapabilityDescriptorIsolation::new().map_err(ApplicationLaunchError::Descriptor)?;
+    let child = syscall::fork().map_err(ApplicationLaunchError::Descriptor)?;
+    if child == 0 {
+        launch_isolated_child(launch.command, release.pair, isolated.pair)
+    }
+
+    if platform::set_process_group(child, child).is_err() {
+        terminate_and_reap(child);
+        return Err(ApplicationLaunchError::InvalidDescription);
+    }
+    if let Err(error) = isolated.wait_for_child() {
+        terminate_and_reap(child);
+        return Err(ApplicationLaunchError::Descriptor(error));
+    }
+    if let Err(error) = ipc::job_assign(job, child) {
+        terminate_and_reap(child);
+        return Err(ApplicationLaunchError::Capability(error));
+    }
+    if let Err(error) = install_application_start(child, launch) {
+        terminate_and_reap(child);
+        return Err(ApplicationLaunchError::Startup(error));
+    }
+    if let Err(error) = release.release() {
+        terminate_and_reap(child);
+        return Err(ApplicationLaunchError::Descriptor(error));
+    }
+    Ok(child)
 }
 
 fn install_application_start<const N: usize>(
@@ -698,10 +1023,13 @@ fn arguments_match(arguments: Args<'_>, start: ValidatedProcessStart<'_>) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationIdentity, ApplicationLaunch, ApplicationProfile,
-        DESKTOP_CHILD_NAMESPACE_PROFILE_ID, DESKTOP_NAMESPACE_PROFILE_ID,
-        WORKER_NAMESPACE_PROFILE_ID, is_absolute_canonical_executable, validate_launch,
+        ApplicationCapability, ApplicationComponentCapability, ApplicationComponentLaunch,
+        ApplicationComponentLaunchError, ApplicationIdentity, ApplicationLaunch,
+        ApplicationProfile, ComponentProfileSet, DESKTOP_CHILD_NAMESPACE_PROFILE_ID,
+        DESKTOP_NAMESPACE_PROFILE_ID, WORKER_NAMESPACE_PROFILE_ID,
+        is_absolute_canonical_executable, validate_component_launch, validate_launch,
     };
+    use crate::{ipc::Rights, runtime_context::CapabilityRole};
 
     const IDENTITY: ApplicationIdentity = ApplicationIdentity {
         package: 1,
@@ -770,5 +1098,123 @@ mod tests {
             &capabilities,
         );
         assert!(validate_launch(&invalid).is_err());
+    }
+
+    #[test]
+    fn component_allowlist_requires_exact_delegable_source_and_reduced_rights() {
+        let ceiling = [
+            ApplicationCapability::new(11, Rights::SEND, CapabilityRole::LOGGING)
+                .delegable_to(ComponentProfileSet::ALL_REDUCED),
+            ApplicationCapability::new(12, Rights::SEND, CapabilityRole::SERVICE_NAMESPACE),
+        ];
+        let requested = [ApplicationComponentCapability::new(
+            11,
+            Rights::SEND,
+            CapabilityRole::LOGGING,
+        )];
+        let launch = ApplicationComponentLaunch::new(
+            b"/Applications/Test/worker",
+            4,
+            ApplicationProfile::Worker,
+            &requested,
+        );
+        assert_eq!(validate_component_launch(&ceiling, &launch), Ok(()));
+
+        let wrong_source = [ApplicationComponentCapability::new(
+            13,
+            Rights::SEND,
+            CapabilityRole::LOGGING,
+        )];
+        assert_eq!(
+            validate_component_launch(
+                &ceiling,
+                &ApplicationComponentLaunch::new(
+                    b"/Applications/Test/worker",
+                    4,
+                    ApplicationProfile::Worker,
+                    &wrong_source,
+                ),
+            ),
+            Err(ApplicationComponentLaunchError::AuthorityNotDelegable(
+                CapabilityRole::LOGGING
+            ))
+        );
+
+        let nondelegable = [ApplicationComponentCapability::new(
+            12,
+            Rights::SEND,
+            CapabilityRole::SERVICE_NAMESPACE,
+        )];
+        assert_eq!(
+            validate_component_launch(
+                &ceiling,
+                &ApplicationComponentLaunch::new(
+                    b"/Applications/Test/worker",
+                    4,
+                    ApplicationProfile::Worker,
+                    &nondelegable,
+                ),
+            ),
+            Err(ApplicationComponentLaunchError::AuthorityNotDelegable(
+                CapabilityRole::SERVICE_NAMESPACE
+            ))
+        );
+    }
+
+    #[test]
+    fn component_launch_rejects_profile_relaxation_and_authority_cloning() {
+        let ceiling = [
+            ApplicationCapability::new(11, Rights::SEND, CapabilityRole::LOGGING)
+                .delegable_to(ComponentProfileSet::ALL_REDUCED),
+        ];
+        let requested = [ApplicationComponentCapability::new(
+            11,
+            Rights::SEND,
+            CapabilityRole::LOGGING,
+        )];
+        assert_eq!(
+            validate_component_launch(
+                &ceiling,
+                &ApplicationComponentLaunch::new(
+                    b"/Applications/Test/child",
+                    4,
+                    ApplicationProfile::Desktop,
+                    &requested,
+                ),
+            ),
+            Err(ApplicationComponentLaunchError::InvalidDescription)
+        );
+        assert_eq!(
+            validate_component_launch(
+                &ceiling,
+                &ApplicationComponentLaunch::new(
+                    b"/Applications/Test/child",
+                    4,
+                    ApplicationProfile::DesktopChild,
+                    &requested,
+                ),
+            ),
+            Err(ApplicationComponentLaunchError::AuthorityNotReduced)
+        );
+
+        let escalated = [ApplicationComponentCapability::new(
+            11,
+            Rights::SEND | Rights::DUPLICATE,
+            CapabilityRole::LOGGING,
+        )];
+        assert_eq!(
+            validate_component_launch(
+                &ceiling,
+                &ApplicationComponentLaunch::new(
+                    b"/Applications/Test/child",
+                    4,
+                    ApplicationProfile::DesktopChild,
+                    &escalated,
+                ),
+            ),
+            Err(ApplicationComponentLaunchError::AuthorityEscalation(
+                CapabilityRole::LOGGING
+            ))
+        );
     }
 }

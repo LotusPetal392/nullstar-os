@@ -141,6 +141,12 @@ See [Service, session, and application lifecycle](service-and-session-lifecycle.
 
 ## Application isolation and permissions
 
+The native launch foundation now scrubs inherited descriptors and capabilities, assigns a bounded
+application job before release, delivers typed startup identity and authority, and creates
+`desktop-child` and `worker` components from explicit profile-specific capability allowlists. Stable
+verified application identity is the next foundation layer; general application-manager routing is
+still future work.
+
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;
 2. establish stable signed application identity and technical sandbox profiles;
