@@ -8,6 +8,7 @@ use userspace::{
     application_launch::{
         ApplicationInstallScope, ApplicationProfile, ApplicationStart, ApplicationTrustClass,
     },
+    application_lifecycle::APPLICATION_READY_MESSAGE,
     application_service::{DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     args::Args,
     handle::Endpoint,
@@ -61,17 +62,28 @@ userspace::panic_handler!();
 fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<3>) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
     let expected = match arguments.get(1) {
-        Some(b"root") if arguments.len() == 2 => {
-            (ApplicationProfile::Desktop, ROOT_COMPONENT, true, 1_u8)
-        }
+        Some(b"root") if arguments.len() == 2 => (
+            ApplicationProfile::Desktop,
+            ROOT_COMPONENT,
+            true,
+            1_u8,
+            0_u8,
+        ),
         Some(b"desktop-child") if arguments.len() == 2 => (
             ApplicationProfile::DesktopChild,
             DESKTOP_CHILD_COMPONENT,
             false,
             2,
+            0,
         ),
         Some(b"worker") if arguments.len() == 2 => {
-            (ApplicationProfile::Worker, WORKER_COMPONENT, false, 3)
+            (ApplicationProfile::Worker, WORKER_COMPONENT, false, 3, 0)
+        }
+        Some(b"lifecycle-unready") if arguments.len() == 2 => {
+            (ApplicationProfile::Desktop, ROOT_COMPONENT, true, 0, 1)
+        }
+        Some(b"lifecycle-running") if arguments.len() == 2 => {
+            (ApplicationProfile::Desktop, ROOT_COMPONENT, true, 0, 2)
         }
         _ => syscall::exit(1),
     };
@@ -112,7 +124,7 @@ fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<3>) -> ! {
         Ok(status) => status,
         Err(_) => syscall::exit(5),
     };
-    if expected.2 {
+    if expected.4 == 0 && expected.2 {
         let service_namespace = match start
             .context
             .take::<Endpoint>(CapabilityRole::SERVICE_NAMESPACE, Rights::SEND)
@@ -135,6 +147,33 @@ fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<3>) -> ! {
             syscall::exit(7);
         }
         drop(private_storage);
+    }
+    if expected.4 != 0 {
+        let service_namespace = match start
+            .context
+            .take::<Endpoint>(CapabilityRole::SERVICE_NAMESPACE, Rights::SEND)
+        {
+            Ok(endpoint) => endpoint,
+            Err(_) => syscall::exit(6),
+        };
+        let private_storage = match start
+            .context
+            .take::<Endpoint>(CapabilityRole::PRIVATE_STORAGE, Rights::SEND)
+        {
+            Ok(endpoint) => endpoint,
+            Err(_) => syscall::exit(6),
+        };
+        drop(service_namespace);
+        drop(private_storage);
+        if !start.context.is_empty() {
+            syscall::exit(8);
+        }
+        if expected.4 == 2 && ipc::send(status.as_raw(), APPLICATION_READY_MESSAGE, None).is_err() {
+            syscall::exit(8);
+        }
+        loop {
+            let _ = syscall::yield_now();
+        }
     }
     if !start.context.is_empty()
         || ipc::send(status.as_raw(), &[expected.3, expected.1 as u8], None).is_err()

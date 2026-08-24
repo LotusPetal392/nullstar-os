@@ -153,7 +153,10 @@ uses one immutable multi-route NSRT ingress for the baseline display, lifecycle,
 logging-producer, audio-playback, and portal routes; policy denial precedes provider availability,
 and published routes retain generation-bound endpoint issuance. Concrete providers, provider-backed
 directory provisioning, cryptographic package and registry services, and a standalone application
-manager remain future work; application lifecycle supervision is the next launch layer.
+manager remain future work. Application lifecycle supervision now pins readiness to the current root,
+applies bounded startup and relaunch policy, drains each failed or stopped job completely before
+replacement, and suppresses relaunch for user, session, or manager teardown. Portals and persistent
+grants are the next application-isolation layer.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

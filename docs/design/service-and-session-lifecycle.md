@@ -544,6 +544,15 @@ A native application launch is:
 9. the initial thread starts;
 10. the application reports readiness and may create visible surfaces.
 
+The implemented lifecycle adapter now owns the launched job through this transition. It accepts an
+exact readiness record only from the current root process, treats startup timeout and root failure as
+bounded relaunch candidates, terminates remaining components when the root exits, and drains every
+job completion before permitting replacement. Replacement generations must preserve verified
+application identity, publisher lineage, installation provenance, desktop profile, and manager
+generation. Clean completion is terminal; explicit user termination, session teardown, and manager
+shutdown stop the job and cancel pending relaunch. A future session-manager event loop must supply
+clock-based polling and construct each authorized replacement.
+
 The capability and permission rules are specified in
 [Capability-based application sandboxing](application-sandboxing.md).
 
