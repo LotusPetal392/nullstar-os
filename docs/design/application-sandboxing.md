@@ -40,6 +40,12 @@ constructed capability table and restricted service namespace. A process cannot 
 use a resource merely because it knows a pathname, service name, process ID, device
 name, user identity, or package location.
 
+The implemented baseline desktop namespace is one exact-`SEND` NSRT endpoint backed by an
+immutable route allowlist rather than a global registry handle. It admits display,
+application-lifecycle, settings, logging-producer, audio-playback, and portal client routes. A key
+outside that set is denied before provider lookup, while an allowed key may independently be
+unavailable or resolve to the current generation's exact send-only provider endpoint.
+
 ## Terminology
 
 These terms have distinct meanings:

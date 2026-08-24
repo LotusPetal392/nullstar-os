@@ -297,6 +297,11 @@ UUIDv4 service ID and nonzero role. The protocol deliberately uses one transferr
 capability per message: a route request carries exactly one fresh send-only reply endpoint and an
 accepted response carries exactly one send-only provider ingress; failure responses carry none.
 
+Desktop applications receive a separate restricted NSRT namespace endpoint. Its immutable baseline
+allowlist covers display, application lifecycle, settings, logging production, audio playback, and
+portals. Namespace policy rejects other keys before route publication is consulted; allowed routes
+still cross caller authorization and resolve through the same generation-aware table.
+
 PID 1 is the temporary broker for the logging service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable
 route authorities. The broker authorizes the kernel-stamped caller PID before consulting its

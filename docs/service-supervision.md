@@ -53,9 +53,9 @@ PID 1
   -> interactive shell started
 ```
 
-There is no global service namespace yet. Direct-child grants remain the only
-bootstrap mechanism, and readiness endpoints are private to PID 1 and its
-children.
+There is no global service namespace yet. This supervision probe still uses a direct-child grant as
+its bootstrap mechanism, and readiness endpoints are private to PID 1 and its children. Managed
+desktop applications separately receive an explicit restricted NSRT namespace capability.
 
 ## Failure injection
 

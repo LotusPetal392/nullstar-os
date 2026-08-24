@@ -360,6 +360,11 @@ one fresh reply capability with its 40-byte request; an accepted reply transfers
 send-only capability for the current provider ingress. The broker authorizes before checking
 availability and never parses the service protocol carried on the returned endpoint.
 
+The same request/reply transport now supports a restricted application namespace whose ingress is
+bound to an immutable set of service-and-role keys. It rejects keys outside that set before
+availability lookup, then applies the ordinary caller authorizer and route table. This is a scoped
+capability, not a privileged global name.
+
 A provider replacement publishes fresh ingress endpoint objects for the new generation. This keeps
 old clients isolated from the replacement without pretending to revoke every old delegated handle:
 the current kernel has no global capability-revocation primitive. Old ingress handles can remain
