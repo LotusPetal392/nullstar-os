@@ -9,7 +9,9 @@ file/directory forwarding service, and durable permission-store service remain o
 [application filesystem resource resolver](application-resource-resolution.md) now supplies the
 stable UUID/object/generation identity required before grant issuance, and the
 [application resource capability adapter](application-resource-capabilities.md) mints a fresh
-rights-reduced endpoint from each authorization.
+rights-reduced endpoint from each authorization. The
+[application selection transaction](application-selection-transactions.md) now couples prepared
+grant policy to endpoint delivery without spending authority on failure.
 
 The implementation provides:
 
@@ -80,8 +82,8 @@ containing directory of a selected file.
 
 The scopes are:
 
-- `Once`: bound to the current session and atomically replaced by a `Consumed` tombstone on the first
-  successful authorization;
+- `Once`: bound to the current session and atomically replaced by a `Consumed` tombstone when an
+  immediate authorization commits or a prepared portal capability delivery succeeds;
 - `Session`: reusable only by the exact verified subject in the issuing session; and
 - `Persistent`: reusable by the exact verified subject in later sessions, subject to current policy
   and resource resolution.
@@ -89,8 +91,13 @@ The scopes are:
 Authorization returns only the requested subset of stored rights. The returned policy object is not
 a kernel capability. `ApplicationResourceBroker::mint` now consumes that object as policy input for
 a fresh channel pair: the broker retains `RECEIVE | WAIT`, a transfer-staging peer has
-`SEND | TRANSFER`, and the application receives exact `SEND`. The retained authority gates generic filesystem
-operations against the authorized file/directory rights.
+`SEND | TRANSFER`, and the application receives exact `SEND`. The retained authority gates generic
+filesystem operations against the authorized file/directory rights.
+
+Portal completion uses `PreparedApplicationGrant` instead of immediately mutating the store. New
+grant records and one-shot consumption revisions are fully checked and reserved while the store is
+mutably borrowed, but are committed only after the selected endpoint move succeeds. Dropping the
+prepared grant leaves records and monotonic counters unchanged.
 
 ## Revocation and persistence
 
@@ -110,9 +117,8 @@ atomically and compact tombstones only while preserving rollback/replay protecti
 
 ## Next steps
 
-1. Make grant authorization, endpoint creation, and portal response transfer failure-atomic.
-2. Forward broker requests to rooted live nodes and resolve stored identities without accepting
+1. Forward broker requests to rooted live nodes and resolve stored identities without accepting
    pathname or inode reuse.
-3. Implement the portal/compositor transports and trusted picker UI around the admission protocol.
-4. Persist checkpoint state transactionally and expose permission inspection, revocation, and reset.
-5. Extend the same policy foundation to drag-and-drop and share transfers.
+2. Implement the portal/compositor transports and trusted picker UI around the admission protocol.
+3. Persist checkpoint state transactionally and expose permission inspection, revocation, and reset.
+4. Extend the same policy foundation to drag-and-drop and share transfers.

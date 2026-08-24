@@ -331,8 +331,14 @@ one fresh generic-filesystem ingress for an exact grant authorization. The broke
 `SEND`. Portal construction binds that endpoint to the response's grant and receiver validation pins
 the kernel object kind and rights. The adapter denies unsupported and stable-identity operations and
 maps lookup, I/O, enumeration, create, remove, rename, and sync to exact grant rights. Rooted live-I/O
-forwarding, active revocation, failure-atomic selection completion, compositor transport, and picker
-UI remain future layers.
+forwarding and active revocation remain future layers.
+
+The [application selection transaction](design/application-selection-transactions.md) preflights a
+new grant or existing authorization without changing the permission store, then owns that mutation
+with the exact endpoint pair and selected response. Failed minting, response binding, or kernel
+move-transfer closes staged authority and leaves grant records and counters unchanged. Successful
+transfer commits an infallibly reserved mutation, including the `Consumed` tombstone for one-shot
+authority. Crash-safe persistence, compositor transport, and picker UI remain future layers.
 
 PID 1 is the temporary broker for the logging service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable

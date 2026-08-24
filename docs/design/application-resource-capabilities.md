@@ -80,9 +80,12 @@ remove an immutable kernel handle. The future broker lifecycle must observe the 
 stop accepting new work, fail or safely drain pending work, close its ingress, and make the
 application observe peer closure. Reauthorization creates a fresh endpoint pair.
 
-One-shot authorization is already consumed atomically by the permission store before minting. The
-next selection-completion transaction must therefore clean up or compensate if endpoint creation or
-portal transfer fails, so a failed response cannot silently spend a one-shot grant.
+The [application selection transaction](application-selection-transactions.md) now preflights grant
+issuance or authorization without changing the store, then owns that deferred mutation with both
+endpoint sides and the response. Failed endpoint creation, response binding, or portal transfer
+closes staged authority and leaves grant records and counters unchanged. A successful transfer
+commits the reserved mutation, including a one-shot `Consumed` tombstone, with no remaining fallible
+policy operation.
 
 ## Coverage
 
@@ -91,14 +94,13 @@ stable-identity queries, and open-flag escalation. Portal tests validate missing
 wrong-kind, and over-righted attachments. The freestanding application probe creates a real endpoint,
 checks both local rights sets and object identity, move-transfers the application side with exact
 `SEND`, rejects receive authority on the application side and send authority on the broker side, and
-delivers a message through the resulting one-way channel.
+delivers a message through the resulting one-way channel. It first forces transfer failure through a
+closed portal peer and verifies that grant records and counters remain unchanged before retrying.
 
 ## Next steps
 
-1. Implement failure-atomic selection completion across grant issuance/authorization, endpoint
-   creation, response transfer, and one-shot compensation.
-2. Add the live forwarding adapter with canonical request validation and a rooted node map.
-3. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
-4. Close active brokers on grant revocation, session expiry, provider replacement, or resource
+1. Add the live forwarding adapter with canonical request validation and a rooted node map.
+2. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
+3. Close active brokers on grant revocation, session expiry, provider replacement, or resource
    removal.
-5. Implement the portal/compositor transport and trusted picker UI.
+4. Implement the portal/compositor transport and trusted picker UI.

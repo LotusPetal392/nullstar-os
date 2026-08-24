@@ -7,6 +7,8 @@ file and directory portals. It connects a verified desktop application and a tru
 one bounded picker transaction. It does not yet implement a compositor, portal service process,
 picker UI, live filesystem forwarding, or complete portal service transport. Stable-resource
 resolution and the rights-reduced capability-adapter contract are now implemented separately.
+Failure-atomic grant and endpoint delivery is implemented by the
+[application selection transaction](application-selection-transactions.md).
 
 The implementation provides:
 
@@ -24,8 +26,8 @@ The host suite covers codec corruption, invalid operation/rights combinations, i
 event cloning, process/application/session/surface mismatch, replay, expiry, transient persistence,
 fixed-capacity exhaustion, transaction-ID exhaustion, cross-subject grant substitution, and response
 capability cardinality and kernel object/rights validation. The QEMU application probe exercises the
-complete in-memory path from a gesture ticket through grant-backed selected response validation and
-a real rights-reduced endpoint move transfer.
+complete in-memory path from a gesture ticket through failed-delivery rollback, grant-backed selected
+response validation, and a real rights-reduced endpoint move transfer.
 
 ## Trust boundary
 
@@ -97,12 +99,15 @@ endpoint with exact `SEND` rights; broader, missing, wrong-kind, and terminal-re
 fail closed. The endpoint and operation policy are detailed in
 [Application resource capability adapter](application-resource-capabilities.md).
 
+`PreparedApplicationSelection` owns the response and staged endpoint with an uncommitted permission
+mutation. A failed endpoint mint, response bind, or move-transfer closes staged authority and leaves
+the grant store unchanged. Success commits the reserved grant state immediately after the kernel's
+atomic payload-and-capability transfer.
+
 ## Next steps
 
-1. Make grant issuance/authorization, endpoint minting, and response transfer failure-atomic,
-   including one-shot compensation.
-2. Forward the broker protocol to rooted live nodes and restore stored identities without accepting
+1. Forward the broker protocol to rooted live nodes and restore stored identities without accepting
    pathname or inode reuse.
-3. Implement the portal service transport using kernel-stamped sender identities and authenticated
+2. Implement the portal service transport using kernel-stamped sender identities and authenticated
    compositor startup authority.
-4. Add a trusted picker UI and transactional permission persistence.
+3. Add a trusted picker UI and transactional permission persistence.
