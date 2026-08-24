@@ -319,6 +319,13 @@ impl<D: BlockDevice> FilesystemServer<D> {
                 }
                 false
             }
+            protocol::operation::RESTORE_IDENTITY => {
+                reject_unexpected_capability(capability, &mut reply);
+                if reply.status == protocol::status::OK {
+                    self.restore_identity(&request, &mut reply);
+                }
+                false
+            }
             protocol::operation::OPEN => {
                 reject_unexpected_capability(capability, &mut reply);
                 if reply.status == protocol::status::OK {
@@ -770,6 +777,47 @@ impl<D: BlockDevice> FilesystemServer<D> {
         reply.data[..bytes.len()].copy_from_slice(bytes);
         reply.data_length = bytes.len() as u16;
         reply.node_id = request.node_id;
+        reply.node_kind = stable.kind;
+    }
+
+    fn restore_identity(&mut self, request: &protocol::Request, reply: &mut protocol::Reply) {
+        let Some(stable) = canonical_restore_identity(request) else {
+            reply.status = protocol::status::INVALID;
+            return;
+        };
+        if stable.filesystem_uuid != self.filesystem.superblock().filesystem_uuid {
+            reply.status = protocol::status::STALE_NODE;
+            return;
+        }
+        let attributes = match self.filesystem.attributes(NodeId(stable.object_id)) {
+            Ok(attributes) => attributes,
+            Err(CoreError::InvalidNode) => {
+                reply.status = protocol::status::STALE_NODE;
+                return;
+            }
+            Err(error) => {
+                reply.status = core_status(error);
+                return;
+            }
+        };
+        if attributes.generation != stable.object_generation
+            || protocol_node_kind(attributes.kind) != stable.kind
+            || attributes.link_count == 0
+        {
+            reply.status = protocol::status::STALE_NODE;
+            return;
+        }
+        let opaque_id = match self.intern_node(attributes.node, &attributes) {
+            Ok(opaque_id) => opaque_id,
+            Err(status) => {
+                reply.status = status;
+                return;
+            }
+        };
+        let bytes = value_bytes(&stable);
+        reply.data[..bytes.len()].copy_from_slice(bytes);
+        reply.data_length = bytes.len() as u16;
+        reply.node_id = opaque_id;
         reply.node_kind = stable.kind;
     }
 
@@ -1883,6 +1931,24 @@ fn canonical_node_request(request: &protocol::Request) -> bool {
         && request.file_offset == 0
         && request.bulk == protocol::BulkBuffer::NONE
         && empty_name(request)
+}
+
+fn canonical_restore_identity(request: &protocol::Request) -> Option<protocol::StableNodeIdentity> {
+    let identity_bytes = size_of::<protocol::StableNodeIdentity>();
+    if request.flags != 0
+        || request.node_id != protocol::INVALID_ID
+        || request.secondary_node_id != protocol::INVALID_ID
+        || request.file_offset != 0
+        || request.bulk != protocol::BulkBuffer::NONE
+        || usize::from(request.name_length) != identity_bytes
+        || request.name[identity_bytes..].iter().any(|byte| *byte != 0)
+    {
+        return None;
+    }
+    let identity = unsafe {
+        core::ptr::read_unaligned(request.name.as_ptr() as *const protocol::StableNodeIdentity)
+    };
+    identity.canonical().then_some(identity)
 }
 
 fn canonical_bulk_node_request(request: &protocol::Request) -> bool {

@@ -79,6 +79,20 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     {
         syscall::exit(37);
     }
+    let unsupported_identity = filesystem_protocol::StableNodeIdentity::new(
+        [0x44; 16],
+        1,
+        1,
+        filesystem_protocol::node_kind::FILE,
+    )
+    .unwrap();
+    if session.restore_identity(18, unsupported_identity)
+        != Err(userspace::filesystem::Error::Service(
+            filesystem_protocol::status::NOT_SUPPORTED,
+        ))
+    {
+        syscall::exit(38);
+    }
     let shared_memory = match ipc::shared_memory_create(512) {
         Ok(handle) => handle,
         Err(_) => syscall::exit(14),

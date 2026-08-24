@@ -6,9 +6,10 @@ userspace filesystem-service contract defined in
 registered bulk buffers are active for tmpfs and NullFS. NullFS supports
 explicitly negotiated direct writable sessions and a bounded writable public VFS
 proxy. The public filesystem protocol remains `VERSION = 1`: its `Request` and
-`Reply` layouts are unchanged, and optional operation `RESOLVE_IDENTITY` adds a canonical stable
-resource record without changing existing operations. The public file-descriptor ABI also remains
-unchanged while kernel proxies bridge the migration.
+`Reply` layouts are unchanged, and optional operations `RESOLVE_IDENTITY` and `RESTORE_IDENTITY` map
+between live opaque nodes and canonical stable resource records without changing existing
+operations. The public file-descriptor ABI also remains unchanged while kernel proxies bridge the
+migration.
 
 ## Design goals
 
@@ -30,11 +31,12 @@ Node IDs are meaningful only within one session generation. A client must
 discard every node and buffer ID after receiving `STALE_SESSION` or observing a
 replacement generation.
 
-`RESOLVE_IDENTITY` is the explicit exception for persistence: a provider that owns stable volume and
-object identity may translate a live node to a 40-byte filesystem UUID, object ID, object generation,
-and kind record. The opaque node ID is mirrored only for correlation and is never persisted. NullFS
-supports the operation; tmpfs returns `NOT_SUPPORTED`. Clients must treat support as optional rather
-than inferring it from protocol version 1.
+`RESOLVE_IDENTITY` and `RESTORE_IDENTITY` are the explicit persistence bridge: a provider that owns
+stable volume and object identity may translate between a live node and a 40-byte filesystem UUID,
+object ID, object generation, and kind record. The opaque node ID is only session-scoped and is never
+persisted. Restoration carries and echoes the complete record, revalidates it without a pathname,
+and returns a fresh opaque node. NullFS supports both operations; tmpfs returns `NOT_SUPPORTED`.
+Clients must treat support as optional rather than inferring it from protocol version 1.
 
 ## VFS namespace-routing protocol
 
@@ -350,8 +352,9 @@ for a Mac-like filesystem to add:
 Those features should be added as explicit versioned operations rather than
 overloading generic flags or inline data.
 
-The first such extension is `RESOLVE_IDENTITY`. It deliberately keeps provider-generation opaque
-node IDs separate from persistent resource identity. Its exact application-facing trust model is in
+The first such extensions are `RESOLVE_IDENTITY` and `RESTORE_IDENTITY`. They deliberately keep
+provider-generation opaque node IDs separate from persistent resource identity. Their exact
+application-facing trust model is in
 [Application filesystem resource resolution](design/application-resource-resolution.md).
 
 Application file and directory capabilities reuse this protocol behind a fresh per-authorization

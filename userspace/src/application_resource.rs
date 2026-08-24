@@ -167,7 +167,9 @@ impl ApplicationResourceAuthority {
                     Err(Error::RightsDenied)
                 }
             }
-            protocol::operation::RESOLVE_IDENTITY => Err(Error::UnsupportedOperation),
+            protocol::operation::RESOLVE_IDENTITY | protocol::operation::RESTORE_IDENTITY => {
+                Err(Error::UnsupportedOperation)
+            }
             _ => Err(Error::UnsupportedOperation),
         }
     }
@@ -429,6 +431,10 @@ mod tests {
         );
         assert_eq!(
             read.authorize_operation(protocol::operation::RESOLVE_IDENTITY, 0),
+            Err(ApplicationResourceAuthorizationError::UnsupportedOperation)
+        );
+        assert_eq!(
+            read.authorize_operation(protocol::operation::RESTORE_IDENTITY, 0),
             Err(ApplicationResourceAuthorizationError::UnsupportedOperation)
         );
         assert_eq!(

@@ -12,7 +12,7 @@ use userspace::{
     application_permission::{
         ApplicationGrantRights, ApplicationGrantScope, ApplicationPermissionStore,
         ApplicationResourceIdentity, ApplicationResourceKind, ApplicationResourceResolveError,
-        ApplicationResourceResolver,
+        ApplicationResourceResolver, ApplicationResourceRestoreError, ApplicationResourceRestorer,
     },
     application_resource::ApplicationResourceBroker,
     application_resource_forwarding::{
@@ -126,6 +126,46 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             != Err(ApplicationResourceResolveError::FilesystemMismatch)
     {
         syscall::exit(62);
+    }
+    let restorer =
+        ApplicationResourceRestorer::new(session, nullfs_primary_volume::FILESYSTEM_UUID)
+            .unwrap_or_else(|| syscall::exit(64));
+    let restored_welcome = restorer
+        .restore(106, welcome_identity)
+        .unwrap_or_else(|_| syscall::exit(65));
+    let restored_attributes = session
+        .attributes(107, restored_welcome)
+        .unwrap_or_else(|_| syscall::exit(66));
+    let reused_identity = ApplicationResourceIdentity::new(
+        welcome_identity.filesystem_uuid(),
+        welcome_identity.object_id(),
+        welcome_identity.object_generation() + 1,
+        welcome_identity.kind(),
+    )
+    .unwrap_or_else(|| syscall::exit(67));
+    let wrong_kind_identity = ApplicationResourceIdentity::new(
+        welcome_identity.filesystem_uuid(),
+        welcome_identity.object_id(),
+        welcome_identity.object_generation(),
+        ApplicationResourceKind::Directory,
+    )
+    .unwrap_or_else(|| syscall::exit(68));
+    if restored_attributes.kind != protocol::node_kind::FILE
+        || restored_attributes.size != WELCOME.len() as u64
+        || restorer.restore(108, reused_identity)
+            != Err(ApplicationResourceRestoreError::Filesystem(
+                Error::StaleNode,
+            ))
+        || restorer.restore(109, wrong_kind_identity)
+            != Err(ApplicationResourceRestoreError::Filesystem(
+                Error::StaleNode,
+            ))
+        || ApplicationResourceRestorer::new(session, [0x5a; 16])
+            .unwrap()
+            .restore(110, welcome_identity)
+            != Err(ApplicationResourceRestoreError::FilesystemMismatch)
+    {
+        syscall::exit(69);
     }
     if docs.id() == root.id()
         || welcome.id() == root.id()
@@ -474,13 +514,12 @@ fn application_resource_forwarding_probe(
     let Ok(provider_session) = filesystem::connect_service(service, 200) else {
         return false;
     };
-    let provider_root = Node::root(provider_session);
-    let Ok(provider_file) = provider_session.lookup_node(201, provider_root, b"welcome.txt") else {
-        return false;
-    };
-    let Ok(mut forwarder) =
-        ApplicationResourceForwarder::new(broker, provider_session, provider_file)
-    else {
+    let Ok(mut forwarder) = ApplicationResourceForwarder::restore(
+        broker,
+        provider_session,
+        nullfs_primary_volume::FILESYSTEM_UUID,
+        201,
+    ) else {
         return false;
     };
 

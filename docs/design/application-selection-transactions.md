@@ -76,8 +76,7 @@ send-only application-to-broker channel.
 
 ## Remaining work
 
-1. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
-2. Close active brokers on grant revocation, session expiry, provider replacement, or resource
+1. Close active brokers on grant revocation, session expiry, provider replacement, or resource
    removal.
-3. Implement crash-safe transactional permission persistence.
-4. Implement the portal/compositor transport and trusted picker UI.
+2. Implement crash-safe transactional permission persistence.
+3. Implement the portal/compositor transport and trusted picker UI.

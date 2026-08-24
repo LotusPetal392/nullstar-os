@@ -308,15 +308,15 @@ The [application permission-store foundation](design/application-permission-stor
 policy identity beneath file and directory portals. Fixed-capacity `NSPG` v1 records bind one verified
 application installation to a filesystem UUID, object ID, object generation, resource kind, rights,
 and scope. One-shot consumption and explicit revocation retain revisioned tombstones; strict
-checkpoint loading rejects stale counters and duplicate active grants. The current layer does not yet
-restore those identities into live filesystem authority or persist a transactional checkpoint.
+checkpoint loading rejects stale counters and duplicate active grants. Stable tuples now restore into
+live NullFS nodes without pathname lookup; durable transactional checkpoints remain future work.
 
 The [application filesystem resource resolver](design/application-resource-resolution.md) adds
-optional filesystem protocol operation `RESOLVE_IDENTITY`. NullFS resolves a generation-scoped opaque
-node to its selected-superblock UUID and validated inode number, inode generation, and kind. The
-application adapter pins an independently expected UUID, rejects symbolic links and kind
-substitution, and then constructs the permission identity. Tmpfs returns `NOT_SUPPORTED`; no provider
-can gain persistence merely by returning an opaque node ID.
+optional filesystem protocol operations `RESOLVE_IDENTITY` and `RESTORE_IDENTITY`. NullFS maps
+between a generation-scoped opaque node and its selected-superblock UUID plus validated inode number,
+inode generation, and kind. The application adapter pins an independently expected UUID, rejects
+symbolic links and kind substitution, and restores only an exact tuple. Tmpfs returns
+`NOT_SUPPORTED`; no provider can gain persistence merely by returning an opaque node ID.
 
 The [application portal admission foundation](design/application-portal-admission.md) adds canonical
 open, save, and directory-selection messages plus authenticated one-shot gesture admission. A ticket
@@ -329,9 +329,9 @@ The [application resource capability adapter](design/application-resource-capabi
 one fresh generic-filesystem ingress for an exact grant authorization. The broker retains only
 `RECEIVE | WAIT`; the transfer source has `SEND | TRANSFER`; and the application receives exact
 `SEND`. Portal construction binds that endpoint to the response's grant and receiver validation pins
-the kernel object kind and rights. The adapter denies unsupported and stable-identity operations and
-maps lookup, I/O, enumeration, create, remove, rename, and sync to exact grant rights. Rooted live-I/O
-forwarding and active revocation remain future layers.
+the kernel object kind and rights. The adapter denies application-facing stable-identity operations,
+maps lookup, I/O, enumeration, create, remove, rename, and sync to exact grant rights, and forwards
+through private buffers and a bounded rooted node map. Active revocation remains a future layer.
 
 The [application selection transaction](design/application-selection-transactions.md) preflights a
 new grant or existing authorization without changing the permission store, then owns that mutation

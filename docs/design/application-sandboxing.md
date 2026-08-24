@@ -518,8 +518,8 @@ event-bound trusted gesture policy are detailed in
 
 The implemented [Application resource capability adapter](application-resource-capabilities.md)
 creates one fresh endpoint per grant authorization, gives the application exact send-only authority,
-and applies the grant's file/directory rights as a generic-filesystem operation ceiling. Rooted live
-forwarding and revocation-driven endpoint teardown remain outstanding.
+applies the grant's file/directory rights as a generic-filesystem operation ceiling, and forwards
+through a private rooted provider session. Revocation-driven endpoint teardown remains outstanding.
 
 ### Drag and drop and sharing
 
@@ -1038,9 +1038,10 @@ authenticated NullFS UUID/inode/generation resolution are also implemented. Fres
 send-only resource ingress, portal endpoint binding, kernel kind/rights validation, and the
 filesystem-operation rights ceiling are implemented as well. Grant issuance/authorization,
 endpoint minting, response binding, and capability transfer now complete as one failure-atomic
-in-memory selection transaction, including one-shot compensation. Compositor and portal transports,
-the picker UI, live rooted forwarding, transactional persistence, restoration of stored identities,
-active revocation, and compatibility projection remain future increments.
+in-memory selection transaction, including one-shot compensation. Rooted live forwarding and
+pathname-free restoration of stored identities are implemented. Compositor and portal transports,
+the picker UI, transactional persistence, active revocation, and compatibility projection remain
+future increments.
 
 - trusted window and user-gesture tokens;
 - open, save, directory-selection, drag-and-drop, and share portals;

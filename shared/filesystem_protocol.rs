@@ -33,6 +33,7 @@ pub mod operation {
     pub const RMDIR: u16 = 18;
     pub const SYNC: u16 = 19;
     pub const RESOLVE_IDENTITY: u16 = 20;
+    pub const RESTORE_IDENTITY: u16 = 21;
 }
 
 pub mod lifecycle {
