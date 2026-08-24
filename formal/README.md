@@ -1,10 +1,11 @@
 # NullStar formal security models
 
 This directory contains small executable specifications for security-relevant
-NullStar kernel and userspace-service semantics. These models are intentionally
-not a formal model of the whole operating system. They isolate authority and
-lifecycle transitions so important invariants can be machine-checked before
-those semantics spread across more kernel objects and services.
+NullStar kernel, userspace-service, and target application-policy semantics. These
+models are intentionally not a formal model of the whole operating system. They
+isolate authority and lifecycle transitions so important invariants can be
+machine-checked before those semantics spread across more kernel objects and
+services.
 
 ## Phase 1: capability core
 
@@ -82,8 +83,46 @@ leaves application-protocol session semantics, authorization policy, broker PID
 identity, endpoint queue contents, process restart mechanics, and cross-boot
 generation persistence outside this layer.
 
-These are architecture properties and implementation-alignment checks, not a
-claim that the complete kernel or service manager has been formally verified.
+## Phase 7: application sandbox target state
+
+`ApplicationSandbox.tla` composes the earlier authority and containment rules at
+the accepted future application-manager boundary. Unlike phases 1 through 6, it
+is explicitly a **target-state architecture model**, not an implementation-
+alignment claim about the current launcher.
+
+The finite scenario contains two application identities, one reduced child
+component, a narrow trusted launch baseline, one sensitive broker-issued resource,
+one portal-selected document class, and one directly delegable private resource.
+It checks that:
+
+- application identity is descriptive and never creates authority by itself;
+- trusted root launch installs only a fixed baseline allowlist;
+- manifest/runtime declaration and policy approval remain separate from actual
+  broker issuance;
+- every live capability is inside the immutable process/profile ceiling;
+- every non-baseline authority has explicit broker, portal, or parent-delegation
+  provenance;
+- a reduced child starts from an explicit allowlist instead of cloning the main
+  component's capability table;
+- direct parent delegation is same-application and restricted to resources whose
+  transfer policy permits it;
+- selected documents reach another component or application only through the
+  portal-mediated path;
+- the reduced child cannot inherit the main component's portal or sensitive
+  authority merely because it belongs to the same application;
+- an application whose fixed policy ceiling excludes a sensitive resource cannot
+  self-grant it through identity, manifest declarations, or approvals.
+
+This model assumes the non-escape properties already checked by
+`JobContainment.tla` and does not remodel the job tree. It also does not model the
+future package verifier, signing lineage, permission database, trusted prompt UI,
+lease revocation, concrete filesystem/network/device service protocols, or the
+current raw `fork` ABI. Those will require implementation milestones and more
+specific refinements before conformance claims are appropriate.
+
+These are architecture properties and, where stated, implementation-alignment
+checks. They are not a claim that the complete kernel, service manager, or future
+application runtime has been formally verified.
 
 ## Running TLC
 
@@ -114,6 +153,10 @@ java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
   tlc2.TLC -deadlock \
   -config formal/ServiceGeneration.cfg formal/ServiceGeneration.tla
+
+java -XX:+UseParallelGC -cp /path/to/tla2tools.jar \
+  tlc2.TLC -deadlock \
+  -config formal/ApplicationSandbox.cfg formal/ApplicationSandbox.tla
 ```
 
 `-deadlock` disables TLC's deadlock error because intentional terminal states are
@@ -124,8 +167,7 @@ The repository CI pins TLA+ Tools 1.7.4 for repeatability and checks all modules
 
 ## Refinement plan
 
-The model is intentionally layered. Later modules should add semantics only when
-the lower layer is stable:
+The first formal-security sequence is intentionally layered:
 
 1. **CapabilityCore** — authority ownership, attenuation, replacement, close, and
    move-transfer. Implemented and machine-checked.
@@ -140,9 +182,17 @@ the lower layer is stable:
    and drainage, empty-leaf retirement, and post-retirement reclamation.
    Implemented and machine-checked.
 6. **ServiceGeneration** — monotonic publication, fresh provider ingress,
-   generation-bound issuance, and non-rebinding old authority.
+   generation-bound issuance, and non-rebinding old authority. Implemented and
+   machine-checked.
 7. **ApplicationSandbox** — explicit bootstrap authority, broker-issued grants,
-   delegation limits, and sandbox containment.
+   portal mediation, delegation ceilings, and sandbox containment. Target-state
+   architecture model; implementation milestones remain future work.
+
+After this sequence, formal work should follow concrete implementation milestones
+rather than grow into a monolithic policy model. Useful next refinements include
+endpoint peer-closure/wakeup lifecycle, mapped shared-memory protection/W^X,
+application-manager conformance traces once that runtime exists, and later
+MMIO/IRQ/DMA authority when userspace drivers arrive.
 
 ## Implementation relationship
 
@@ -178,19 +228,34 @@ structures. The intended mapping remains small and explicit:
 | `ServiceGeneration.CompleteRequestSuccess` | issue exact provider authority for the current generation |
 | `ServiceGeneration.CompleteRequestUnavailable` | return unavailable without provider authority |
 | `ServiceGeneration.CloseGrant` | release one old or current provider handle without rebinding it |
+| `ApplicationSandbox.LaunchRoot` | trusted application manager installs a narrow baseline allowlist |
+| `ApplicationSandbox.SpawnChild` | create a reduced declared component from an explicit handle allowlist |
+| `ApplicationSandbox.DeclareSensitive` | record permission/request metadata without granting authority |
+| `ApplicationSandbox.ApproveSensitive` | record policy/user approval without granting authority |
+| `ApplicationSandbox.BrokerGrant` | issue an eligible approved resource through an authorized provider |
+| `ApplicationSandbox.PortalAcquire` | issue one exact user-selected resource through trusted UI mediation |
+| `ApplicationSandbox.PortalTransfer` | mediate a scoped resource transfer to another component/application |
+| `ApplicationSandbox.DelegateSameApplication` | directly delegate only a transfer-policy-approved reduced resource |
+| `ApplicationSandbox.DropAuthority` | close one live grant without changing identity or policy metadata |
 
-The live service-route implementation matches this boundary. `RouteTable::publish`
-requires a generation strictly greater than the retained generation and keeps the
-latest generation after withdrawal. `RouteBroker::connect` authorizes first,
-resolves the currently published route, and passes that exact generation into the
-issuer. The native adapter duplicates the current stable provider source and
-returns exact `SEND` authority plus the same generation in the accepted response.
-Each replacement provider generation uses fresh ingress endpoint objects, so old
-exact-`SEND` handles retain old-object identity rather than reaching the
-replacement.
+The live service-route implementation matches the phase-six boundary.
+`RouteTable::publish` requires a generation strictly greater than the retained
+generation and keeps the latest generation after withdrawal.
+`RouteBroker::connect` authorizes first, resolves the currently published route,
+and passes that exact generation into the issuer. The native adapter duplicates
+the current stable provider source and returns exact `SEND` authority plus the
+same generation in the accepted response. Each replacement provider generation
+uses fresh ingress endpoint objects, so old exact-`SEND` handles retain old-object
+identity rather than reaching the replacement.
+
+For phase seven, the implementation mapping above is architectural intent. The
+current kernel already supplies process-local capabilities, rights attenuation,
+direct-child bootstrap, jobs, and service-route primitives, but the full
+application manager, signed application identity, portal suite, permission store,
+and component allowlist launcher are not yet implemented.
 
 The guiding rule is that the formal model should stay smaller than the
 implementation. When a new feature cannot be described without pulling large
-amounts of unrelated kernel or service-manager state into a security model, that
-is a signal to reconsider the abstraction boundary rather than model the entire
-system.
+amounts of unrelated kernel, service-manager, or desktop-policy state into a
+security model, that is a signal to reconsider the abstraction boundary rather
+than model the entire system.

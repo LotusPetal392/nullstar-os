@@ -104,3 +104,13 @@ jobs:
             -deadlock \
             -config formal/ServiceGeneration.cfg \
             formal/ServiceGeneration.tla
+
+      - name: Parse application sandbox model
+        run: java -cp "$TLA_TOOLS_JAR" tla2sany.SANY formal/ApplicationSandbox.tla
+
+      - name: Check application sandbox invariants
+        run: |
+          java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC \
+            -deadlock \
+            -config formal/ApplicationSandbox.cfg \
+            formal/ApplicationSandbox.tla
