@@ -10,6 +10,8 @@ use crate::{
         ApplicationGrantAuthorization, ApplicationGrantRights, ApplicationGrantScope,
         ApplicationGrantSubject, ApplicationResourceKind,
     },
+    application_resource::{APPLICATION_RESOURCE_CLIENT_RIGHTS, ApplicationResourceClientEndpoint},
+    ipc::{CapabilityInfo, ObjectKind},
 };
 
 pub const MAX_PORTAL_GESTURES: usize = 64;
@@ -584,7 +586,7 @@ pub struct ApplicationPortalResponse {
 }
 
 impl ApplicationPortalResponse {
-    pub fn selected(
+    fn selected(
         admission: AdmittedPortalRequest,
         grant: ApplicationGrantAuthorization,
     ) -> Result<Self, PortalSelectionError> {
@@ -611,6 +613,19 @@ impl ApplicationPortalResponse {
             rights: grant.rights(),
             scope: Some(grant.scope()),
         })
+    }
+
+    /// Constructs a selected response only when the staged endpoint was minted for the exact grant
+    /// represented by the response.
+    pub fn selected_with_resource_endpoint(
+        admission: AdmittedPortalRequest,
+        grant: ApplicationGrantAuthorization,
+        endpoint: &ApplicationResourceClientEndpoint,
+    ) -> Result<Self, PortalSelectionError> {
+        if !endpoint.matches(grant) {
+            return Err(PortalSelectionError::ResourceEndpointMismatch);
+        }
+        Self::selected(admission, grant)
     }
 
     pub const fn terminal(request_id: u64, status: ApplicationPortalStatus) -> Option<Self> {
@@ -737,6 +752,29 @@ impl ApplicationPortalResponse {
         }
     }
 
+    /// Validates the kernel metadata for the response's optional capability attachment.
+    pub fn validate_capability_envelope(
+        self,
+        capability: Option<CapabilityInfo>,
+    ) -> Result<(), PortalResponseEnvelopeError> {
+        match (self.status, capability) {
+            (ApplicationPortalStatus::Selected, None) => {
+                Err(PortalResponseEnvelopeError::MissingCapability)
+            }
+            (ApplicationPortalStatus::Selected, Some(info)) => {
+                if info.kind != ObjectKind::Endpoint {
+                    return Err(PortalResponseEnvelopeError::WrongCapabilityKind);
+                }
+                if info.rights != APPLICATION_RESOURCE_CLIENT_RIGHTS {
+                    return Err(PortalResponseEnvelopeError::WrongCapabilityRights);
+                }
+                Ok(())
+            }
+            (_, Some(_)) => Err(PortalResponseEnvelopeError::UnexpectedCapability),
+            (_, None) => Ok(()),
+        }
+    }
+
     const fn canonical(self) -> bool {
         if self.request_id == 0 {
             return false;
@@ -767,6 +805,7 @@ pub enum PortalSelectionError {
     ResourceKindMismatch,
     RightsMismatch,
     ScopeMismatch,
+    ResourceEndpointMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,6 +824,10 @@ pub enum PortalResponseDecodeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalResponseEnvelopeError {
     CapabilityCount { expected: usize, actual: usize },
+    MissingCapability,
+    UnexpectedCapability,
+    WrongCapabilityKind,
+    WrongCapabilityRights,
 }
 
 const fn grant_scope_from_raw(value: u8) -> Option<ApplicationGrantScope> {
@@ -1316,6 +1359,34 @@ mod tests {
         assert_eq!(response.transaction_id(), Some(1));
         assert_eq!(response.grant_id(), Some(1));
         assert_eq!(response.validate_envelope(1), Ok(()));
+        let capability = CapabilityInfo {
+            object_id: 77,
+            kind: ObjectKind::Endpoint,
+            rights: APPLICATION_RESOURCE_CLIENT_RIGHTS,
+            size: 0,
+        };
+        assert_eq!(
+            response.validate_capability_envelope(Some(capability)),
+            Ok(())
+        );
+        assert_eq!(
+            response.validate_capability_envelope(None),
+            Err(PortalResponseEnvelopeError::MissingCapability)
+        );
+        assert_eq!(
+            response.validate_capability_envelope(Some(CapabilityInfo {
+                kind: ObjectKind::Notification,
+                ..capability
+            })),
+            Err(PortalResponseEnvelopeError::WrongCapabilityKind)
+        );
+        assert_eq!(
+            response.validate_capability_envelope(Some(CapabilityInfo {
+                rights: APPLICATION_RESOURCE_CLIENT_RIGHTS.union(crate::ipc::Rights::WAIT),
+                ..capability
+            })),
+            Err(PortalResponseEnvelopeError::WrongCapabilityRights)
+        );
         assert_eq!(
             response.validate_envelope(0),
             Err(PortalResponseEnvelopeError::CapabilityCount {
@@ -1331,6 +1402,11 @@ mod tests {
             Ok(terminal)
         );
         assert_eq!(terminal.validate_envelope(0), Ok(()));
+        assert_eq!(terminal.validate_capability_envelope(None), Ok(()));
+        assert_eq!(
+            terminal.validate_capability_envelope(Some(capability)),
+            Err(PortalResponseEnvelopeError::UnexpectedCapability)
+        );
         assert!(
             ApplicationPortalResponse::terminal(701, ApplicationPortalStatus::Selected).is_none()
         );

@@ -1,0 +1,104 @@
+# Application resource capability adapter
+
+## Status
+
+This document describes the implemented authority boundary between an authorized application grant
+and one live file/directory broker endpoint. `ApplicationResourceBroker::mint` creates a fresh kernel
+channel pair with distinct endpoint identities for every authorization. The broker keeps only
+`RECEIVE | WAIT`; the portal stages one non-duplicable `SEND | TRANSFER` peer and moves it to the
+application with exact `SEND`.
+
+The adapter currently defines endpoint ownership, portal binding, and the generic-filesystem
+operation ceiling. It does not yet forward requests to a live filesystem session, restore a stored
+identity to a current node, run a standalone broker process, or tear down a live endpoint when its
+grant is revoked.
+
+## Capability topology
+
+```text
+permission authorization
+          |
+          v
+fresh endpoint pair
+  broker end: RECEIVE | WAIT
+  staged peer: SEND | TRANSFER
+          |
+          | portal move-transfer, reduced
+          v
+application handle: SEND
+```
+
+The staged peer has no `DUPLICATE` or `RECEIVE` authority. The application handle has neither
+`DUPLICATE`, `TRANSFER`, nor `RECEIVE`. The broker cannot send requests into its own ingress and the
+application cannot consume another client's requests or delegate the broker endpoint directly.
+Closing the broker end makes subsequent application sends observe peer closure instead of leaving an
+unserviced shared mailbox alive.
+
+The client endpoint speaks the existing generic filesystem protocol. `CONNECT` transfers a private
+send-only reply endpoint, so an application needs only `SEND` on the broker ingress. Shared-memory
+attachments carry their own transfer authority; the ingress itself does not need `TRANSFER`.
+
+The portal's selected-response constructor now accepts the staged endpoint only when its immutable
+authority copy matches the exact grant ID, revision, subject, stable resource, rights, and scope used
+for the response. Receiver-side envelope validation additionally requires one kernel `Endpoint` with
+exact `SEND` rights. A notification, a broader endpoint, a missing endpoint, or a capability attached
+to a terminal response fails validation.
+
+## Filesystem operation ceiling
+
+`ApplicationResourceAuthority` maps generic filesystem operations to grant rights:
+
+| Filesystem operation | Required grant authority |
+| --- | --- |
+| connect read-only, buffers, close, cancel, disconnect | session control |
+| writable connect, sync | at least one mutation right |
+| attributes | metadata access inherent in the endpoint |
+| lookup | directory root plus `READ` |
+| open | exact `READ`, `WRITE`, and/or `CREATE` implied by its flags |
+| read | `READ` |
+| write, append, truncate | `WRITE` |
+| directory iteration | directory root plus `ENUMERATE` |
+| create file/directory | directory root plus `CREATE`; truncating an existing file also needs `WRITE` |
+| unlink/rmdir | directory root plus `REMOVE` |
+| rename | directory root plus `CREATE | REMOVE` |
+
+Unknown operations and `RESOLVE_IDENTITY` are denied. No operation maps to execute authority.
+Malformed or contradictory operation flags fail before rights are considered.
+
+This gate is one layer of the broker, not a complete request validator. The forwarding adapter must
+also enforce the generic protocol's canonical wire shape, session generation, attached-buffer
+ownership and bounds, and a broker-local opaque node namespace. For a selected file, that namespace
+contains only the selected file. For a selected directory, every child node must originate from a
+relative lookup beneath the selected root; caller-supplied provider node IDs, absolute paths, `.` and
+`..` cannot enter the mapping.
+
+## Grant and endpoint lifetime
+
+The endpoint is live authority and the `NSPG` record is policy. A process cannot manufacture an
+endpoint by copying grant metadata. Conversely, revoking a stored record does not retroactively
+remove an immutable kernel handle. The future broker lifecycle must observe the exact grant revision,
+stop accepting new work, fail or safely drain pending work, close its ingress, and make the
+application observe peer closure. Reauthorization creates a fresh endpoint pair.
+
+One-shot authorization is already consumed atomically by the permission store before minting. The
+next selection-completion transaction must therefore clean up or compensate if endpoint creation or
+portal transfer fails, so a failed response cannot silently spend a one-shot grant.
+
+## Coverage
+
+Host tests exercise file and directory operation matrices, writable-session denial, unsupported
+stable-identity queries, and open-flag escalation. Portal tests validate missing, unexpected,
+wrong-kind, and over-righted attachments. The freestanding application probe creates a real endpoint,
+checks both local rights sets and object identity, move-transfers the application side with exact
+`SEND`, rejects receive authority on the application side and send authority on the broker side, and
+delivers a message through the resulting one-way channel.
+
+## Next steps
+
+1. Implement failure-atomic selection completion across grant issuance/authorization, endpoint
+   creation, response transfer, and one-shot compensation.
+2. Add the live forwarding adapter with canonical request validation and a rooted node map.
+3. Resolve stored identities back to current live nodes without pathname or inode-reuse confusion.
+4. Close active brokers on grant revocation, session expiry, provider replacement, or resource
+   removal.
+5. Implement the portal/compositor transport and trusted picker UI.

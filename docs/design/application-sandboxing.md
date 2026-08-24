@@ -516,6 +516,11 @@ Canonical request/response records and the process-, application-, session-, sur
 event-bound trusted gesture policy are detailed in
 [Application portal admission foundation](application-portal-admission.md).
 
+The implemented [Application resource capability adapter](application-resource-capabilities.md)
+creates one fresh endpoint per grant authorization, gives the application exact send-only authority,
+and applies the grant's file/directory rights as a generic-filesystem operation ceiling. Rooted live
+forwarding and revocation-driven endpoint teardown remain outstanding.
+
 ### Drag and drop and sharing
 
 Drag and drop is a user-mediated capability transfer. A file-transfer or share portal
@@ -1029,9 +1034,12 @@ portal mediation remain outstanding.
 
 The stable resource-identity, canonical grant-record, bounded restoration, revocation, and reset
 foundation is implemented. Canonical open/save/directory requests, trusted gesture admission, and
-authenticated NullFS UUID/inode/generation resolution are also implemented. Compositor and portal
-transports, the picker UI, rights-reduced authority issuance, transactional persistence, restoration
-of stored identities, and compatibility projection remain future increments.
+authenticated NullFS UUID/inode/generation resolution are also implemented. Fresh grant-bound
+send-only resource ingress, portal endpoint binding, kernel kind/rights validation, and the
+filesystem-operation rights ceiling are implemented as well. Compositor and portal transports, the
+picker UI, failure-atomic selection completion, live rooted forwarding, transactional persistence,
+restoration of stored identities, active revocation, and compatibility projection remain future
+increments.
 
 - trusted window and user-gesture tokens;
 - open, save, directory-selection, drag-and-drop, and share portals;

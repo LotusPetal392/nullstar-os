@@ -5,9 +5,11 @@
 This document describes the implemented allocation-free policy foundation for application file and
 directory grants. Canonical portal requests and trusted user-gesture admission are now defined by the
 [application portal admission foundation](application-portal-admission.md). A trusted picker, live
-file/directory broker endpoint, and durable permission-store service remain outstanding. The
+file/directory forwarding service, and durable permission-store service remain outstanding. The
 [application filesystem resource resolver](application-resource-resolution.md) now supplies the
-stable UUID/object/generation identity required before grant issuance.
+stable UUID/object/generation identity required before grant issuance, and the
+[application resource capability adapter](application-resource-capabilities.md) mints a fresh
+rights-reduced endpoint from each authorization.
 
 The implementation provides:
 
@@ -67,8 +69,8 @@ filesystem service must not invalidate the underlying resource.
 NullFS exposes this tuple through the optional authenticated `RESOLVE_IDENTITY` filesystem operation.
 `ApplicationResourceResolver` pins the provider response to an independently expected volume UUID,
 rejects symbolic links, and requires the exact file/directory kind admitted by the portal. The
-resolver produces policy identity only; restoring the tuple to a live node and minting resource
-authority remain future work.
+resolver produces policy identity only; restoring a stored tuple to a new live node remains future
+work.
 
 ## Rights and scopes
 
@@ -85,8 +87,10 @@ The scopes are:
   and resource resolution.
 
 Authorization returns only the requested subset of stored rights. The returned policy object is not
-a kernel capability; the future portal/provider adapter must use it to mint a fresh rights-reduced
-broker endpoint for the exact resolved resource.
+a kernel capability. `ApplicationResourceBroker::mint` now consumes that object as policy input for
+a fresh channel pair: the broker retains `RECEIVE | WAIT`, a transfer-staging peer has
+`SEND | TRANSFER`, and the application receives exact `SEND`. The retained authority gates generic filesystem
+operations against the authorized file/directory rights.
 
 ## Revocation and persistence
 
@@ -106,9 +110,9 @@ atomically and compact tombstones only while preserving rollback/replay protecti
 
 ## Next steps
 
-1. Mint rights-reduced file and directory broker endpoints from successful selections or restored
-   grants.
-2. Resolve stored identities back to current live nodes without accepting pathname or inode reuse.
+1. Make grant authorization, endpoint creation, and portal response transfer failure-atomic.
+2. Forward broker requests to rooted live nodes and resolve stored identities without accepting
+   pathname or inode reuse.
 3. Implement the portal/compositor transports and trusted picker UI around the admission protocol.
 4. Persist checkpoint state transactionally and expose permission inspection, revocation, and reset.
 5. Extend the same policy foundation to drag-and-drop and share transfers.

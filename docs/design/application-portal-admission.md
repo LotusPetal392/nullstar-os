@@ -5,7 +5,8 @@
 This document describes the implemented allocation-free admission and wire-protocol foundation for
 file and directory portals. It connects a verified desktop application and a trusted user gesture to
 one bounded picker transaction. It does not yet implement a compositor, portal service process,
-picker UI, authenticated filesystem resolver, or resource-capability adapter.
+picker UI, live filesystem forwarding, or complete portal service transport. Stable-resource
+resolution and the rights-reduced capability-adapter contract are now implemented separately.
 
 The implementation provides:
 
@@ -22,8 +23,9 @@ The implementation provides:
 The host suite covers codec corruption, invalid operation/rights combinations, issuer spoofing,
 event cloning, process/application/session/surface mismatch, replay, expiry, transient persistence,
 fixed-capacity exhaustion, transaction-ID exhaustion, cross-subject grant substitution, and response
-capability cardinality. The QEMU application probe exercises the complete in-memory path from a
-gesture ticket through grant-backed selected response validation.
+capability cardinality and kernel object/rights validation. The QEMU application probe exercises the
+complete in-memory path from a gesture ticket through grant-backed selected response validation and
+a real rights-reduced endpoint move transfer.
 
 ## Trust boundary
 
@@ -89,14 +91,18 @@ application subject, resource kind, rights, and scope as the admitted request. T
 implementation from accidentally returning another application's grant, a directory for a file
 operation, broadened/reduced rights, or a differently scoped authorization.
 
-Capability cardinality does not yet validate the transferred object's type or rights. Stable
-filesystem identity resolution is now implemented, but the resource endpoint adapter remains the
-next increment.
+`selected_with_resource_endpoint` additionally requires the staged endpoint to match the exact grant
+represented in the response. Receiver-side validation requires the attachment to be a kernel
+endpoint with exact `SEND` rights; broader, missing, wrong-kind, and terminal-response attachments
+fail closed. The endpoint and operation policy are detailed in
+[Application resource capability adapter](application-resource-capabilities.md).
 
 ## Next steps
 
-1. Issue the grant and mint one rights-reduced resource endpoint with failure-atomic cleanup.
-2. Resolve stored identities back to current live nodes without accepting pathname or inode reuse.
+1. Make grant issuance/authorization, endpoint minting, and response transfer failure-atomic,
+   including one-shot compensation.
+2. Forward the broker protocol to rooted live nodes and restore stored identities without accepting
+   pathname or inode reuse.
 3. Implement the portal service transport using kernel-stamped sender identities and authenticated
    compositor startup authority.
 4. Add a trusted picker UI and transactional permission persistence.

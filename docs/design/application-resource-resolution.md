@@ -8,8 +8,10 @@ volume UUID, inode number, inode generation, and node kind through an optional g
 operation. The application resolver pins that reply to the expected mounted volume and requested
 resource kind.
 
-This increment does not mint a file or directory endpoint, restore a stored identity to a new live
-node, implement the picker UI, or make the permission store durable.
+The [application resource capability adapter](application-resource-capabilities.md) now mints and
+rights-reduces a grant-bound broker endpoint from this policy identity. Restoring a stored identity to
+a new live node, forwarding broker I/O, implementing the picker UI, and making the permission store
+durable remain future work.
 
 ## Generic filesystem operation
 
@@ -82,9 +84,9 @@ probe verifies unsupported providers cannot fabricate an identity.
 
 ## Next steps
 
-1. Define a rights-reduced resource endpoint/session contract for one resolved file or directory.
-2. Make selection completion failure-atomic across grant issuance, endpoint creation, and response
+1. Make selection completion failure-atomic across grant issuance, endpoint creation, and response
    transfer.
-3. Resolve stored identities back to current live nodes without accepting pathname or inode reuse.
-4. Implement the portal service transport and trusted picker around these policy boundaries.
-5. Persist grants and revocation state transactionally.
+2. Implement rooted live-filesystem forwarding and resolve stored identities without accepting
+   pathname or inode reuse.
+3. Implement the portal service transport and trusted picker around these policy boundaries.
+4. Persist grants and revocation state transactionally.

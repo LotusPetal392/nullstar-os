@@ -185,6 +185,10 @@ impl ApplicationGrantRights {
         self.0 & requested.0 == requested.0
     }
 
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     pub const fn valid_for(self, kind: ApplicationResourceKind) -> bool {
         if self.0 == 0 {
             return false;
