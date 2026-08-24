@@ -105,7 +105,5 @@ probe verifies unsupported providers cannot resolve or restore persistent identi
 
 ## Next steps
 
-1. Close active brokers on grant revocation, session expiry, provider replacement, or resource
-   removal.
-2. Implement the portal service transport and trusted picker around these policy boundaries.
-3. Persist grants and revocation state transactionally.
+1. Implement the portal service transport and trusted picker around these policy boundaries.
+2. Persist grants and revocation state transactionally.

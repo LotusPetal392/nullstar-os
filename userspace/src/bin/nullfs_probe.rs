@@ -10,13 +10,15 @@ use userspace::{
         InstalledApplicationComponent, PackageVerification, authorize_application_launch,
     },
     application_permission::{
-        ApplicationGrantRights, ApplicationGrantScope, ApplicationPermissionStore,
-        ApplicationResourceIdentity, ApplicationResourceKind, ApplicationResourceResolveError,
-        ApplicationResourceResolver, ApplicationResourceRestoreError, ApplicationResourceRestorer,
+        ApplicationGrantRevocation, ApplicationGrantRights, ApplicationGrantScope,
+        ApplicationPermissionStore, ApplicationResourceIdentity, ApplicationResourceKind,
+        ApplicationResourceResolveError, ApplicationResourceResolver,
+        ApplicationResourceRestoreError, ApplicationResourceRestorer,
     },
     application_resource::ApplicationResourceBroker,
     application_resource_forwarding::{
         ApplicationResourceForwardOutcome, ApplicationResourceForwarder,
+        ApplicationResourceForwarderRegistry, ApplicationResourceLifecycleEvent,
     },
     args::Args,
     filesystem::{self, Error, Node, protocol},
@@ -514,12 +516,16 @@ fn application_resource_forwarding_probe(
     let Ok(provider_session) = filesystem::connect_service(service, 200) else {
         return false;
     };
-    let Ok(mut forwarder) = ApplicationResourceForwarder::restore(
+    let Ok(forwarder) = ApplicationResourceForwarder::restore(
         broker,
         provider_session,
         nullfs_primary_volume::FILESYSTEM_UUID,
         201,
     ) else {
+        return false;
+    };
+    let mut registry = ApplicationResourceForwarderRegistry::new();
+    let Ok(forwarder_id) = registry.register(forwarder) else {
         return false;
     };
 
@@ -533,7 +539,7 @@ fn application_resource_forwarding_probe(
         .endpoint()
         .send_move(bytes_of(&connect), reply_sender, Rights::SEND)
         .is_err()
-        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+        || registry.forward_one(forwarder_id) != Ok(ApplicationResourceForwardOutcome::Replied)
     {
         return false;
     }
@@ -559,7 +565,7 @@ fn application_resource_forwarding_probe(
         .endpoint()
         .send_move(bytes_of(&attach), shared, Rights::READ.union(Rights::WRITE))
         .is_err()
-        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+        || registry.forward_one(forwarder_id) != Ok(ApplicationResourceForwardOutcome::Replied)
         || receive_forwarded_reply(&reply_endpoint, &attach).is_none()
     {
         return false;
@@ -575,7 +581,7 @@ fn application_resource_forwarding_probe(
         return false;
     };
     if client.endpoint().send(bytes_of(&read)).is_err()
-        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+        || registry.forward_one(forwarder_id) != Ok(ApplicationResourceForwardOutcome::Replied)
         || receive_forwarded_reply(&reply_endpoint, &read)
             .is_none_or(|reply| reply.value != WELCOME.len() as u64)
     {
@@ -592,20 +598,24 @@ fn application_resource_forwarding_probe(
     let mut attributes = attributes;
     attributes.node_id = client_file.id();
     if client.endpoint().send(bytes_of(&attributes)).is_err()
-        || forwarder.forward_one() != Ok(ApplicationResourceForwardOutcome::Replied)
+        || registry.forward_one(forwarder_id) != Ok(ApplicationResourceForwardOutcome::Replied)
         || receive_forwarded_reply(&reply_endpoint, &attributes)
             .is_none_or(|reply| reply.node_id != protocol::ROOT_NODE_ID)
     {
         return false;
     }
 
-    let Ok(disconnect) = client_session.request(protocol::operation::DISCONNECT, 206) else {
+    let Ok(revoked) = store.revoke(grant.grant_id(), ApplicationGrantRevocation::User) else {
         return false;
     };
-    client.endpoint().send(bytes_of(&disconnect)).is_ok()
-        && forwarder.forward_one() == Ok(ApplicationResourceForwardOutcome::Disconnected)
-        && receive_forwarded_reply(&reply_endpoint, &disconnect).is_some()
-        && forwarder.disconnected()
+    let Some(event) = ApplicationResourceLifecycleEvent::grant_revoked(revoked) else {
+        return false;
+    };
+    let report = registry.invalidate(event);
+    report.brokers_closed() == 1
+        && report.provider_disconnect_failures() == 0
+        && registry.is_empty()
+        && client.endpoint().send(bytes_of(&attributes)).is_err()
 }
 
 fn receive_forwarded_reply(
