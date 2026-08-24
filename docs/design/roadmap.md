@@ -143,9 +143,11 @@ See [Service, session, and application lifecycle](service-and-session-lifecycle.
 
 The native launch foundation now scrubs inherited descriptors and capabilities, assigns a bounded
 application job before release, delivers typed startup identity and authority, and creates
-`desktop-child` and `worker` components from explicit profile-specific capability allowlists. Stable
-verified application identity is the next foundation layer; general application-manager routing is
-still future work.
+`desktop-child` and `worker` components from explicit profile-specific capability allowlists. Launch
+now additionally requires package-verifier output to match an installed generation's stable
+application/publisher lineage, provenance, component executable, user scope, and authorized profile.
+Cryptographic package and registry services plus general application-manager routing are still
+future work; private storage and restricted namespace construction are the next launch layers.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

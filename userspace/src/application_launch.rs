@@ -12,13 +12,16 @@
 //! - application capabilities are carried inside the typed `NSPC` startup
 //!   envelope and are rights-reduced by receiver policy;
 //! - `NSPD` data carries trusted descriptive application identity and profile;
+//! - a package-verification result must match an installed generation before
+//!   an opaque launch authorization can reach this primitive;
 //! - reduced components reuse the root job and derive identity from the root;
 //! - component capabilities require explicit profile opt-in and monotonic
 //!   rights reduction.
 //!
-//! Package signature verification, persistent grants, private directory
-//! construction, service-namespace construction, and portal policy remain
-//! application-manager responsibilities above this layer.
+//! Cryptographic package verification and authenticated verifier routing,
+//! persistent grants, private directory construction, service-namespace
+//! construction, and portal policy remain application-manager responsibilities
+//! above this layer.
 
 use crate::{
     abi::{limits, signal},
@@ -40,53 +43,27 @@ use crate::{
     syscall::{self, DescriptorFlags, FileDescriptor, PipePair, ProcessId},
 };
 
-/// Provisional namespace/profile identifiers for native application components.
-///
-/// These values are descriptive launch metadata, not authority. They are kept
-/// separate from the system-service namespace profile (`1`).
-pub const DESKTOP_NAMESPACE_PROFILE_ID: u64 = 2;
-pub const DESKTOP_CHILD_NAMESPACE_PROFILE_ID: u64 = 3;
-pub const WORKER_NAMESPACE_PROFILE_ID: u64 = 4;
+use crate::application_identity::{
+    APPLICATION_IDENTITY_METADATA_BYTES, ApplicationIdentityMetadata,
+};
+pub use crate::application_identity::{
+    ApplicationIdentity, ApplicationIdentityError, ApplicationInstallScope,
+    ApplicationInstallation, ApplicationInstallationProvenance, ApplicationLaunchSelection,
+    ApplicationProfile, ApplicationProfileSet, ApplicationTrustClass, AuthorizedApplication,
+    DESKTOP_CHILD_NAMESPACE_PROFILE_ID, DESKTOP_NAMESPACE_PROFILE_ID,
+    InstalledApplicationComponent, PackageVerification, StableApplicationPrincipal,
+    WORKER_NAMESPACE_PROFILE_ID, authorize_application_launch,
+};
 
-const REQUIRED_SECTIONS: [StartupSectionId; 4] = [
+const REQUIRED_SECTIONS: [StartupSectionId; 5] = [
     StartupSectionId::IDENTITY,
     StartupSectionId::ARGUMENTS,
     StartupSectionId::ENVIRONMENT,
     StartupSectionId::LAUNCH,
+    StartupSectionId::APPLICATION_IDENTITY,
 ];
 const ISOLATION_ACK: u8 = 1;
 const DEFAULT_PROCESS_LIMIT: usize = 16;
-
-/// Native application component class selected by the trusted launcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApplicationProfile {
-    Desktop,
-    DesktopChild,
-    Worker,
-}
-
-impl ApplicationProfile {
-    pub const fn namespace_profile_id(self) -> u64 {
-        match self {
-            Self::Desktop => DESKTOP_NAMESPACE_PROFILE_ID,
-            Self::DesktopChild => DESKTOP_CHILD_NAMESPACE_PROFILE_ID,
-            Self::Worker => WORKER_NAMESPACE_PROFILE_ID,
-        }
-    }
-
-    pub const fn from_namespace_profile_id(value: u64) -> Option<Self> {
-        match value {
-            DESKTOP_NAMESPACE_PROFILE_ID => Some(Self::Desktop),
-            DESKTOP_CHILD_NAMESPACE_PROFILE_ID => Some(Self::DesktopChild),
-            WORKER_NAMESPACE_PROFILE_ID => Some(Self::Worker),
-            _ => None,
-        }
-    }
-
-    pub const fn is_reduced_component(self) -> bool {
-        matches!(self, Self::DesktopChild | Self::Worker)
-    }
-}
 
 /// Component profiles to which one root capability may be delegated.
 ///
@@ -112,31 +89,6 @@ impl ComponentProfileSet {
 
     const fn is_empty(self) -> bool {
         self.0 == 0
-    }
-}
-
-/// Trusted descriptive identity attached to one application process launch.
-///
-/// The values identify the package/application/component selected by the
-/// application manager. They never grant authority by themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApplicationIdentity {
-    pub package: u64,
-    pub package_generation: u64,
-    pub application: u64,
-    pub component: u64,
-    pub user: u64,
-    pub session: u64,
-}
-
-impl ApplicationIdentity {
-    pub const fn is_valid(self) -> bool {
-        self.package != 0
-            && self.package_generation != 0
-            && self.application != 0
-            && self.component != 0
-            && self.user != 0
-            && self.session != 0
     }
 }
 
@@ -199,8 +151,7 @@ impl ApplicationComponentCapability {
 pub struct ApplicationLaunch<'a, const N: usize> {
     /// Absolute canonical executable followed by whitespace-separated arguments.
     pub command: &'a [u8],
-    pub identity: ApplicationIdentity,
-    pub profile: ApplicationProfile,
+    pub authorization: AuthorizedApplication,
     pub manager_generation: u64,
     pub process_limit: usize,
     pub capabilities: &'a [ApplicationCapability; N],
@@ -235,15 +186,13 @@ impl<'a, const N: usize> ApplicationComponentLaunch<'a, N> {
 impl<'a, const N: usize> ApplicationLaunch<'a, N> {
     pub const fn new(
         command: &'a [u8],
-        identity: ApplicationIdentity,
-        profile: ApplicationProfile,
+        authorization: AuthorizedApplication,
         manager_generation: u64,
         capabilities: &'a [ApplicationCapability; N],
     ) -> Self {
         Self {
             command,
-            identity,
-            profile,
+            authorization,
             manager_generation,
             process_limit: DEFAULT_PROCESS_LIMIT,
             capabilities,
@@ -263,8 +212,7 @@ impl<'a, const N: usize> ApplicationLaunch<'a, N> {
 pub struct ApplicationInstance<const N: usize> {
     pub process_id: ProcessId,
     pub job: OwnedHandle<Job>,
-    identity: ApplicationIdentity,
-    profile: ApplicationProfile,
+    authorization: AuthorizedApplication,
     manager_generation: u64,
     authority_ceiling: [ApplicationCapability; N],
     authority_sources: [Option<OwnedHandle<AnyObject>>; N],
@@ -283,6 +231,8 @@ pub struct ApplicationComponentInstance {
 pub struct ApplicationStart<const N: usize> {
     pub context: ProcessContext<ApplicationProcess, N>,
     pub identity: ApplicationIdentity,
+    pub principal: StableApplicationPrincipal,
+    pub provenance: ApplicationInstallationProvenance,
     pub profile: ApplicationProfile,
     pub manager_generation: u64,
 }
@@ -302,6 +252,7 @@ pub enum ApplicationComponentLaunchError {
     AuthorityNotDelegable(CapabilityRole),
     AuthorityEscalation(CapabilityRole),
     AuthorityNotReduced,
+    Identity(ApplicationIdentityError),
     Descriptor(syscall::Errno),
     Capability(ipc::Error),
     Startup(ApplicationStartupSendError),
@@ -340,7 +291,8 @@ pub fn spawn_application<const N: usize>(
     launch: ApplicationLaunch<'_, N>,
 ) -> Result<ApplicationInstance<N>, ApplicationLaunchError> {
     validate_launch(&launch).map_err(|_| ApplicationLaunchError::InvalidDescription)?;
-    let authority_sources = retain_component_sources(launch.profile, launch.capabilities)?;
+    let authority_sources =
+        retain_component_sources(launch.authorization.profile(), launch.capabilities)?;
 
     let job = OwnedHandle::<Job>::create().map_err(ApplicationLaunchError::Capability)?;
     ipc::job_set_process_limit(job.as_raw(), launch.process_limit)
@@ -351,8 +303,7 @@ pub fn spawn_application<const N: usize>(
     Ok(ApplicationInstance {
         process_id: child,
         job,
-        identity: launch.identity,
-        profile: launch.profile,
+        authorization: launch.authorization,
         manager_generation: launch.manager_generation,
         authority_ceiling: *launch.capabilities,
         authority_sources,
@@ -361,11 +312,19 @@ pub fn spawn_application<const N: usize>(
 
 impl<const N: usize> ApplicationInstance<N> {
     pub const fn identity(&self) -> ApplicationIdentity {
-        self.identity
+        self.authorization.identity()
     }
 
     pub const fn profile(&self) -> ApplicationProfile {
-        self.profile
+        self.authorization.profile()
+    }
+
+    pub const fn principal(&self) -> StableApplicationPrincipal {
+        self.authorization.principal()
+    }
+
+    pub const fn provenance(&self) -> ApplicationInstallationProvenance {
+        self.authorization.provenance()
     }
 
     pub const fn manager_generation(&self) -> u64 {
@@ -383,17 +342,20 @@ impl<const N: usize> ApplicationInstance<N> {
         &self,
         launch: ApplicationComponentLaunch<'_, M>,
     ) -> Result<ApplicationComponentInstance, ApplicationComponentLaunchError> {
-        if self.profile != ApplicationProfile::Desktop {
+        if self.profile() != ApplicationProfile::Desktop {
             return Err(ApplicationComponentLaunchError::RootProfileRequired);
         }
-        if launch.component == self.identity.component {
+        if launch.component == self.identity().component {
             return Err(ApplicationComponentLaunchError::InvalidDescription);
         }
         validate_component_launch(&self.authority_ceiling, &launch)?;
-        let identity = ApplicationIdentity {
-            component: launch.component,
-            ..self.identity
-        };
+        let executable = command_executable(launch.command)
+            .ok_or(ApplicationComponentLaunchError::InvalidDescription)?;
+        let authorization = self
+            .authorization
+            .authorize_component(launch.component, launch.profile, executable)
+            .map_err(ApplicationComponentLaunchError::Identity)?;
+        let identity = authorization.identity();
         let mut capabilities = launch
             .capabilities
             .map(ApplicationComponentCapability::as_application_capability);
@@ -412,8 +374,7 @@ impl<const N: usize> ApplicationInstance<N> {
         }
         let application_launch = ApplicationLaunch::new(
             launch.command,
-            identity,
-            launch.profile,
+            authorization,
             self.manager_generation,
             &capabilities,
         );
@@ -503,7 +464,7 @@ pub unsafe fn receive_application_start<const N: usize>(
     let context =
         ProcessContext::<ApplicationProcess, N>::receive_startup(&bootstrap, parent, policies)
             .map_err(ApplicationStartError::Capabilities)?;
-    let data = receive_process_start_data::<4608, 4>(
+    let data = receive_process_start_data::<4608, 5>(
         &bootstrap,
         parent,
         &REQUIRED_SECTIONS,
@@ -511,6 +472,11 @@ pub unsafe fn receive_application_start<const N: usize>(
     )
     .map_err(ApplicationStartError::Transport)?;
     let start = ValidatedProcessStart::from_data(&data).map_err(ApplicationStartError::Data)?;
+    let metadata = ApplicationIdentityMetadata::decode(
+        data.section(StartupSectionId::APPLICATION_IDENTITY)
+            .ok_or(ApplicationStartError::InvalidDescription)?,
+    )
+    .ok_or(ApplicationStartError::InvalidDescription)?;
     bootstrap
         .close()
         .map_err(ApplicationStartError::Bootstrap)?;
@@ -530,6 +496,9 @@ pub unsafe fn receive_application_start<const N: usize>(
         .get(0)
         .ok_or(ApplicationStartError::InvalidDescription)?;
     if !identity.is_valid()
+        || metadata.package != identity.package
+        || metadata.package_generation != identity.package_generation
+        || metadata.principal.application != identity.application
         || start.identity.process != process_id
         || start.identity.executable != crate::managed_startup::numeric_executable_id(executable)
         || start.identity.service != 0
@@ -547,13 +516,15 @@ pub unsafe fn receive_application_start<const N: usize>(
     Ok(ApplicationStart {
         context,
         identity,
+        principal: metadata.principal,
+        provenance: metadata.provenance,
         profile,
         manager_generation: start.launch.manager_generation,
     })
 }
 
 fn validate_launch<const N: usize>(launch: &ApplicationLaunch<'_, N>) -> Result<(), ()> {
-    if !launch.identity.is_valid()
+    if !launch.authorization.identity().is_valid()
         || launch.manager_generation == 0
         || launch.process_limit == 0
         || launch.process_limit > limits::MAX_JOB_PROCESSES
@@ -562,7 +533,13 @@ fn validate_launch<const N: usize>(launch: &ApplicationLaunch<'_, N>) -> Result<
     {
         return Err(());
     }
-    validate_command(launch.command)
+    validate_command(launch.command)?;
+    let executable = command_executable(launch.command).ok_or(())?;
+    launch
+        .authorization
+        .authorizes_executable(executable)
+        .then_some(())
+        .ok_or(())
 }
 
 fn validate_component_launch<const N: usize, const M: usize>(
@@ -644,6 +621,12 @@ fn validate_command(command: &[u8]) -> Result<(), ()> {
         return Err(());
     }
     Ok(())
+}
+
+fn command_executable(command: &[u8]) -> Option<&[u8]> {
+    command
+        .split(u8::is_ascii_whitespace)
+        .find(|argument| !argument.is_empty())
 }
 
 fn spawn_application_in_job<const N: usize>(
@@ -762,26 +745,28 @@ fn send_application_start<const N: usize>(
         platform::monotonic_time_ns().map_err(|_| ApplicationStartupSendError::Clock)?;
     let identity = StartupIdentity {
         process: process_id,
-        package: launch.identity.package,
-        package_generation: launch.identity.package_generation,
+        package: launch.authorization.identity().package,
+        package_generation: launch.authorization.identity().package_generation,
         executable: crate::managed_startup::numeric_executable_id(arguments[0]),
-        application: launch.identity.application,
+        application: launch.authorization.identity().application,
         service: 0,
-        component: launch.identity.component,
-        user: launch.identity.user,
-        session: launch.identity.session,
+        component: launch.authorization.identity().component,
+        user: launch.authorization.identity().user,
+        session: launch.authorization.identity().session,
     }
     .encode();
     let launch_data = StartupLaunch {
         launch: process_id,
         manager_generation: launch.manager_generation,
-        namespace_profile: launch.profile.namespace_profile_id(),
+        namespace_profile: launch.authorization.profile().namespace_profile_id(),
         monotonic_start_ns,
         attempt: 1,
         reason: StartupLaunchReason::User,
         flags: 0,
     }
     .encode();
+    let application_identity = launch.authorization.encode_metadata();
+    let _: [u8; APPLICATION_IDENTITY_METADATA_BYTES] = application_identity;
     let sections = [
         StartupSectionPayload {
             id: StartupSectionId::IDENTITY,
@@ -802,6 +787,11 @@ fn send_application_start<const N: usize>(
             id: StartupSectionId::LAUNCH,
             required: true,
             bytes: &launch_data,
+        },
+        StartupSectionPayload {
+            id: StartupSectionId::APPLICATION_IDENTITY,
+            required: true,
+            bytes: &application_identity,
         },
     ];
     send_process_start_data(sender, &sections).map_err(ApplicationStartupSendError::Transport)
@@ -1024,21 +1014,54 @@ fn arguments_match(arguments: Args<'_>, start: ValidatedProcessStart<'_>) -> boo
 mod tests {
     use super::{
         ApplicationCapability, ApplicationComponentCapability, ApplicationComponentLaunch,
-        ApplicationComponentLaunchError, ApplicationIdentity, ApplicationLaunch,
-        ApplicationProfile, ComponentProfileSet, DESKTOP_CHILD_NAMESPACE_PROFILE_ID,
-        DESKTOP_NAMESPACE_PROFILE_ID, WORKER_NAMESPACE_PROFILE_ID,
+        ApplicationComponentLaunchError, ApplicationInstallScope, ApplicationInstallation,
+        ApplicationLaunch, ApplicationLaunchSelection, ApplicationProfile, ApplicationProfileSet,
+        ApplicationTrustClass, ComponentProfileSet, DESKTOP_CHILD_NAMESPACE_PROFILE_ID,
+        DESKTOP_NAMESPACE_PROFILE_ID, InstalledApplicationComponent, PackageVerification,
+        WORKER_NAMESPACE_PROFILE_ID, authorize_application_launch,
         is_absolute_canonical_executable, validate_component_launch, validate_launch,
     };
     use crate::{ipc::Rights, runtime_context::CapabilityRole};
 
-    const IDENTITY: ApplicationIdentity = ApplicationIdentity {
-        package: 1,
-        package_generation: 1,
-        application: 2,
-        component: 3,
-        user: 4,
-        session: 5,
-    };
+    fn authorization() -> super::AuthorizedApplication {
+        let components = [InstalledApplicationComponent::new(
+            5,
+            b"/Applications/Test/app",
+            ApplicationProfileSet::DESKTOP,
+            true,
+        )];
+        authorize_application_launch(
+            PackageVerification {
+                package: 1,
+                package_generation: 1,
+                application: 2,
+                publisher: 3,
+                signing_lineage: 4,
+                trust_class: ApplicationTrustClass::Repository,
+                system_application: false,
+                components: &components,
+            },
+            ApplicationInstallation {
+                installation: 6,
+                package: 1,
+                package_generation: 1,
+                application: 2,
+                publisher: 3,
+                signing_lineage: 4,
+                trust_class: ApplicationTrustClass::Repository,
+                scope: ApplicationInstallScope::User,
+                owner_user: 7,
+                system_application: false,
+            },
+            ApplicationLaunchSelection {
+                component: 5,
+                user: 7,
+                session: 8,
+                profile: ApplicationProfile::Desktop,
+            },
+        )
+        .unwrap()
+    }
 
     #[test]
     fn profiles_have_distinct_non_system_namespace_ids() {
@@ -1076,24 +1099,19 @@ mod tests {
     }
 
     #[test]
-    fn launch_requires_nonzero_identity_and_bounded_process_limit() {
+    fn launch_requires_authorized_executable_and_bounded_process_limit() {
         let capabilities = [];
         let launch = ApplicationLaunch::new(
             b"/Applications/Test/app --probe",
-            IDENTITY,
-            ApplicationProfile::Desktop,
+            authorization(),
             1,
             &capabilities,
         );
         assert!(validate_launch(&launch).is_ok());
         assert!(validate_launch(&launch.with_process_limit(0)).is_err());
         let invalid = ApplicationLaunch::new(
-            b"/Applications/Test/app",
-            ApplicationIdentity {
-                application: 0,
-                ..IDENTITY
-            },
-            ApplicationProfile::Desktop,
+            b"/Applications/Test/other",
+            authorization(),
             1,
             &capabilities,
         );

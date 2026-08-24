@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod application_identity;
 pub mod application_launch;
 pub mod args;
 pub mod async_ipc;
