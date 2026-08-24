@@ -283,7 +283,9 @@ detach an empty child leaf so bounded hierarchies can reclaim completed generati
 uses fresh jobs for policy-pinned definition-backed service attempts and every logging,
 NullFS, tmpfs, and VFS generation before launch-barrier release, retains only `SIGNAL | WAIT`, and drains each
 generation to `ECHILD` before replacement. PID 1 still uses one flat job per service
-generation; session, application, and resource-policy integration remain future work. NullFS
+generation. The application launch layer separately retains each application job for root-pinned
+readiness, bounded relaunch, complete drainage, and explicit user/session teardown; standalone
+session-manager and resource-policy integration remain future work. NullFS
 preserves its exact quiesce and clean-unmount durability proof before job drainage;
 failure paths terminate and drain the job before dirty recovery. Shared PID 1 cleanup now
 uses allocation-free result classification and canonical bootstrap diagnostics for unexpected

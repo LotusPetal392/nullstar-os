@@ -7,11 +7,16 @@ use userspace::{
     application_launch::{
         ApplicationCapability, ApplicationComponentCapability, ApplicationComponentLaunch,
         ApplicationComponentLaunchError, ApplicationIdentityError, ApplicationInstallScope,
-        ApplicationInstallation, ApplicationLaunch, ApplicationLaunchSelection,
-        ApplicationNamespace, ApplicationNamespaceError, ApplicationNamespaceSources,
-        ApplicationProfile, ApplicationProfileSet, ApplicationTrustClass, ComponentProfileSet,
+        ApplicationInstallation, ApplicationInstance, ApplicationLaunch,
+        ApplicationLaunchSelection, ApplicationNamespace, ApplicationNamespaceError,
+        ApplicationNamespaceSources, ApplicationProfile, ApplicationProfileSet,
+        ApplicationTrustClass, AuthorizedApplication, ComponentProfileSet,
         InstalledApplicationComponent, PackageVerification, authorize_application_launch,
         spawn_application,
+    },
+    application_lifecycle::{
+        ApplicationFailure, ApplicationLifecyclePolicy, ApplicationLifecycleState,
+        ApplicationTerminationReason, SupervisedApplication,
     },
     application_service::{BASELINE_DESKTOP_ROUTES, DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     handle::{Endpoint, OwnedHandle},
@@ -32,18 +37,24 @@ const IDENTITY_PUBLISHER: u64 = 17;
 const IDENTITY_SIGNING_LINEAGE: u64 = 18;
 const IDENTITY_INSTALLATION: u64 = 19;
 const APPLICATION_ROUTE_GENERATION: u64 = 1;
+const ROOT_COMPONENT: u64 = 21;
+const DESKTOP_CHILD_COMPONENT: u64 = 22;
+const WORKER_COMPONENT: u64 = 23;
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
 
 fn rust_main(_initial_stack: *const usize) -> ! {
-    syscall::exit(if application_component_probe() { 0 } else { 1 })
+    syscall::exit(
+        if application_component_probe() && application_lifecycle_probe() {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 fn application_component_probe() -> bool {
-    const ROOT_COMPONENT: u64 = 21;
-    const DESKTOP_CHILD_COMPONENT: u64 = 22;
-    const WORKER_COMPONENT: u64 = 23;
     const ROOT_REPORT: u8 = ROOT_COMPONENT as u8;
     const DESKTOP_CHILD_REPORT: u8 = DESKTOP_CHILD_COMPONENT as u8;
     const WORKER_REPORT: u8 = WORKER_COMPONENT as u8;
@@ -389,6 +400,175 @@ fn application_component_probe() -> bool {
         && exited
         && completed == expected_completions
         && application.job.info().is_ok_and(|info| info.size == 0)
+}
+
+fn application_lifecycle_probe() -> bool {
+    let Some(authorization) = authorized_root_application() else {
+        return false;
+    };
+    let Ok(service_namespace) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(private_storage) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let sources = ApplicationNamespaceSources {
+        service_namespace: service_namespace.as_raw(),
+        private_storage: private_storage.as_raw(),
+    };
+    let Some((first, first_readiness)) = launch_lifecycle_attempt(
+        authorization,
+        sources,
+        b"/application-component-target lifecycle-unready",
+    ) else {
+        return false;
+    };
+    let Ok(policy) = ApplicationLifecyclePolicy::new(64, 1, 4) else {
+        return false;
+    };
+    let Ok(mut supervised) = SupervisedApplication::new(first, first_readiness, policy) else {
+        return false;
+    };
+
+    if !poll_until_state(&mut supervised, ApplicationLifecycleState::RelaunchPending)
+        || supervised.lifecycle().last_failure() != Some(ApplicationFailure::ReadinessTimeout)
+        || supervised.lifecycle().relaunch_count() != 1
+        || supervised.completion_count() != 1
+    {
+        return false;
+    }
+
+    let Some((second, second_readiness)) = launch_lifecycle_attempt(
+        authorization,
+        sources,
+        b"/application-component-target lifecycle-running",
+    ) else {
+        return false;
+    };
+    if supervised
+        .install_relaunch(second, second_readiness)
+        .is_err()
+        || !poll_until_state(&mut supervised, ApplicationLifecycleState::Running)
+        || supervised.lifecycle().attempt() != 2
+    {
+        return false;
+    }
+    if supervised
+        .request_termination(ApplicationTerminationReason::SessionTeardown)
+        .is_err()
+        || !poll_until_state(&mut supervised, ApplicationLifecycleState::Stopped)
+    {
+        return false;
+    }
+    supervised.lifecycle().termination_reason()
+        == Some(ApplicationTerminationReason::SessionTeardown)
+        && supervised.lifecycle().relaunch_count() == 1
+        && supervised.completion_count() == 2
+        && supervised
+            .instance()
+            .job
+            .info()
+            .is_ok_and(|info| info.size == 0)
+        && ipc::job_try_wait(supervised.instance().job.as_raw()) == Err(ipc::Error::NO_CHILD)
+}
+
+fn authorized_root_application() -> Option<AuthorizedApplication> {
+    let components = [
+        InstalledApplicationComponent::new(
+            ROOT_COMPONENT,
+            b"/application-component-target",
+            ApplicationProfileSet::DESKTOP,
+            true,
+        ),
+        InstalledApplicationComponent::new(
+            DESKTOP_CHILD_COMPONENT,
+            b"/application-component-target",
+            ApplicationProfileSet::DESKTOP_CHILD,
+            false,
+        ),
+        InstalledApplicationComponent::new(
+            WORKER_COMPONENT,
+            b"/application-component-target",
+            ApplicationProfileSet::WORKER,
+            false,
+        ),
+    ];
+    authorize_application_launch(
+        PackageVerification {
+            package: IDENTITY_PACKAGE,
+            package_generation: IDENTITY_PACKAGE_GENERATION,
+            application: IDENTITY_APPLICATION,
+            publisher: IDENTITY_PUBLISHER,
+            signing_lineage: IDENTITY_SIGNING_LINEAGE,
+            trust_class: ApplicationTrustClass::Repository,
+            system_application: false,
+            components: &components,
+        },
+        ApplicationInstallation {
+            installation: IDENTITY_INSTALLATION,
+            package: IDENTITY_PACKAGE,
+            package_generation: IDENTITY_PACKAGE_GENERATION,
+            application: IDENTITY_APPLICATION,
+            publisher: IDENTITY_PUBLISHER,
+            signing_lineage: IDENTITY_SIGNING_LINEAGE,
+            trust_class: ApplicationTrustClass::Repository,
+            scope: ApplicationInstallScope::User,
+            owner_user: IDENTITY_USER,
+            system_application: false,
+        },
+        ApplicationLaunchSelection {
+            component: ROOT_COMPONENT,
+            user: IDENTITY_USER,
+            session: IDENTITY_SESSION,
+            profile: ApplicationProfile::Desktop,
+        },
+    )
+    .ok()
+}
+
+fn launch_lifecycle_attempt(
+    authorization: AuthorizedApplication,
+    sources: ApplicationNamespaceSources,
+    command: &[u8],
+) -> Option<(ApplicationInstance<1>, OwnedHandle<Endpoint>)> {
+    let readiness = OwnedHandle::<Endpoint>::create().ok()?;
+    let namespace = ApplicationNamespace::new(authorization, sources).ok()?;
+    let capabilities = [ApplicationCapability::new(
+        readiness.as_raw(),
+        Rights::SEND,
+        CapabilityRole::READINESS,
+    )];
+    let launch = ApplicationLaunch::new(
+        command,
+        authorization,
+        namespace,
+        MANAGER_GENERATION,
+        &capabilities,
+    )
+    .with_process_limit(2);
+    let instance = spawn_application(launch).ok()?;
+    Some((instance, readiness))
+}
+
+fn poll_until_state<const N: usize>(
+    supervised: &mut SupervisedApplication<N>,
+    expected: ApplicationLifecycleState,
+) -> bool {
+    for _ in 0..JOB_WAIT_YIELDS {
+        match supervised.poll() {
+            Ok(state) if state == expected => return true,
+            Ok(ApplicationLifecycleState::Completed)
+            | Ok(ApplicationLifecycleState::Stopped)
+            | Ok(ApplicationLifecycleState::Failed)
+            | Err(_) => return false,
+            Ok(_) => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[derive(Default)]

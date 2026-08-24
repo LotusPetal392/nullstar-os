@@ -2,8 +2,8 @@
 
 ## Status
 
-This document describes the **implemented launch, verified-identity admission, and reduced-component
-foundation** for the
+This document describes the **implemented launch, verified-identity admission, reduced-component,
+and lifecycle-supervision foundation** for the
 application-sandbox architecture. It is intentionally narrower than the complete design in
 [`application-sandboxing.md`](application-sandboxing.md).
 
@@ -21,12 +21,14 @@ The current implementation provides a native mediated launch primitive with:
   profile;
 - distinct `desktop`, `desktop-child`, and `worker` profile identities;
 - manager-mediated `desktop-child` and `worker` spawning from explicit, rights-monotonic
-  capability allowlists; and
+  capability allowlists;
+- root-process-pinned readiness with bounded startup deadlines and relaunch backoff;
+- whole-job termination and completion drainage before relaunch or teardown; and
 - a mandatory application entry wrapper that validates startup before application code executes.
 
 It does **not** yet provide a complete desktop application manager, cryptographic package verifier,
-application registry service, private storage builder, restricted service namespace, portal suite,
-permission database, or compatibility namespace.
+application registry service, private storage builder, standalone restricted-namespace broker,
+portal suite, permission database, or compatibility namespace.
 
 ## Why both authority tables are scrubbed
 
@@ -83,11 +85,37 @@ descriptor/capability scrub and receives a fresh bootstrap endpoint rather than 
 process's tables.
 
 Dropping the job handle is not an implicit application kill: the kernel roots a job while members are
-alive. A future application-manager lifecycle layer must retain the handle when it needs explicit
-termination, completion drainage, and supervision.
+alive. `SupervisedApplication` therefore retains the handle for explicit whole-job termination,
+completion drainage, and relaunch supervision.
 
 The current default application subtree process limit is 16 and callers may tighten it to any
 nonzero value no greater than the kernel `MAX_JOB_PROCESSES` bound.
+
+## Lifecycle supervision
+
+`application_lifecycle` separates lifecycle policy from kernel effects. Its allocation-free state
+machine covers `Starting`, `Running`, `Draining`, bounded `Backoff`, `RelaunchPending`, and terminal
+`Completed`, `Stopped`, or `Failed` states. Startup and backoff budgets are finite cooperative-yield
+counts; the policy permits at most eight relaunches and rejects values above the shared lifecycle
+yield ceiling.
+
+The job-backed `SupervisedApplication` accepts only the exact `application-ready:v1` record without
+an attached capability, stamped by the current root process. A readiness timeout, malformed or
+foreign readiness, pre-readiness exit, or unsuccessful running root moves the generation through
+whole-job termination and complete job-exit drainage. A replacement may be installed only after the
+old job reaches `NO_CHILD`, and must preserve the root's application identity, desktop profile,
+stable publisher principal, installation provenance, and manager generation. A clean root exit is
+terminal and is not charged to relaunch policy.
+
+User termination, session teardown, and manager shutdown are explicit stop reasons. They override a
+pending drain or backoff, terminate the current job when one exists, and suppress relaunch. Every job
+completion observed by the adapter is reaped, including reduced components and descendants visible
+only through the job completion stream.
+
+The QEMU launch gate exercises a timed-out first generation, verifies complete drainage, installs an
+identity-pinned second generation, accepts its root readiness, and then proves session teardown drains
+that generation without a third launch. The application manager remains responsible for constructing
+the replacement launch and for scheduling `poll` calls against a real clock or event loop.
 
 ## Bootstrap and authority construction
 
@@ -283,9 +311,9 @@ refines the TLA+ module.
 The launch foundation is intentionally small enough to become the common mechanism beneath a future
 application manager. The next useful layers are:
 
-1. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
-   relaunch policy, and user/session teardown.
-2. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
+1. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
    resource and device policy.
-3. **Production package and registry services** — cryptographic bundle verification, authenticated
+2. **Production package and registry services** — cryptographic bundle verification, authenticated
    verifier routing, immutable generation selection, revocation, and durable installation records.
+3. **Standalone application-manager integration** — event-driven launch ownership, namespace and
+   storage providers, session wiring, and durable relaunch policy.

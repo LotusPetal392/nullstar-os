@@ -438,6 +438,12 @@ application manager to construct the sandbox:
 Direct execution of a bundle executable must not bypass application mediation. A shell
 launch of a graphical bundle should cross back through the application manager.
 
+The native lifecycle layer now supervises the resulting job with root-pinned readiness, bounded
+startup and relaunch budgets, whole-job termination, and completion drainage before replacement.
+User termination and session teardown are terminal stop reasons and cannot accidentally reactivate an
+application from backoff. Persistent restoration and permission grants remain manager policy above
+this mechanism.
+
 ## Baseline authority
 
 A normal desktop application may initially receive:
