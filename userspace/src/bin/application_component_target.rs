@@ -9,8 +9,9 @@ use userspace::{
     args::Args,
     handle::Endpoint,
     ipc::{self, ObjectKind, Rights},
+    platform,
     runtime_context::{CapabilityRole, StartupCapabilityPolicy},
-    syscall,
+    syscall::{self, OpenFlags},
 };
 
 const IDENTITY_PACKAGE: u64 = 11;
@@ -26,7 +27,7 @@ const ROOT_COMPONENT: u64 = 21;
 const DESKTOP_CHILD_COMPONENT: u64 = 22;
 const WORKER_COMPONENT: u64 = 23;
 
-const POLICIES: [StartupCapabilityPolicy; 2] = [
+const POLICIES: [StartupCapabilityPolicy; 3] = [
     StartupCapabilityPolicy {
         role: CapabilityRole::READINESS,
         kind: ObjectKind::Endpoint,
@@ -41,12 +42,19 @@ const POLICIES: [StartupCapabilityPolicy; 2] = [
         maximum_rights: Rights::SEND,
         required: false,
     },
+    StartupCapabilityPolicy {
+        role: CapabilityRole::PRIVATE_STORAGE,
+        kind: ObjectKind::Endpoint,
+        minimum_rights: Rights::SEND,
+        maximum_rights: Rights::SEND,
+        required: false,
+    },
 ];
 
-userspace::application_entry!(rust_main, 2, &POLICIES);
+userspace::application_entry!(rust_main, 3, &POLICIES);
 userspace::panic_handler!();
 
-fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<2>) -> ! {
+fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<3>) -> ! {
     let arguments = unsafe { Args::from_stack(initial_stack) };
     let expected = match arguments.get(1) {
         Some(b"root") if arguments.len() == 2 => {
@@ -78,7 +86,9 @@ fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<2>) -> ! {
         || start.principal.system_application
         || start.provenance.installation != IDENTITY_INSTALLATION
         || start.provenance.scope != ApplicationInstallScope::User
-        || start.context.contains(CapabilityRole::SERVICE_NAMESPACE) != expected.2
+        || namespace_roles()
+            .iter()
+            .any(|role| start.context.contains(*role) != expected.2)
     {
         syscall::exit(2);
     }
@@ -88,28 +98,50 @@ fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<2>) -> ! {
             _ => syscall::exit(3),
         }
     }
+    if !ambient_paths_are_sealed() {
+        syscall::exit(4);
+    }
     let status = match start
         .context
         .take::<Endpoint>(CapabilityRole::READINESS, Rights::SEND)
     {
         Ok(status) => status,
-        Err(_) => syscall::exit(4),
+        Err(_) => syscall::exit(5),
     };
     if expected.2 {
-        let namespace = match start
-            .context
-            .take::<Endpoint>(CapabilityRole::SERVICE_NAMESPACE, Rights::SEND)
-        {
-            Ok(namespace) => namespace,
-            Err(_) => syscall::exit(5),
-        };
-        drop(namespace);
+        for (role, marker) in namespace_roles().into_iter().zip(1_u8..) {
+            let endpoint = match start.context.take::<Endpoint>(role, Rights::SEND) {
+                Ok(endpoint) => endpoint,
+                Err(_) => syscall::exit(6),
+            };
+            if ipc::send(endpoint.as_raw(), &[marker], None).is_err() {
+                syscall::exit(7);
+            }
+            drop(endpoint);
+        }
     }
     if !start.context.is_empty()
         || ipc::send(status.as_raw(), &[expected.3, expected.1 as u8], None).is_err()
     {
-        syscall::exit(6);
+        syscall::exit(8);
     }
     drop(status);
     syscall::exit(0)
+}
+
+const fn namespace_roles() -> [CapabilityRole; 2] {
+    [
+        CapabilityRole::SERVICE_NAMESPACE,
+        CapabilityRole::PRIVATE_STORAGE,
+    ]
+}
+
+fn ambient_paths_are_sealed() -> bool {
+    let mut entries = [];
+    syscall::open(b"/", OpenFlags::READ) == Err(syscall::Errno::PERMISSION)
+        && platform::stat(b"/") == Err(platform::Errno::PERMISSION)
+        && platform::read_directory(b"/", 0, &mut entries) == Err(platform::Errno::PERMISSION)
+        && platform::chdir(b"/") == Err(platform::Errno::PERMISSION)
+        && platform::unlink(b"/forbidden") == Err(platform::Errno::PERMISSION)
+        && syscall::execve(b"/forbidden") == Err(syscall::Errno::PERMISSION)
 }

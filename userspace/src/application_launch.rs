@@ -14,14 +14,15 @@
 //! - `NSPD` data carries trusted descriptive application identity and profile;
 //! - a package-verification result must match an installed generation before
 //!   an opaque launch authorization can reach this primitive;
+//! - desktop roots receive identity-bound private-storage and restricted
+//!   service-namespace endpoints rather than ambient path authority;
 //! - reduced components reuse the root job and derive identity from the root;
 //! - component capabilities require explicit profile opt-in and monotonic
 //!   rights reduction.
 //!
 //! Cryptographic package verification and authenticated verifier routing,
-//! persistent grants, private directory construction, service-namespace
-//! construction, and portal policy remain application-manager responsibilities
-//! above this layer.
+//! persistent grants, storage-broker implementation, service routing, and
+//! portal policy remain application-manager responsibilities above this layer.
 
 use crate::{
     abi::{limits, signal},
@@ -64,6 +65,89 @@ const REQUIRED_SECTIONS: [StartupSectionId; 5] = [
 ];
 const ISOLATION_ACK: u8 = 1;
 const DEFAULT_PROCESS_LIMIT: usize = 16;
+pub const APPLICATION_NAMESPACE_CAPABILITY_COUNT: usize = 2;
+
+/// Logical root selected by a request to the identity-bound private-storage
+/// broker. The endpoint is authority; this role only narrows that authority to
+/// one root for a relative operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ApplicationStorageRole {
+    Bundle = 1,
+    Data = 2,
+    Cache = 3,
+    Temporary = 4,
+    Runtime = 5,
+}
+
+impl ApplicationStorageRole {
+    pub const fn writable(self) -> bool {
+        !matches!(self, Self::Bundle)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationStorageOperation {
+    Lookup,
+    Read,
+    Write,
+    Create,
+    Remove,
+}
+
+impl ApplicationStorageOperation {
+    const fn mutates(self) -> bool {
+        matches!(self, Self::Write | Self::Create | Self::Remove)
+    }
+}
+
+/// Validated request shape accepted by an application-private storage broker.
+/// The endpoint carrying the request identifies the application; callers may
+/// select only one logical root and a canonical relative path beneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationStorageRequest<'a> {
+    role: ApplicationStorageRole,
+    operation: ApplicationStorageOperation,
+    path: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationStorageRequestError {
+    InvalidRelativePath,
+    ReadOnlyRoot,
+}
+
+impl<'a> ApplicationStorageRequest<'a> {
+    pub fn new(
+        role: ApplicationStorageRole,
+        operation: ApplicationStorageOperation,
+        path: &'a [u8],
+    ) -> Result<Self, ApplicationStorageRequestError> {
+        if !is_canonical_application_relative_path(path) {
+            return Err(ApplicationStorageRequestError::InvalidRelativePath);
+        }
+        if operation.mutates() && !role.writable() {
+            return Err(ApplicationStorageRequestError::ReadOnlyRoot);
+        }
+        Ok(Self {
+            role,
+            operation,
+            path,
+        })
+    }
+
+    pub const fn role(self) -> ApplicationStorageRole {
+        self.role
+    }
+
+    pub const fn operation(self) -> ApplicationStorageOperation {
+        self.operation
+    }
+
+    pub const fn path(self) -> &'a [u8] {
+        self.path
+    }
+}
 
 /// Component profiles to which one root capability may be delegated.
 ///
@@ -94,12 +178,86 @@ impl ComponentProfileSet {
 
 /// One capability that the trusted launcher may place in the application
 /// startup context.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplicationCapability {
     pub source_handle: u64,
     pub rights: Rights,
     pub role: CapabilityRole,
     component_profiles: ComponentProfileSet,
+}
+
+/// Manager-owned endpoints used to construct one desktop application's
+/// private-storage broker and restricted service namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationNamespaceSources {
+    pub service_namespace: u64,
+    pub private_storage: u64,
+}
+
+/// Opaque proof that one complete, non-aliased namespace capability set was
+/// bound to the exact application authorization used for launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationNamespace {
+    identity: ApplicationIdentity,
+    capabilities: [ApplicationCapability; APPLICATION_NAMESPACE_CAPABILITY_COUNT],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationNamespaceError {
+    RootProfileRequired,
+    InvalidHandle(CapabilityRole, ipc::Error),
+    WrongObjectKind(CapabilityRole),
+    InsufficientRights(CapabilityRole),
+    AliasedEndpoint(CapabilityRole),
+}
+
+impl ApplicationNamespace {
+    /// Validates two distinct manager endpoints and binds them to the stable
+    /// identity selected by `authorization`.
+    pub fn new(
+        authorization: AuthorizedApplication,
+        sources: ApplicationNamespaceSources,
+    ) -> Result<Self, ApplicationNamespaceError> {
+        if authorization.profile() != ApplicationProfile::Desktop {
+            return Err(ApplicationNamespaceError::RootProfileRequired);
+        }
+        let entries = [
+            (sources.service_namespace, CapabilityRole::SERVICE_NAMESPACE),
+            (sources.private_storage, CapabilityRole::PRIVATE_STORAGE),
+        ];
+        let required_source_rights = Rights::DUPLICATE | Rights::TRANSFER | Rights::SEND;
+        let mut object_ids = [0_u64; APPLICATION_NAMESPACE_CAPABILITY_COUNT];
+        let mut capabilities =
+            [ApplicationCapability::new(0, Rights::SEND, CapabilityRole::SERVICE_NAMESPACE);
+                APPLICATION_NAMESPACE_CAPABILITY_COUNT];
+        for (index, (handle, role)) in entries.into_iter().enumerate() {
+            let info = ipc::info(handle)
+                .map_err(|error| ApplicationNamespaceError::InvalidHandle(role, error))?;
+            if info.kind != ObjectKind::Endpoint {
+                return Err(ApplicationNamespaceError::WrongObjectKind(role));
+            }
+            if !info.rights.contains(required_source_rights) {
+                return Err(ApplicationNamespaceError::InsufficientRights(role));
+            }
+            if object_ids[..index].contains(&info.object_id) {
+                return Err(ApplicationNamespaceError::AliasedEndpoint(role));
+            }
+            object_ids[index] = info.object_id;
+            capabilities[index] = ApplicationCapability::new(handle, Rights::SEND, role);
+        }
+        Ok(Self {
+            identity: authorization.identity(),
+            capabilities,
+        })
+    }
+
+    pub const fn identity(self) -> ApplicationIdentity {
+        self.identity
+    }
+
+    pub fn capabilities(&self) -> &[ApplicationCapability; APPLICATION_NAMESPACE_CAPABILITY_COUNT] {
+        &self.capabilities
+    }
 }
 
 impl ApplicationCapability {
@@ -152,6 +310,7 @@ pub struct ApplicationLaunch<'a, const N: usize> {
     /// Absolute canonical executable followed by whitespace-separated arguments.
     pub command: &'a [u8],
     pub authorization: AuthorizedApplication,
+    namespace: Option<ApplicationNamespace>,
     pub manager_generation: u64,
     pub process_limit: usize,
     pub capabilities: &'a [ApplicationCapability; N],
@@ -187,12 +346,14 @@ impl<'a, const N: usize> ApplicationLaunch<'a, N> {
     pub const fn new(
         command: &'a [u8],
         authorization: AuthorizedApplication,
+        namespace: ApplicationNamespace,
         manager_generation: u64,
         capabilities: &'a [ApplicationCapability; N],
     ) -> Self {
         Self {
             command,
             authorization,
+            namespace: Some(namespace),
             manager_generation,
             process_limit: DEFAULT_PROCESS_LIMIT,
             capabilities,
@@ -202,6 +363,22 @@ impl<'a, const N: usize> ApplicationLaunch<'a, N> {
     pub const fn with_process_limit(mut self, process_limit: usize) -> Self {
         self.process_limit = process_limit;
         self
+    }
+
+    const fn new_component(
+        command: &'a [u8],
+        authorization: AuthorizedApplication,
+        manager_generation: u64,
+        capabilities: &'a [ApplicationCapability; N],
+    ) -> Self {
+        Self {
+            command,
+            authorization,
+            namespace: None,
+            manager_generation,
+            process_limit: DEFAULT_PROCESS_LIMIT,
+            capabilities,
+        }
     }
 }
 
@@ -348,7 +525,11 @@ impl<const N: usize> ApplicationInstance<N> {
         if launch.component == self.identity().component {
             return Err(ApplicationComponentLaunchError::InvalidDescription);
         }
-        validate_component_launch(&self.authority_ceiling, &launch)?;
+        validate_component_launch_with_extent(
+            &self.authority_ceiling,
+            N + APPLICATION_NAMESPACE_CAPABILITY_COUNT,
+            &launch,
+        )?;
         let executable = command_executable(launch.command)
             .ok_or(ApplicationComponentLaunchError::InvalidDescription)?;
         let authorization = self
@@ -372,7 +553,7 @@ impl<const N: usize> ApplicationInstance<N> {
             };
             capability.source_handle = source.as_raw();
         }
-        let application_launch = ApplicationLaunch::new(
+        let application_launch = ApplicationLaunch::new_component(
             launch.command,
             authorization,
             self.manager_generation,
@@ -528,10 +709,23 @@ fn validate_launch<const N: usize>(launch: &ApplicationLaunch<'_, N>) -> Result<
         || launch.manager_generation == 0
         || launch.process_limit == 0
         || launch.process_limit > limits::MAX_JOB_PROCESSES
-        || N > limits::MAX_IPC_MESSAGE_HANDLES
+        || N + launch
+            .namespace
+            .map_or(0, |_| APPLICATION_NAMESPACE_CAPABILITY_COUNT)
+            > limits::MAX_IPC_MESSAGE_HANDLES
         || !capability_descriptions_valid(launch.capabilities)
+        || launch
+            .capabilities
+            .iter()
+            .any(|capability| is_application_namespace_role(capability.role))
     {
         return Err(());
+    }
+    match (launch.authorization.profile(), launch.namespace) {
+        (ApplicationProfile::Desktop, Some(namespace))
+            if namespace.identity() == launch.authorization.identity() => {}
+        (profile, None) if profile.is_reduced_component() => {}
+        _ => return Err(()),
     }
     validate_command(launch.command)?;
     let executable = command_executable(launch.command).ok_or(())?;
@@ -542,12 +736,33 @@ fn validate_launch<const N: usize>(launch: &ApplicationLaunch<'_, N>) -> Result<
         .ok_or(())
 }
 
-fn validate_component_launch<const N: usize, const M: usize>(
+fn is_application_namespace_role(role: CapabilityRole) -> bool {
+    matches!(
+        role,
+        CapabilityRole::SERVICE_NAMESPACE | CapabilityRole::PRIVATE_STORAGE
+    )
+}
+
+/// Returns whether a storage-broker path is a bounded canonical path relative
+/// to one supplied directory capability.
+pub fn is_canonical_application_relative_path(path: &[u8]) -> bool {
+    !path.is_empty()
+        && path.len() <= limits::MAX_PATH_BYTES
+        && path[0] != b'/'
+        && !path.contains(&0)
+        && path
+            .split(|byte| *byte == b'/')
+            .all(|component| !component.is_empty() && component != b"." && component != b"..")
+}
+
+fn validate_component_launch_with_extent<const N: usize, const M: usize>(
     authority_ceiling: &[ApplicationCapability; N],
+    root_authority_count: usize,
     launch: &ApplicationComponentLaunch<'_, M>,
 ) -> Result<(), ApplicationComponentLaunchError> {
     if launch.component == 0
         || !launch.profile.is_reduced_component()
+        || root_authority_count < N
         || M > limits::MAX_IPC_MESSAGE_HANDLES
         || !component_capability_descriptions_valid(launch.capabilities)
         || validate_command(launch.command).is_err()
@@ -579,11 +794,19 @@ fn validate_component_launch<const N: usize, const M: usize>(
         }
         strictly_reduced |= allowed.rights != requested.rights;
     }
-    strictly_reduced |= M < N;
+    strictly_reduced |= M < root_authority_count;
     if !strictly_reduced {
         return Err(ApplicationComponentLaunchError::AuthorityNotReduced);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn validate_component_launch<const N: usize, const M: usize>(
+    authority_ceiling: &[ApplicationCapability; N],
+    launch: &ApplicationComponentLaunch<'_, M>,
+) -> Result<(), ApplicationComponentLaunchError> {
+    validate_component_launch_with_extent(authority_ceiling, N, launch)
 }
 
 fn capability_descriptions_valid<const N: usize>(
@@ -697,37 +920,46 @@ fn send_application_start<const N: usize>(
     process_id: ProcessId,
     launch: ApplicationLaunch<'_, N>,
 ) -> Result<(), ApplicationStartupSendError> {
-    let mut resources = [None; N];
+    let mut resources = [None; limits::MAX_IPC_MESSAGE_HANDLES];
     let mut transfers = [Transfer {
         handle: 0,
         rights: Rights::EMPTY,
-    }; N];
-    let mut duplicates = [0_u64; N];
-    for (index, capability) in launch.capabilities.iter().enumerate() {
-        let duplicate = match ipc::duplicate(
-            capability.source_handle,
-            capability.rights | Rights::TRANSFER,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                close_duplicates(&duplicates[..index]);
-                return Err(ApplicationStartupSendError::CapabilityDuplicate(error));
+    }; limits::MAX_IPC_MESSAGE_HANDLES];
+    let mut duplicates = [0_u64; limits::MAX_IPC_MESSAGE_HANDLES];
+    let mut capability_count = 0;
+    if let Some(namespace) = launch.namespace {
+        for capability in namespace.capabilities() {
+            if let Err(error) = append_startup_capability(
+                *capability,
+                &mut capability_count,
+                &mut resources,
+                &mut transfers,
+                &mut duplicates,
+            ) {
+                close_duplicates(&duplicates[..capability_count]);
+                return Err(error);
             }
-        };
-        duplicates[index] = duplicate;
-        resources[index] = Some(StartupResource {
-            role: capability.role,
-            required: true,
-        });
-        transfers[index] = Transfer {
-            handle: duplicate,
-            rights: capability.rights,
-        };
+        }
     }
-    let message = StartupMessage::<N>::new(StartupRuntimeRole::Application, resources)
-        .map_err(|_| ApplicationStartupSendError::InvalidDescription)?;
-    if let Err(error) = send_startup_message(sender, &message, &transfers) {
-        close_duplicates(&duplicates);
+    for capability in launch.capabilities {
+        if let Err(error) = append_startup_capability(
+            *capability,
+            &mut capability_count,
+            &mut resources,
+            &mut transfers,
+            &mut duplicates,
+        ) {
+            close_duplicates(&duplicates[..capability_count]);
+            return Err(error);
+        }
+    }
+    let message = StartupMessage::<{ limits::MAX_IPC_MESSAGE_HANDLES }>::new(
+        StartupRuntimeRole::Application,
+        resources,
+    )
+    .map_err(|_| ApplicationStartupSendError::InvalidDescription)?;
+    if let Err(error) = send_startup_message(sender, &message, &transfers[..capability_count]) {
+        close_duplicates(&duplicates[..capability_count]);
         return Err(ApplicationStartupSendError::CapabilityMessage(error));
     }
 
@@ -795,6 +1027,32 @@ fn send_application_start<const N: usize>(
         },
     ];
     send_process_start_data(sender, &sections).map_err(ApplicationStartupSendError::Transport)
+}
+
+fn append_startup_capability(
+    capability: ApplicationCapability,
+    count: &mut usize,
+    resources: &mut [Option<StartupResource>; limits::MAX_IPC_MESSAGE_HANDLES],
+    transfers: &mut [Transfer; limits::MAX_IPC_MESSAGE_HANDLES],
+    duplicates: &mut [u64; limits::MAX_IPC_MESSAGE_HANDLES],
+) -> Result<(), ApplicationStartupSendError> {
+    let index = *count;
+    let duplicate = ipc::duplicate(
+        capability.source_handle,
+        capability.rights | Rights::TRANSFER,
+    )
+    .map_err(ApplicationStartupSendError::CapabilityDuplicate)?;
+    duplicates[index] = duplicate;
+    resources[index] = Some(StartupResource {
+        role: capability.role,
+        required: true,
+    });
+    transfers[index] = Transfer {
+        handle: duplicate,
+        rights: capability.rights,
+    };
+    *count += 1;
+    Ok(())
 }
 
 fn close_duplicates(handles: &[u64]) {
@@ -927,7 +1185,10 @@ fn launch_isolated_child(command: &[u8], release: PipePair, isolation: PipePair)
     }
 
     wait_for_release(release.reader);
-    if syscall::execve(command).is_err() {
+    if platform::chdir(b"/").is_err()
+        || syscall::seal_ambient_paths_on_exec().is_err()
+        || syscall::execve(command).is_err()
+    {
         syscall::exit(126);
     }
     syscall::exit(127)
@@ -1015,11 +1276,13 @@ mod tests {
     use super::{
         ApplicationCapability, ApplicationComponentCapability, ApplicationComponentLaunch,
         ApplicationComponentLaunchError, ApplicationInstallScope, ApplicationInstallation,
-        ApplicationLaunch, ApplicationLaunchSelection, ApplicationProfile, ApplicationProfileSet,
-        ApplicationTrustClass, ComponentProfileSet, DESKTOP_CHILD_NAMESPACE_PROFILE_ID,
-        DESKTOP_NAMESPACE_PROFILE_ID, InstalledApplicationComponent, PackageVerification,
-        WORKER_NAMESPACE_PROFILE_ID, authorize_application_launch,
-        is_absolute_canonical_executable, validate_component_launch, validate_launch,
+        ApplicationLaunch, ApplicationLaunchSelection, ApplicationNamespace, ApplicationProfile,
+        ApplicationProfileSet, ApplicationStorageOperation, ApplicationStorageRequest,
+        ApplicationStorageRequestError, ApplicationStorageRole, ApplicationTrustClass,
+        ComponentProfileSet, DESKTOP_CHILD_NAMESPACE_PROFILE_ID, DESKTOP_NAMESPACE_PROFILE_ID,
+        InstalledApplicationComponent, PackageVerification, WORKER_NAMESPACE_PROFILE_ID,
+        authorize_application_launch, is_absolute_canonical_executable,
+        is_canonical_application_relative_path, validate_component_launch, validate_launch,
     };
     use crate::{ipc::Rights, runtime_context::CapabilityRole};
 
@@ -1063,6 +1326,16 @@ mod tests {
         .unwrap()
     }
 
+    fn namespace(authorization: super::AuthorizedApplication) -> ApplicationNamespace {
+        ApplicationNamespace {
+            identity: authorization.identity(),
+            capabilities: [
+                ApplicationCapability::new(1, Rights::SEND, CapabilityRole::SERVICE_NAMESPACE),
+                ApplicationCapability::new(2, Rights::SEND, CapabilityRole::PRIVATE_STORAGE),
+            ],
+        }
+    }
+
     #[test]
     fn profiles_have_distinct_non_system_namespace_ids() {
         assert_eq!(
@@ -1099,11 +1372,43 @@ mod tests {
     }
 
     #[test]
+    fn private_storage_paths_are_strictly_relative_and_canonical() {
+        assert!(is_canonical_application_relative_path(b"settings/theme"));
+        assert!(is_canonical_application_relative_path(b"cache.db"));
+        assert!(!is_canonical_application_relative_path(b"/settings/theme"));
+        assert!(!is_canonical_application_relative_path(b"settings//theme"));
+        assert!(!is_canonical_application_relative_path(
+            b"settings/../other"
+        ));
+        assert!(!is_canonical_application_relative_path(b"."));
+        assert!(!is_canonical_application_relative_path(b"bad\0name"));
+        assert_eq!(
+            ApplicationStorageRequest::new(
+                ApplicationStorageRole::Bundle,
+                ApplicationStorageOperation::Write,
+                b"resources/theme",
+            ),
+            Err(ApplicationStorageRequestError::ReadOnlyRoot)
+        );
+        let request = ApplicationStorageRequest::new(
+            ApplicationStorageRole::Data,
+            ApplicationStorageOperation::Create,
+            b"profiles/default",
+        )
+        .unwrap();
+        assert_eq!(request.role(), ApplicationStorageRole::Data);
+        assert_eq!(request.operation(), ApplicationStorageOperation::Create);
+        assert_eq!(request.path(), b"profiles/default");
+    }
+
+    #[test]
     fn launch_requires_authorized_executable_and_bounded_process_limit() {
         let capabilities = [];
+        let authorization = authorization();
         let launch = ApplicationLaunch::new(
             b"/Applications/Test/app --probe",
-            authorization(),
+            authorization,
+            namespace(authorization),
             1,
             &capabilities,
         );
@@ -1111,7 +1416,8 @@ mod tests {
         assert!(validate_launch(&launch.with_process_limit(0)).is_err());
         let invalid = ApplicationLaunch::new(
             b"/Applications/Test/other",
-            authorization(),
+            authorization,
+            namespace(authorization),
             1,
             &capabilities,
         );

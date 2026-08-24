@@ -187,6 +187,7 @@ const ERR_NO_SPACE: i64 = abi::errno::NO_SPACE;
 const ERR_READ_ONLY: i64 = abi::errno::READ_ONLY;
 const ERR_BROKEN_PIPE: i64 = abi::errno::BROKEN_PIPE;
 const ERR_NOT_IMPLEMENTED: i64 = abi::errno::NOT_IMPLEMENTED;
+const ERR_PERMISSION: i64 = abi::errno::PERMISSION;
 
 static PROCESS_MANAGER: PreemptMutex<ProcessManager> = PreemptMutex::new(ProcessManager::new());
 
@@ -1338,6 +1339,8 @@ struct Process {
     task_id: u64,
     path: String,
     environment: Vec<String>,
+    ambient_path_access: bool,
+    seal_ambient_paths_on_exec: bool,
     state: ProcessState,
     stopped_resume_state: Option<ProcessState>,
     last_stop_signal: Option<u64>,
@@ -2307,6 +2310,8 @@ fn spawn_with_mode(
         task_id: 0,
         path: path.to_string(),
         environment,
+        ambient_path_access: true,
+        seal_ambient_paths_on_exec: false,
         state: ProcessState::Runnable,
         stopped_resume_state: None,
         last_stop_signal: None,
@@ -2498,6 +2503,8 @@ pub struct PipelineResult {
 struct ForkSnapshot {
     path: String,
     environment: Vec<String>,
+    ambient_path_access: bool,
+    seal_ambient_paths_on_exec: bool,
     process_group_id: u64,
     job: Option<CapabilityObjectRef>,
     entry_point: u64,
@@ -3012,6 +3019,8 @@ impl Runtime {
             ForkSnapshot {
                 path: parent.path.clone(),
                 environment: parent.environment.clone(),
+                ambient_path_access: parent.ambient_path_access,
+                seal_ambient_paths_on_exec: parent.seal_ambient_paths_on_exec,
                 process_group_id: parent.process_group_id,
                 job: parent.job,
                 entry_point: parent.entry_point,
@@ -3109,6 +3118,8 @@ impl Runtime {
                 task_id,
                 path: snapshot.path.clone(),
                 environment: snapshot.environment.clone(),
+                ambient_path_access: snapshot.ambient_path_access,
+                seal_ambient_paths_on_exec: snapshot.seal_ambient_paths_on_exec,
                 state: ProcessState::Runnable,
                 stopped_resume_state: None,
                 last_stop_signal: None,
@@ -3851,6 +3862,10 @@ impl Runtime {
                 .process_mut(process_id)
                 .expect("exec process disappeared after scheduler replacement");
             let old_path = core::mem::replace(&mut process.path, new_path);
+            if process.seal_ambient_paths_on_exec {
+                process.ambient_path_access = false;
+                process.seal_ambient_paths_on_exec = false;
+            }
             let old_frames = core::mem::replace(
                 &mut process.owned_frames,
                 core::mem::take(&mut address_space.owned_frames),

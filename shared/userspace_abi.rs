@@ -10,7 +10,7 @@ pub const INIT_PROCESS_ID: u64 = 1;
 
 /// First documented version of the NullStar OS userspace ABI.
 pub const ABI_VERSION_MAJOR: u64 = 1;
-pub const ABI_VERSION_MINOR: u64 = 31;
+pub const ABI_VERSION_MINOR: u64 = 32;
 
 pub mod syscall {
     pub const WRITE: u64 = 1;
@@ -111,6 +111,9 @@ pub mod syscall {
     pub const EVENT_SET: u64 = 89;
     pub const EVENT_RESET: u64 = 90;
     pub const CAPABILITY_HANDLE_AT_SLOT: u64 = 91;
+    /// Irreversibly removes ambient path authority after the caller's next
+    /// successful image replacement.
+    pub const SEAL_AMBIENT_PATHS_ON_EXEC: u64 = 92;
 }
 
 pub mod filesystem_provider {
@@ -150,6 +153,7 @@ pub mod capability {
     pub const TIMER_OBJECTS: u64 = 1 << 27;
     pub const EVENT_OBJECTS: u64 = 1 << 28;
     pub const GENERATION_CHECKED_HANDLES: u64 = 1 << 29;
+    pub const AMBIENT_PATH_SEALING: u64 = 1 << 30;
 
     pub const PLATFORM_V1: u64 = FILE_METADATA
         | DIRECTORY_READ
@@ -157,7 +161,8 @@ pub mod capability {
         | DESCRIPTOR_DUPLICATION
         | PARENT_PROCESS
         | DIRECT_SIGNALS
-        | PROCESS_GROUP_CONTROL;
+        | PROCESS_GROUP_CONTROL
+        | AMBIENT_PATH_SEALING;
 
     pub const PROTECTION_V1: u64 = HANDLE_TABLE
         | IPC_ENDPOINTS

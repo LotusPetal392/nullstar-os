@@ -185,6 +185,38 @@ The application runtime pins the startup sender to its direct parent, validates 
 executable identity, requires the service identity to be zero, verifies application identity fields,
 and rejects an unknown namespace/profile value before returning control to application code.
 
+## Private storage and restricted namespace authority
+
+A desktop root launch now requires an opaque `ApplicationNamespace` constructed against the exact
+`AuthorizedApplication`. Construction validates two distinct manager-owned endpoints with the rights
+needed to duplicate a send-only client view:
+
+- `PRIVATE_STORAGE` names an application-private broker bound to the stable application, user, and
+  session identity; and
+- `SERVICE_NAMESPACE` names the restricted service router selected for that application profile.
+
+The private-storage broker contract exposes logical `bundle`, `data`, `cache`, `temporary`, and
+`runtime` roots. Requests select one root and a bounded canonical relative path. Absolute paths,
+empty components, `.`, `..`, repeated separators, and embedded NUL bytes are rejected before broker
+routing. The bundle role is read-only; write, create, and remove requests against it fail closed.
+Physical NullFS/tmpfs layout is deliberately not an authority token and remains hidden behind the
+broker endpoint.
+
+Namespace roles are reserved by the launcher and cannot be injected through an ordinary capability
+list. Reduced components receive neither endpoint automatically; later profile policy must delegate
+an explicitly reduced route if a worker needs storage or service access.
+
+Before the managed image is loaded, the launch shim asks the kernel to seal ambient path authority on
+the next successful `execve`. The seal becomes irreversible when that image is committed, is inherited
+by `fork`, and denies global-path `open`, `stat`, directory-read, `chdir`, `unlink`, `execve`, and legacy
+spawn operations. Capability IPC remains available, so filesystem and service access must cross one
+of the supplied endpoints. The QEMU launch probe checks the complete send-only endpoint set, rejects
+aliased namespace endpoints, and verifies ambient-path denial in the root and both reduced profiles.
+
+Provider-backed directory provisioning and the concrete private-storage/service-namespace broker
+processes remain application-manager integration work; this layer establishes the non-bypassable
+launch and request-policy boundary they consume.
+
 ## Executable and environment boundary
 
 The initial implementation accepts only an absolute canonical executable path in its command. The
@@ -197,9 +229,9 @@ environment-construction step is implemented. Environment values are therefore *
 sandbox confidentiality boundary**. The future application manager should construct an explicit
 minimal environment rather than inheriting manager state.
 
-Likewise, this launch primitive does not yet disable or virtualize legacy global-path syscalls. The
-application-sandbox design still requires private directory capabilities and a restricted filesystem
-namespace/service path before ordinary applications can be described as fully filesystem sandboxed.
+Global path operations are sealed by the kernel for every managed application image. Compatibility
+applications that require pathname projection will therefore need a separately authorized broker or
+compatibility profile rather than silently regaining the machine namespace.
 
 ## Failure behavior
 
@@ -227,6 +259,9 @@ refining several of its assumptions:
   authority ceiling and profile-specific delegation policy;
 - `BootstrapGrant` -> explicit typed `NSPC` capability attachments;
 - `AuthorityWithinCeiling` -> receiver-side `StartupCapabilityPolicy` rights reduction;
+- private storage and namespace authority -> identity-bound send-only broker endpoints plus
+  canonical relative-root requests;
+- ambient path exclusion -> a one-way kernel seal applied when the managed image is committed;
 - `IdentityIsNotAuthority` -> separate `NSPD` descriptive identity and capability-bearing `NSPC`
   records, with verified principal/provenance metadata still unable to create authority; and
 - containment assumptions -> existing non-relaxable job membership and inherited fork containment.
@@ -239,13 +274,11 @@ refines the TLA+ module.
 The launch foundation is intentionally small enough to become the common mechanism beneath a future
 application manager. The next useful layers are:
 
-1. **Private storage and restricted namespace construction** — bundle/data/cache/temp/runtime roots
-   and removal of ambient global-path authority for native applications.
-2. **Baseline service routing** — restricted display, lifecycle, settings, logging, audio playback,
+1. **Baseline service routing** — restricted display, lifecycle, settings, logging, audio playback,
    portal, and service-namespace endpoints.
-3. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
+2. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
    relaunch policy, and user/session teardown.
-4. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
+3. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
    resource and device policy.
-5. **Production package and registry services** — cryptographic bundle verification, authenticated
+4. **Production package and registry services** — cryptographic bundle verification, authenticated
    verifier routing, immutable generation selection, revocation, and durable installation records.

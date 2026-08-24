@@ -6,7 +6,7 @@ NullStar OS exposes a small Rust-oriented ring-3 ABI through software interrupt
 in `shared/protection_abi.rs`. Kernel and userspace include these files directly
 so they cannot silently disagree about call numbers or layouts.
 
-The ABI is experimental, but callers can query the current version, 1.31, and a
+The ABI is experimental, but callers can query the current version, 1.32, and a
 documented capability mask before relying on optional platform services.
 
 ## Calling convention
@@ -114,6 +114,24 @@ opaque handle currently installed at one of the caller's own slots and returns `
 when that slot is empty. The slot is a discovery coordinate used by managed bootstrap
 and cleanup code; knowing a slot does not grant authority, and the packed handle layout
 is not part of the public ABI contract.
+
+## Version 1.32 ambient-path sealing
+
+| Number | Name | Arguments | Result |
+| ---: | --- | --- | --- |
+| 92 | `seal_ambient_paths_on_exec` | none | zero |
+
+ABI 1.32 advertises `capability::AMBIENT_PATH_SEALING`. The call schedules an irreversible removal
+of ambient global-path authority when the caller's next `execve` successfully commits a new image.
+Scheduling the seal does not interfere with loading that image, and a failed `execve` does not apply
+it. Once active, the policy is inherited by `fork`, survives later image replacement, and cannot be
+relaxed.
+
+Sealed processes receive `EPERM` from path-based `open`, `stat`, `read_directory`, `chdir`, `unlink`,
+`execve`, and legacy `spawn_command`. Descriptor operations and capability IPC are unaffected. The
+managed application launcher sets its working directory to `/`, schedules the seal, and then loads
+the authorized image, forcing subsequent filesystem and service access through explicit broker
+capabilities.
 
 ## Version 1.4 tmpfs registration
 
@@ -829,6 +847,8 @@ reset. `EVENT_OBJECTS` in `SystemInfo.capabilities` advertises all three calls.
 - ABI 1.28 adds bounded queued edge-event ports at syscalls 81 through 84.
 - ABI 1.29 adds one-shot monotonic timer objects at syscalls 85 through 87.
 - ABI 1.30 adds manual-reset event objects at syscalls 88 through 90.
+- ABI 1.31 adds generation-checked capability handles and process-local slot discovery at syscall 91.
+- ABI 1.32 adds irreversible ambient-path sealing on successful exec at syscall 92.
 - New structures use `#[repr(C)]` and fixed-width integer fields.
 - Unknown calls return `ENOSYS`.
 - Resource bounds remain part of normal failure behavior; protection bounds are

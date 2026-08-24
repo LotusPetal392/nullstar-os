@@ -5,8 +5,9 @@ use userspace::{
     application_launch::{
         ApplicationCapability, ApplicationComponentCapability, ApplicationComponentLaunch,
         ApplicationComponentLaunchError, ApplicationIdentityError, ApplicationInstallScope,
-        ApplicationInstallation, ApplicationLaunch, ApplicationLaunchSelection, ApplicationProfile,
-        ApplicationProfileSet, ApplicationTrustClass, ComponentProfileSet,
+        ApplicationInstallation, ApplicationLaunch, ApplicationLaunchSelection,
+        ApplicationNamespace, ApplicationNamespaceError, ApplicationNamespaceSources,
+        ApplicationProfile, ApplicationProfileSet, ApplicationTrustClass, ComponentProfileSet,
         InstalledApplicationComponent, PackageVerification, authorize_application_launch,
         spawn_application,
     },
@@ -112,21 +113,39 @@ fn application_component_probe() -> bool {
     let Ok(status) = OwnedHandle::<Endpoint>::create() else {
         return false;
     };
-    let Ok(namespace) = OwnedHandle::<Endpoint>::create() else {
+    let Ok(service_namespace) = OwnedHandle::<Endpoint>::create() else {
         return false;
     };
-    let root_capabilities = [
-        ApplicationCapability::new(status.as_raw(), Rights::SEND, CapabilityRole::READINESS)
-            .delegable_to(ComponentProfileSet::ALL_REDUCED),
-        ApplicationCapability::new(
-            namespace.as_raw(),
-            Rights::SEND,
-            CapabilityRole::SERVICE_NAMESPACE,
-        ),
-    ];
+    let Ok(private_storage) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let aliased_sources = ApplicationNamespaceSources {
+        service_namespace: service_namespace.as_raw(),
+        private_storage: service_namespace.as_raw(),
+    };
+    if ApplicationNamespace::new(authorization, aliased_sources)
+        != Err(ApplicationNamespaceError::AliasedEndpoint(
+            CapabilityRole::PRIVATE_STORAGE,
+        ))
+    {
+        return false;
+    }
+    let namespace_sources = ApplicationNamespaceSources {
+        service_namespace: service_namespace.as_raw(),
+        private_storage: private_storage.as_raw(),
+    };
+    let Ok(namespace) = ApplicationNamespace::new(authorization, namespace_sources) else {
+        return false;
+    };
+    let root_capabilities =
+        [
+            ApplicationCapability::new(status.as_raw(), Rights::SEND, CapabilityRole::READINESS)
+                .delegable_to(ComponentProfileSet::ALL_REDUCED),
+        ];
     let root_launch = ApplicationLaunch::new(
         b"/application-component-target root",
         authorization,
+        namespace,
         MANAGER_GENERATION,
         &root_capabilities,
     )
@@ -144,7 +163,7 @@ fn application_component_probe() -> bool {
     let mut process_ids = [application.process_id, 0, 0];
 
     let forbidden_capabilities = [ApplicationComponentCapability::new(
-        namespace.as_raw(),
+        service_namespace.as_raw(),
         Rights::SEND,
         CapabilityRole::SERVICE_NAMESPACE,
     )];
@@ -279,6 +298,13 @@ fn application_component_probe() -> bool {
         result &= received == 0b111;
     }
 
+    if result {
+        let namespace_reports = [(&service_namespace, 1_u8), (&private_storage, 2)];
+        result = namespace_reports.iter().all(|(endpoint, marker)| {
+            receive_namespace_report(endpoint, application.process_id, *marker)
+        });
+    }
+
     if !result {
         let _ = ipc::job_terminate(application.job.as_raw());
     }
@@ -323,6 +349,31 @@ fn application_component_probe() -> bool {
         && exited
         && completed == expected_completions
         && application.job.info().is_ok_and(|info| info.size == 0)
+}
+
+fn receive_namespace_report(
+    endpoint: &OwnedHandle<Endpoint>,
+    expected_sender: u64,
+    expected_marker: u8,
+) -> bool {
+    let mut report = [0_u8; 1];
+    for _ in 0..JOB_WAIT_YIELDS {
+        match endpoint.try_receive(&mut report) {
+            Ok(message) => {
+                return message.bytes == 1
+                    && message.capability.is_none()
+                    && message.sender_process_id == expected_sender
+                    && report[0] == expected_marker;
+            }
+            Err(error) if error == ipc::Error::TRY_AGAIN => {
+                if syscall::yield_now().is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn bounded_job_wait(handle: ipc::CapabilityHandle) -> Option<ipc::JobExit> {

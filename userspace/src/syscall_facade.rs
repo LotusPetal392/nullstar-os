@@ -19,8 +19,9 @@ pub use crate::syscall_legacy::{
     ProcessId, Result, STDERR, STDIN, STDOUT, SeekFrom, SignalAction, SignalActionFlags,
     SignalFrame, SignalHandler, SignalMask, SignalMaskHow, SpawnFlags, close, current_signal_mask,
     environment_set, environment_unset, execve, exit, foreground_process_group, fork, getpid, open,
-    pipe_pair, query_signal_action, read, seek, set_descriptor_flags, signal_action, signal_mask,
-    signal_process_group, try_wait_child, wait_child, write, write_all, yield_now,
+    pipe_pair, query_signal_action, read, seal_ambient_paths_on_exec, seek, set_descriptor_flags,
+    signal_action, signal_mask, signal_process_group, try_wait_child, wait_child, write, write_all,
+    yield_now,
 };
 
 const GROUP_SETUP_YIELDS: usize = 256;
