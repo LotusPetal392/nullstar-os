@@ -1,6 +1,12 @@
 name: Application launch branch validation
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "scripts/fix-application-launch.py"
+      - ".github/workflows/application-launch-fix.yml"
   push:
     branches:
       - feature/application-launch-foundation
@@ -48,6 +54,7 @@ jobs:
         run: cargo +nightly-2026-02-01 build --release --locked --quiet
 
       - name: Commit validated source
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         run: |
           if git diff --quiet -- userspace/src/application_launch.rs userspace/src/lib.rs; then
             exit 0
