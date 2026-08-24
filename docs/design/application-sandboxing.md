@@ -986,12 +986,14 @@ a system generation is activated.
 
 ## Implementation sequence
 
-The native implementation currently provides the launch-boundary, verified-identity admission, and
-reduced-component portions of Milestone 1: clean descriptor/capability tables, bounded application
-jobs, typed root startup, package/installation/publisher-lineage matching, installed executable and
-profile authorization, and explicit rights-monotonic `desktop-child`/`worker` allowlists. The
-cryptographic package-verifier and registry services, private storage, restricted namespaces, and
-general application-manager routing remain outstanding.
+The native implementation now provides the launch-boundary portions of Milestone 1: clean
+descriptor/capability tables, bounded application jobs, typed root startup,
+package/installation/publisher-lineage matching, installed executable and profile authorization,
+explicit rights-monotonic `desktop-child`/`worker` allowlists, an identity-bound private-storage
+broker and restricted service-namespace capability set, canonical relative-root request policy, and
+an inherited one-way kernel seal against ambient global paths. Concrete provider-backed directory
+provisioning, service-route population, cryptographic package-verifier and registry services, and
+general application-manager supervision remain outstanding.
 
 ### Milestone 1: mandatory application isolation
 

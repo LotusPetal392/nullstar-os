@@ -427,6 +427,16 @@ pub fn getpid() -> Result<ProcessId> {
     decode(result)
 }
 
+/// Irreversibly removes global path-based filesystem and executable lookup
+/// authority when the caller next completes `execve` successfully.
+pub fn seal_ambient_paths_on_exec() -> Result<()> {
+    let mut result = syscall::SEAL_AMBIENT_PATHS_ON_EXEC;
+    unsafe {
+        asm!("int 0x80", inlateout("rax") result);
+    }
+    decode(result).map(|_| ())
+}
+
 pub fn wait_child(process_id: ProcessId) -> Result<ChildStatus> {
     let mut result = syscall::WAIT_CHILD;
     unsafe {

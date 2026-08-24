@@ -81,6 +81,16 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
         return current_stack_pointer;
     };
 
+    let registers = unsafe { &mut *registers_pointer };
+    if syscall_number == abi::syscall::SEAL_AMBIENT_PATHS_ON_EXEC {
+        registers.rax = platform_seal_ambient_paths_on_exec(process_id);
+        return current_stack_pointer;
+    }
+    if platform_ambient_path_call(syscall_number) && !platform_ambient_paths_allowed(process_id) {
+        registers.rax = error_return(ERR_PERMISSION);
+        return current_stack_pointer;
+    }
+
     if cwd_aware_legacy_call {
         let mut manager = PROCESS_MANAGER.lock();
         let Some(process) = manager.process_mut(process_id) else {
@@ -93,7 +103,6 @@ pub extern "C" fn galactic_platform_syscall_dispatch(current_stack_pointer: usiz
     // Keep the existing exact smoke-test counter stable: legacy calls continue
     // to be counted, while platform ABI calls are deliberately excluded until
     // versioned syscall metrics are added.
-    let registers = unsafe { &mut *registers_pointer };
     if syscall_number == abi::syscall::SPAWN_COMMAND {
         return match platform_spawn_command(
             process_id,
@@ -261,7 +270,39 @@ fn platform_syscall_number(number: u64) -> bool {
             | abi::syscall::DUP2
             | abi::syscall::GETPPID
             | abi::syscall::KILL
+            | abi::syscall::SEAL_AMBIENT_PATHS_ON_EXEC
     )
+}
+
+fn platform_ambient_path_call(number: u64) -> bool {
+    matches!(
+        number,
+        abi::syscall::OPEN
+            | abi::syscall::SPAWN_COMMAND
+            | abi::syscall::EXECVE
+            | abi::syscall::STAT
+            | abi::syscall::READ_DIRECTORY
+            | abi::syscall::CHDIR
+            | abi::syscall::UNLINK
+    )
+}
+
+fn platform_ambient_paths_allowed(process_id: u64) -> bool {
+    PROCESS_MANAGER
+        .lock()
+        .processes
+        .iter()
+        .find(|process| process.process_id == process_id)
+        .is_some_and(|process| process.ambient_path_access)
+}
+
+fn platform_seal_ambient_paths_on_exec(process_id: u64) -> u64 {
+    let mut manager = PROCESS_MANAGER.lock();
+    let Some(process) = manager.process_mut(process_id) else {
+        return error_return(ERR_NO_PROCESS);
+    };
+    process.seal_ambient_paths_on_exec = true;
+    0
 }
 
 fn platform_reserved_environment_call(

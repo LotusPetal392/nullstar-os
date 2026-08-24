@@ -146,8 +146,12 @@ application job before release, delivers typed startup identity and authority, a
 `desktop-child` and `worker` components from explicit profile-specific capability allowlists. Launch
 now additionally requires package-verifier output to match an installed generation's stable
 application/publisher lineage, provenance, component executable, user scope, and authorized profile.
-Cryptographic package and registry services plus general application-manager routing are still
-future work; private storage and restricted namespace construction are the next launch layers.
+Desktop roots now also require identity-bound private-storage and restricted service-namespace
+endpoints, canonical relative-root policy keeps bundle access read-only, and a one-way inherited
+kernel seal removes ambient global-path operations after managed exec. Concrete broker services,
+provider-backed directory provisioning, cryptographic package and registry services, and general
+application-manager routing remain future work; baseline restricted service routing is the next
+launch layer.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;
