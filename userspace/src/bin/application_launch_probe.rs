@@ -23,6 +23,11 @@ use userspace::{
         ApplicationGrantScope, ApplicationPermissionStore, ApplicationResourceIdentity,
         ApplicationResourceKind,
     },
+    application_portal::{
+        AdmittedPortalRequest, ApplicationPortalAdmission, ApplicationPortalOperation,
+        ApplicationPortalRequest, ApplicationPortalResponse, PortalAdmissionError,
+        TrustedUserGestureTicket,
+    },
     application_service::{BASELINE_DESKTOP_ROUTES, DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     handle::{Endpoint, OwnedHandle},
     ipc::{self, CapabilityHandle, Rights, Signals},
@@ -54,6 +59,7 @@ fn rust_main(_initial_stack: *const usize) -> ! {
         if application_component_probe()
             && application_lifecycle_probe()
             && application_permission_probe()
+            && application_portal_probe()
         {
             0
         } else {
@@ -521,6 +527,98 @@ fn application_permission_probe() -> bool {
         .is_err()
         && store.records().count() == 1
         && store.records().all(|record| !record.active())
+}
+
+fn application_portal_probe() -> bool {
+    const GESTURE_ISSUER_PROCESS: u64 = 41;
+    const CLIENT_PROCESS: u64 = 42;
+    const PARENT_SURFACE: u64 = 43;
+
+    let Some(authorization) = authorized_root_application() else {
+        return false;
+    };
+    let Some(ticket) = TrustedUserGestureTicket::new(
+        44,
+        CLIENT_PROCESS,
+        authorization.identity().user,
+        authorization.identity().session,
+        authorization.principal().application,
+        authorization.provenance().installation,
+        PARENT_SURFACE,
+        45,
+        46,
+        100,
+        200,
+    ) else {
+        return false;
+    };
+    let Some(request) = ApplicationPortalRequest::new(
+        47,
+        ticket.id(),
+        PARENT_SURFACE,
+        ApplicationPortalOperation::OpenFile,
+        ApplicationGrantRights::READ,
+        ApplicationGrantScope::Persistent,
+    ) else {
+        return false;
+    };
+    if TrustedUserGestureTicket::decode(&ticket.encode()) != Ok(ticket)
+        || ApplicationPortalRequest::decode(&request.encode()) != Ok(request)
+    {
+        return false;
+    }
+    let Some(admitted) = admit_portal_request(
+        GESTURE_ISSUER_PROCESS,
+        CLIENT_PROCESS,
+        authorization,
+        ticket,
+        request,
+    ) else {
+        return false;
+    };
+    let Some(resource) =
+        ApplicationResourceIdentity::new([0x52; 16], 701, 10, ApplicationResourceKind::File)
+    else {
+        return false;
+    };
+    let mut store = ApplicationPermissionStore::new();
+    if store
+        .issue(authorization, resource, request.rights(), request.scope())
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(grant) = store.authorize(authorization, resource, request.rights()) else {
+        return false;
+    };
+    let Ok(response) = ApplicationPortalResponse::selected(admitted, grant) else {
+        return false;
+    };
+    ApplicationPortalResponse::decode(&response.encode()) == Ok(response)
+        && response.validate_envelope(1).is_ok()
+        && response.validate_envelope(0).is_err()
+}
+
+fn admit_portal_request(
+    gesture_issuer_process: u64,
+    client_process: u64,
+    authorization: AuthorizedApplication,
+    ticket: TrustedUserGestureTicket,
+    request: ApplicationPortalRequest,
+) -> Option<AdmittedPortalRequest> {
+    let mut admission = ApplicationPortalAdmission::new(gesture_issuer_process)?;
+    admission
+        .register_ticket(gesture_issuer_process, 100, ticket)
+        .ok()?;
+    let admitted = admission
+        .admit_request(client_process, 101, authorization, request)
+        .ok()?;
+    if admission.admit_request(client_process, 102, authorization, request)
+        != Err(PortalAdmissionError::TicketReplayed)
+    {
+        return None;
+    }
+    Some(admitted)
 }
 
 fn authorized_root_application() -> Option<AuthorizedApplication> {

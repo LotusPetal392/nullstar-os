@@ -311,6 +311,14 @@ and scope. One-shot consumption and explicit revocation retain revisioned tombst
 checkpoint loading rejects stale counters and duplicate active grants. The current layer does not yet
 resolve those identities into live filesystem authority or persist a transactional checkpoint.
 
+The [application portal admission foundation](design/application-portal-admission.md) adds canonical
+open, save, and directory-selection messages plus authenticated one-shot gesture admission. A ticket
+is accepted only from the configured kernel-stamped gesture issuer and binds the client process,
+verified installation, user session, parent surface, seat event, and a bounded lifetime. Selected
+responses must match the admitted subject, resource kind, rights, and scope and carry exactly one
+capability. The compositor transport, picker, resource resolver, and endpoint adapter remain future
+layers.
+
 PID 1 is the temporary broker for the logging service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable
 route authorities. The broker authorizes the kernel-stamped caller PID before consulting its

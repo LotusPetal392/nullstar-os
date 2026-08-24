@@ -3,8 +3,9 @@
 ## Status
 
 This document describes the implemented allocation-free policy foundation for application file and
-directory grants. It does not yet provide a trusted picker, portal request protocol, live
-file/directory broker endpoint, or durable permission-store service.
+directory grants. Canonical portal requests and trusted user-gesture admission are now defined by the
+[application portal admission foundation](application-portal-admission.md). A trusted picker, live
+file/directory broker endpoint, and durable permission-store service remain outstanding.
 
 The implementation provides:
 
@@ -102,9 +103,9 @@ atomically and compact tombstones only while preserving rollback/replay protecti
 
 ## Next steps
 
-1. Define the portal request/reply protocol and trusted window/user-gesture tickets.
-2. Add authenticated filesystem resource resolution including UUID and inode generation.
-3. Mint rights-reduced file and directory broker endpoints from successful selections or restored
+1. Add authenticated filesystem resource resolution including UUID and inode generation.
+2. Mint rights-reduced file and directory broker endpoints from successful selections or restored
    grants.
+3. Implement the portal/compositor transports and trusted picker UI around the admission protocol.
 4. Persist checkpoint state transactionally and expose permission inspection, revocation, and reset.
 5. Extend the same policy foundation to drag-and-drop and share transfers.

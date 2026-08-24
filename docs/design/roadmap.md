@@ -159,8 +159,10 @@ replacement, and suppresses relaunch for user, session, or manager teardown. Por
 grants are the next application-isolation layer. The permission-store foundation now defines stable
 filesystem UUID/object/generation identities, exact file/directory rights, one-shot/session/persistent
 scopes, canonical checksummed records, strict checkpoint restoration, and revisioned revocation/reset
-tombstones. Trusted gesture admission, live resource resolution and authority issuance, and
-transactional persistence are the next portal increments.
+tombstones. Canonical open/save/directory requests and process-, application-, session-, surface-,
+and event-bound gesture admission are now implemented as well. Compositor and portal transports,
+live resource resolution and authority issuance, the picker UI, and transactional persistence are the
+next portal increments.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

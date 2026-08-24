@@ -516,8 +516,10 @@ pub enum ApplicationPermissionLoadError {
 pub struct ApplicationGrantAuthorization {
     grant_id: u64,
     grant_revision: u64,
+    subject: ApplicationGrantSubject,
     resource: ApplicationResourceIdentity,
     rights: ApplicationGrantRights,
+    scope: ApplicationGrantScope,
 }
 
 impl ApplicationGrantAuthorization {
@@ -529,12 +531,20 @@ impl ApplicationGrantAuthorization {
         self.grant_revision
     }
 
+    pub const fn subject(self) -> ApplicationGrantSubject {
+        self.subject
+    }
+
     pub const fn resource(self) -> ApplicationResourceIdentity {
         self.resource
     }
 
     pub const fn rights(self) -> ApplicationGrantRights {
         self.rights
+    }
+
+    pub const fn scope(self) -> ApplicationGrantScope {
+        self.scope
     }
 }
 
@@ -699,8 +709,10 @@ impl ApplicationPermissionStore {
         Ok(ApplicationGrantAuthorization {
             grant_id: record.id,
             grant_revision: record.revision,
+            subject: record.subject,
             resource,
             rights: requested_rights,
+            scope: record.scope,
         })
     }
 
