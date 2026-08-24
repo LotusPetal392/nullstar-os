@@ -148,10 +148,12 @@ now additionally requires package-verifier output to match an installed generati
 application/publisher lineage, provenance, component executable, user scope, and authorized profile.
 Desktop roots now also require identity-bound private-storage and restricted service-namespace
 endpoints, canonical relative-root policy keeps bundle access read-only, and a one-way inherited
-kernel seal removes ambient global-path operations after managed exec. Concrete broker services,
-provider-backed directory provisioning, cryptographic package and registry services, and general
-application-manager routing remain future work; baseline restricted service routing is the next
-launch layer.
+kernel seal removes ambient global-path operations after managed exec. The restricted namespace now
+uses one immutable multi-route NSRT ingress for the baseline display, lifecycle, settings,
+logging-producer, audio-playback, and portal routes; policy denial precedes provider availability,
+and published routes retain generation-bound endpoint issuance. Concrete providers, provider-backed
+directory provisioning, cryptographic package and registry services, and a standalone application
+manager remain future work; application lifecycle supervision is the next launch layer.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

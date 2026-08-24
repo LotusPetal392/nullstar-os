@@ -34,6 +34,21 @@ The service ID is distinct from the logging NSWP protocol family ID
 `7db79cd9-c685-400f-b9f1-55d89b8e8a8a`. A service route selects authority and a current provider;
 NSWP negotiation selects the application protocol and compatible version on the returned endpoint.
 
+The baseline desktop-application namespace exposes role `1` for the following routes:
+
+| Route | Service ID | Role |
+| --- | --- | ---: |
+| Display client | `d8013ccf-3f73-48e5-a77d-b7c2fda45f91` | 1 |
+| Application lifecycle client | `f0f2f0c7-799b-4c81-a571-a23f11e2deea` | 1 |
+| Settings client | `dc60e2c7-f52c-43d7-acd1-a03241ad49b5` | 1 |
+| Logging producer | `7cbd3f65-50a6-4c30-b195-9fbed633da43` | 1 |
+| Audio playback client | `8eeee34d-ac55-486a-bcf0-37d6ddc93c92` | 1 |
+| Portal client | `086ead96-e1c1-43c9-b846-16cd4f5df1c5` | 1 |
+
+These identifiers and roles select protocol routes but grant no authority by themselves. Display,
+lifecycle, settings, audio, and portal providers may be absent while their stable policy routes are
+already present in an application's namespace.
+
 ## Exact `NSRT` v1 wire contract
 
 Every request and response is exactly 40 bytes. There is no shorter form, extension trailer, or
@@ -76,8 +91,10 @@ order exactly as stored by `ServiceId`.
 
 ## Capability exchange
 
-A client receives a route grant with exact `SEND` rights. The grant reaches a broker ingress already
-bound to one route key; the request cannot use its payload to select a different route.
+A client receives either a route grant or a restricted service namespace with exact `SEND` rights.
+A route grant reaches a broker ingress bound to one route key; the request cannot use its payload to
+select a different route. A restricted namespace reaches one broker ingress bound to an immutable,
+nonempty, duplicate-free allowlist and may select only a key in that set.
 
 Resolution proceeds as follows:
 
@@ -108,14 +125,22 @@ The kernel stamps a nonzero sender PID on received messages. The broker authoriz
 not a PID claimed in `NSRT`; there is no caller-identity field in the 40-byte record. The current
 policy hook receives the PID and route key.
 
+Application namespaces are delivered with exact `SEND` rights, so the application cannot transfer
+the namespace endpoint to another process. A denied key receives canonical `Unauthorized` before
+the broker consults route publication, regardless of whether that provider exists. An allowed key
+still crosses the normal caller-authorizer hook before availability lookup. Thus one endpoint can
+carry several explicitly selected routes without becoming a global service namespace or an
+availability oracle.
+
 ## Authorization and publication ordering
 
 The broker applies operations in this order:
 
 1. decode and validate the request, its granted route key, sender PID, and reply capability;
-2. authorize the sender for that route key;
-3. only after authorization, consult route availability;
-4. issue the current generation's endpoint or return a canonical failure.
+2. for a restricted namespace, reject keys outside its immutable allowlist;
+3. authorize the sender for that route key;
+4. only after both policy checks, consult route availability;
+5. issue the current generation's endpoint or return a canonical failure.
 
 Authorization therefore precedes availability disclosure. A denied caller receives `Unauthorized`
 whether or not a provider is currently published.

@@ -251,6 +251,12 @@ nonzero role. Logging producer role `1` and observer role `2` under service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43` are separate authorities. Knowing those identifiers grants
 nothing.
 
+A desktop application's service namespace is also exact `SEND`, but its broker ingress is bound to
+a fixed nonempty route allowlist rather than one key. The handle cannot be transferred without
+`TRANSFER` authority. Requests outside the allowlist receive `Unauthorized` before availability
+lookup; allowed requests still require kernel-stamped caller authorization before publication is
+examined.
+
 `NSRT` v1 records are exactly 40 bytes. A request must transfer exactly one fresh empty reply
 endpoint with exact `SEND` rights. An accepted reply transfers exactly one current provider ingress
 with exact `SEND` rights; a failure transfers no capability. These cardinalities use the implemented

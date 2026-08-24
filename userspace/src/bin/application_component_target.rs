@@ -1,16 +1,20 @@
 #![no_std]
 #![no_main]
 
+use nswp_logging::{LOGGING_OBSERVER_ROLE, LOGGING_SERVICE_ID};
+use service_route::{RouteFailure, RouteKey};
 use userspace::{
     abi::limits,
     application_launch::{
         ApplicationInstallScope, ApplicationProfile, ApplicationStart, ApplicationTrustClass,
     },
+    application_service::{DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     args::Args,
     handle::Endpoint,
     ipc::{self, ObjectKind, Rights},
     platform,
     runtime_context::{CapabilityRole, StartupCapabilityPolicy},
+    service_route::{ResolveError, ResolvedRoute, RouteResolution},
     syscall::{self, OpenFlags},
 };
 
@@ -109,16 +113,28 @@ fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<3>) -> ! {
         Err(_) => syscall::exit(5),
     };
     if expected.2 {
-        for (role, marker) in namespace_roles().into_iter().zip(1_u8..) {
-            let endpoint = match start.context.take::<Endpoint>(role, Rights::SEND) {
-                Ok(endpoint) => endpoint,
-                Err(_) => syscall::exit(6),
-            };
-            if ipc::send(endpoint.as_raw(), &[marker], None).is_err() {
-                syscall::exit(7);
-            }
-            drop(endpoint);
+        let service_namespace = match start
+            .context
+            .take::<Endpoint>(CapabilityRole::SERVICE_NAMESPACE, Rights::SEND)
+        {
+            Ok(endpoint) => endpoint,
+            Err(_) => syscall::exit(6),
+        };
+        if !exercise_service_namespace(service_namespace.as_raw()) {
+            syscall::exit(7);
         }
+        drop(service_namespace);
+        let private_storage = match start
+            .context
+            .take::<Endpoint>(CapabilityRole::PRIVATE_STORAGE, Rights::SEND)
+        {
+            Ok(endpoint) => endpoint,
+            Err(_) => syscall::exit(6),
+        };
+        if ipc::send(private_storage.as_raw(), &[2], None).is_err() {
+            syscall::exit(7);
+        }
+        drop(private_storage);
     }
     if !start.context.is_empty()
         || ipc::send(status.as_raw(), &[expected.3, expected.1 as u8], None).is_err()
@@ -127,6 +143,61 @@ fn rust_main(initial_stack: *const usize, mut start: ApplicationStart<3>) -> ! {
     }
     drop(status);
     syscall::exit(0)
+}
+
+fn exercise_service_namespace(namespace: u64) -> bool {
+    let Ok(mut logging) = RouteResolution::begin(namespace, LOGGING_PRODUCER_ROUTE) else {
+        return false;
+    };
+    let Ok(route) = wait_for_route(&mut logging) else {
+        return false;
+    };
+    if route.key() != LOGGING_PRODUCER_ROUTE
+        || route.generation().get() != 1
+        || route.broker_process_id() == 0
+        || route.object_id() == 0
+    {
+        return false;
+    }
+    let provider = route.into_handle();
+    let provider_sent = ipc::send(provider, &[1], None).is_ok();
+    let provider_closed = ipc::close(provider).is_ok();
+    if !provider_sent || !provider_closed {
+        return false;
+    }
+
+    let Ok(mut unavailable) = RouteResolution::begin(namespace, DISPLAY_CLIENT_ROUTE) else {
+        return false;
+    };
+    if !matches!(
+        wait_for_route(&mut unavailable),
+        Err(ResolveError::BrokerFailure(RouteFailure::Unavailable))
+    ) {
+        return false;
+    }
+
+    let denied_key = RouteKey::new(LOGGING_SERVICE_ID, LOGGING_OBSERVER_ROLE);
+    let Ok(mut denied) = RouteResolution::begin(namespace, denied_key) else {
+        return false;
+    };
+    matches!(
+        wait_for_route(&mut denied),
+        Err(ResolveError::BrokerFailure(RouteFailure::Unauthorized))
+    )
+}
+
+fn wait_for_route(resolution: &mut RouteResolution) -> Result<ResolvedRoute, ResolveError> {
+    for _ in 0..4096 {
+        match resolution.try_complete()? {
+            Some(route) => return Ok(route),
+            None => {
+                if syscall::yield_now().is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    Err(ResolveError::Receive(ipc::Error::TRY_AGAIN))
 }
 
 const fn namespace_roles() -> [CapabilityRole; 2] {

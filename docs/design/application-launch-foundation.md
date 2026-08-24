@@ -206,6 +206,14 @@ Namespace roles are reserved by the launcher and cannot be injected through an o
 list. Reduced components receive neither endpoint automatically; later profile policy must delegate
 an explicitly reduced route if a worker needs storage or service access.
 
+The service-namespace endpoint now speaks the existing `NSRT` v1 route protocol through a
+multi-route `ServiceNamespaceIngress`. Its immutable desktop allowlist contains display,
+application-lifecycle, settings, logging-producer, audio-playback, and portal client routes. Route
+knowledge remains descriptive: a requested key outside the allowlist receives `Unauthorized`
+before publication lookup, an allowed route without a current provider receives `Unavailable`, and
+an allowed published route returns the exact send-only endpoint for its current nonzero generation.
+The normal broker authorizer still pins the kernel-stamped caller before availability is consulted.
+
 Before the managed image is loaded, the launch shim asks the kernel to seal ambient path authority on
 the next successful `execve`. The seal becomes irreversible when that image is committed, is inherited
 by `fork`, and denies global-path `open`, `stat`, directory-read, `chdir`, `unlink`, `execve`, and legacy
@@ -213,9 +221,10 @@ spawn operations. Capability IPC remains available, so filesystem and service ac
 of the supplied endpoints. The QEMU launch probe checks the complete send-only endpoint set, rejects
 aliased namespace endpoints, and verifies ambient-path denial in the root and both reduced profiles.
 
-Provider-backed directory provisioning and the concrete private-storage/service-namespace broker
-processes remain application-manager integration work; this layer establishes the non-bypassable
-launch and request-policy boundary they consume.
+Provider-backed directory provisioning and a standalone application-manager broker process remain
+integration work. The current QEMU manager probe owns the restricted ingress and proves accepted,
+allowed-but-unavailable, and denied route behavior without giving the application a global route
+grant.
 
 ## Executable and environment boundary
 
@@ -274,11 +283,9 @@ refines the TLA+ module.
 The launch foundation is intentionally small enough to become the common mechanism beneath a future
 application manager. The next useful layers are:
 
-1. **Baseline service routing** — restricted display, lifecycle, settings, logging, audio playback,
-   portal, and service-namespace endpoints.
-2. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
+1. **Application lifecycle supervision** — readiness, termination, completion drainage, restart or
    relaunch policy, and user/session teardown.
-3. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
+2. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
    resource and device policy.
-4. **Production package and registry services** — cryptographic bundle verification, authenticated
+3. **Production package and registry services** — cryptographic bundle verification, authenticated
    verifier routing, immutable generation selection, revocation, and durable installation records.

@@ -3,6 +3,7 @@
 
 pub mod application_identity;
 pub mod application_launch;
+pub mod application_service;
 pub mod args;
 pub mod async_ipc;
 pub mod block_device;

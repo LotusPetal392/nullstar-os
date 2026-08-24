@@ -453,6 +453,15 @@ pub enum BindError {
     Invalid(EndpointShapeError),
 }
 
+/// Failure while binding one multi-route application service namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceNamespaceBindError {
+    EmptyPolicy,
+    DuplicateRoute(RouteKey),
+    Inspect(ipc::Error),
+    Invalid(EndpointShapeError),
+}
+
 /// Failure while receiving or validating one route request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressError {
@@ -536,12 +545,134 @@ impl Drop for RouteIngress {
     }
 }
 
+/// A request rejected by a restricted namespace before route availability was consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceNamespaceDenial {
+    pub key: RouteKey,
+    pub sender_process_id: u64,
+    pub reply_error: Option<ipc::Error>,
+}
+
+/// One consumed service-namespace request.
+pub enum ServiceNamespaceEvent {
+    Allowed(PendingRouteRequest),
+    Denied(ServiceNamespaceDenial),
+}
+
+/// Broker ingress for one immutable, capability-bound set of service routes.
+///
+/// Unlike [`RouteIngress`], the request key selects one of several routes. Keys outside the fixed
+/// allowlist receive `Unauthorized` before the caller can observe whether a provider is published.
+pub struct ServiceNamespaceIngress<const N: usize> {
+    allowed_routes: [RouteKey; N],
+    receive: Option<CapabilityHandle>,
+    object_id: u64,
+}
+
+impl<const N: usize> ServiceNamespaceIngress<N> {
+    pub fn bind(
+        receive: CapabilityHandle,
+        allowed_routes: [RouteKey; N],
+    ) -> Result<Self, ServiceNamespaceBindError> {
+        if N == 0 {
+            return Err(ServiceNamespaceBindError::EmptyPolicy);
+        }
+        for (index, route) in allowed_routes.iter().copied().enumerate() {
+            if allowed_routes[..index].contains(&route) {
+                return Err(ServiceNamespaceBindError::DuplicateRoute(route));
+            }
+        }
+        let info = ipc::info(receive).map_err(ServiceNamespaceBindError::Inspect)?;
+        validate_endpoint(info, Rights::RECEIVE, false)
+            .map_err(ServiceNamespaceBindError::Invalid)?;
+        Ok(Self {
+            allowed_routes,
+            receive: Some(receive),
+            object_id: info.object_id,
+        })
+    }
+
+    pub const fn allowed_routes(&self) -> &[RouteKey; N] {
+        &self.allowed_routes
+    }
+
+    pub const fn object_id(&self) -> u64 {
+        self.object_id
+    }
+
+    /// Attempts one non-blocking request receive and applies the immutable route allowlist.
+    pub fn try_accept(&mut self) -> Result<Option<ServiceNamespaceEvent>, IngressError> {
+        let Some(receive) = self.receive else {
+            return Err(IngressError::Receive(ipc::Error::BAD_FILE_DESCRIPTOR));
+        };
+        let mut bytes = [0_u8; crate::abi::limits::MAX_IPC_MESSAGE_BYTES];
+        let received = match ipc::try_receive(receive, &mut bytes) {
+            Ok(received) => received,
+            Err(error) if error == ipc::Error::TRY_AGAIN => return Ok(None),
+            Err(error) => return Err(IngressError::Receive(error)),
+        };
+        let mut request = validate_unbound_ingress_request(
+            self.object_id,
+            &bytes[..received.bytes],
+            received.sender_process_id,
+            received.capability,
+        )?;
+        if self.allowed_routes.contains(&request.key()) {
+            return Ok(Some(ServiceNamespaceEvent::Allowed(request)));
+        }
+
+        let key = request.key();
+        let sender_process_id = request.sender_process_id();
+        let denial = ServiceNamespaceDenial {
+            key,
+            sender_process_id,
+            reply_error: request
+                .reply_message(RouteMessage::Failure {
+                    key,
+                    failure: RouteFailure::Unauthorized,
+                })
+                .err(),
+        };
+        Ok(Some(ServiceNamespaceEvent::Denied(denial)))
+    }
+
+    pub fn into_handle(mut self) -> CapabilityHandle {
+        self.receive
+            .take()
+            .expect("service namespace ingress handle is present until consumed")
+    }
+}
+
+impl<const N: usize> Drop for ServiceNamespaceIngress<N> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.receive.take() {
+            close_quietly(handle);
+        }
+    }
+}
+
+#[cfg(test)]
 fn validate_request_envelope(
     granted_key: RouteKey,
     bytes: &[u8],
     sender_process_id: u64,
     capability_rights: Option<Rights>,
 ) -> Result<(), IngressError> {
+    let requested = decode_request_envelope(bytes, sender_process_id, capability_rights)?;
+    if requested != granted_key {
+        return Err(IngressError::WrongGrantedKey {
+            granted: granted_key,
+            requested,
+        });
+    }
+    Ok(())
+}
+
+fn decode_request_envelope(
+    bytes: &[u8],
+    sender_process_id: u64,
+    capability_rights: Option<Rights>,
+) -> Result<RouteKey, IngressError> {
     let message = RouteMessage::decode(bytes).map_err(IngressError::Decode)?;
     let requested = match message {
         RouteMessage::Request { key } => key,
@@ -549,18 +680,12 @@ fn validate_request_envelope(
             return Err(IngressError::UnexpectedMessage);
         }
     };
-    if requested != granted_key {
-        return Err(IngressError::WrongGrantedKey {
-            granted: granted_key,
-            requested,
-        });
-    }
     if sender_process_id == 0 {
         return Err(IngressError::ZeroSenderProcessId);
     }
     match capability_rights {
         None => Err(IngressError::MissingReplyCapability),
-        Some(Rights::SEND) => Ok(()),
+        Some(Rights::SEND) => Ok(requested),
         Some(actual) => Err(IngressError::InvalidTransferredRights { actual }),
     }
 }
@@ -572,15 +697,36 @@ fn validate_ingress_request(
     sender_process_id: u64,
     capability: Option<ReceivedCapability>,
 ) -> Result<PendingRouteRequest, IngressError> {
-    if let Err(error) = validate_request_envelope(
-        granted_key,
+    let request =
+        validate_unbound_ingress_request(ingress_object_id, bytes, sender_process_id, capability)?;
+    if request.key() != granted_key {
+        let requested = request.key();
+        drop(request);
+        return Err(IngressError::WrongGrantedKey {
+            granted: granted_key,
+            requested,
+        });
+    }
+    Ok(request)
+}
+
+fn validate_unbound_ingress_request(
+    ingress_object_id: u64,
+    bytes: &[u8],
+    sender_process_id: u64,
+    capability: Option<ReceivedCapability>,
+) -> Result<PendingRouteRequest, IngressError> {
+    let requested = match decode_request_envelope(
         bytes,
         sender_process_id,
         capability.map(|received| received.rights),
     ) {
-        close_received(capability);
-        return Err(error);
-    }
+        Ok(requested) => requested,
+        Err(error) => {
+            close_received(capability);
+            return Err(error);
+        }
+    };
     let reply = capability.expect("valid request envelope requires a reply capability");
     let info = match ipc::info(reply.handle) {
         Ok(info) => info,
@@ -601,7 +747,7 @@ fn validate_ingress_request(
     }
 
     Ok(PendingRouteRequest {
-        key: granted_key,
+        key: requested,
         sender_process_id,
         reply_object_id: info.object_id,
         reply: Some(reply.handle),
@@ -1122,6 +1268,18 @@ mod tests {
             validate_endpoint(endpoint(0, Rights::SEND, 0), Rights::SEND, false),
             Err(EndpointShapeError::ZeroObjectId)
         );
+    }
+
+    #[test]
+    fn service_namespace_policy_rejects_empty_and_duplicate_route_sets() {
+        assert!(matches!(
+            ServiceNamespaceIngress::<0>::bind(0, []),
+            Err(ServiceNamespaceBindError::EmptyPolicy)
+        ));
+        assert!(matches!(
+            ServiceNamespaceIngress::bind(0, [key(1), key(1)]),
+            Err(ServiceNamespaceBindError::DuplicateRoute(route)) if route == key(1)
+        ));
     }
 
     #[test]

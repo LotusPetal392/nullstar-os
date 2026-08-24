@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use nswp_logging::{LOGGING_OBSERVER_ROLE, LOGGING_SERVICE_ID};
+use service_route::{Authorizer, ProviderGeneration, RouteFailure, RouteKey};
 use userspace::{
     application_launch::{
         ApplicationCapability, ApplicationComponentCapability, ApplicationComponentLaunch,
@@ -11,9 +13,11 @@ use userspace::{
         InstalledApplicationComponent, PackageVerification, authorize_application_launch,
         spawn_application,
     },
+    application_service::{BASELINE_DESKTOP_ROUTES, DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     handle::{Endpoint, OwnedHandle},
-    ipc::{self, Rights, Signals},
+    ipc::{self, CapabilityHandle, Rights, Signals},
     runtime_context::CapabilityRole,
+    service_route::{NativeRouteTable, RouteReply, ServiceNamespaceEvent, ServiceNamespaceIngress},
     syscall,
 };
 
@@ -27,6 +31,7 @@ const MANAGER_GENERATION: u64 = 16;
 const IDENTITY_PUBLISHER: u64 = 17;
 const IDENTITY_SIGNING_LINEAGE: u64 = 18;
 const IDENTITY_INSTALLATION: u64 = 19;
+const APPLICATION_ROUTE_GENERATION: u64 = 1;
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
@@ -119,6 +124,36 @@ fn application_component_probe() -> bool {
     let Ok(private_storage) = OwnedHandle::<Endpoint>::create() else {
         return false;
     };
+    let Ok(service_namespace_receive) = ipc::duplicate(service_namespace.as_raw(), Rights::RECEIVE)
+    else {
+        return false;
+    };
+    let mut service_namespace_ingress =
+        match ServiceNamespaceIngress::bind(service_namespace_receive, BASELINE_DESKTOP_ROUTES) {
+            Ok(ingress) => ingress,
+            Err(_) => {
+                let _ = ipc::close(service_namespace_receive);
+                return false;
+            }
+        };
+    let Ok(logging_provider) = OwnedHandle::<Endpoint>::create() else {
+        return false;
+    };
+    let Ok(logging_authority) = ipc::duplicate(
+        logging_provider.as_raw(),
+        Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+    ) else {
+        return false;
+    };
+    let mut application_routes = NativeRouteTable::<CapabilityHandle, 1>::new();
+    let route_generation = ProviderGeneration::new(APPLICATION_ROUTE_GENERATION)
+        .expect("application route generation is nonzero");
+    if let Err(error) =
+        application_routes.publish(LOGGING_PRODUCER_ROUTE, route_generation, logging_authority)
+    {
+        let _ = ipc::close(error.into_authority());
+        return false;
+    }
     let aliased_sources = ApplicationNamespaceSources {
         service_namespace: service_namespace.as_raw(),
         private_storage: service_namespace.as_raw(),
@@ -161,6 +196,7 @@ fn application_component_probe() -> bool {
         return false;
     }
     let mut process_ids = [application.process_id, 0, 0];
+    let mut route_probe = ApplicationRouteProbe::default();
 
     let forbidden_capabilities = [ApplicationComponentCapability::new(
         service_namespace.as_raw(),
@@ -260,6 +296,12 @@ fn application_component_probe() -> bool {
             let mut report = [0_u8; 2];
             let mut message = None;
             for _ in 0..JOB_WAIT_YIELDS {
+                pump_application_namespace(
+                    &mut service_namespace_ingress,
+                    &application_routes,
+                    application.process_id,
+                    &mut route_probe,
+                );
                 match status.try_receive(&mut report) {
                     Ok(received_message) => {
                         message = Some(received_message);
@@ -295,14 +337,12 @@ fn application_component_probe() -> bool {
             }
             received |= bit;
         }
-        result &= received == 0b111;
+        result &= received == 0b111 && route_probe.complete();
     }
 
     if result {
-        let namespace_reports = [(&service_namespace, 1_u8), (&private_storage, 2)];
-        result = namespace_reports.iter().all(|(endpoint, marker)| {
-            receive_namespace_report(endpoint, application.process_id, *marker)
-        });
+        result = receive_namespace_report(&logging_provider, application.process_id, 1)
+            && receive_namespace_report(&private_storage, application.process_id, 2);
     }
 
     if !result {
@@ -349,6 +389,91 @@ fn application_component_probe() -> bool {
         && exited
         && completed == expected_completions
         && application.job.info().is_ok_and(|info| info.size == 0)
+}
+
+#[derive(Default)]
+struct ApplicationRouteProbe {
+    accepted: usize,
+    unavailable: usize,
+    denied: usize,
+    failed: bool,
+}
+
+impl ApplicationRouteProbe {
+    fn complete(&self) -> bool {
+        !self.failed && self.accepted == 1 && self.unavailable == 1 && self.denied == 1
+    }
+}
+
+struct ExactApplicationCaller {
+    process_id: u64,
+}
+
+impl Authorizer<u64> for ExactApplicationCaller {
+    type Error = ();
+
+    fn authorize(&mut self, caller: &u64, _key: RouteKey) -> Result<(), Self::Error> {
+        if *caller == self.process_id {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+fn pump_application_namespace(
+    ingress: &mut ServiceNamespaceIngress<{ BASELINE_DESKTOP_ROUTES.len() }>,
+    routes: &NativeRouteTable<CapabilityHandle, 1>,
+    application_process_id: u64,
+    probe: &mut ApplicationRouteProbe,
+) {
+    for _ in 0..8 {
+        let event = match ingress.try_accept() {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(_) => {
+                probe.failed = true;
+                break;
+            }
+        };
+        match event {
+            ServiceNamespaceEvent::Allowed(request) => {
+                let key = request.key();
+                let mut caller = ExactApplicationCaller {
+                    process_id: application_process_id,
+                };
+                let Ok(authorized) = request.authorize(&mut caller) else {
+                    probe.failed = true;
+                    continue;
+                };
+                match authorized.resolve(routes) {
+                    Ok(RouteReply::Accepted { generation })
+                        if key == LOGGING_PRODUCER_ROUTE
+                            && generation.get() == APPLICATION_ROUTE_GENERATION =>
+                    {
+                        probe.accepted += 1;
+                    }
+                    Ok(RouteReply::Failure(RouteFailure::Unavailable))
+                        if key == DISPLAY_CLIENT_ROUTE =>
+                    {
+                        probe.unavailable += 1;
+                    }
+                    _ => probe.failed = true,
+                }
+            }
+            ServiceNamespaceEvent::Denied(denial) => {
+                let expected = RouteKey::new(LOGGING_SERVICE_ID, LOGGING_OBSERVER_ROLE);
+                if denial.key == expected
+                    && denial.sender_process_id == application_process_id
+                    && denial.reply_error.is_none()
+                {
+                    probe.denied += 1;
+                } else {
+                    probe.failed = true;
+                }
+            }
+        }
+    }
 }
 
 fn receive_namespace_report(
