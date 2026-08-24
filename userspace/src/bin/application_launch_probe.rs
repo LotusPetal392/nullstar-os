@@ -18,6 +18,11 @@ use userspace::{
         ApplicationFailure, ApplicationLifecyclePolicy, ApplicationLifecycleState,
         ApplicationTerminationReason, SupervisedApplication,
     },
+    application_permission::{
+        ApplicationGrantRecord, ApplicationGrantRevocation, ApplicationGrantRights,
+        ApplicationGrantScope, ApplicationPermissionStore, ApplicationResourceIdentity,
+        ApplicationResourceKind,
+    },
     application_service::{BASELINE_DESKTOP_ROUTES, DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     handle::{Endpoint, OwnedHandle},
     ipc::{self, CapabilityHandle, Rights, Signals},
@@ -46,7 +51,10 @@ userspace::panic_handler!();
 
 fn rust_main(_initial_stack: *const usize) -> ! {
     syscall::exit(
-        if application_component_probe() && application_lifecycle_probe() {
+        if application_component_probe()
+            && application_lifecycle_probe()
+            && application_permission_probe()
+        {
             0
         } else {
             1
@@ -470,6 +478,49 @@ fn application_lifecycle_probe() -> bool {
             .info()
             .is_ok_and(|info| info.size == 0)
         && ipc::job_try_wait(supervised.instance().job.as_raw()) == Err(ipc::Error::NO_CHILD)
+}
+
+fn application_permission_probe() -> bool {
+    let Some(authorization) = authorized_root_application() else {
+        return false;
+    };
+    let Some(resource) =
+        ApplicationResourceIdentity::new([0x51; 16], 700, 9, ApplicationResourceKind::File)
+    else {
+        return false;
+    };
+    let mut store = ApplicationPermissionStore::new();
+    let Ok(grant) = store.issue(
+        authorization,
+        resource,
+        ApplicationGrantRights::READ,
+        ApplicationGrantScope::Persistent,
+    ) else {
+        return false;
+    };
+    let encoded = grant.encode();
+    if ApplicationGrantRecord::decode(&encoded) != Ok(grant)
+        || store
+            .authorize(authorization, resource, ApplicationGrantRights::READ)
+            .is_err()
+        || store
+            .authorize(
+                authorization,
+                resource,
+                ApplicationGrantRights::READ | ApplicationGrantRights::WRITE,
+            )
+            .is_ok()
+        || store
+            .revoke(grant.id(), ApplicationGrantRevocation::User)
+            .is_err()
+    {
+        return false;
+    }
+    store
+        .authorize(authorization, resource, ApplicationGrantRights::READ)
+        .is_err()
+        && store.records().count() == 1
+        && store.records().all(|record| !record.active())
 }
 
 fn authorized_root_application() -> Option<AuthorizedApplication> {

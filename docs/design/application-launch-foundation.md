@@ -311,8 +311,9 @@ refines the TLA+ module.
 The launch foundation is intentionally small enough to become the common mechanism beneath a future
 application manager. The next useful layers are:
 
-1. **Portals and persistent grants** — user-selected file/directory authority followed by sensitive
-   resource and device policy.
+1. **Portal mediation and grant-backed authority** — trusted user-gesture requests, authenticated
+   filesystem resource resolution, and rights-reduced file/directory broker endpoints built on the
+   implemented permission-store records.
 2. **Production package and registry services** — cryptographic bundle verification, authenticated
    verifier routing, immutable generation selection, revocation, and durable installation records.
 3. **Standalone application-manager integration** — event-driven launch ownership, namespace and

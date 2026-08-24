@@ -509,6 +509,9 @@ A pathname may be shown for user understanding or compatibility, but it is not t
 security token. Persistent permission records store stable resource identity and policy
 needed to recreate authority, not a serialized live handle.
 
+The implemented record and restoration rules are detailed in
+[Application permission-store foundation](application-permission-store.md).
+
 ### Drag and drop and sharing
 
 Drag and drop is a user-mediated capability transfer. A file-transfer or share portal
@@ -1003,9 +1006,10 @@ descriptor/capability tables, bounded application jobs, typed root startup,
 package/installation/publisher-lineage matching, installed executable and profile authorization,
 explicit rights-monotonic `desktop-child`/`worker` allowlists, an identity-bound private-storage
 broker and restricted service-namespace capability set, canonical relative-root request policy, and
-an inherited one-way kernel seal against ambient global paths. Concrete provider-backed directory
-provisioning, service-route population, cryptographic package-verifier and registry services, and
-general application-manager supervision remain outstanding.
+an inherited one-way kernel seal against ambient global paths. Lifecycle supervision and the first
+permission-store foundation are also implemented. Concrete provider-backed directory provisioning,
+cryptographic package-verifier and registry services, a standalone application manager, and trusted
+portal mediation remain outstanding.
 
 ### Milestone 1: mandatory application isolation
 
@@ -1018,6 +1022,10 @@ general application-manager supervision remain outstanding.
 - no privilege based on installation path.
 
 ### Milestone 2: file portal and permission store
+
+The stable resource-identity, canonical grant-record, bounded restoration, revocation, and reset
+foundation is implemented. Trusted gesture admission, live resource resolution, authority issuance,
+transactional persistence, and compatibility projection remain future increments.
 
 - trusted window and user-gesture tokens;
 - open, save, directory-selection, drag-and-drop, and share portals;

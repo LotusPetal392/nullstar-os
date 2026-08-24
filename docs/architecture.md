@@ -304,6 +304,13 @@ allowlist covers display, application lifecycle, settings, logging production, a
 portals. Namespace policy rejects other keys before route publication is consulted; allowed routes
 still cross caller authorization and resolve through the same generation-aware table.
 
+The [application permission-store foundation](design/application-permission-store.md) defines the
+policy identity beneath file and directory portals. Fixed-capacity `NSPG` v1 records bind one verified
+application installation to a filesystem UUID, object ID, object generation, resource kind, rights,
+and scope. One-shot consumption and explicit revocation retain revisioned tombstones; strict
+checkpoint loading rejects stale counters and duplicate active grants. The current layer does not yet
+resolve those identities into live filesystem authority or persist a transactional checkpoint.
+
 PID 1 is the temporary broker for the logging service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable
 route authorities. The broker authorizes the kernel-stamped caller PID before consulting its
