@@ -20,7 +20,7 @@
 use crate::{
     abi::{limits, signal},
     args::Args,
-    handle::{ApplicationProcess, Endpoint, Job, OwnedHandle},
+    handle::{Endpoint, Job, OwnedHandle},
     ipc::{self, ObjectKind, Rights, Transfer},
     platform,
     process_start::{
@@ -30,8 +30,9 @@ use crate::{
         receive_process_start_data, send_process_start_data,
     },
     runtime_context::{
-        CapabilityRole, ProcessContext, StartupCapabilityPolicy, StartupMessage, StartupReceiveError,
-        StartupResource, StartupRuntimeRole, StartupSendError, send_startup_message,
+        ApplicationProcess, CapabilityRole, ProcessContext, StartupCapabilityPolicy,
+        StartupMessage, StartupReceiveError, StartupResource, StartupRuntimeRole, StartupSendError,
+        send_startup_message,
     },
     syscall::{self, DescriptorFlags, FileDescriptor, PipePair, ProcessId},
 };
@@ -224,8 +225,8 @@ pub fn spawn_application<const N: usize>(
         .map_err(ApplicationLaunchError::Capability)?;
 
     let mut release = LaunchReleaseBarrier::new().map_err(ApplicationLaunchError::Descriptor)?;
-    let mut isolated = CapabilityDescriptorIsolation::new()
-        .map_err(ApplicationLaunchError::Descriptor)?;
+    let mut isolated =
+        CapabilityDescriptorIsolation::new().map_err(ApplicationLaunchError::Descriptor)?;
     let child = syscall::fork().map_err(ApplicationLaunchError::Descriptor)?;
     if child == 0 {
         launch_isolated_child(launch.command, release.pair, isolated.pair)
@@ -282,12 +283,9 @@ pub fn receive_application_start<const N: usize>(
     if parent == 0 {
         return Err(ApplicationStartError::ProcessIdentity);
     }
-    let context = ProcessContext::<ApplicationProcess, N>::receive_startup(
-        &bootstrap,
-        parent,
-        policies,
-    )
-    .map_err(ApplicationStartError::Capabilities)?;
+    let context =
+        ProcessContext::<ApplicationProcess, N>::receive_startup(&bootstrap, parent, policies)
+            .map_err(ApplicationStartError::Capabilities)?;
     let data = receive_process_start_data::<4608, 4>(
         &bootstrap,
         parent,
@@ -362,8 +360,8 @@ fn install_application_start<const N: usize>(
     child: ProcessId,
     launch: ApplicationLaunch<'_, N>,
 ) -> Result<(), ApplicationStartupSendError> {
-    let (sender, receiver) = ipc::endpoint_create_pair()
-        .map_err(ApplicationStartupSendError::CapabilityDuplicate)?;
+    let (sender, receiver) =
+        ipc::endpoint_create_pair().map_err(ApplicationStartupSendError::CapabilityDuplicate)?;
     let granted = ipc::grant_child(
         child,
         receiver,
@@ -429,16 +427,14 @@ fn send_application_start<const N: usize>(
     let argument_count = split_command(launch.command, &mut arguments)
         .ok_or(ApplicationStartupSendError::InvalidDescription)?;
     let mut argument_bytes = [0_u8; limits::MAX_ARGUMENT_BYTES];
-    let argument_length = encode_startup_arguments(
-        &arguments[..argument_count],
-        &mut argument_bytes,
-    )
-    .map_err(ApplicationStartupSendError::Data)?;
+    let argument_length =
+        encode_startup_arguments(&arguments[..argument_count], &mut argument_bytes)
+            .map_err(ApplicationStartupSendError::Data)?;
     let mut environment_bytes = [0_u8; limits::MAX_ENVIRONMENT_BYTES];
     let environment_length = encode_startup_environment(&[], &mut environment_bytes)
         .map_err(ApplicationStartupSendError::Data)?;
-    let monotonic_start_ns = platform::monotonic_time_ns()
-        .map_err(|_| ApplicationStartupSendError::Clock)?;
+    let monotonic_start_ns =
+        platform::monotonic_time_ns().map_err(|_| ApplicationStartupSendError::Clock)?;
     let identity = StartupIdentity {
         process: process_id,
         package: launch.identity.package,
@@ -702,9 +698,9 @@ fn arguments_match(arguments: Args<'_>, start: ValidatedProcessStart<'_>) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationIdentity, ApplicationLaunch, ApplicationProfile, DESKTOP_CHILD_NAMESPACE_PROFILE_ID,
-        DESKTOP_NAMESPACE_PROFILE_ID, WORKER_NAMESPACE_PROFILE_ID, is_absolute_canonical_executable,
-        validate_launch,
+        ApplicationIdentity, ApplicationLaunch, ApplicationProfile,
+        DESKTOP_CHILD_NAMESPACE_PROFILE_ID, DESKTOP_NAMESPACE_PROFILE_ID,
+        WORKER_NAMESPACE_PROFILE_ID, is_absolute_canonical_executable, validate_launch,
     };
 
     const IDENTITY: ApplicationIdentity = ApplicationIdentity {
@@ -718,22 +714,36 @@ mod tests {
 
     #[test]
     fn profiles_have_distinct_non_system_namespace_ids() {
-        assert_eq!(ApplicationProfile::Desktop.namespace_profile_id(), DESKTOP_NAMESPACE_PROFILE_ID);
+        assert_eq!(
+            ApplicationProfile::Desktop.namespace_profile_id(),
+            DESKTOP_NAMESPACE_PROFILE_ID
+        );
         assert_eq!(
             ApplicationProfile::DesktopChild.namespace_profile_id(),
             DESKTOP_CHILD_NAMESPACE_PROFILE_ID
         );
-        assert_eq!(ApplicationProfile::Worker.namespace_profile_id(), WORKER_NAMESPACE_PROFILE_ID);
+        assert_eq!(
+            ApplicationProfile::Worker.namespace_profile_id(),
+            WORKER_NAMESPACE_PROFILE_ID
+        );
         assert_ne!(DESKTOP_NAMESPACE_PROFILE_ID, 1);
-        assert_ne!(DESKTOP_NAMESPACE_PROFILE_ID, DESKTOP_CHILD_NAMESPACE_PROFILE_ID);
-        assert_ne!(DESKTOP_CHILD_NAMESPACE_PROFILE_ID, WORKER_NAMESPACE_PROFILE_ID);
+        assert_ne!(
+            DESKTOP_NAMESPACE_PROFILE_ID,
+            DESKTOP_CHILD_NAMESPACE_PROFILE_ID
+        );
+        assert_ne!(
+            DESKTOP_CHILD_NAMESPACE_PROFILE_ID,
+            WORKER_NAMESPACE_PROFILE_ID
+        );
     }
 
     #[test]
     fn application_executable_must_be_absolute_and_canonical() {
         assert!(is_absolute_canonical_executable(b"/Applications/Test/app"));
         assert!(!is_absolute_canonical_executable(b"Applications/Test/app"));
-        assert!(!is_absolute_canonical_executable(b"/Applications/../bin/app"));
+        assert!(!is_absolute_canonical_executable(
+            b"/Applications/../bin/app"
+        ));
         assert!(!is_absolute_canonical_executable(b"/Applications//app"));
     }
 
