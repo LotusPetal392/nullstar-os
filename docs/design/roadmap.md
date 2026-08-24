@@ -156,7 +156,11 @@ directory provisioning, cryptographic package and registry services, and a stand
 manager remain future work. Application lifecycle supervision now pins readiness to the current root,
 applies bounded startup and relaunch policy, drains each failed or stopped job completely before
 replacement, and suppresses relaunch for user, session, or manager teardown. Portals and persistent
-grants are the next application-isolation layer.
+grants are the next application-isolation layer. The permission-store foundation now defines stable
+filesystem UUID/object/generation identities, exact file/directory rights, one-shot/session/persistent
+scopes, canonical checksummed records, strict checkpoint restoration, and revisioned revocation/reset
+tombstones. Trusted gesture admission, live resource resolution and authority issuance, and
+transactional persistence are the next portal increments.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

@@ -4,6 +4,7 @@
 pub mod application_identity;
 pub mod application_launch;
 pub mod application_lifecycle;
+pub mod application_permission;
 pub mod application_service;
 pub mod args;
 pub mod async_ipc;
