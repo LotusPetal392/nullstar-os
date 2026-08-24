@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod application_launch;
 pub mod args;
 pub mod async_ipc;
 pub mod block_device;
@@ -122,6 +123,29 @@ macro_rules! managed_capability_tool_entry {
         }
 
         $crate::entry!(__nullstar_managed_capability_tool_entry);
+    };
+}
+
+/// Defines a mandatory native-application entry point.
+///
+/// The application cannot reach its program entry function until the runtime
+/// has validated the receive-only bootstrap channel, the typed application
+/// capability context, and the trusted descriptive launch record.
+#[macro_export]
+macro_rules! application_entry {
+    ($entry:path, $capacity:expr, $policies:expr) => {
+        extern "C" fn __nullstar_application_entry(initial_stack: *const usize) -> ! {
+            let start = match $crate::application_launch::receive_application_start::<$capacity>(
+                initial_stack,
+                $policies,
+            ) {
+                Ok(start) => start,
+                Err(_) => $crate::syscall::exit(125),
+            };
+            $entry(initial_stack, start)
+        }
+
+        $crate::entry!(__nullstar_application_entry);
     };
 }
 
