@@ -165,9 +165,11 @@ resolution now pins the volume UUID, inode number, inode generation, and kind in
 provider-process generations. Fresh grant-bound resource ingress endpoints now reduce broker
 authority to `RECEIVE | WAIT`, application authority to exact `SEND`, bind selected responses to the
 minted grant, validate transferred kernel kind/rights, and gate generic filesystem operations against
-the grant ceiling. Failure-atomic selection completion, rooted live-I/O forwarding, stored-identity
-restoration, active revocation, compositor and portal transports, the picker UI, and transactional
-persistence are the next portal increments.
+the grant ceiling. Selection completion now preflights grant issuance or authorization, owns it with
+the endpoint pair and response, commits only after a successful atomic move-transfer, and leaves no
+record, counter, or one-shot consumption behind on failure. Rooted live-I/O forwarding,
+stored-identity restoration, active revocation, compositor and portal transports, the picker UI, and
+transactional persistence are the next portal increments.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

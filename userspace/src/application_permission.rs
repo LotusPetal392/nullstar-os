@@ -629,6 +629,77 @@ impl ApplicationGrantAuthorization {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedGrantCommit {
+    Existing {
+        index: usize,
+        consumed_revision: Option<u64>,
+        next_revision: u64,
+    },
+    Issued {
+        slot: usize,
+        stored_record: ApplicationGrantRecord,
+        next_grant_id: u64,
+        next_revision: u64,
+    },
+}
+
+/// A preflighted grant authorization whose policy mutation is infallible at commit time.
+///
+/// Dropping this value leaves the permission store unchanged. Portal selection uses that property
+/// to mint and transfer a resource endpoint before committing a new grant or consuming a one-shot
+/// grant.
+pub struct PreparedApplicationGrant<'a> {
+    store: &'a mut ApplicationPermissionStore,
+    authorization: ApplicationGrantAuthorization,
+    commit: PreparedGrantCommit,
+}
+
+impl PreparedApplicationGrant<'_> {
+    pub const fn authorization(&self) -> ApplicationGrantAuthorization {
+        self.authorization
+    }
+
+    /// Applies the already-reserved store mutation. All capacity and counter checks happened while
+    /// preparing the transaction, so this operation cannot fail.
+    pub fn commit(self) -> ApplicationGrantAuthorization {
+        let Self {
+            store,
+            authorization,
+            commit,
+        } = self;
+        match commit {
+            PreparedGrantCommit::Existing {
+                index,
+                consumed_revision,
+                next_revision,
+            } => {
+                if let Some(revision) = consumed_revision {
+                    let record = store.grants[index].expect("prepared grant still exists");
+                    store.grants[index] = Some(ApplicationGrantRecord {
+                        revision,
+                        state: ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed),
+                        ..record
+                    });
+                    store.next_revision = next_revision;
+                }
+            }
+            PreparedGrantCommit::Issued {
+                slot,
+                stored_record,
+                next_grant_id,
+                next_revision,
+            } => {
+                debug_assert!(store.grants[slot].is_none());
+                store.grants[slot] = Some(stored_record);
+                store.next_grant_id = next_grant_id;
+                store.next_revision = next_revision;
+            }
+        }
+        authorization
+    }
+}
+
 /// Fixed-capacity policy store. Revoked records remain as tombstones so an old
 /// persisted record cannot be replayed after revocation or reset.
 pub struct ApplicationPermissionStore {
@@ -753,6 +824,18 @@ impl ApplicationPermissionStore {
         resource: ApplicationResourceIdentity,
         requested_rights: ApplicationGrantRights,
     ) -> Result<ApplicationGrantAuthorization, ApplicationGrantAuthorizationError> {
+        self.prepare_authorization(authorization, resource, requested_rights)
+            .map(PreparedApplicationGrant::commit)
+    }
+
+    /// Preflights authorization without changing the store. Dropping the returned transaction
+    /// compensates a failed endpoint mint or response transfer by construction.
+    pub fn prepare_authorization(
+        &mut self,
+        authorization: AuthorizedApplication,
+        resource: ApplicationResourceIdentity,
+        requested_rights: ApplicationGrantRights,
+    ) -> Result<PreparedApplicationGrant<'_>, ApplicationGrantAuthorizationError> {
         let subject = ApplicationGrantSubject::from_authorization(authorization)
             .ok_or(ApplicationGrantAuthorizationError::InvalidAuthorization)?;
         if !requested_rights.valid_for(resource.kind) {
@@ -776,24 +859,114 @@ impl ApplicationPermissionStore {
         {
             return Err(ApplicationGrantAuthorizationError::ScopeExpired);
         }
-        if record.scope == ApplicationGrantScope::Once {
+        let (consumed_revision, next_revision) = if record.scope == ApplicationGrantScope::Once {
             let revision = self.next_revision;
-            self.next_revision = revision
+            let next_revision = revision
                 .checked_add(1)
                 .ok_or(ApplicationGrantAuthorizationError::RevisionExhausted)?;
-            self.grants[index] = Some(ApplicationGrantRecord {
-                revision,
-                state: ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed),
-                ..record
-            });
-        }
-        Ok(ApplicationGrantAuthorization {
+            (Some(revision), next_revision)
+        } else {
+            (None, self.next_revision)
+        };
+        let authorization = ApplicationGrantAuthorization {
             grant_id: record.id,
             grant_revision: record.revision,
             subject: record.subject,
             resource,
             rights: requested_rights,
             scope: record.scope,
+        };
+        Ok(PreparedApplicationGrant {
+            store: self,
+            authorization,
+            commit: PreparedGrantCommit::Existing {
+                index,
+                consumed_revision,
+                next_revision,
+            },
+        })
+    }
+
+    /// Preflights issuing and authorizing one exact picker selection. No grant is visible and no
+    /// counter advances until the returned transaction commits. A one-shot grant commits directly
+    /// as a consumed tombstone after its endpoint has been transferred successfully.
+    pub fn prepare_issue_authorization(
+        &mut self,
+        authorization: AuthorizedApplication,
+        resource: ApplicationResourceIdentity,
+        rights: ApplicationGrantRights,
+        scope: ApplicationGrantScope,
+    ) -> Result<PreparedApplicationGrant<'_>, ApplicationPermissionStoreError> {
+        let subject = ApplicationGrantSubject::from_authorization(authorization)
+            .ok_or(ApplicationPermissionStoreError::InvalidAuthorization)?;
+        if !rights.valid_for(resource.kind) {
+            return Err(ApplicationPermissionStoreError::InvalidRights);
+        }
+        if scope == ApplicationGrantScope::Persistent && subject.is_transient() {
+            return Err(ApplicationPermissionStoreError::TransientPersistence);
+        }
+        if self.grants.iter().flatten().any(|record| {
+            record.active() && record.subject == subject && record.resource == resource
+        }) {
+            return Err(ApplicationPermissionStoreError::DuplicateGrant);
+        }
+        let Some(slot) = self.grants.iter().position(Option::is_none) else {
+            return Err(ApplicationPermissionStoreError::Full);
+        };
+        let id = self.next_grant_id;
+        let next_grant_id = id
+            .checked_add(1)
+            .ok_or(ApplicationPermissionStoreError::GrantIdExhausted)?;
+        let revision = self.next_revision;
+        let after_issue_revision = revision
+            .checked_add(1)
+            .ok_or(ApplicationPermissionStoreError::RevisionExhausted)?;
+        let record = ApplicationGrantRecord {
+            id,
+            revision,
+            subject,
+            resource,
+            rights,
+            scope,
+            session: if scope == ApplicationGrantScope::Persistent {
+                0
+            } else {
+                authorization.identity().session
+            },
+            state: ApplicationGrantState::Active,
+        };
+        let (stored_record, next_revision) = if scope == ApplicationGrantScope::Once {
+            let next_revision = after_issue_revision
+                .checked_add(1)
+                .ok_or(ApplicationPermissionStoreError::RevisionExhausted)?;
+            (
+                ApplicationGrantRecord {
+                    revision: after_issue_revision,
+                    state: ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed),
+                    ..record
+                },
+                next_revision,
+            )
+        } else {
+            (record, after_issue_revision)
+        };
+        let grant = ApplicationGrantAuthorization {
+            grant_id: id,
+            grant_revision: revision,
+            subject,
+            resource,
+            rights,
+            scope,
+        };
+        Ok(PreparedApplicationGrant {
+            store: self,
+            authorization: grant,
+            commit: PreparedGrantCommit::Issued {
+                slot,
+                stored_record,
+                next_grant_id,
+                next_revision,
+            },
         })
     }
 
@@ -1160,6 +1333,110 @@ mod tests {
             store.records().next().unwrap().state(),
             ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed)
         );
+    }
+
+    #[test]
+    fn prepared_once_authorization_changes_state_only_on_commit() {
+        let authorization = repository_authorization(18);
+        let selected = resource(52, ApplicationResourceKind::File);
+        let mut store = ApplicationPermissionStore::new();
+        let grant = store
+            .issue(
+                authorization,
+                selected,
+                ApplicationGrantRights::READ,
+                ApplicationGrantScope::Once,
+            )
+            .unwrap();
+        let next_revision = store.next_revision();
+
+        {
+            let prepared = store
+                .prepare_authorization(authorization, selected, ApplicationGrantRights::READ)
+                .unwrap();
+            assert_eq!(prepared.authorization().grant_id(), grant.id());
+        }
+        assert!(store.records().next().unwrap().active());
+        assert_eq!(store.next_revision(), next_revision);
+
+        let prepared = store
+            .prepare_authorization(authorization, selected, ApplicationGrantRights::READ)
+            .unwrap();
+        let authorized = prepared.commit();
+        assert_eq!(authorized.grant_revision(), grant.revision());
+        assert_eq!(store.next_revision(), next_revision + 1);
+        assert_eq!(
+            store.records().next().unwrap().state(),
+            ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed)
+        );
+    }
+
+    #[test]
+    fn prepared_issue_rolls_back_all_counters_and_commits_one_shot_tombstone() {
+        let authorization = repository_authorization(18);
+        let selected = resource(53, ApplicationResourceKind::File);
+        let mut store = ApplicationPermissionStore::new();
+
+        {
+            let prepared = store
+                .prepare_issue_authorization(
+                    authorization,
+                    selected,
+                    ApplicationGrantRights::READ,
+                    ApplicationGrantScope::Once,
+                )
+                .unwrap();
+            assert_eq!(prepared.authorization().grant_id(), 1);
+            assert_eq!(prepared.authorization().grant_revision(), 1);
+        }
+        assert_eq!(store.records().count(), 0);
+        assert_eq!(store.next_grant_id(), 1);
+        assert_eq!(store.next_revision(), 1);
+
+        let prepared = store
+            .prepare_issue_authorization(
+                authorization,
+                selected,
+                ApplicationGrantRights::READ,
+                ApplicationGrantScope::Once,
+            )
+            .unwrap();
+        let authorized = prepared.commit();
+        assert_eq!(authorized.grant_id(), 1);
+        assert_eq!(store.next_grant_id(), 2);
+        assert_eq!(store.next_revision(), 3);
+        let record = store.records().next().unwrap();
+        assert_eq!(record.id(), authorized.grant_id());
+        assert_eq!(record.revision(), 2);
+        assert_eq!(
+            record.state(),
+            ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed)
+        );
+    }
+
+    #[test]
+    fn prepared_reusable_issue_publishes_the_reserved_active_record() {
+        let authorization = repository_authorization(18);
+        let selected = resource(54, ApplicationResourceKind::Directory);
+        let mut store = ApplicationPermissionStore::new();
+        let prepared = store
+            .prepare_issue_authorization(
+                authorization,
+                selected,
+                ApplicationGrantRights::READ | ApplicationGrantRights::ENUMERATE,
+                ApplicationGrantScope::Session,
+            )
+            .unwrap();
+        let authorized = prepared.commit();
+
+        assert_eq!(store.next_grant_id(), 2);
+        assert_eq!(store.next_revision(), 2);
+        let record = store.records().next().unwrap();
+        assert!(record.active());
+        assert_eq!(record.id(), authorized.grant_id());
+        assert_eq!(record.revision(), authorized.grant_revision());
+        assert_eq!(record.rights(), authorized.rights());
+        assert_eq!(record.scope(), ApplicationGrantScope::Session);
     }
 
     #[test]

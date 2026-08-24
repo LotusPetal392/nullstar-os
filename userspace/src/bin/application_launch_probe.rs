@@ -20,8 +20,8 @@ use userspace::{
     },
     application_permission::{
         ApplicationGrantRecord, ApplicationGrantRevocation, ApplicationGrantRights,
-        ApplicationGrantScope, ApplicationPermissionStore, ApplicationResourceIdentity,
-        ApplicationResourceKind,
+        ApplicationGrantScope, ApplicationGrantState, ApplicationPermissionStore,
+        ApplicationResourceIdentity, ApplicationResourceKind,
     },
     application_portal::{
         AdmittedPortalRequest, ApplicationPortalAdmission, ApplicationPortalOperation,
@@ -31,8 +31,9 @@ use userspace::{
     application_resource::{
         APPLICATION_RESOURCE_BROKER_RIGHTS, APPLICATION_RESOURCE_CLIENT_RIGHTS,
         APPLICATION_RESOURCE_CLIENT_SOURCE_RIGHTS, ApplicationResourceAccess,
-        ApplicationResourceAuthorizationError, ApplicationResourceBroker,
+        ApplicationResourceAuthorizationError,
     },
+    application_selection::PreparedApplicationSelection,
     application_service::{BASELINE_DESKTOP_ROUTES, DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     handle::{Endpoint, OwnedHandle},
     ipc::{self, CapabilityHandle, Rights, Signals},
@@ -563,7 +564,7 @@ fn application_portal_probe() -> bool {
         PARENT_SURFACE,
         ApplicationPortalOperation::OpenFile,
         ApplicationGrantRights::READ,
-        ApplicationGrantScope::Persistent,
+        ApplicationGrantScope::Once,
     ) else {
         return false;
     };
@@ -587,51 +588,63 @@ fn application_portal_probe() -> bool {
         return false;
     };
     let mut store = ApplicationPermissionStore::new();
-    if store
-        .issue(authorization, resource, request.rights(), request.scope())
-        .is_err()
+    let Ok(failed_selection) = PreparedApplicationSelection::issue(&mut store, admitted, resource)
+    else {
+        return false;
+    };
+    let Ok((failed_sender, failed_receiver)) = OwnedHandle::<Endpoint>::create_pair() else {
+        return false;
+    };
+    drop(failed_receiver);
+    if failed_selection.complete(failed_sender.borrow()).is_ok()
+        || store.records().count() != 0
+        || store.next_grant_id() != 1
+        || store.next_revision() != 1
     {
         return false;
     }
-    let Ok(grant) = store.authorize(authorization, resource, request.rights()) else {
+
+    let Ok(selection) = PreparedApplicationSelection::issue(&mut store, admitted, resource) else {
         return false;
     };
-    let Ok((broker, client)) = ApplicationResourceBroker::mint(grant) else {
+    let grant = selection.grant_authorization();
+    let response = selection.response();
+    let Ok(broker_info) = selection.broker().endpoint().info() else {
         return false;
     };
-    let Ok(broker_info) = broker.endpoint().info() else {
-        return false;
-    };
-    let Ok(client_info) = client.endpoint().info() else {
+    let Ok(client_info) = selection.client_endpoint().endpoint().info() else {
         return false;
     };
     if broker_info.kind != ipc::ObjectKind::Endpoint
         || broker_info.rights != APPLICATION_RESOURCE_BROKER_RIGHTS
         || client_info.object_id == broker_info.object_id
         || client_info.rights != APPLICATION_RESOURCE_CLIENT_SOURCE_RIGHTS
-        || broker.authorize_operation(userspace::filesystem::protocol::operation::READ, 0)
+        || selection
+            .broker()
+            .authorize_operation(userspace::filesystem::protocol::operation::READ, 0)
             != Ok(ApplicationResourceAccess::Read)
-        || broker.authorize_operation(userspace::filesystem::protocol::operation::WRITE, 0)
+        || selection
+            .broker()
+            .authorize_operation(userspace::filesystem::protocol::operation::WRITE, 0)
             != Err(ApplicationResourceAuthorizationError::RightsDenied)
     {
         return false;
     }
-    let Ok(response) =
-        ApplicationPortalResponse::selected_with_resource_endpoint(admitted, grant, &client)
-    else {
-        return false;
-    };
     let Ok((portal_sender, portal_receiver)) = OwnedHandle::<Endpoint>::create_pair() else {
         return false;
     };
     let encoded = response.encode();
-    if portal_sender
-        .send_move(
-            &encoded,
-            client.into_endpoint(),
-            APPLICATION_RESOURCE_CLIENT_RIGHTS,
-        )
-        .is_err()
+    let Ok(broker) = selection.complete(portal_sender.borrow()) else {
+        return false;
+    };
+    if store.next_grant_id() != 2
+        || store.next_revision() != 3
+        || !store.records().any(|record| {
+            record.id() == grant.grant_id()
+                && record.revision() == 2
+                && record.state()
+                    == ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed)
+        })
     {
         return false;
     }

@@ -1036,10 +1036,11 @@ The stable resource-identity, canonical grant-record, bounded restoration, revoc
 foundation is implemented. Canonical open/save/directory requests, trusted gesture admission, and
 authenticated NullFS UUID/inode/generation resolution are also implemented. Fresh grant-bound
 send-only resource ingress, portal endpoint binding, kernel kind/rights validation, and the
-filesystem-operation rights ceiling are implemented as well. Compositor and portal transports, the
-picker UI, failure-atomic selection completion, live rooted forwarding, transactional persistence,
-restoration of stored identities, active revocation, and compatibility projection remain future
-increments.
+filesystem-operation rights ceiling are implemented as well. Grant issuance/authorization,
+endpoint minting, response binding, and capability transfer now complete as one failure-atomic
+in-memory selection transaction, including one-shot compensation. Compositor and portal transports,
+the picker UI, live rooted forwarding, transactional persistence, restoration of stored identities,
+active revocation, and compatibility projection remain future increments.
 
 - trusted window and user-gesture tokens;
 - open, save, directory-selection, drag-and-drop, and share portals;

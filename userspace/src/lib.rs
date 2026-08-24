@@ -7,6 +7,7 @@ pub mod application_lifecycle;
 pub mod application_permission;
 pub mod application_portal;
 pub mod application_resource;
+pub mod application_selection;
 pub mod application_service;
 pub mod args;
 pub mod async_ipc;

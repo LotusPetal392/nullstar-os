@@ -11,7 +11,8 @@ resource kind.
 The [application resource capability adapter](application-resource-capabilities.md) now mints and
 rights-reduces a grant-bound broker endpoint from this policy identity. Restoring a stored identity to
 a new live node, forwarding broker I/O, implementing the picker UI, and making the permission store
-durable remain future work.
+durable remain future work. Endpoint delivery and grant mutation are now coordinated by the
+[application selection transaction](application-selection-transactions.md).
 
 ## Generic filesystem operation
 
@@ -84,9 +85,7 @@ probe verifies unsupported providers cannot fabricate an identity.
 
 ## Next steps
 
-1. Make selection completion failure-atomic across grant issuance, endpoint creation, and response
-   transfer.
-2. Implement rooted live-filesystem forwarding and resolve stored identities without accepting
+1. Implement rooted live-filesystem forwarding and resolve stored identities without accepting
    pathname or inode reuse.
-3. Implement the portal service transport and trusted picker around these policy boundaries.
-4. Persist grants and revocation state transactionally.
+2. Implement the portal service transport and trusted picker around these policy boundaries.
+3. Persist grants and revocation state transactionally.
