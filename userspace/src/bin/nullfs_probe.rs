@@ -4,10 +4,13 @@
 use core::mem::size_of;
 
 use userspace::{
+    application_permission::{
+        ApplicationResourceKind, ApplicationResourceResolveError, ApplicationResourceResolver,
+    },
     args::Args,
     filesystem::{self, Error, Node, protocol},
     ipc::{self, ObjectKind, Rights},
-    syscall,
+    nullfs_primary_volume, syscall,
 };
 
 userspace::entry!(rust_main);
@@ -78,6 +81,40 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         Ok(node) => node,
         Err(_) => syscall::exit(6),
     };
+    let resolver =
+        ApplicationResourceResolver::new(session, nullfs_primary_volume::FILESYSTEM_UUID)
+            .unwrap_or_else(|| syscall::exit(58));
+    let root_identity = resolver
+        .resolve(100, root, ApplicationResourceKind::Directory)
+        .unwrap_or_else(|_| syscall::exit(59));
+    let docs_identity = resolver
+        .resolve(101, docs, ApplicationResourceKind::Directory)
+        .unwrap_or_else(|_| syscall::exit(60));
+    let welcome_identity = resolver
+        .resolve(102, welcome, ApplicationResourceKind::File)
+        .unwrap_or_else(|_| syscall::exit(61));
+    if root_identity.filesystem_uuid() != nullfs_primary_volume::FILESYSTEM_UUID
+        || docs_identity.filesystem_uuid() != nullfs_primary_volume::FILESYSTEM_UUID
+        || welcome_identity.filesystem_uuid() != nullfs_primary_volume::FILESYSTEM_UUID
+        || root_identity.object_id() == 0
+        || docs_identity.object_id() == 0
+        || welcome_identity.object_id() == 0
+        || root_identity.object_id() == docs_identity.object_id()
+        || root_identity.object_id() == welcome_identity.object_id()
+        || docs_identity.object_id() == welcome_identity.object_id()
+        || root_identity.object_generation() == 0
+        || docs_identity.object_generation() == 0
+        || welcome_identity.object_generation() == 0
+        || resolver.resolve(105, welcome, ApplicationResourceKind::File) != Ok(welcome_identity)
+        || resolver.resolve(103, welcome, ApplicationResourceKind::Directory)
+            != Err(ApplicationResourceResolveError::KindMismatch)
+        || ApplicationResourceResolver::new(session, [0x5a; 16])
+            .unwrap()
+            .resolve(104, welcome, ApplicationResourceKind::File)
+            != Err(ApplicationResourceResolveError::FilesystemMismatch)
+    {
+        syscall::exit(62);
+    }
     if docs.id() == root.id()
         || welcome.id() == root.id()
         || docs.id() == 2

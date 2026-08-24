@@ -309,15 +309,21 @@ policy identity beneath file and directory portals. Fixed-capacity `NSPG` v1 rec
 application installation to a filesystem UUID, object ID, object generation, resource kind, rights,
 and scope. One-shot consumption and explicit revocation retain revisioned tombstones; strict
 checkpoint loading rejects stale counters and duplicate active grants. The current layer does not yet
-resolve those identities into live filesystem authority or persist a transactional checkpoint.
+restore those identities into live filesystem authority or persist a transactional checkpoint.
+
+The [application filesystem resource resolver](design/application-resource-resolution.md) adds
+optional filesystem protocol operation `RESOLVE_IDENTITY`. NullFS resolves a generation-scoped opaque
+node to its selected-superblock UUID and validated inode number, inode generation, and kind. The
+application adapter pins an independently expected UUID, rejects symbolic links and kind
+substitution, and then constructs the permission identity. Tmpfs returns `NOT_SUPPORTED`; no provider
+can gain persistence merely by returning an opaque node ID.
 
 The [application portal admission foundation](design/application-portal-admission.md) adds canonical
 open, save, and directory-selection messages plus authenticated one-shot gesture admission. A ticket
 is accepted only from the configured kernel-stamped gesture issuer and binds the client process,
 verified installation, user session, parent surface, seat event, and a bounded lifetime. Selected
 responses must match the admitted subject, resource kind, rights, and scope and carry exactly one
-capability. The compositor transport, picker, resource resolver, and endpoint adapter remain future
-layers.
+capability. The compositor transport, picker, and endpoint adapter remain future layers.
 
 PID 1 is the temporary broker for the logging service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable

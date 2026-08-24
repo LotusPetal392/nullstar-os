@@ -6,8 +6,9 @@ userspace filesystem-service contract defined in
 registered bulk buffers are active for tmpfs and NullFS. NullFS supports
 explicitly negotiated direct writable sessions and a bounded writable public VFS
 proxy. The public filesystem protocol remains `VERSION = 1`: its `Request` and
-`Reply` layouts and operation set are unchanged. The public file-descriptor ABI
-also remains unchanged while kernel proxies bridge the migration.
+`Reply` layouts are unchanged, and optional operation `RESOLVE_IDENTITY` adds a canonical stable
+resource record without changing existing operations. The public file-descriptor ABI also remains
+unchanged while kernel proxies bridge the migration.
 
 ## Design goals
 
@@ -28,6 +29,12 @@ kernel VFS:
 Node IDs are meaningful only within one session generation. A client must
 discard every node and buffer ID after receiving `STALE_SESSION` or observing a
 replacement generation.
+
+`RESOLVE_IDENTITY` is the explicit exception for persistence: a provider that owns stable volume and
+object identity may translate a live node to a 40-byte filesystem UUID, object ID, object generation,
+and kind record. The opaque node ID is mirrored only for correlation and is never persisted. NullFS
+supports the operation; tmpfs returns `NOT_SUPPORTED`. Clients must treat support as optional rather
+than inferring it from protocol version 1.
 
 ## VFS namespace-routing protocol
 
@@ -65,8 +72,8 @@ backing prefix before traversing it internally. This is not a general service-co
 redirect. Matching paths below `/Volumes/NullStar` remain raw administrative aliases,
 while cwd and open-file paths retain canonical names.
 
-This routing change does not alter public filesystem protocol version 1, its `Request`,
-`Reply`, or operations, the public file-descriptor ABI, or `NSVC` version 1.
+This routing change does not alter public filesystem protocol version 1, its `Request` or `Reply`
+layout, the public file-descriptor ABI, or `NSVC` version 1.
 
 ## Session bootstrap
 
@@ -342,6 +349,10 @@ for a Mac-like filesystem to add:
 
 Those features should be added as explicit versioned operations rather than
 overloading generic flags or inline data.
+
+The first such extension is `RESOLVE_IDENTITY`. It deliberately keeps provider-generation opaque
+node IDs separate from persistent resource identity. Its exact application-facing trust model is in
+[Application filesystem resource resolution](design/application-resource-resolution.md).
 
 ## Migration sequence
 

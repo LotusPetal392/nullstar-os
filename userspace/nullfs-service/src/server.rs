@@ -312,6 +312,13 @@ impl<D: BlockDevice> FilesystemServer<D> {
                 }
                 false
             }
+            protocol::operation::RESOLVE_IDENTITY => {
+                reject_unexpected_capability(capability, &mut reply);
+                if reply.status == protocol::status::OK {
+                    self.resolve_identity(&request, &mut reply);
+                }
+                false
+            }
             protocol::operation::OPEN => {
                 reject_unexpected_capability(capability, &mut reply);
                 if reply.status == protocol::status::OK {
@@ -736,6 +743,34 @@ impl<D: BlockDevice> FilesystemServer<D> {
         reply.data_length = bytes.len() as u16;
         reply.node_id = attributes.node_id;
         reply.node_kind = attributes.kind;
+    }
+
+    fn resolve_identity(&mut self, request: &protocol::Request, reply: &mut protocol::Reply) {
+        if !canonical_node_request(request) {
+            reply.status = protocol::status::INVALID;
+            return;
+        }
+        let (identity, attributes) = match self.resolve_current(request.node_id) {
+            Ok(resolved) => resolved,
+            Err(status) => {
+                reply.status = status;
+                return;
+            }
+        };
+        let Some(stable) = protocol::StableNodeIdentity::new(
+            self.filesystem.superblock().filesystem_uuid,
+            identity.node.0,
+            attributes.generation,
+            protocol_node_kind(attributes.kind),
+        ) else {
+            reply.status = protocol::status::IO;
+            return;
+        };
+        let bytes = value_bytes(&stable);
+        reply.data[..bytes.len()].copy_from_slice(bytes);
+        reply.data_length = bytes.len() as u16;
+        reply.node_id = request.node_id;
+        reply.node_kind = stable.kind;
     }
 
     fn open(&mut self, request: &protocol::Request, reply: &mut protocol::Reply) -> bool {
@@ -2155,6 +2190,7 @@ fn fail(code: u64, message: &[u8]) -> ! {
 }
 
 const _: () = assert!(size_of::<protocol::NodeAttributes>() <= protocol::MAX_INLINE_DATA_BYTES);
+const _: () = assert!(size_of::<protocol::StableNodeIdentity>() <= protocol::MAX_INLINE_DATA_BYTES);
 const _: () =
     assert!(size_of::<protocol::Request>() <= userspace::abi::limits::MAX_IPC_MESSAGE_BYTES);
 const _: () =

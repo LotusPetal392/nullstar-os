@@ -160,9 +160,11 @@ grants are the next application-isolation layer. The permission-store foundation
 filesystem UUID/object/generation identities, exact file/directory rights, one-shot/session/persistent
 scopes, canonical checksummed records, strict checkpoint restoration, and revisioned revocation/reset
 tombstones. Canonical open/save/directory requests and process-, application-, session-, surface-,
-and event-bound gesture admission are now implemented as well. Compositor and portal transports,
-live resource resolution and authority issuance, the picker UI, and transactional persistence are the
-next portal increments.
+and event-bound gesture admission are now implemented as well. Authenticated NullFS stable-resource
+resolution now pins the volume UUID, inode number, inode generation, and kind independently of
+provider-process generations. Rights-reduced authority issuance, stored-identity restoration,
+compositor and portal transports, the picker UI, and transactional persistence are the next portal
+increments.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;
