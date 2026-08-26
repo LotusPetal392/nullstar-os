@@ -340,7 +340,14 @@ new grant or existing authorization without changing the permission store, then 
 with the exact endpoint pair and selected response. Failed minting, response binding, or kernel
 move-transfer closes staged authority and leaves grant records and counters unchanged. Successful
 transfer commits an infallibly reserved mutation, including the `Consumed` tombstone for one-shot
-authority. Crash-safe persistence, compositor transport, and picker UI remain future layers.
+authority.
+
+The [application portal transport](design/application-portal-transport.md) retains separate
+`RECEIVE | WAIT` ingress objects for application requests and compositor gesture tickets. A
+manager-owned source issues exact send-only application endpoints, kernel sender IDs select private
+desktop authorization bindings, and pending requests own validated exact-send reply endpoints through
+terminal or selected completion. Authenticated startup wiring, the trusted picker UI, and crash-safe
+persistence remain future layers.
 
 PID 1 is the temporary broker for the logging service ID
 `7cbd3f65-50a6-4c30-b195-9fbed633da43`. Producer role `1` and observer role `2` are separate stable

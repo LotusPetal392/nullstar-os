@@ -6,6 +6,7 @@ pub mod application_launch;
 pub mod application_lifecycle;
 pub mod application_permission;
 pub mod application_portal;
+pub mod application_portal_transport;
 pub mod application_resource;
 pub mod application_resource_forwarding;
 pub mod application_selection;

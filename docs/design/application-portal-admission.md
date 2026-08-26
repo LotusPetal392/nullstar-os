@@ -106,6 +106,9 @@ atomic payload-and-capability transfer.
 
 ## Next steps
 
-1. Implement the portal service transport using kernel-stamped sender identities and authenticated
-   compositor startup authority.
-2. Add a trusted picker UI and transactional permission persistence.
+The [application portal transport](application-portal-transport.md) now applies kernel-stamped sender
+identities to separate application and compositor ingress channels, manager-owned client bindings,
+and exact send-only reply endpoints.
+
+1. Add a trusted picker UI and connect both sources to authenticated service startup.
+2. Add transactional permission persistence.

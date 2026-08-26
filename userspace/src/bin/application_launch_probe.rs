@@ -25,8 +25,15 @@ use userspace::{
     },
     application_portal::{
         AdmittedPortalRequest, ApplicationPortalAdmission, ApplicationPortalOperation,
-        ApplicationPortalRequest, ApplicationPortalResponse, PortalAdmissionError,
-        TrustedUserGestureTicket,
+        ApplicationPortalRequest, ApplicationPortalResponse, ApplicationPortalStatus,
+        PortalAdmissionError, TrustedUserGestureTicket,
+    },
+    application_portal_transport::{
+        APPLICATION_PORTAL_CLIENT_RIGHTS, APPLICATION_PORTAL_CLIENT_SOURCE_RIGHTS,
+        APPLICATION_PORTAL_GESTURE_SOURCE_RIGHTS, APPLICATION_PORTAL_INGRESS_RIGHTS,
+        APPLICATION_PORTAL_REPLY_RECEIVER_RIGHTS, APPLICATION_PORTAL_REPLY_SOURCE_RIGHTS,
+        ApplicationPortalClientBindingError, ApplicationPortalReplyReceiver,
+        ApplicationPortalTransport,
     },
     application_resource::{
         APPLICATION_RESOURCE_BROKER_RIGHTS, APPLICATION_RESOURCE_CLIENT_RIGHTS,
@@ -66,6 +73,7 @@ fn rust_main(_initial_stack: *const usize) -> ! {
             && application_lifecycle_probe()
             && application_permission_probe()
             && application_portal_probe()
+            && application_portal_transport_probe()
         {
             0
         } else {
@@ -686,6 +694,139 @@ fn application_portal_probe() -> bool {
         .endpoint()
         .try_receive(&mut broker_request)
         .is_ok_and(|message| message.bytes == 4 && broker_request == *b"NSRC")
+}
+
+fn application_portal_transport_probe() -> bool {
+    const PARENT_SURFACE: u64 = 801;
+
+    macro_rules! fail {
+        ($message:literal) => {{
+            let _ = syscall::write_all(
+                syscall::STDERR,
+                concat!("application portal transport probe: ", $message, "\n").as_bytes(),
+            );
+            return false;
+        }};
+    }
+
+    let Ok(process_id) = syscall::getpid() else {
+        fail!("process identity");
+    };
+    let Some(authorization) = authorized_root_application() else {
+        fail!("application authorization");
+    };
+    let Ok((mut transport, client_source, gesture_source)) =
+        ApplicationPortalTransport::mint(process_id, process_id)
+    else {
+        fail!("mint");
+    };
+    let Ok(request_ingress_info) = transport.request_ingress().info() else {
+        fail!("request ingress info");
+    };
+    let Ok(gesture_ingress_info) = transport.gesture_ingress().info() else {
+        fail!("gesture ingress info");
+    };
+    let Ok(client_source_info) = client_source.endpoint().info() else {
+        fail!("client source info");
+    };
+    let Ok(gesture_source_info) = gesture_source.endpoint().info() else {
+        fail!("gesture source info");
+    };
+    if request_ingress_info.rights != APPLICATION_PORTAL_INGRESS_RIGHTS
+        || gesture_ingress_info.rights != APPLICATION_PORTAL_INGRESS_RIGHTS
+        || client_source_info.rights != APPLICATION_PORTAL_CLIENT_SOURCE_RIGHTS
+        || gesture_source_info.rights != APPLICATION_PORTAL_GESTURE_SOURCE_RIGHTS
+        || transport.bind_client(process_id + 1, process_id, authorization)
+            != Err(ApplicationPortalClientBindingError::UnauthorizedManager)
+        || transport
+            .bind_client(process_id, process_id, authorization)
+            .is_err()
+        || transport.client_authorization(process_id) != Some(authorization)
+    {
+        fail!("rights or manager binding");
+    }
+
+    let Some(ticket) = TrustedUserGestureTicket::new(
+        802,
+        process_id,
+        authorization.identity().user,
+        authorization.identity().session,
+        authorization.principal().application,
+        authorization.provenance().installation,
+        PARENT_SURFACE,
+        803,
+        804,
+        100,
+        200,
+    ) else {
+        fail!("ticket construction");
+    };
+    let Some(request) = ApplicationPortalRequest::new(
+        805,
+        ticket.id(),
+        PARENT_SURFACE,
+        ApplicationPortalOperation::OpenFile,
+        ApplicationGrantRights::READ,
+        ApplicationGrantScope::Once,
+    ) else {
+        fail!("request construction");
+    };
+    if gesture_source.send_ticket(ticket).is_err()
+        || transport.try_receive_gesture(100) != Ok(Some(ticket))
+    {
+        fail!("gesture delivery");
+    }
+
+    let Ok(client) = client_source.issue_client() else {
+        fail!("client issue");
+    };
+    let Ok(client_info) = client.endpoint().info() else {
+        fail!("client info");
+    };
+    let Ok((reply_receiver, reply_source)) = ApplicationPortalReplyReceiver::mint() else {
+        fail!("reply pair");
+    };
+    let Ok(reply_receiver_info) = reply_receiver.endpoint().info() else {
+        fail!("reply receiver info");
+    };
+    let Ok(reply_source_info) = reply_source.endpoint().info() else {
+        fail!("reply source info");
+    };
+    if client_info.rights != APPLICATION_PORTAL_CLIENT_RIGHTS
+        || reply_receiver_info.rights != APPLICATION_PORTAL_REPLY_RECEIVER_RIGHTS
+        || reply_source_info.rights != APPLICATION_PORTAL_REPLY_SOURCE_RIGHTS
+        || client.send_request(request, reply_source).is_err()
+    {
+        fail!("request delivery");
+    }
+    let Ok(Some(pending)) = transport.try_receive_request(101) else {
+        fail!("request admission");
+    };
+    if pending.request() != request
+        || pending.admission().client_process_id() != process_id
+        || pending
+            .reply_terminal(ApplicationPortalStatus::Cancelled)
+            .is_err()
+    {
+        fail!("terminal reply");
+    }
+
+    let mut response_bytes = [0_u8; 64];
+    let Ok(response_message) = reply_receiver.try_receive(&mut response_bytes) else {
+        fail!("response receive");
+    };
+    let Ok(response) = ApplicationPortalResponse::decode(&response_bytes) else {
+        fail!("response decode");
+    };
+    response_message.sender_process_id == process_id
+        && response_message.bytes == response_bytes.len()
+        && response_message.capability.is_none()
+        && response.status() == ApplicationPortalStatus::Cancelled
+        && response.request_id() == request.request_id()
+        && transport.unbind_client(process_id + 1, process_id)
+            == Err(ApplicationPortalClientBindingError::UnauthorizedManager)
+        && transport.unbind_client(process_id, process_id) == Ok(authorization)
+        && transport.client_authorization(process_id).is_none()
 }
 
 fn admit_portal_request(
