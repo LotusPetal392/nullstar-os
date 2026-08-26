@@ -76,5 +76,8 @@ send-only application-to-broker channel.
 
 ## Remaining work
 
+The [application portal transport](application-portal-transport.md) now owns an admitted request's
+reply endpoint and can complete this transaction directly on it.
+
 1. Implement crash-safe transactional permission persistence.
-2. Implement the portal/compositor transport and trusted picker UI.
+2. Implement and connect the compositor-hosted trusted picker UI.

@@ -171,8 +171,11 @@ record, counter, or one-shot consumption behind on failure. Grant-local live I/O
 canonical generic filesystem wire shape, forwards through private shared-memory mirrors, and rewrites
 all provider nodes through a bounded rooted map. Stored identities now restore to fresh live NullFS
 nodes by revalidating the complete volume/object/generation/kind tuple without a pathname, and the
-grant forwarder accepts that restored node as its root. Active revocation, compositor and portal
-transports, the picker UI, and transactional persistence are the next portal increments.
+grant forwarder accepts that restored node as its root. Active revocation now closes matching live
+broker authority. The application portal transport now separates compositor gestures from
+application requests, authenticates both with kernel sender IDs, uses manager-installed desktop
+bindings, and owns exact send-only reply endpoints. The compositor picker UI, authenticated startup
+wiring, and transactional persistence are the next portal increments.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;
