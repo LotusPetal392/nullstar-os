@@ -12,8 +12,13 @@ and boots as a BIOS disk image in QEMU.
 The project is under active development. It is intended for operating-system
 experimentation, not production use or untrusted workloads.
 
-## Current capabilities
+## Overview
 
+NullStar OS is an experimental x86-64 operating system written in Rust. It combines a freestanding `no_std` kernel with a small `no_std` ring-3 userspace and boots as a BIOS disk image in QEMU.
+
+## Current Capabilities
+
+### Kernel Features
 - x86-64 paging, physical-frame allocation, a coalescing kernel heap, GDT/TSS,
   an IDT, exception handling, and timer-driven scheduling
 - ACPI discovery, PCIe ECAM enumeration, APIC/IOAPIC interrupts with legacy
@@ -23,6 +28,8 @@ experimentation, not production use or untrusted workloads.
   endpoints, narrowly scoped writable raw endpoints for discovered NullFS
   partitions, FAT12/16/32 reads, constrained FAT16 writes, a root VFS mount, and
   a bounded `/tmp` tmpfs
+
+### Userspace Features
 - a host-testable NullFS 1.2 stack with explicit little-endian records,
   authoritative allocation maps, bounded redo recovery, deterministic crash
   testing, formatter, image, inspection, and read-only checking tools, plus a
@@ -72,9 +79,37 @@ experimentation, not production use or untrusted workloads.
   paths terminate and drain the whole job before dirty recovery. A userspace shell (`ush`)
   provides pipelines, redirection, variables, background jobs and basic job control;
   an emergency kernel diagnostic shell
-- separate normal-boot and destructive smoke-test images, including non-destructive
+
+### Filesystems and Storage
+- NullFS supports host-side writable images and recovery. PID 1 launches
+  `nullfs-service --writable` with a partition-scoped raw `READ | WRITE | FLUSH`
+  endpoint. The kernel proxy negotiates exactly `WRITE`, requires the returned
+  `WRITE` session feature, and exposes bounded create, write, truncate, append,
+  and unlink through the UUID-selected 4 MiB primary volume at
+  `/Volumes/NullStar`; stat, read, open, `fstat`, seek, directory reads, and
+  `chdir` also remain available. The volume contains `System/`, `Applications/`,
+  and `Users/`; all three are implemented namespace bindings that retain
+  canonical paths while using the volume's matching backing nodes.
+  The System subtree is read-only through both canonical and raw public views.
+  A statically linked fixture now executes through `/System/bin`, while PID 1 and
+  recovery utilities remain independent bootstrap-image programs. The writable
+  `/Users` binding contains a fixture home with the accepted managed `Profile`
+  layout. Direct flags-zero sessions stay read-only, and raw block authority,
+  session authority, and public VFS policy remain separate. The bounded version 1
+  service-definition parser and one policy-pinned `/System/services` activation pilot are
+  implemented; general discovery, enablement, dependencies, a separate manager, public
+  `mkdir`, `rmdir`, rename, and offline repair remain future work.
+- FAT writes are limited to regular files in the FAT16 root directory with 8.3
+  names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
+
+### System Architecture
+- The launcher produces BIOS images for QEMU's `q35` machine with one CPU and
+  128 MiB of memory; UEFI and SMP are not wired into the current boot path.
+- Separate normal-boot and destructive smoke-test images, including non-destructive
   NullFS raw-endpoint identity, bounds, and flush checks during normal boot, plus
   host-side unit tests and a local pre-push check script
+
+## Documentation
 
 See [Architecture](docs/architecture.md) for how the implemented pieces fit
 together, [Design direction](docs/design/README.md) and the
@@ -100,7 +135,7 @@ needs network access to download Rust components and Cargo dependencies.
 Development is currently tested on Linux. Hardware boot and other QEMU machine
 models are not supported targets yet.
 
-## Quick start
+## Quick Start
 
 ```sh
 git clone https://github.com/LotusPetal392/nullstar-os.git
@@ -112,7 +147,7 @@ QEMU opens a display for the framebuffer and PS/2 keyboard. The host terminal
 shows the serial log. Focus the QEMU window and enter `help` when the NullStar OS
 prompt appears. Stop QEMU with `Ctrl-C` in the host terminal.
 
-### Run modes
+### Run Modes
 
 | Command | Behavior |
 | --- | --- |
@@ -133,7 +168,7 @@ The smoke, out-of-space, block-device-loss, crash-recovery, and boot-generation 
 dedicated source images to temporary files before testing, so persistence, reclamation,
 uncertain-outcome, and rollback checks remain repeatable and do not mutate generated source images.
 
-## Using the shells
+## Using the Shells
 
 Normal boot starts `/init` as PID 1. Init launches `ush` as the foreground
 userspace shell and supervises it. Program names may omit the leading slash. A
@@ -159,7 +194,7 @@ If init cannot start or terminates unexpectedly, the kernel enters its emergency
 diagnostic shell. That shell exposes hardware and kernel-state commands such as
 `memory`, `interrupts`, `pci`, `disk`, and `process`.
 
-## Testing locally
+## Testing Locally
 
 GitHub Actions automatically run the kernel QEMU smoke workflow for pull
 requests and pushes to `main`. Local checks remain the required pre-push
@@ -186,7 +221,7 @@ unavailable-primary recovery, and logging lifecycle convergence. It can take sev
 minutes. Individual Cargo commands should generally include `--locked` so local
 results use the committed dependency graph.
 
-## Repository layout
+## Repository Layout
 
 ```text
 .
@@ -205,31 +240,11 @@ The root package is a host executable. It uses Cargo artifact dependencies to
 build the kernel and userspace for `x86_64-unknown-none`, assembles the disk
 images, and launches QEMU.
 
-## Current limitations
+## Current Limitations
 
 - The launcher produces BIOS images for QEMU's `q35` machine with one CPU and
   128 MiB of memory; UEFI and SMP are not wired into the current boot path.
 - There is no networking stack or network driver.
-- FAT writes are limited to regular files in the FAT16 root directory with 8.3
-  names and a 1 MiB per-file bound. `/tmp` is volatile and intentionally small.
-  NullFS supports host-side writable images and recovery. PID 1 launches
-  `nullfs-service --writable` with a partition-scoped raw `READ | WRITE | FLUSH`
-  endpoint. The kernel proxy negotiates exactly `WRITE`, requires the returned
-  `WRITE` session feature, and exposes bounded create, write, truncate, append,
-  and unlink through the UUID-selected 4 MiB primary volume at
-  `/Volumes/NullStar`; stat, read, open, `fstat`, seek, directory reads, and
-  `chdir` also remain available. The volume contains `System/`, `Applications/`,
-  and `Users/`; all three are implemented namespace bindings that retain
-  canonical paths while using the volume's matching backing nodes.
-  The System subtree is read-only through both canonical and raw public views.
-  A statically linked fixture now executes through `/System/bin`, while PID 1 and
-  recovery utilities remain independent bootstrap-image programs. The writable
-  `/Users` binding contains a fixture home with the accepted managed `Profile`
-  layout. Direct flags-zero sessions stay read-only, and raw block authority,
-  session authority, and public VFS policy remain separate. The bounded version 1
-  service-definition parser and one policy-pinned `/System/services` activation pilot are
-  implemented; general discovery, enablement, dependencies, a separate manager, public
-  `mkdir`, `rmdir`, rename, and offline repair remain future work.
 - Userspace has no standard library, libc, dynamic linker, package manager, or
   general POSIX compatibility. Programs are statically built into the image.
 - Metadata, directory, working-directory, `open`, `spawn_command`, and `execve`
@@ -250,11 +265,13 @@ images, and launches QEMU.
   the kernel is still evolving.
 - Security hardening and broad hardware compatibility are incomplete.
 
-## AI-assisted development
+## AI-Assisted Development
 
 NullStar OS is developed and maintained by Natalie Rockot with substantial
 assistance from OpenAI's ChatGPT for design discussion, implementation,
 debugging, testing guidance, review, and documentation.
+
+The project also benefits from assistance by the Qwen3-coder-30b model for code generation and development support.
 
 AI-assisted changes are reviewed and accepted by the project maintainer, who
 remains responsible for the project's direction and published contents.
