@@ -261,3 +261,51 @@ name = "sv"
 path = "src/bin/sv.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "ahci_driver"
+path = "src/bin/drivers/ahci_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "console_driver"
+path = "src/bin/drivers/console_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "serial_driver"
+path = "src/bin/drivers/serial_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "pci_driver"
+path = "src/bin/drivers/pci_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "ahci_driver"
+path = "src/bin/drivers/ahci_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "console_driver"
+path = "src/bin/drivers/console_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "serial_driver"
+path = "src/bin/drivers/serial_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "keyboard_driver"
+path = "src/bin/drivers/keyboard_driver.rs"
+test = false
+bench = false

@@ -52,11 +52,51 @@ pub const VFS_SERVICE_ID: service_control::ServiceId =
         Err(_) => panic!("VFS service ID must be a canonical UUIDv4"),
     };
 
-const KNOWN_SERVICES: [(&[u8], service_control::ServiceId); 4] = [
+pub const AHCI_SERVICE_ID: service_control::ServiceId =
+    match service_control::ServiceId::from_bytes([
+        0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8,
+        0x09,
+    ]) {
+        Ok(id) => id,
+        Err(_) => panic!("AHCI service ID must be a canonical UUIDv4"),
+    };
+
+pub const CONSOLE_SERVICE_ID: service_control::ServiceId =
+    match service_control::ServiceId::from_bytes([
+        0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
+        0x1a,
+    ]) {
+        Ok(id) => id,
+        Err(_) => panic!("Console service ID must be a canonical UUIDv4"),
+    };
+
+pub const SERIAL_SERVICE_ID: service_control::ServiceId =
+    match service_control::ServiceId::from_bytes([
+        0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a,
+        0x2b,
+    ]) {
+        Ok(id) => id,
+        Err(_) => panic!("Serial service ID must be a canonical UUIDv4"),
+    };
+
+pub const KEYBOARD_SERVICE_ID: service_control::ServiceId =
+    match service_control::ServiceId::from_bytes([
+        0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b,
+        0x3c,
+    ]) {
+        Ok(id) => id,
+        Err(_) => panic!("Keyboard service ID must be a canonical UUIDv4"),
+    };
+
+const KNOWN_SERVICES: [(&[u8], service_control::ServiceId); 8] = [
     (b"logging", LOGGING_SERVICE_ID),
     (b"nullfs", NULLFS_SERVICE_ID),
     (b"tmpfs", TMPFS_SERVICE_ID),
     (b"vfs", VFS_SERVICE_ID),
+    (b"ahci", AHCI_SERVICE_ID),
+    (b"console", CONSOLE_SERVICE_ID),
+    (b"serial", SERIAL_SERVICE_ID),
+    (b"keyboard", KEYBOARD_SERVICE_ID),
 ];
 
 /// Maps a stable command name to its committed service ID.

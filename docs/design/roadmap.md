@@ -175,7 +175,18 @@ grant forwarder accepts that restored node as its root. Active revocation now cl
 broker authority. The application portal transport now separates compositor gestures from
 application requests, authenticates both with kernel sender IDs, uses manager-installed desktop
 bindings, and owns exact send-only reply endpoints. The compositor picker UI, authenticated startup
-wiring, and transactional persistence are the next portal increments.
+wiring, and transactional persistence now have bounded implementation foundations: provider-sourced
+picker pages cannot inject paths or cross the selected volume, the checksummed `NSPS` startup record
+pins distinct manager and compositor process identities, and the `NSGC`/`NSGS` two-checkpoint,
+two-selector protocol makes synchronized selector publication the durable permission-store commit
+point with fallback recovery. The provider and persistence adapters are also implemented: picker
+pages are rebuilt from canonical live directory replies only after name lookup and stable-identity
+resolution, and a fixed 16,640-byte NullFS file maps both checkpoint and selector slots through
+private shared memory with ordered filesystem synchronization. Durable selection completion now
+holds broker authority until selector publication, and fail-stops the portal generation on any
+post-transfer persistence error so recovery—not request retry—resolves the outcome. The remaining
+increments are the compositor renderer, portal/application-manager process integration, and a
+crash-injection acceptance gate.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

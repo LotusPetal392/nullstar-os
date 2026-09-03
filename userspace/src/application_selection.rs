@@ -1,14 +1,18 @@
 //! Failure-atomic completion for portal-selected application resources.
 //!
 //! A selection keeps its permission-store mutation prepared while it creates and binds a fresh
-//! broker endpoint. The kernel move-send is the only fallible completion step. Success commits the
-//! preflighted grant mutation; failure drops both endpoint sides and leaves the store unchanged.
+//! broker endpoint. Basic completion commits after the kernel move-send. Durable completion then
+//! publishes the resulting permission snapshot before releasing the broker for service.
 
 use crate::{
     application_permission::{
         ApplicationGrantAuthorization, ApplicationGrantAuthorizationError,
         ApplicationPermissionStore, ApplicationPermissionStoreError, ApplicationResourceIdentity,
         PreparedApplicationGrant,
+    },
+    application_permission_persistence::{
+        ApplicationPermissionCommit, ApplicationPermissionPersistence,
+        ApplicationPermissionPersistenceError, commit_application_permission_store,
     },
     application_portal::{AdmittedPortalRequest, ApplicationPortalResponse, PortalSelectionError},
     application_resource::{
@@ -30,6 +34,40 @@ pub enum ApplicationSelectionPrepareError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationSelectionCompletionError {
     Transfer(ipc::Error),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplicationSelectionDurableCompletionError<E> {
+    Transfer(ipc::Error),
+    PersistenceAfterTransfer(ApplicationPermissionPersistenceError<E>),
+}
+
+impl<E> ApplicationSelectionDurableCompletionError<E> {
+    /// A persistence error happens after the application has received its endpoint. The portal
+    /// generation must therefore stop instead of accepting another request with uncertain state.
+    pub const fn requires_fail_stop(&self) -> bool {
+        matches!(self, Self::PersistenceAfterTransfer(_))
+    }
+}
+
+/// A selected resource whose permission snapshot reached the durable publication point.
+pub struct DurableApplicationSelection {
+    broker: ApplicationResourceBroker,
+    commit: ApplicationPermissionCommit,
+}
+
+impl DurableApplicationSelection {
+    pub const fn broker(&self) -> &ApplicationResourceBroker {
+        &self.broker
+    }
+
+    pub const fn commit(&self) -> ApplicationPermissionCommit {
+        self.commit
+    }
+
+    pub fn into_broker(self) -> ApplicationResourceBroker {
+        self.broker
+    }
 }
 
 /// One response, endpoint pair, and deferred grant mutation owned as a single transaction.
@@ -132,5 +170,37 @@ impl<'a> PreparedApplicationSelection<'a> {
         }
         grant.commit();
         Ok(broker)
+    }
+
+    /// Transfers the selected endpoint, commits the prepared policy mutation, and synchronously
+    /// publishes the complete store snapshot before returning the broker. If publication fails,
+    /// the broker is closed and the error requires the current portal generation to fail-stop;
+    /// recovery determines whether an outcome-unknown selector publication became durable.
+    pub fn complete_durable<B: ApplicationPermissionPersistence>(
+        self,
+        portal_endpoint: BorrowedHandle<'_, Endpoint>,
+        backend: &mut B,
+        previous: Option<ApplicationPermissionCommit>,
+    ) -> Result<DurableApplicationSelection, ApplicationSelectionDurableCompletionError<B::Error>>
+    {
+        let Self {
+            grant,
+            response,
+            broker,
+            client,
+        } = self;
+        if let Err(error) = portal_endpoint.send_move(
+            &response.encode(),
+            client.into_endpoint(),
+            APPLICATION_RESOURCE_CLIENT_RIGHTS,
+        ) {
+            return Err(ApplicationSelectionDurableCompletionError::Transfer(
+                error.error(),
+            ));
+        }
+        let (_, store) = grant.commit_with_store();
+        let commit = commit_application_permission_store(backend, store, previous)
+            .map_err(ApplicationSelectionDurableCompletionError::PersistenceAfterTransfer)?;
+        Ok(DurableApplicationSelection { broker, commit })
     }
 }

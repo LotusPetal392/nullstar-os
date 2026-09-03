@@ -15,6 +15,12 @@ use userspace::{
         ApplicationResourceResolveError, ApplicationResourceResolver,
         ApplicationResourceRestoreError, ApplicationResourceRestorer,
     },
+    application_permission_persistence::{
+        commit_application_permission_store, recover_application_permission_store,
+    },
+    application_permission_storage::{
+        ApplicationPermissionFilePersistence, NullFsApplicationPermissionFile,
+    },
     application_resource::ApplicationResourceBroker,
     application_resource_forwarding::{
         ApplicationResourceForwardOutcome, ApplicationResourceForwarder,
@@ -42,6 +48,7 @@ const WRITABLE_DIRECTORY_B: &[u8] = b"nullfs-probe-b";
 const WRITABLE_FILE: &[u8] = b"payload.bin";
 const RENAMED_FILE: &[u8] = b"renamed.bin";
 const PUBLIC_VFS_PROBE_FILE: &[u8] = b"nullstar-vfs-probe-v1.bin";
+const PERMISSION_STORE_PROBE_FILE: &[u8] = b"nullstar-permission-store-probe.bin";
 const INITIAL_BYTES: &[u8] = b"NullStar writable";
 const APPEND_BYTES: &[u8] = b" probe";
 const COMPLETE_BYTES: &[u8] = b"NullStar writable probe";
@@ -454,6 +461,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         syscall::exit(46);
     }
 
+    if let Err(exit_code) = application_permission_storage_probe(writable_session, writable_root) {
+        syscall::exit(exit_code);
+    }
+
     if writable_session
         .rmdir(59, writable_root, WRITABLE_DIRECTORY_A)
         .is_err()
@@ -685,6 +696,20 @@ struct RecoveredDirectory {
 }
 
 fn recover_probe_artifacts(session: filesystem::Session, root: Node, shared_memory: u64) -> bool {
+    match session.lookup_node(900, root, PERMISSION_STORE_PROBE_FILE) {
+        Ok(file) => {
+            if session
+                .unlink(901, root, PERMISSION_STORE_PROBE_FILE)
+                .is_err()
+                || session.sync(902).is_err()
+            {
+                return false;
+            }
+            let _ = session.close_node(903, file);
+        }
+        Err(Error::NotFound) => {}
+        Err(_) => return false,
+    }
     let directory_a = match inspect_reserved_directory(
         session,
         root,
@@ -728,6 +753,44 @@ fn recover_probe_artifacts(session: filesystem::Session, root: Node, shared_memo
     }
 
     (directory_a.is_none() && directory_b.is_none()) || session.sync(43).is_ok()
+}
+
+fn application_permission_storage_probe(
+    session: filesystem::Session,
+    root: Node,
+) -> Result<(), u64> {
+    const STORAGE_BUFFER_ID: u64 = 2;
+    let file = session
+        .create_file(1_000, root, PERMISSION_STORE_PROBE_FILE, true, false)
+        .map_err(|_| 70_u64)?;
+    let adapter = match NullFsApplicationPermissionFile::format_new(
+        session,
+        file,
+        STORAGE_BUFFER_ID,
+        1_001,
+    ) {
+        Ok(adapter) => adapter,
+        Err(_) => {
+            let _ = session.unlink(1_090, root, PERMISSION_STORE_PROBE_FILE);
+            return Err(71_u64);
+        }
+    };
+    let mut persistence = ApplicationPermissionFilePersistence::new(adapter);
+    let store = ApplicationPermissionStore::new();
+    let first =
+        commit_application_permission_store(&mut persistence, &store, None).map_err(|_| 72_u64)?;
+    let second = commit_application_permission_store(&mut persistence, &store, Some(first))
+        .map_err(|_| 73_u64)?;
+    let recovered = recover_application_permission_store(&mut persistence).map_err(|_| 74_u64)?;
+    if recovered.commit != second {
+        return Err(75_u64);
+    }
+    persistence.into_file().detach().map_err(|_| 76_u64)?;
+    session
+        .unlink(1_091, root, PERMISSION_STORE_PROBE_FILE)
+        .map_err(|_| 77_u64)?;
+    session.sync(1_092).map_err(|_| 78_u64)?;
+    Ok(())
 }
 
 fn inspect_reserved_directory(

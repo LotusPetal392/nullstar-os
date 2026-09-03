@@ -51,6 +51,8 @@ impl StartupSectionId {
     pub const LAUNCH: Self = Self(4);
     /// Stable application principal and installation provenance.
     pub const APPLICATION_IDENTITY: Self = Self(5);
+    /// Authenticated application-portal manager/compositor configuration.
+    pub const APPLICATION_PORTAL: Self = Self(6);
 
     pub const fn new(value: u16) -> Option<Self> {
         if value == 0 { None } else { Some(Self(value)) }

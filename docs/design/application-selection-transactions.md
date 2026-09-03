@@ -8,8 +8,9 @@ one fresh broker endpoint pair, and the exact selected response until the respon
 move-transferred successfully.
 
 Endpoint creation, response binding, and transfer failures leave the permission store unchanged.
-Successful transfer commits an already-reserved mutation that cannot fail. This is an in-memory
-service transaction; crash-safe permission persistence remains a separate milestone.
+Successful transfer commits an already-reserved mutation that cannot fail. Durable completion then
+synchronously publishes the complete store snapshot and returns the broker only after selector
+publication succeeds.
 
 ## Completion sequence
 
@@ -31,7 +32,16 @@ kernel atomic move-send of client endpoint
           | success                 | failure
           v                         v
 commit reserved grant         close both endpoint sides
-return broker endpoint        discard prepared mutation
+          |                   discard prepared mutation
+          v
+write + sync inactive checkpoint
+          |
+          v
+write + sync inactive selector
+          | success                 | failure
+          v                         v
+return broker endpoint        close broker peer and fail-stop
+                              portal generation; recover store
 ```
 
 The mutable borrow held by `PreparedApplicationGrant` prevents another store operation from using
@@ -63,21 +73,31 @@ portal; the typed send wrapper returns it, and selection cleanup closes it toget
 
 The response payload and capability are sent by one syscall. A selected payload therefore cannot be
 enqueued without its endpoint, and the endpoint cannot be transferred without the matching payload.
-The prepared grant is committed immediately after that successful syscall with no remaining
-fallible policy step.
+The prepared grant is committed immediately after that successful syscall. Basic `complete` then
+returns the broker for explicitly volatile callers. `complete_durable` instead retains the broker
+while it publishes the resulting store through the two-slot persistence protocol.
+
+A storage error after transfer is an outcome-unknown boundary: the application may already hold the
+queued endpoint and selector synchronization may have reached durable media even if the call
+reported failure. `ApplicationSelectionDurableCompletionError::PersistenceAfterTransfer` therefore
+closes the broker peer and reports `requires_fail_stop()`. The current portal generation must stop,
+recover the permission store, and must not retry that request. Recovery chooses the valid published
+selector; it is the authority on whether the mutation committed durably.
 
 ## Coverage
 
 Host tests prove that dropping prepared existing and newly issued one-shot grants preserves records
 and counters, while commit produces the reserved tombstone revision. The freestanding application
-probe sends first to a closed portal peer, confirms complete grant/counter rollback, retries the same
-admitted selection successfully, validates the resulting consumed tombstone, and exercises the real
-send-only application-to-broker channel.
+probe sends first to a closed portal peer and confirms complete grant/counter rollback. It then
+injects a checkpoint-write failure after successful endpoint transfer, validates the explicit
+fail-stop error and closed broker peer, and proves the in-memory one-shot mutation cannot be reused.
+Finally it completes against memory-backed persistence, recovers the exact commit and consumed
+tombstone, and exercises the real send-only application-to-broker channel.
 
 ## Remaining work
 
 The [application portal transport](application-portal-transport.md) now owns an admitted request's
 reply endpoint and can complete this transaction directly on it.
 
-1. Implement crash-safe transactional permission persistence.
+1. Add a deliberate process-crash acceptance gate at each portal reply publication stage.
 2. Implement and connect the compositor-hosted trusted picker UI.

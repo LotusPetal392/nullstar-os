@@ -906,6 +906,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         runtime_probe_result.bytes_written
     );
 
+    let application_probe_result = match userspace_runtime.run("/application-launch-probe", &[]) {
+        Ok(result) => result,
+        Err(error) => {
+            serial_println!("application isolation validation failed to launch: {error}");
+            hlt_loop();
+        }
+    };
+    if application_probe_result.exit_code() != Some(0)
+        || application_probe_result.path != "/application-launch-probe"
+    {
+        serial_println!(
+            "application isolation verification failed: exit={:?}, path={}, syscalls={}",
+            application_probe_result.exit_code(),
+            application_probe_result.path,
+            application_probe_result.syscall_count
+        );
+        hlt_loop();
+    }
+    serial_println!(
+        "application isolation verified: pid={}, syscalls={}, exit_code=0",
+        application_probe_result.process_id,
+        application_probe_result.syscall_count
+    );
+
     let exec_before = userspace::snapshot();
     let exec_memory_before = userspace_runtime.memory_stats();
     let exec_source_spawn = match userspace_runtime.spawn_foreground("/exec-source", &[]) {

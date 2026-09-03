@@ -23,6 +23,11 @@ use userspace::{
         ApplicationGrantScope, ApplicationGrantState, ApplicationPermissionStore,
         ApplicationResourceIdentity, ApplicationResourceKind,
     },
+    application_permission_persistence::{
+        APPLICATION_PERMISSION_CHECKPOINT_BYTES, APPLICATION_PERMISSION_SELECTOR_BYTES,
+        ApplicationPermissionPersistence, ApplicationPermissionPersistenceError,
+        recover_application_permission_store,
+    },
     application_portal::{
         AdmittedPortalRequest, ApplicationPortalAdmission, ApplicationPortalOperation,
         ApplicationPortalRequest, ApplicationPortalResponse, ApplicationPortalStatus,
@@ -40,7 +45,9 @@ use userspace::{
         APPLICATION_RESOURCE_CLIENT_SOURCE_RIGHTS, ApplicationResourceAccess,
         ApplicationResourceAuthorizationError,
     },
-    application_selection::PreparedApplicationSelection,
+    application_selection::{
+        ApplicationSelectionDurableCompletionError, PreparedApplicationSelection,
+    },
     application_service::{BASELINE_DESKTOP_ROUTES, DISPLAY_CLIENT_ROUTE, LOGGING_PRODUCER_ROUTE},
     handle::{Endpoint, OwnedHandle},
     ipc::{self, CapabilityHandle, Rights, Signals},
@@ -63,6 +70,86 @@ const APPLICATION_ROUTE_GENERATION: u64 = 1;
 const ROOT_COMPONENT: u64 = 21;
 const DESKTOP_CHILD_COMPONENT: u64 = 22;
 const WORKER_COMPONENT: u64 = 23;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePermissionPersistenceError {
+    InjectedCheckpointWrite,
+}
+
+struct ProbePermissionPersistence {
+    checkpoints: [[u8; APPLICATION_PERMISSION_CHECKPOINT_BYTES]; 2],
+    selectors: [[u8; APPLICATION_PERMISSION_SELECTOR_BYTES]; 2],
+    fail_checkpoint_write: bool,
+}
+
+impl ProbePermissionPersistence {
+    const fn new() -> Self {
+        Self {
+            checkpoints: [[0; APPLICATION_PERMISSION_CHECKPOINT_BYTES]; 2],
+            selectors: [[0; APPLICATION_PERMISSION_SELECTOR_BYTES]; 2],
+            fail_checkpoint_write: false,
+        }
+    }
+
+    const fn failing_checkpoint_write() -> Self {
+        Self {
+            fail_checkpoint_write: true,
+            ..Self::new()
+        }
+    }
+}
+
+impl ApplicationPermissionPersistence for ProbePermissionPersistence {
+    type Error = ProbePermissionPersistenceError;
+
+    fn read_checkpoint(
+        &mut self,
+        slot: usize,
+        output: &mut [u8; APPLICATION_PERMISSION_CHECKPOINT_BYTES],
+    ) -> Result<(), Self::Error> {
+        *output = self.checkpoints[slot];
+        Ok(())
+    }
+
+    fn write_checkpoint(
+        &mut self,
+        slot: usize,
+        bytes: &[u8; APPLICATION_PERMISSION_CHECKPOINT_BYTES],
+    ) -> Result<(), Self::Error> {
+        if self.fail_checkpoint_write {
+            self.fail_checkpoint_write = false;
+            return Err(ProbePermissionPersistenceError::InjectedCheckpointWrite);
+        }
+        self.checkpoints[slot] = *bytes;
+        Ok(())
+    }
+
+    fn sync_checkpoint(&mut self, _slot: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn read_selector(
+        &mut self,
+        slot: usize,
+        output: &mut [u8; APPLICATION_PERMISSION_SELECTOR_BYTES],
+    ) -> Result<(), Self::Error> {
+        *output = self.selectors[slot];
+        Ok(())
+    }
+
+    fn write_selector(
+        &mut self,
+        slot: usize,
+        bytes: &[u8; APPLICATION_PERMISSION_SELECTOR_BYTES],
+    ) -> Result<(), Self::Error> {
+        self.selectors[slot] = *bytes;
+        Ok(())
+    }
+
+    fn sync_selector(&mut self, _slot: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 userspace::entry!(rust_main);
 userspace::panic_handler!();
@@ -612,6 +699,62 @@ fn application_portal_probe() -> bool {
         return false;
     }
 
+    let mut failed_persistence_store = ApplicationPermissionStore::new();
+    let Ok(failed_persistence_selection) =
+        PreparedApplicationSelection::issue(&mut failed_persistence_store, admitted, resource)
+    else {
+        return false;
+    };
+    let failed_persistence_grant = failed_persistence_selection.grant_authorization();
+    let Ok((failed_persistence_sender, failed_persistence_receiver)) =
+        OwnedHandle::<Endpoint>::create_pair()
+    else {
+        return false;
+    };
+    let mut failed_persistence = ProbePermissionPersistence::failing_checkpoint_write();
+    let Err(error) = failed_persistence_selection.complete_durable(
+        failed_persistence_sender.borrow(),
+        &mut failed_persistence,
+        None,
+    ) else {
+        return false;
+    };
+    if !error.requires_fail_stop()
+        || error
+            != ApplicationSelectionDurableCompletionError::PersistenceAfterTransfer(
+                ApplicationPermissionPersistenceError::Storage(
+                    ProbePermissionPersistenceError::InjectedCheckpointWrite,
+                ),
+            )
+        || failed_persistence_store.next_grant_id() != 2
+        || failed_persistence_store.next_revision() != 3
+        || !failed_persistence_store.records().any(|record| {
+            record.id() == failed_persistence_grant.grant_id()
+                && record.state()
+                    == ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed)
+        })
+    {
+        return false;
+    }
+    let mut failed_persistence_response = [0_u8; 64];
+    let Ok(failed_persistence_message) =
+        failed_persistence_receiver.try_receive(&mut failed_persistence_response)
+    else {
+        return false;
+    };
+    let Some(failed_persistence_capability) = failed_persistence_message.capability else {
+        return false;
+    };
+    let Ok(failed_persistence_client) = failed_persistence_capability.handle.try_cast::<Endpoint>()
+    else {
+        return false;
+    };
+    if failed_persistence_message.bytes != failed_persistence_response.len()
+        || failed_persistence_client.send(b"closed") != Err(ipc::Error::BROKEN_PIPE)
+    {
+        return false;
+    }
+
     let Ok(selection) = PreparedApplicationSelection::issue(&mut store, admitted, resource) else {
         return false;
     };
@@ -642,12 +785,28 @@ fn application_portal_probe() -> bool {
         return false;
     };
     let encoded = response.encode();
-    let Ok(broker) = selection.complete(portal_sender.borrow()) else {
+    let mut persistence = ProbePermissionPersistence::new();
+    let Ok(completed) = selection.complete_durable(portal_sender.borrow(), &mut persistence, None)
+    else {
+        return false;
+    };
+    let commit = completed.commit();
+    let broker = completed.into_broker();
+    let Ok(recovered) = recover_application_permission_store(&mut persistence) else {
         return false;
     };
     if store.next_grant_id() != 2
         || store.next_revision() != 3
         || !store.records().any(|record| {
+            record.id() == grant.grant_id()
+                && record.revision() == 2
+                && record.state()
+                    == ApplicationGrantState::Revoked(ApplicationGrantRevocation::Consumed)
+        })
+        || recovered.commit != commit
+        || recovered.store.next_grant_id() != store.next_grant_id()
+        || recovered.store.next_revision() != store.next_revision()
+        || !recovered.store.records().any(|record| {
             record.id() == grant.grant_id()
                 && record.revision() == 2
                 && record.state()

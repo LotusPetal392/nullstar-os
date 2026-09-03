@@ -48,6 +48,8 @@ impl CapabilityRole {
     pub const NULLFS_CRASH_TEST_CONTROL: Self = Self(15);
     pub const SERVICE_CONTROL_OBSERVATION: Self = Self(16);
     pub const SERVICE_CONTROL_MUTATION: Self = Self(17);
+    pub const APPLICATION_PORTAL_CLIENT_SOURCE: Self = Self(18);
+    pub const APPLICATION_PORTAL_GESTURE_SOURCE: Self = Self(19);
 
     pub const fn new(value: u32) -> Option<Self> {
         if value == 0 { None } else { Some(Self(value)) }

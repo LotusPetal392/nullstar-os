@@ -111,13 +111,37 @@ zeroed reserved bytes, canonical state/scope relationships, and a CRC32C checksu
 requires the next grant-ID and revision counters to be strictly newer than every record, rejects
 duplicate IDs or revisions, and permits at most one active record for a subject/resource pair.
 
-The implementation does not yet define the durable checkpoint container, transaction protocol, or
-tombstone compaction proof. A production permission-store service must persist records and counters
-atomically and compact tombstones only while preserving rollback/replay protection.
+The allocation-free persistence foundation defines a fixed `NSGC` checkpoint containing the complete
+record set and monotonic counters. Two checkpoint slots are paired with two checksummed `NSGS`
+selectors. A commit writes and synchronizes the inactive checkpoint before publishing and
+synchronizing the inactive selector. Recovery considers only selector-referenced checkpoints, chooses
+the newest valid selector, and falls back to the preceding committed selector if the latest
+checkpoint is corrupt. An unreferenced checkpoint is never a committed store.
+
+A production permission-store service must fail-stop on outcome-unknown synchronization and compact
+tombstones only while preserving rollback/replay protection. Durable selection completion now
+coordinates reply transfer with this persistence protocol: it commits the prepared mutation after
+the atomic endpoint move, retains the broker until selector synchronization succeeds, and closes the
+broker plus requires a portal-generation fail-stop if storage fails after transfer. Recovery decides
+whether an outcome-unknown selector became durable; the request is never retried.
+
+The live storage adapter now maps the two checkpoint and two selector slots into one exact 16,640-byte
+file reached through an already-authorized writable filesystem session. New files are formatted only
+from exact size zero; existing files must already have the exact layout size. Checkpoint and selector
+I/O uses one private shared-memory attachment and every persistence barrier maps to filesystem
+`SYNC`; checkpoint transfers are split into 4,096-byte requests to respect the public NullFS write
+limit without weakening the selector commit boundary. Host failure injection covers every
+publication stage, and the NullFS QEMU probe exercises format, two commits, latest-selector recovery,
+and cleanup against the real service. Durable portal-reply coordination is implemented; a deliberate
+post-write process-crash gate remains future work.
 
 ## Next steps
 
-1. Close live brokers immediately when grants, sessions, providers, or resources become invalid.
-2. Implement the portal/compositor transports and trusted picker UI around the admission protocol.
-3. Persist checkpoint state transactionally and expose permission inspection, revocation, and reset.
+1. **Implemented foundation:** close live brokers immediately when grants, sessions, providers, or
+   resources become invalid.
+2. **Implemented foundation:** capability-separated portal/compositor transport, rooted trusted
+   picker policy, and authenticated live-filesystem adapter; a concrete compositor renderer remains.
+3. **Implemented foundation:** transactional checkpoint container, recovery protocol, live
+   NullFS-file binding, and durable reply coordination; process-crash injection, tombstone
+   compaction, and administrative transport remain.
 4. Extend the same policy foundation to drag-and-drop and share transfers.
