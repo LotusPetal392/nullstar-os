@@ -30,6 +30,7 @@ authoritative when it differs from future design.
 - [Service, session, and application lifecycle](service-and-session-lifecycle.md)
 - [Service management and command line](service-management-and-cli.md)
 - [Capability-based application sandboxing](application-sandboxing.md)
+- [Application portal picker renderer](application-portal-picker-ui.md)
 - [Application bundles, signing, and deployment](application-bundles-and-deployment.md)
 - [Executable loading and linking](executable-loading.md)
 - [Magnetar package and deployment management](package-management.md)

@@ -184,9 +184,10 @@ pages are rebuilt from canonical live directory replies only after name lookup a
 resolution, and a fixed 16,640-byte NullFS file maps both checkpoint and selector slots through
 private shared memory with ordered filesystem synchronization. Durable selection completion now
 holds broker authority until selector publication, and fail-stops the portal generation on any
-post-transfer persistence error so recovery—not request retry—resolves the outcome. The remaining
-increments are the compositor renderer, portal/application-manager process integration, and a
-crash-injection acceptance gate.
+post-transfer persistence error so recovery—not request retry—resolves the outcome. The
+allocation-free compositor renderer, ARGB software surface, authenticated input router, and bounded
+picker-session registry are now implemented as well. The remaining increments are
+portal/application-manager process integration and a crash-injection acceptance gate.
 
 1. require every graphical bundle to launch through the application manager regardless
    of installation path;

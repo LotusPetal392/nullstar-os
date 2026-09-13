@@ -15,7 +15,6 @@ use crate::{
     application_selection::{ApplicationSelectionPrepareError, PreparedApplicationSelection},
     filesystem::protocol,
 };
-
 pub const MAX_APPLICATION_PICKER_ENTRIES: usize = 32;
 pub const MAX_APPLICATION_PICKER_DEPTH: usize = 8;
 

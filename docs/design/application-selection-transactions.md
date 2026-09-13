@@ -100,4 +100,4 @@ The [application portal transport](application-portal-transport.md) now owns an 
 reply endpoint and can complete this transaction directly on it.
 
 1. Add a deliberate process-crash acceptance gate at each portal reply publication stage.
-2. Implement and connect the compositor-hosted trusted picker UI.
+2. Connect the implemented compositor-hosted trusted picker UI to the live portal process.

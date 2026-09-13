@@ -140,7 +140,7 @@ post-write process-crash gate remains future work.
 1. **Implemented foundation:** close live brokers immediately when grants, sessions, providers, or
    resources become invalid.
 2. **Implemented foundation:** capability-separated portal/compositor transport, rooted trusted
-   picker policy, and authenticated live-filesystem adapter; a concrete compositor renderer remains.
+   picker policy, authenticated live-filesystem adapter, software renderer, and input routing.
 3. **Implemented foundation:** transactional checkpoint container, recovery protocol, live
    NullFS-file binding, and durable reply coordination; process-crash injection, tombstone
    compaction, and administrative transport remain.

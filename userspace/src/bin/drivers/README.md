@@ -1,6 +1,7 @@
 # Userspace Drivers
 
-This directory contains userspace implementations of various system drivers for the nullstar-os operating system.
+This directory contains provisional managed-service entry points for future userspace drivers.
+The active hardware implementations still live in the kernel.
 
 ## Available Drivers
 
@@ -12,35 +13,36 @@ This directory contains userspace implementations of various system drivers for 
 
 ## Driver Structure
 
-Each driver follows a common pattern:
-1. Implements the standard service interface with `service_control` capability
-2. Uses `managed_startup` to initialize properly in the userspace environment
-3. Sends a "service-ready" message upon successful initialization
-4. Runs an event loop to handle service control requests
+Each entry point delegates to the allocation-free `driver_service` harness, which:
+
+1. validates the managed startup record and exact service identity;
+2. accepts only send-only readiness and receive-only request endpoints;
+3. sends a readiness message after successful validation; and
+4. drains request messages and closes any transferred authority until a device protocol exists.
 
 ## Implementation Status
 
-These are skeleton implementations that demonstrate the expected structure and interfaces:
+These targets are buildable startup skeletons, not hardware drivers:
 
 ### ahci_driver
-- **Status**: Partial implementation with register definitions and data structures
-- **TODO**: Add actual PCI enumeration, MMIO access, and command execution
+- **Status**: Managed startup skeleton
+- **TODO**: Define the block-device hardware authority contract, then migrate AHCI safely
 
 ### console_driver  
-- **Status**: Basic skeleton with placeholder for framebuffer access
-- **TODO**: Implement actual display initialization and text output
+- **Status**: Managed startup skeleton
+- **TODO**: Define compositor/display-device protocols and framebuffer authority
 
 ### serial_driver
-- **Status**: Basic skeleton with UART register definitions
-- **TODO**: Add actual UART hardware access and configuration
+- **Status**: Managed startup skeleton
+- **TODO**: Define UART device and interrupt protocols
 
 ### keyboard_driver
-- **Status**: Basic skeleton with PS/2 scan code definitions  
-- **TODO**: Add actual keyboard hardware interface and scan code processing
+- **Status**: Managed startup skeleton
+- **TODO**: Define input-device and interrupt protocols
 
 ### pci_driver
-- **Status**: Basic skeleton with PCI configuration space definitions
-- **TODO**: Add actual PCI enumeration capabilities for userspace
+- **Status**: Managed startup skeleton
+- **TODO**: Define PCI configuration-space and device-delegation protocols
 
 ## Hardware Access Considerations
 
