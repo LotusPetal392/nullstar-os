@@ -25,6 +25,7 @@ const ELF_TEST_MARKER: &str = "ELF image validated:";
 const USERSPACE_TEST_MARKER: &str = "process isolation verified:";
 const USER_FILE_IO_TEST_MARKER: &str = "userspace file I/O verified:";
 const USER_RUST_RUNTIME_TEST_MARKER: &str = "userspace Rust runtime verified:";
+const APPLICATION_ISOLATION_TEST_MARKER: &str = "application isolation verified:";
 const USER_EXEC_TEST_MARKER: &str = "userspace transactional exec verified:";
 const USER_FORK_TEST_MARKER: &str = "userspace copy-on-write fork verified:";
 const USER_ENVIRONMENT_TEST_MARKER: &str = "userspace environments verified:";
@@ -1186,6 +1187,7 @@ fn run_qemu_phase(command: Command, phase: SmokePhase) -> bool {
     let mut userspace_ready = false;
     let mut user_file_io_ready = false;
     let mut user_rust_runtime_ready = false;
+    let mut application_isolation_ready = false;
     let mut user_exec_ready = false;
     let mut user_fork_ready = false;
     let mut user_environment_ready = false;
@@ -1225,6 +1227,7 @@ fn run_qemu_phase(command: Command, phase: SmokePhase) -> bool {
         userspace_ready |= line.contains(USERSPACE_TEST_MARKER);
         user_file_io_ready |= line.contains(USER_FILE_IO_TEST_MARKER);
         user_rust_runtime_ready |= line.contains(USER_RUST_RUNTIME_TEST_MARKER);
+        application_isolation_ready |= line.contains(APPLICATION_ISOLATION_TEST_MARKER);
         user_exec_ready |= line.contains(USER_EXEC_TEST_MARKER);
         user_fork_ready |= line.contains(USER_FORK_TEST_MARKER);
         user_environment_ready |= line.contains(USER_ENVIRONMENT_TEST_MARKER);
@@ -1254,6 +1257,7 @@ fn run_qemu_phase(command: Command, phase: SmokePhase) -> bool {
             && userspace_ready
             && user_file_io_ready
             && user_rust_runtime_ready
+            && application_isolation_ready
             && user_exec_ready
             && user_fork_ready
             && user_environment_ready

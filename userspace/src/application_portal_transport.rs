@@ -8,6 +8,9 @@ use crate::{
     abi::limits,
     application_identity::{ApplicationProfile, AuthorizedApplication},
     application_permission::ApplicationGrantSubject,
+    application_permission_persistence::{
+        ApplicationPermissionCommit, ApplicationPermissionPersistence,
+    },
     application_portal::{
         AdmittedPortalRequest, ApplicationPortalAdmission, ApplicationPortalRequest,
         ApplicationPortalStatus, PORTAL_GESTURE_TICKET_BYTES, PORTAL_REQUEST_BYTES,
@@ -15,7 +18,10 @@ use crate::{
         TrustedUserGestureTicket,
     },
     application_resource::ApplicationResourceBroker,
-    application_selection::{ApplicationSelectionCompletionError, PreparedApplicationSelection},
+    application_selection::{
+        ApplicationSelectionCompletionError, ApplicationSelectionDurableCompletionError,
+        DurableApplicationSelection, PreparedApplicationSelection,
+    },
     handle::{
         BorrowedHandle, Endpoint, OwnedHandle, ReceivedCapability, ReceivedMessage, SendMoveError,
     },
@@ -241,6 +247,17 @@ impl PendingApplicationPortalRequest {
         selection: PreparedApplicationSelection<'a>,
     ) -> Result<ApplicationResourceBroker, ApplicationSelectionCompletionError> {
         selection.complete(self.reply.borrow())
+    }
+
+    /// Completes a selection and returns its broker only after the permission snapshot is durable.
+    pub fn complete_durable_selection<'a, B: ApplicationPermissionPersistence>(
+        self,
+        selection: PreparedApplicationSelection<'a>,
+        backend: &mut B,
+        previous: Option<ApplicationPermissionCommit>,
+    ) -> Result<DurableApplicationSelection, ApplicationSelectionDurableCompletionError<B::Error>>
+    {
+        selection.complete_durable(self.reply.borrow(), backend, previous)
     }
 }
 

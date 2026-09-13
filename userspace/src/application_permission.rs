@@ -720,7 +720,7 @@ pub struct PreparedApplicationGrant<'a> {
     commit: PreparedGrantCommit,
 }
 
-impl PreparedApplicationGrant<'_> {
+impl<'a> PreparedApplicationGrant<'a> {
     pub const fn authorization(&self) -> ApplicationGrantAuthorization {
         self.authorization
     }
@@ -728,6 +728,17 @@ impl PreparedApplicationGrant<'_> {
     /// Applies the already-reserved store mutation. All capacity and counter checks happened while
     /// preparing the transaction, so this operation cannot fail.
     pub fn commit(self) -> ApplicationGrantAuthorization {
+        self.commit_with_store().0
+    }
+
+    /// Applies the reserved mutation and returns the still-exclusively borrowed store so a caller
+    /// can publish the resulting snapshot before releasing any associated resource authority.
+    pub(crate) fn commit_with_store(
+        self,
+    ) -> (
+        ApplicationGrantAuthorization,
+        &'a mut ApplicationPermissionStore,
+    ) {
         let Self {
             store,
             authorization,
@@ -761,7 +772,7 @@ impl PreparedApplicationGrant<'_> {
                 store.next_revision = next_revision;
             }
         }
-        authorization
+        (authorization, store)
     }
 }
 
@@ -790,6 +801,25 @@ impl ApplicationPermissionStore {
         if records.len() > MAX_APPLICATION_GRANTS {
             return Err(ApplicationPermissionLoadError::Capacity);
         }
+        let mut slots = [None; MAX_APPLICATION_GRANTS];
+        for (slot, record) in slots.iter_mut().zip(records.iter().copied()) {
+            *slot = Some(record);
+        }
+        Self::restore_checkpoint_slots(slots, records.len(), next_grant_id, next_revision)
+    }
+
+    pub(crate) fn restore_checkpoint_slots(
+        records: [Option<ApplicationGrantRecord>; MAX_APPLICATION_GRANTS],
+        record_count: usize,
+        next_grant_id: u64,
+        next_revision: u64,
+    ) -> Result<Self, ApplicationPermissionLoadError> {
+        if record_count > MAX_APPLICATION_GRANTS
+            || records[..record_count].iter().any(Option::is_none)
+            || records[record_count..].iter().any(Option::is_some)
+        {
+            return Err(ApplicationPermissionLoadError::Capacity);
+        }
         if next_grant_id == 0 || next_revision == 0 {
             return Err(ApplicationPermissionLoadError::InvalidCounter);
         }
@@ -798,7 +828,11 @@ impl ApplicationPermissionStore {
             next_grant_id,
             next_revision,
         };
-        for (index, record) in records.iter().copied().enumerate() {
+        for (index, record) in records[..record_count]
+            .iter()
+            .map(|record| record.expect("validated checkpoint record remains present"))
+            .enumerate()
+        {
             if !record.canonical() || record.id >= next_grant_id || record.revision >= next_revision
             {
                 return Err(ApplicationPermissionLoadError::InvalidRecord);
