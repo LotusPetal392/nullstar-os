@@ -417,6 +417,7 @@ pub struct ApplicationStart<const N: usize> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationLaunchError {
     InvalidDescription,
+    AdmissionRejected,
     Descriptor(syscall::Errno),
     Capability(ipc::Error),
     Startup(ApplicationStartupSendError),
@@ -467,6 +468,16 @@ pub enum ApplicationStartError {
 pub fn spawn_application<const N: usize>(
     launch: ApplicationLaunch<'_, N>,
 ) -> Result<ApplicationInstance<N>, ApplicationLaunchError> {
+    spawn_application_with_admission(launch, |_| Ok(()))
+}
+
+/// Installs manager-owned service bindings after isolation/startup and before releasing the child.
+/// An admission failure kills and reaps the blocked child. Callers must withdraw any externally
+/// installed binding if this function fails after their callback succeeds.
+pub fn spawn_application_with_admission<const N: usize>(
+    launch: ApplicationLaunch<'_, N>,
+    admit: impl FnOnce(ProcessId) -> Result<(), ApplicationLaunchError>,
+) -> Result<ApplicationInstance<N>, ApplicationLaunchError> {
     validate_launch(&launch).map_err(|_| ApplicationLaunchError::InvalidDescription)?;
     let authority_sources =
         retain_component_sources(launch.authorization.profile(), launch.capabilities)?;
@@ -475,7 +486,7 @@ pub fn spawn_application<const N: usize>(
     ipc::job_set_process_limit(job.as_raw(), launch.process_limit)
         .map_err(ApplicationLaunchError::Capability)?;
 
-    let child = spawn_application_in_job(launch, job.as_raw())?;
+    let child = spawn_application_in_job_with_admission(launch, job.as_raw(), admit)?;
 
     Ok(ApplicationInstance {
         process_id: child,
@@ -562,7 +573,8 @@ impl<const N: usize> ApplicationInstance<N> {
         let process_id =
             spawn_application_in_job(application_launch, self.job.as_raw()).map_err(|error| {
                 match error {
-                    ApplicationLaunchError::InvalidDescription => {
+                    ApplicationLaunchError::InvalidDescription
+                    | ApplicationLaunchError::AdmissionRejected => {
                         ApplicationComponentLaunchError::InvalidDescription
                     }
                     ApplicationLaunchError::Descriptor(error) => {
@@ -856,6 +868,14 @@ fn spawn_application_in_job<const N: usize>(
     launch: ApplicationLaunch<'_, N>,
     job: ipc::CapabilityHandle,
 ) -> Result<ProcessId, ApplicationLaunchError> {
+    spawn_application_in_job_with_admission(launch, job, |_| Ok(()))
+}
+
+fn spawn_application_in_job_with_admission<const N: usize>(
+    launch: ApplicationLaunch<'_, N>,
+    job: ipc::CapabilityHandle,
+    admit: impl FnOnce(ProcessId) -> Result<(), ApplicationLaunchError>,
+) -> Result<ProcessId, ApplicationLaunchError> {
     let mut release = LaunchReleaseBarrier::new().map_err(ApplicationLaunchError::Descriptor)?;
     let mut isolated =
         CapabilityDescriptorIsolation::new().map_err(ApplicationLaunchError::Descriptor)?;
@@ -879,6 +899,10 @@ fn spawn_application_in_job<const N: usize>(
     if let Err(error) = install_application_start(child, launch) {
         terminate_and_reap(child);
         return Err(ApplicationLaunchError::Startup(error));
+    }
+    if let Err(error) = admit(child) {
+        terminate_and_reap(child);
+        return Err(error);
     }
     if let Err(error) = release.release() {
         terminate_and_reap(child);

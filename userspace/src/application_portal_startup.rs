@@ -139,9 +139,109 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+pub const APPLICATION_PORTAL_SERVICE_STARTUP_BYTES: usize = 104;
+
+/// Complete live-service configuration: a private state file and a separately selected browse root.
+/// All identities come from the authenticated parent, and must belong to the same pinned volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationPortalServiceStartup {
+    pub portal: ApplicationPortalStartup,
+    pub state_file: crate::application_permission::ApplicationResourceIdentity,
+    pub picker_root: crate::application_permission::ApplicationResourceIdentity,
+}
+
+impl ApplicationPortalServiceStartup {
+    pub fn new(
+        portal: ApplicationPortalStartup,
+        state_file: crate::application_permission::ApplicationResourceIdentity,
+        picker_root: crate::application_permission::ApplicationResourceIdentity,
+    ) -> Option<Self> {
+        use crate::application_permission::ApplicationResourceKind;
+        (state_file.kind() == ApplicationResourceKind::File
+            && picker_root.kind() == ApplicationResourceKind::Directory
+            && state_file.filesystem_uuid() == picker_root.filesystem_uuid())
+        .then_some(Self {
+            portal,
+            state_file,
+            picker_root,
+        })
+    }
+
+    pub fn encode(self) -> [u8; APPLICATION_PORTAL_SERVICE_STARTUP_BYTES] {
+        let mut bytes = [0; APPLICATION_PORTAL_SERVICE_STARTUP_BYTES];
+        bytes[..48].copy_from_slice(&self.portal.encode());
+        bytes[48..64].copy_from_slice(&self.state_file.filesystem_uuid());
+        for (offset, value) in [
+            (64, self.state_file.object_id()),
+            (72, self.state_file.object_generation()),
+            (80, self.picker_root.object_id()),
+            (88, self.picker_root.object_generation()),
+        ] {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let checksum = crc32c(&bytes[..96]);
+        bytes[96..100].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        use crate::application_permission::{ApplicationResourceIdentity, ApplicationResourceKind};
+        if bytes.len() != APPLICATION_PORTAL_SERVICE_STARTUP_BYTES
+            || bytes[100..] != [0; 4]
+            || crc32c(&bytes[..96]) != u32::from_le_bytes(bytes[96..100].try_into().ok()?)
+        {
+            return None;
+        }
+        let portal = ApplicationPortalStartup::decode(&bytes[..48]).ok()?;
+        let uuid = bytes[48..64].try_into().ok()?;
+        Self::new(
+            portal,
+            ApplicationResourceIdentity::new(
+                uuid,
+                read_u64(bytes, 64),
+                read_u64(bytes, 72),
+                ApplicationResourceKind::File,
+            )?,
+            ApplicationResourceIdentity::new(
+                uuid,
+                read_u64(bytes, 80),
+                read_u64(bytes, 88),
+                ApplicationResourceKind::Directory,
+            )?,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_startup_checksums_storage_and_browse_identities() {
+        use crate::application_permission::{ApplicationResourceIdentity, ApplicationResourceKind};
+        let portal = ApplicationPortalStartup::new(10, 20, 7, 30).unwrap();
+        let file =
+            ApplicationResourceIdentity::new([1; 16], 2, 3, ApplicationResourceKind::File).unwrap();
+        let directory =
+            ApplicationResourceIdentity::new([1; 16], 4, 5, ApplicationResourceKind::Directory)
+                .unwrap();
+        let startup = ApplicationPortalServiceStartup::new(portal, file, directory).unwrap();
+        let bytes = startup.encode();
+        assert_eq!(
+            ApplicationPortalServiceStartup::decode(&bytes),
+            Some(startup)
+        );
+        for offset in [48, 64, 72, 80, 88, 96, 100] {
+            let mut corrupt = bytes;
+            corrupt[offset] ^= 1;
+            assert!(ApplicationPortalServiceStartup::decode(&corrupt).is_none());
+        }
+        let foreign =
+            ApplicationResourceIdentity::new([2; 16], 4, 5, ApplicationResourceKind::Directory)
+                .unwrap();
+        assert!(ApplicationPortalServiceStartup::new(portal, file, foreign).is_none());
+        assert!(ApplicationPortalServiceStartup::new(portal, directory, file).is_none());
+    }
 
     #[test]
     fn startup_record_is_canonical_and_checksummed() {

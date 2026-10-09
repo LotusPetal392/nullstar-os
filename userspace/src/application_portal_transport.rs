@@ -397,6 +397,7 @@ impl ApplicationPortalTransport {
         else {
             return Err(ApplicationPortalClientBindingError::NotBound);
         };
+        self.admission.retire_client(process_id);
         Ok(slot
             .take()
             .expect("matched portal client binding")

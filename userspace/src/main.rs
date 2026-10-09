@@ -4024,6 +4024,23 @@ extern "C" fn rust_main(_initial_stack: *const usize) -> ! {
     register_vfs_router(vfs_generation, vfs_request_endpoint);
     let mut service_control = ServiceControlState::new();
     if nullfs_restart_test {
+        let portal_manager = spawn_managed_capability_tool(
+            b"/application-manager probe",
+            SpawnFlags::NEW_PROCESS_GROUP,
+            &[ManagedToolCapability::new(
+                nullfs_request_endpoint,
+                Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+                CapabilityRole::PRIVATE_STORAGE,
+            )],
+            b"userspace init: live application portal launch failed\n",
+        );
+        if !syscall::wait_child(portal_manager).is_ok_and(|status| status.success()) {
+            fail(b"userspace init: live application portal integration failed\n");
+        }
+        let _ = syscall::write_all(
+            STDOUT,
+            b"userspace init: live application portal integration passed\n",
+        );
         run_probe(
             NULLFS_FULL_PROBE_COMMAND,
             nullfs_request_endpoint,

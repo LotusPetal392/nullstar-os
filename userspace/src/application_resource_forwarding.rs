@@ -311,6 +311,19 @@ impl ApplicationResourceForwarderRegistry {
             .any(|entry| entry.as_ref().is_some_and(|entry| entry.id == id))
     }
 
+    /// Removes one process-owned broker before best-effort provider session cleanup.
+    pub fn remove(&mut self, id: ApplicationResourceForwarderId) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|entry| entry.id == id))
+        else {
+            return false;
+        };
+        let _ = self.close_entry(index);
+        true
+    }
+
     pub fn len(&self) -> usize {
         self.entries.iter().flatten().count()
     }

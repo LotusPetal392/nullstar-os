@@ -535,7 +535,9 @@ fn validate_readiness_endpoint(
     let info = readiness
         .info()
         .map_err(ApplicationSupervisionError::Readiness)?;
-    if info.kind != ObjectKind::Endpoint || info.rights != Rights::ENDPOINT || info.size != 0 {
+    // The released child can queue readiness before its manager constructs the supervisor.
+    // poll_readiness authenticates the sender and exact message before accepting it.
+    if info.kind != ObjectKind::Endpoint || info.rights != Rights::ENDPOINT {
         return Err(ApplicationSupervisionError::InvalidReadinessEndpoint);
     }
     Ok(())
