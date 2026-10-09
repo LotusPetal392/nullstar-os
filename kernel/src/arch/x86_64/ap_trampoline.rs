@@ -50,8 +50,7 @@ impl ApTrampoline {
         frame_allocator: &mut BootInfoFrameAllocator,
     ) -> Result<Self, TrampolineError> {
         let physical_address = frame.start_address().as_u64();
-        if physical_address < 0x1000
-            || physical_address >= LOW_MEMORY_LIMIT
+        if !(0x1000..LOW_MEMORY_LIMIT).contains(&physical_address)
             || physical_address & (PAGE_SIZE as u64 - 1) != 0
         {
             return Err(TrampolineError::InvalidPhysicalAddress);

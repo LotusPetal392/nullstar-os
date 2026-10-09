@@ -518,12 +518,7 @@ mod tests {
                 PortalColor::SELECTED,
             )
             .unwrap();
-        assert!(
-            surface
-                .pixels()
-                .iter()
-                .any(|pixel| *pixel == PortalColor::TEXT.0)
-        );
+        assert!(surface.pixels().contains(&PortalColor::TEXT.0));
         assert_eq!(surface.pixels()[19 * 20 + 19], PortalColor::SELECTED.0);
     }
 
