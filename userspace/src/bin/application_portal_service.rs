@@ -51,6 +51,16 @@ userspace::panic_handler!();
 // BSS avoids copying it through multiple constructor temporaries on the 256 KiB userspace stack.
 static mut PICKERS: ApplicationPortalCompositor = ApplicationPortalCompositor::new();
 
+/// Concrete live service state kept in BSS so its transport, store, and request registries never
+/// occupy the 256 KiB userspace stack while nested polling calls accumulate their own frames on
+/// top of rust_main's live frame.
+type PortalServiceState = ApplicationPortalService<
+    'static,
+    ApplicationPermissionFilePersistence<NullFsApplicationPermissionFile>,
+>;
+
+static mut SERVICE: core::mem::MaybeUninit<PortalServiceState> = core::mem::MaybeUninit::uninit();
+
 fn rust_main(_: *const usize, mut start: ManagedToolStart<2>) -> ! {
     let manager = start
         .context
@@ -126,29 +136,41 @@ fn rust_main(_: *const usize, mut start: ManagedToolStart<2>) -> ! {
             CONTROL_RIGHTS | Rights::TRANSFER,
         )
         .unwrap_or_else(|_| syscall::exit(21));
-    let mut service = ApplicationPortalService::new(
-        startup,
-        PortalServiceResources {
-            manager,
-            compositor,
-            filesystem,
-            transport,
-            browser,
-            root,
-            store: recovered.store,
-            persistence,
-            commit: recovered.commit,
-        },
-        // SAFETY: rust_main runs once; no other code or thread accesses PICKERS.
-        unsafe { &mut *core::ptr::addr_of_mut!(PICKERS) },
-    );
+    let service_slot = core::ptr::addr_of_mut!(SERVICE);
+    // SAFETY: rust_main runs once and is the sole accessor of SERVICE; it writes exactly one
+    // initialized value before reading, and never touches PICKERS directly after handing this
+    // exclusive borrow to the service. PICKERS lives for the program duration, so its borrow can
+    // be 'static while stored inside SERVICE.
+    let picker_ui: &'static mut ApplicationPortalCompositor =
+        unsafe { &mut *core::ptr::addr_of_mut!(PICKERS) };
+    unsafe {
+        (*service_slot).write(ApplicationPortalService::new(
+            startup,
+            PortalServiceResources {
+                manager,
+                compositor,
+                filesystem,
+                transport,
+                browser,
+                root,
+                store: recovered.store,
+                persistence,
+                commit: recovered.commit,
+            },
+            picker_ui,
+        ));
+    }
+    let service = unsafe { (*service_slot).as_mut_ptr() };
     loop {
-        match service.poll() {
+        match unsafe { (&mut *service).poll() } {
             Ok(true) => {
                 let _ = syscall::yield_now();
             }
             Ok(false) => {
-                let persistence = service.finish();
+                // SAFETY: SERVICE holds exactly one initialized value; read moves it onto the
+                // stack to be finished. Shutdown depth is shallow, so this temporary fits easily.
+                let owned = unsafe { core::ptr::read(service) };
+                let persistence = owned.finish();
                 if persistence.into_file().detach().is_err()
                     || storage_session.disconnect(100).is_err()
                     || browser_session.disconnect(100).is_err()
