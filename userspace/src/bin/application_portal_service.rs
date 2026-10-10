@@ -61,7 +61,16 @@ type PortalServiceState = ApplicationPortalService<
 
 static mut SERVICE: core::mem::MaybeUninit<PortalServiceState> = core::mem::MaybeUninit::uninit();
 
-fn rust_main(_: *const usize, mut start: ManagedToolStart<2>) -> ! {
+/// Authenticates startup, recovers durable state, and constructs the live service into BSS.
+///
+/// `#[inline(never)]` is required: construction holds the transport (~27 KiB), recovered store,
+/// and the 68 KiB service temporary alive simultaneously. Inlined into rust_main those live ranges
+/// merge into a single ~220 KiB frame that stays reserved for the entire poll loop, leaving only
+/// ~35 KiB before the guard page — not enough for the nested poll -> picker input routing chain,
+/// which faults with vector 14 inside PortalPickerSession::handle_event. As its own function this
+/// peak exists only during startup; rust_main then polls from a small frame near the stack top.
+#[inline(never)]
+fn build_service(mut start: ManagedToolStart<2>) -> (filesystem::Session, filesystem::Session) {
     let manager = start
         .context
         .take::<Endpoint>(CapabilityRole::SERVICE_REQUEST, CONTROL_RIGHTS)
@@ -137,10 +146,10 @@ fn rust_main(_: *const usize, mut start: ManagedToolStart<2>) -> ! {
         )
         .unwrap_or_else(|_| syscall::exit(21));
     let service_slot = core::ptr::addr_of_mut!(SERVICE);
-    // SAFETY: rust_main runs once and is the sole accessor of SERVICE; it writes exactly one
-    // initialized value before reading, and never touches PICKERS directly after handing this
-    // exclusive borrow to the service. PICKERS lives for the program duration, so its borrow can
-    // be 'static while stored inside SERVICE.
+    // SAFETY: the single process entry calls build_service once and is the sole accessor of
+    // SERVICE; it writes exactly one initialized value before rust_main reads, and never touches
+    // PICKERS directly after handing this exclusive borrow to the service. PICKERS lives for the
+    // program duration, so its borrow can be 'static while stored inside SERVICE.
     let picker_ui: &'static mut ApplicationPortalCompositor =
         unsafe { &mut *core::ptr::addr_of_mut!(PICKERS) };
     unsafe {
@@ -160,6 +169,13 @@ fn rust_main(_: *const usize, mut start: ManagedToolStart<2>) -> ! {
             picker_ui,
         ));
     }
+    (storage_session, browser_session)
+}
+
+fn rust_main(_: *const usize, start: ManagedToolStart<2>) -> ! {
+    let (storage_session, browser_session) = build_service(start);
+    let service_slot = core::ptr::addr_of_mut!(SERVICE);
+    // SAFETY: build_service wrote exactly one initialized value into SERVICE and never read it.
     let service = unsafe { (*service_slot).as_mut_ptr() };
     loop {
         match unsafe { (&mut *service).poll() } {
@@ -169,7 +185,7 @@ fn rust_main(_: *const usize, mut start: ManagedToolStart<2>) -> ! {
             Ok(false) => {
                 // SAFETY: SERVICE holds exactly one initialized value; read moves it onto the
                 // stack to be finished. Shutdown depth is shallow, so this temporary fits easily.
-                let owned = unsafe { core::ptr::read(service) };
+                let owned: PortalServiceState = unsafe { core::ptr::read(service) };
                 let persistence = owned.finish();
                 if persistence.into_file().detach().is_err()
                     || storage_session.disconnect(100).is_err()
