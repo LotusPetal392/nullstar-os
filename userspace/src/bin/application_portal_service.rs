@@ -172,29 +172,43 @@ fn build_service(mut start: ManagedToolStart<2>) -> (filesystem::Session, filesy
     (storage_session, browser_session)
 }
 
+/// Finishes the live service and detaches its durable state.
+///
+/// `#[inline(never)]` is required: finishing moves the 68 KiB service out of BSS onto this
+/// function's stack. Inlined into rust_main that temporary would merge with rust_main's frame,
+/// forcing a ~72 KiB reservation at entry — which coexists with build_service's ~149 KiB
+/// construction peak and overflows the 256 KiB userspace stack during startup (vector 14 inside
+/// ApplicationPortalTransport::mint). As its own function it runs only after build_service has
+/// returned, so the two peaks never coexist.
+#[inline(never)]
+fn shutdown_service(
+    service: *mut PortalServiceState,
+    storage_session: filesystem::Session,
+    browser_session: filesystem::Session,
+) -> ! {
+    // SAFETY: build_service wrote exactly one initialized value into SERVICE and this is the sole
+    // consumer of it; read transfers ownership here before the process exits.
+    let owned: PortalServiceState = unsafe { core::ptr::read(service) };
+    let persistence = owned.finish();
+    if persistence.into_file().detach().is_err()
+        || storage_session.disconnect(100).is_err()
+        || browser_session.disconnect(100).is_err()
+    {
+        syscall::exit(23);
+    }
+    syscall::exit(0);
+}
+
 fn rust_main(_: *const usize, start: ManagedToolStart<2>) -> ! {
     let (storage_session, browser_session) = build_service(start);
-    let service_slot = core::ptr::addr_of_mut!(SERVICE);
     // SAFETY: build_service wrote exactly one initialized value into SERVICE and never read it.
-    let service = unsafe { (*service_slot).as_mut_ptr() };
+    let service = unsafe { (*core::ptr::addr_of_mut!(SERVICE)).as_mut_ptr() };
     loop {
         match unsafe { (&mut *service).poll() } {
             Ok(true) => {
                 let _ = syscall::yield_now();
             }
-            Ok(false) => {
-                // SAFETY: SERVICE holds exactly one initialized value; read moves it onto the
-                // stack to be finished. Shutdown depth is shallow, so this temporary fits easily.
-                let owned: PortalServiceState = unsafe { core::ptr::read(service) };
-                let persistence = owned.finish();
-                if persistence.into_file().detach().is_err()
-                    || storage_session.disconnect(100).is_err()
-                    || browser_session.disconnect(100).is_err()
-                {
-                    syscall::exit(23);
-                }
-                syscall::exit(0);
-            }
+            Ok(false) => shutdown_service(service, storage_session, browser_session),
             // Exiting closes every broker even if persistence publication had an unknown outcome.
             Err(_) => syscall::exit(22),
         }
