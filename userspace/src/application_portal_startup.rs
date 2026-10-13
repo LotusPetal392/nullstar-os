@@ -118,9 +118,15 @@ impl ApplicationPortalStartup {
     }
 
     /// Mints the two capability-separated ingresses using only authenticated startup identities.
-    pub fn start_transport(
-        self,
-    ) -> Result<
+    ///
+    /// `#[inline(never)]` is required: this method calls into `ApplicationPortalTransport::mint`, which
+    /// constructs a 64-slot client binding array on its own stack frame as part of returning the full
+    /// transport by value. Inlined into build_service that peak would merge with build_service's ~149 KiB
+    /// construction temporaries and overflow the 256 KiB userspace stack during startup (vector 14 inside
+    /// ApplicationPortalTransport::mint, rip in release builds mapping to mint itself). As a separate call
+    /// its small frame and mint's isolated peak occur sequentially rather than coexisting with build_service.
+    #[inline(never)]
+    pub fn start_transport(&self) -> Result<
         (
             ApplicationPortalTransport,
             ApplicationPortalClientSource,

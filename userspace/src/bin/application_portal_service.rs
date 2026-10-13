@@ -100,22 +100,11 @@ fn build_service(mut start: ManagedToolStart<2>) -> (filesystem::Session, filesy
         ApplicationResourceKind::File,
     )
     .unwrap_or_else(|| syscall::exit(8));
-    let storage_session = filesystem::connect_writable_service(filesystem.as_raw(), 1)
-        .unwrap_or_else(|_| syscall::exit(9));
-    let file = ApplicationResourceRestorer::new(storage_session, uuid)
-        .unwrap_or_else(|| syscall::exit(10))
-        .restore(2, identity)
-        .unwrap_or_else(|_| syscall::exit(11));
-    let adapter = NullFsApplicationPermissionFile::attach_existing(storage_session, file, 1, 3)
-        .unwrap_or_else(|_| syscall::exit(12));
-    let mut persistence = ApplicationPermissionFilePersistence::new(adapter);
-    // Never silently reformat a corrupt or uncommitted store at startup.
-    let recovered = recover_application_permission_store(&mut persistence)
-        .unwrap_or_else(|_| syscall::exit(13));
-    let browser_session =
-        filesystem::connect_service(filesystem.as_raw(), 1).unwrap_or_else(|_| syscall::exit(14));
-    let (browser, root) = ApplicationPortalFilesystemBrowser::attach(browser_session, uuid, 1, 2)
-        .unwrap_or_else(|_| syscall::exit(15));
+    // Mint the transport and deliver its endpoints before recovering durable state. Application-
+    // manager blocks on these three deliveries immediately after sending startup config, so they
+    // must precede any other work; doing them first also keeps mint's large construction peak away
+    // from storage/browser temporaries that are still unallocated at this point, so the two peaks
+    // never coexist (same principle as shutdown_service running after build_service returns).
     let (transport, clients, gestures) = startup
         .start_transport()
         .unwrap_or_else(|_| syscall::exit(16));
@@ -145,6 +134,22 @@ fn build_service(mut start: ManagedToolStart<2>) -> (filesystem::Session, filesy
             CONTROL_RIGHTS | Rights::TRANSFER,
         )
         .unwrap_or_else(|_| syscall::exit(21));
+    let storage_session = filesystem::connect_writable_service(filesystem.as_raw(), 1)
+        .unwrap_or_else(|_| syscall::exit(9));
+    let file = ApplicationResourceRestorer::new(storage_session, uuid)
+        .unwrap_or_else(|| syscall::exit(10))
+        .restore(2, identity)
+        .unwrap_or_else(|_| syscall::exit(11));
+    let adapter = NullFsApplicationPermissionFile::attach_existing(storage_session, file, 1, 3)
+        .unwrap_or_else(|_| syscall::exit(12));
+    let mut persistence = ApplicationPermissionFilePersistence::new(adapter);
+    // Never silently reformat a corrupt or uncommitted store at startup.
+    let recovered = recover_application_permission_store(&mut persistence)
+        .unwrap_or_else(|_| syscall::exit(13));
+    let browser_session =
+        filesystem::connect_service(filesystem.as_raw(), 1).unwrap_or_else(|_| syscall::exit(14));
+    let (browser, root) = ApplicationPortalFilesystemBrowser::attach(browser_session, uuid, 1, 2)
+        .unwrap_or_else(|_| syscall::exit(15));
     let service_slot = core::ptr::addr_of_mut!(SERVICE);
     // SAFETY: the single process entry calls build_service once and is the sole accessor of
     // SERVICE; it writes exactly one initialized value before rust_main reads, and never touches

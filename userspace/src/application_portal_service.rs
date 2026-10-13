@@ -191,6 +191,15 @@ impl<'a, B: ApplicationPermissionPersistence> ApplicationPortalService<'a, B> {
 
     /// Services at most one message per ingress and one operation per live broker per turn.
     /// `false` is an authenticated, fully cleaned-up manager shutdown.
+    ///
+    /// `#[inline(never)]` is required: this function's steady-state frame holds its 256-byte ingress
+    /// buffer and control admission state across all three ingress loops. Inlined into rust_main that
+    /// allocation merges with rust_main's live loop-body frame, permanently consuming most of the 256 KiB
+    /// userspace stack and leaving only a few dozen KiB for the nested poll -> handle_authenticated_input
+    /// -> translate -> picker input routing chain on top, which faults with vector 14 inside
+    /// PortalPickerSession::handle_event. As its own function rust_main polls from a small frame near the
+    /// stack top, exactly as intended by isolating build_service and shutdown_service.
+    #[inline(never)]
     pub fn poll(&mut self) -> Result<bool, PortalServiceError> {
         if self
             .manager

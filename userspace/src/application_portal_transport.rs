@@ -272,6 +272,15 @@ pub struct ApplicationPortalTransport {
 }
 
 impl ApplicationPortalTransport {
+    /// Mints the portal transport from authenticated startup identities.
+    ///
+    /// `#[inline(never)]` is required: this constructor builds a 64-slot client binding array on its own
+    /// stack frame as part of returning the full transport by value. Inlined into its caller's context
+    /// (build_service via start_transport) that peak would merge with build_service's ~149 KiB construction
+    /// temporaries and overflow the 256 KiB userspace stack during startup (vector 14 inside mint, rip in
+    /// release builds mapping to mint itself). As a separate call its large frame is established and freed
+    /// independently rather than coexisting with build_service's live ranges.
+    #[inline(never)]
     pub fn mint(
         application_manager_process_id: u64,
         trusted_gesture_issuer_process_id: u64,
