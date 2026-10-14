@@ -443,6 +443,13 @@ impl ApplicationPortalAdmission {
         if now_ns > ticket.expires_at_ns {
             return Err(PortalTicketRegistrationError::Expired);
         }
+        // Expired tickets cannot be admitted again, so their replay tombstones can be reclaimed.
+        // Still-valid consumed or retired tickets remain present and reject replay.
+        for slot in &mut self.records {
+            if slot.is_some_and(|record| now_ns > record.ticket.expires_at_ns) {
+                *slot = None;
+            }
+        }
         if self
             .records
             .iter()
@@ -543,6 +550,15 @@ impl ApplicationPortalAdmission {
 
     pub const fn next_transaction_id(&self) -> u64 {
         self.next_transaction_id
+    }
+
+    /// Invalidates queued gestures when the launch manager withdraws a process binding.
+    pub fn retire_client(&mut self, process_id: u64) {
+        for record in self.records.iter_mut().flatten() {
+            if record.ticket.target_process_id == process_id {
+                record.state = TrustedGestureState::Expired;
+            }
+        }
     }
 
     pub fn records(&self) -> impl Iterator<Item = TrustedGestureRecord> + '_ {

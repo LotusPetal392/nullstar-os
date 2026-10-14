@@ -279,47 +279,43 @@ pub fn init(
     execution_runtime::initialize_bootstrap()
         .expect("kernel execution runtime must initialize exactly once");
 
-    if controller.kind == ControllerKind::Apic {
-        if let (Some(madt), Some(bsp_apic_id)) = (madt, controller.local_apic_id) {
-            smp_runtime::initialize_bootstrap(
-                physical_memory_offset.as_u64(),
-                bsp_apic_id,
-                controller.local_apic_timer_initial_count,
-            );
-            prepare_application_processor_mappings(madt, bsp_apic_id);
+    if controller.kind == ControllerKind::Apic
+        && let (Some(madt), Some(bsp_apic_id)) = (madt, controller.local_apic_id)
+    {
+        smp_runtime::initialize_bootstrap(
+            physical_memory_offset.as_u64(),
+            bsp_apic_id,
+            controller.local_apic_timer_initial_count,
+        );
+        prepare_application_processor_mappings(madt, bsp_apic_id);
 
-            let startup_timer = hpet.and_then(|hpet_info| {
-                match hpet_timer::Hpet::new(
-                    hpet_info,
-                    physical_memory_offset,
-                    physical_memory_end,
-                ) {
-                    Ok(timer) => Some(timer),
-                    Err(error) => {
-                        serial_println!(
-                            "SMP HPET startup timing unavailable: {}; using bounded fallback delays",
-                            error.description()
-                        );
-                        None
-                    }
+        let startup_timer = hpet.and_then(|hpet_info| {
+            match hpet_timer::Hpet::new(hpet_info, physical_memory_offset, physical_memory_end) {
+                Ok(timer) => Some(timer),
+                Err(error) => {
+                    serial_println!(
+                        "SMP HPET startup timing unavailable: {}; using bounded fallback delays",
+                        error.description()
+                    );
+                    None
                 }
-            });
+            }
+        });
 
-            match smp_bringup::bring_up_application_processors(
+        match smp_bringup::bring_up_application_processors(
+            madt,
+            bsp_apic_id,
+            physical_memory_offset,
+            startup_timer,
+        ) {
+            Ok(_) => send_reschedule_probes(
                 madt,
                 bsp_apic_id,
-                physical_memory_offset,
+                physical_memory_offset.as_u64(),
                 startup_timer,
-            ) {
-                Ok(_) => send_reschedule_probes(
-                    madt,
-                    bsp_apic_id,
-                    physical_memory_offset.as_u64(),
-                    startup_timer,
-                ),
-                Err(error) => {
-                    serial_println!("SMP application processor bring-up unavailable: {error:?}");
-                }
+            ),
+            Err(error) => {
+                serial_println!("SMP application processor bring-up unavailable: {error:?}");
             }
         }
     }

@@ -305,6 +305,11 @@ impl AuthorizedApplication {
         }
         .encode()
     }
+
+    pub(crate) fn without_executables(mut self) -> Self {
+        self.component_count = 0;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

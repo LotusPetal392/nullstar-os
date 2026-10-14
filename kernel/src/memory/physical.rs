@@ -110,10 +110,6 @@ impl BootInfoFrameAllocator {
         self.recycled_frames.len()
     }
 
-    pub fn reserved_frame_count(&self) -> usize {
-        usize::from(self.reserved_low_frame.is_some())
-    }
-
     pub fn reserved_low_frame(&self) -> Option<PhysFrame<Size4KiB>> {
         self.reserved_low_frame
     }

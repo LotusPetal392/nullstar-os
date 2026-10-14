@@ -154,6 +154,18 @@ fn main() {
         env::var_os("CARGO_BIN_FILE_USERSPACE_application_launch_probe")
             .expect("userspace application-launch probe artifact path was not set"),
     );
+    let userspace_application_manager = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_application_manager")
+            .expect("application manager artifact path was not set"),
+    );
+    let userspace_application_portal_service = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_application_portal_service")
+            .expect("application portal service artifact path was not set"),
+    );
+    let userspace_application_portal_target = PathBuf::from(
+        env::var_os("CARGO_BIN_FILE_USERSPACE_application_portal_target")
+            .expect("application portal target artifact path was not set"),
+    );
     let userspace_stderr_probe = PathBuf::from(
         env::var_os("CARGO_BIN_FILE_USERSPACE_stderr_probe")
             .expect("userspace stderr-probe artifact path was not set"),
@@ -288,6 +300,18 @@ fn main() {
         image.set_file(
             String::from("application-launch-probe"),
             userspace_application_launch_probe.clone(),
+        );
+        image.set_file(
+            String::from("application-manager"),
+            userspace_application_manager.clone(),
+        );
+        image.set_file(
+            String::from("application-portal-service"),
+            userspace_application_portal_service.clone(),
+        );
+        image.set_file(
+            String::from("application-portal-target"),
+            userspace_application_portal_target.clone(),
         );
         image.set_file(String::from("stderr-probe"), userspace_stderr_probe.clone());
         image.set_file(String::from("exec"), userspace_exec.clone());

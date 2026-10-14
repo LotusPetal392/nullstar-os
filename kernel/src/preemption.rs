@@ -40,13 +40,6 @@ pub fn is_disabled() -> bool {
     PREEMPTION_DEPTHS[cpu_index].load(Ordering::Acquire) != 0
 }
 
-pub fn depth_for_cpu(cpu_index: usize) -> usize {
-    PREEMPTION_DEPTHS
-        .get(cpu_index)
-        .map(|depth| depth.load(Ordering::Acquire))
-        .unwrap_or(0)
-}
-
 pub struct PreemptMutex<T> {
     inner: Mutex<T>,
 }

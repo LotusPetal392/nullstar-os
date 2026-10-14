@@ -1052,7 +1052,15 @@ fn run_logging_lifecycle_test(options: &Options) -> bool {
 }
 
 fn run_nullfs_restart_test(options: &Options) -> bool {
-    let image = Path::new(env!("NULLFS_RESTART_TEST_BIOS_IMAGE"));
+    let source_image = Path::new(env!("NULLFS_RESTART_TEST_BIOS_IMAGE"));
+    let test_image = match DisposableImage::copy_from(source_image, "nullfs-restart") {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("failed to copy NullFS restart image: {error}");
+            return false;
+        }
+    };
+    let image = test_image.path();
     let mut mode_selected = false;
     let mut logging_import_count = 0_u8;
     let mut logging_generation_job_drained = false;
@@ -1060,6 +1068,7 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
     let mut nullfs_containment_descendant_count = 0_u8;
     let mut nullfs_generation_job_drain_count = 0_u8;
     let mut restart_verified = false;
+    let mut portal_verified = false;
     let mut definition_loading_observed = false;
     let mut definition_first_failure_observed = false;
     let mut definition_job_drained_observed = false;
@@ -1073,6 +1082,8 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
         NULLFS_RESTART_TEST_TIMEOUT,
         move |line| {
             mode_selected |= line.contains(NULLFS_RESTART_MODE_MARKER);
+            portal_verified |=
+                line.contains("userspace init: live application portal integration passed");
             cleanup_diagnostic_observed |= line.contains(SERVICE_CLEANUP_DIAGNOSTIC_PREFIX);
             if line.contains(LOGGING_SERVICE_JOB_DRAINED_MARKER) {
                 logging_generation_job_drained = true;
@@ -1110,6 +1121,7 @@ fn run_nullfs_restart_test(options: &Options) -> bool {
             definition_verified |=
                 definition_ready_observed && line.contains(DEFINITION_SERVICE_VERIFIED_MARKER);
             mode_selected
+                && portal_verified
                 && logging_import_count >= 2
                 && logging_generation_job_drained
                 && logging_collector_verified

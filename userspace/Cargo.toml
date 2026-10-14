@@ -17,6 +17,24 @@ service-definition = { path = "../crates/service-definition" }
 service-route = { path = "../crates/service-route" }
 
 [[bin]]
+name = "application_portal_service"
+path = "src/bin/application_portal_service.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "application_manager"
+path = "src/bin/application_manager.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "application_portal_target"
+path = "src/bin/application_portal_target.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "init"
 path = "src/main.rs"
 test = false

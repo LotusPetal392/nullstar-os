@@ -4,8 +4,6 @@
 //! increment will bind each session ID to its owned pending reply capability; this module already
 //! keeps picker state, navigation, terminal UI state, and rendering inside trusted code.
 
-use core::array;
-
 use crate::{
     application_permission::ApplicationResourceIdentity,
     application_portal::AdmittedPortalRequest,
@@ -41,9 +39,9 @@ pub struct ApplicationPortalCompositor {
 }
 
 impl ApplicationPortalCompositor {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            sessions: array::from_fn(|_| None),
+            sessions: [const { None }; MAX_PORTAL_PICKER_SESSIONS],
             next_session_id: 1,
         }
     }
