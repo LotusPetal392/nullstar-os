@@ -126,7 +126,9 @@ impl ApplicationPortalStartup {
     /// ApplicationPortalTransport::mint, rip in release builds mapping to mint itself). As a separate call
     /// its small frame and mint's isolated peak occur sequentially rather than coexisting with build_service.
     #[inline(never)]
-    pub fn start_transport(&self) -> Result<
+    pub fn start_transport(
+        &self,
+    ) -> Result<
         (
             ApplicationPortalTransport,
             ApplicationPortalClientSource,
